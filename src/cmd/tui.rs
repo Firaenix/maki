@@ -372,6 +372,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 keymap_reader: stack.plugin_host.keymap_reader(),
                 hint_reader: stack.plugin_host.hint_reader(),
                 plan_action_reader: stack.plugin_host.plan_action_reader(),
+                completer_reader: stack.plugin_host.completer_reader(),
                 ui_action_rx: stack.plugin_host.ui_action_rx(),
                 ui_attachment: stack.plugin_host.ui_attachment(),
                 lua_event_handle: stack.plugin_host.event_handle(),

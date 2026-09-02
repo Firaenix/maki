@@ -126,6 +126,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
         name: "list",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/list"),
     },
+    BundledPlugin {
+        name: "file_mention",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/file_mention"),
+    },
 ];
 
 /// Every bundled name, not just the default-enabled ones. An external package
@@ -909,6 +913,11 @@ impl PluginHost {
         self.inner.plan_action_reader.clone()
     }
 
+    pub fn completer_reader(&self) -> crate::api::util::command::CompleterReader {
+        self.inner.completer_reader.clone()
+    }
+
+
     pub fn ui_action_rx(&self) -> flume::Receiver<UiAction> {
         self.inner.ui_action_rx.clone()
     }
@@ -986,6 +995,24 @@ impl EventHandle {
             parallel,
             selected,
         });
+    }
+
+    /// Fire-and-forget query to a registered input completer; the UI polls
+    /// the returned receiver so a slow handler never blocks a keystroke.
+    pub fn query_input_completer(
+        &self,
+        plugin: Arc<str>,
+        name: Arc<str>,
+        query: String,
+    ) -> flume::Receiver<Option<Vec<crate::api::util::command::CompletionItem>>> {
+        let (tx, rx) = flume::bounded(1);
+        let _ = self.prio_tx.try_send(Request::QueryInputCompleter {
+            plugin,
+            name,
+            query,
+            reply: tx,
+        });
+        rx
     }
 
     pub fn collect_prompt_slots(&self) -> ResolvedSlots {

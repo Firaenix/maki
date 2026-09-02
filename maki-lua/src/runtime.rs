@@ -109,6 +109,10 @@ static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 /// seconds on a loaded debug build, and a wrongly killed restore loses the
 /// tool's rendered output.
 const RESTORE_ITEM_TIMEOUT: Duration = Duration::from_secs(60);
+/// Wall clock a completer handler gets before its reply is dropped and the
+/// popup closes. Long enough for a `git ls-files` walk on a big repo, short
+/// enough that a hung plugin never leaves the popup spinning.
+const COMPLETER_HANDLER_TIMEOUT: Duration = Duration::from_millis(2000);
 const TURN_END_EVENT: &str = "TurnEnd";
 /// Cap on the last delivery pass a scope makes before it reaps its jobs. A job
 /// printing faster than we deliver always has another event queued, so an
@@ -330,6 +334,12 @@ pub enum Request {
     },
     CollectPromptSlots {
         reply: flume::Sender<ResolvedSlots>,
+    },
+    QueryInputCompleter {
+        plugin: Arc<str>,
+        name: Arc<str>,
+        query: String,
+        reply: flume::Sender<Option<Vec<crate::api::util::command::CompletionItem>>>,
     },
     CollectPluginOptions {
         reply: flume::Sender<PluginOptionSpecs>,
@@ -1975,6 +1985,7 @@ impl LuaRuntime {
         keymap_writer: KeymapWriter,
         hint_writer: HintWriter,
         plan_action_writer: PlanActionWriter,
+        completer_writer: crate::api::util::command::CompleterWriter,
         jit: bool,
         plugin_rules: Arc<PluginRuleStore>,
     ) -> Result<Self, PluginError> {
@@ -2028,6 +2039,8 @@ impl LuaRuntime {
         lua.set_app_data(keymap_writer);
         lua.set_app_data(HintStore::new());
         lua.set_app_data(hint_writer);
+        lua.set_app_data(completer_writer);
+        lua.set_app_data(crate::api::util::command::CompleterMap::new());
         lua.set_app_data(Arc::clone(&registry));
 
         let plugins: PluginMap = Rc::new(RefCell::new(HashMap::new()));
@@ -2144,6 +2157,26 @@ impl LuaRuntime {
                 if let Err(e) = self.lua.remove_registry_value(key) {
                     tracing::warn!(plugin = name, error = %e, "failed to drop review handler key");
                 }
+            }
+        }
+        if let Some(mut completer_map) = self
+            .lua
+            .app_data_mut::<crate::api::util::command::CompleterMap>()
+            && let Some(entries) = completer_map.remove(name)
+        {
+            for (_, entry) in entries {
+                if let Err(e) = self.lua.remove_registry_value(entry.handler) {
+                    tracing::warn!(plugin = name, error = %e, "failed to drop completer key");
+                }
+            }
+            drop(completer_map);
+            if let (Some(map), Some(writer)) = (
+                self.lua
+                    .app_data_ref::<crate::api::util::command::CompleterMap>(),
+                self.lua
+                    .app_data_ref::<crate::api::util::command::CompleterWriter>(),
+            ) {
+                crate::api::util::command::publish_completer_snapshot(&map, &writer);
             }
         }
         if let Some(mut cmd_map) = self.lua.app_data_mut::<CommandHandlerMap>()
@@ -3322,6 +3355,7 @@ pub(crate) struct LuaThread {
     pub keymap_reader: KeymapReader,
     pub hint_reader: crate::api::util::command::HintReader,
     pub plan_action_reader: PlanActionReader,
+    pub completer_reader: crate::api::util::command::CompleterReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
     pub ui_attachment: UiAttachment,
 }
@@ -3347,6 +3381,7 @@ pub fn spawn(
     let (keymap_writer, keymap_reader) = KeymapWriter::new();
     let (hint_writer, hint_reader) = HintWriter::new();
     let (plan_action_writer, plan_action_reader) = PlanActionWriter::new();
+    let (completer_writer, completer_reader) = crate::api::util::command::CompleterWriter::new();
 
     let handle = thread::Builder::new()
         .name("maki-lua".to_owned())
@@ -3362,6 +3397,7 @@ pub fn spawn(
                 keymap_writer,
                 hint_writer,
                 plan_action_writer,
+                completer_writer,
                 jit,
                 plugin_rules,
             ) {
@@ -3744,6 +3780,63 @@ pub fn spawn(
                             let slots = rt.collect_prompt_slots().await;
                             let _ = reply.send(slots);
                         }
+                        Request::QueryInputCompleter {
+                            plugin,
+                            name,
+                            query,
+                            reply,
+                        } => {
+                            let func = rt
+                                .lua
+                                .app_data_ref::<crate::api::util::command::CompleterMap>()
+                                .and_then(|m| {
+                                    let entry = m.get(&plugin)?.get(&name)?;
+                                    rt.lua.registry_value::<Function>(&entry.handler).ok()
+                                });
+                            let Some(func) = func else {
+                                let _ = reply.send(None);
+                                continue;
+                            };
+                            let lua = rt.lua.clone();
+                            let g = Rc::clone(&gate);
+                            ex.spawn(async move {
+                                let deadline = Instant::now() + COMPLETER_HANDLER_TIMEOUT;
+                                let run = async {
+                                    let thread = lua.create_thread(func)?;
+                                    thread.into_async::<Option<mlua::Table>>(query)?.await
+                                };
+                                let outcome = run_awaited(
+                                    &lua,
+                                    &g,
+                                    CancelToken::none(),
+                                    deadline,
+                                    run,
+                                )
+                                .await;
+                                let out = match outcome {
+                                    Ok(Ok(Some(items))) => match crate::api::completer::items_from_lua(&items) {
+                                        Ok(items) => Some(items),
+                                        Err(e) => {
+                                            tracing::warn!(plugin = %plugin, completer = %name, error = %e, "completer handler returned malformed items");
+                                            None
+                                        }
+                                    },
+                                    Ok(Ok(None)) => Some(Vec::new()),
+                                    Ok(Err(e)) => {
+                                        tracing::warn!(plugin = %plugin, completer = %name, error = %e, "completer handler failed");
+                                        None
+                                    }
+                                    Err(msg) => {
+                                        // Deadline or reload cancel: drop the reply so the popup
+                                        // stops waiting and no stale answer clobbers a fresher query.
+                                        tracing::warn!(plugin = %plugin, completer = %name, reason = msg, "completer handler dropped");
+                                        return;
+                                    }
+                                };
+                                let _ = reply.send(out);
+                            })
+                            .detach();
+                        }
                         Request::CollectPluginOptions { reply } => {
                             let _ = reply.send(collect_plugin_options(&rt.lua));
                         }
@@ -3964,6 +4057,7 @@ pub fn spawn(
         keymap_reader,
         hint_reader,
         plan_action_reader,
+        completer_reader,
         ui_action_rx,
         ui_attachment,
     })
