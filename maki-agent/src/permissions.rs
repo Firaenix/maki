@@ -822,6 +822,8 @@ impl PermissionManager {
             attempt: self.review_ledger().get(&ledger_key).cloned(),
         };
         let user_message = build_user_message(&call);
+        let request: Arc<str> = Arc::from(user_message.as_str());
+        let event_scopes: Arc<[String]> = Arc::from(scopes);
 
         let mut decision = ReviewDecision::Undecided;
         for def in chain {
@@ -868,6 +870,8 @@ impl PermissionManager {
                     usage: outcome.usage,
                     billed_cost: outcome.billed_cost,
                     list_cost: outcome.list_cost,
+                    request: Arc::clone(&request),
+                    scopes: Arc::clone(&event_scopes),
                 },
             )));
             match parsed {
@@ -982,6 +986,8 @@ impl PermissionManager {
                 usage: maki_providers::TokenUsage::default(),
                 billed_cost: None,
                 list_cost: None,
+                request: Arc::from(""),
+                scopes: Arc::from([]),
             },
         )));
         Some(guidance)
@@ -1064,6 +1070,8 @@ impl PermissionManager {
                             usage: maki_providers::TokenUsage::default(),
                             billed_cost: None,
                             list_cost: None,
+                            request: Arc::from(""),
+                            scopes: Arc::from([]),
                         },
                     )));
                 }
