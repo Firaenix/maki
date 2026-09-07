@@ -489,7 +489,9 @@ impl<'h> Agent<'h> {
         // Ledger and TurnComplete both use the subsidised list price so a
         // plugin summing per-turn `list_cost` from events lands on the same
         // total the ledger later hands to `Done`.
-        let list_cost = self.model.subsidised_list_cost(&response.usage, self.opts.fast);
+        let list_cost = self
+            .model
+            .subsidised_list_cost(&response.usage, self.opts.fast);
         self.ledger.add(response.usage, cost, list_cost);
         self.event_tx
             .send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
@@ -584,12 +586,17 @@ impl<'h> Agent<'h> {
             local_tools: Arc::clone(&self.local_tools),
             live_sink: None,
             model_policy: Arc::clone(&self.model_policy),
-            recent_user_messages: self
-                .history
-                .recent_user_texts(crate::reviewers::REVIEW_CONTEXT_MESSAGES)
-                .into_iter()
-                .map(Arc::from)
-                .collect(),
+            review_context: Arc::new(crate::reviewers::ReviewContext {
+                opening_user_message: self.history.opening_user_text().map(str::to_owned),
+                task_user_message: self.history.task_user_text().map(str::to_owned),
+                recent_user_messages: self
+                    .history
+                    .recent_user_texts(crate::reviewers::REVIEW_CONTEXT_MESSAGES)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                assistant_intent: self.history.latest_assistant_text().map(str::to_owned),
+            }),
         }
     }
 
