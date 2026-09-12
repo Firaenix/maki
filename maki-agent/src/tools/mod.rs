@@ -438,7 +438,7 @@ fn format_rel(prefix: &str, fallback: &str, rel: &Path) -> String {
 
 /// Convenience wrapper that always respects gitignore.
 pub fn walk_builder(root: &str, patterns: &[&str]) -> Result<WalkBuilder, String> {
-    walk_builder_opts(root, patterns, true)
+    walk_builder_opts(root, patterns, true, false)
 }
 
 /// `.git` is always excluded, even when `gitignore` is false.
@@ -446,6 +446,7 @@ pub fn walk_builder_opts(
     root: &str,
     patterns: &[&str],
     gitignore: bool,
+    follow_links: bool,
 ) -> Result<WalkBuilder, String> {
     let mut ob = ignore::overrides::OverrideBuilder::new(root);
     ob.add("!.git").expect("!.git is a valid glob");
@@ -460,7 +461,7 @@ pub fn walk_builder_opts(
         .map_err(|e| format!("invalid glob pattern: {e}"))?;
 
     let mut wb = WalkBuilder::new(root);
-    wb.hidden(false).overrides(overrides);
+    wb.hidden(false).follow_links(follow_links).overrides(overrides);
     if !gitignore {
         wb.ignore(false)
             .git_ignore(false)
@@ -1138,7 +1139,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        let with_ignored = collect(walk_builder_opts(&root_str, &[], false).unwrap());
+        let with_ignored = collect(walk_builder_opts(&root_str, &[], false, false).unwrap());
         assert!(
             with_ignored.iter().any(|p| p.ends_with("test.log")),
             "gitignore=false should include test.log, got: {with_ignored:?}"
@@ -1148,7 +1149,7 @@ mod tests {
             "gitignore=false should include test.txt, got: {with_ignored:?}"
         );
 
-        let without_ignored = collect(walk_builder_opts(&root_str, &[], true).unwrap());
+        let without_ignored = collect(walk_builder_opts(&root_str, &[], true, false).unwrap());
         assert!(
             !without_ignored.iter().any(|p| p.ends_with("test.log")),
             "gitignore=true should exclude test.log, got: {without_ignored:?}"

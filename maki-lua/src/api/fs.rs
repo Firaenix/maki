@@ -567,12 +567,16 @@ async fn glob(lua: Lua, pattern: Value, opts: Option<Table>) -> LuaResult<Pair<T
         .unwrap_or(true);
     let sort = opts.as_ref().and_then(|t| t.get::<String>("sort").ok());
     let sort_mtime = sort.as_deref() == Some("mtime");
+    let follow_symlinks = opts
+        .as_ref()
+        .and_then(|t| opt_bool(t, "follow_symlinks"))
+        .unwrap_or(false);
 
     let result: Result<Vec<String>, String> = smol::unblock(move || {
         let root = maki_agent::tools::resolve_search_path(path.as_deref())?;
         let pattern_refs: Vec<&str> = patterns.iter().map(|s| s.as_str()).collect();
 
-        let walker = maki_agent::tools::walk_builder_opts(&root, &pattern_refs, gitignore)?.build();
+        let walker = maki_agent::tools::walk_builder_opts(&root, &pattern_refs, gitignore, follow_symlinks)?.build();
 
         let iter = walker
             .flatten()
