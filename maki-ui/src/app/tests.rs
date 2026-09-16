@@ -64,6 +64,7 @@ const OPUS_SPEC: &str = "anthropic/claude-opus-4-8";
 const PLAIN_MODEL_SPEC: &str = "ollama/qwen3";
 const THINKING_OPTIONS: &str = "thinking_options";
 const MODEL_CHANGED_EVENT: &str = "ModelChanged";
+const INPUT_CHANGED_EVENT: &str = "InputChanged";
 const PLAN_READY_EVENT: &str = "PlanReady";
 const PLAN_DRAFT_PATH: &str = "/tmp/plan.md";
 const WALK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -85,6 +86,7 @@ const TRUST: &str = "/trust";
 const GATED_INIT_SOURCE: &str = "-- shipped by the project";
 const PREVIOUS_ANSWER: &str = "Previous answer to select";
 const OTHER_SESSION_ID: &str = "11111111-1111-1111-1111-111111111111";
+const EDIT_PLUGIN: &str = "completion";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -2013,6 +2015,17 @@ fn input_snapshot_offsets_are_byte_offsets() {
     assert_eq!(st["col"], 6);
 }
 
+/// The range a plugin planned, before the guards a test wants to vary.
+fn planned_edit(start: usize, stop: usize, text: &str) -> InputEdit {
+    InputEdit {
+        start,
+        stop,
+        text: text.into(),
+        plugin: Arc::from(EDIT_PLUGIN),
+        ..InputEdit::default()
+    }
+}
+
 /// The bounds check alone passes an edit the user has typed in front of: a
 /// plugin reads "hello" and plans to replace 0..5, the user presses home and
 /// types "x", and 5 still fits "xhello". Only the version catches it.
@@ -2026,15 +2039,21 @@ fn an_input_edit_planned_against_an_older_value_fails_on_the_version() {
     app.input_box.buffer.push_char('x');
 
     let err = app
-        .apply_input_edit(0, 5, "bye", None, Some(planned), None)
+        .apply_input_edit(InputEdit {
+            version: Some(planned),
+            ..planned_edit(0, 5, "bye")
+        })
         .unwrap_err();
     assert!(err.contains("version"), "the error has to name why: {err}");
     assert_eq!(app.input_box.buffer.value(), "xhello");
 
     let fresh = app.input_snapshot()["version"].as_u64().unwrap();
     assert!(
-        app.apply_input_edit(0, 6, "bye", None, Some(fresh), None)
-            .is_ok()
+        app.apply_input_edit(InputEdit {
+            version: Some(fresh),
+            ..planned_edit(0, 6, "bye")
+        })
+        .is_ok()
     );
     assert_eq!(app.input_box.buffer.value(), "bye");
 }
@@ -2047,18 +2066,23 @@ fn an_input_edit_naming_another_session_is_refused() {
     let mut app = test_app();
     app.input_box.set_input("hello".into());
     let st = app.input_snapshot();
-    let version = st["version"].as_u64().unwrap();
 
     let err = app
-        .apply_input_edit(0, 5, "bye", None, Some(version), Some(OTHER_SESSION_ID))
+        .apply_input_edit(InputEdit {
+            session_id: Some(OTHER_SESSION_ID.into()),
+            ..planned_edit(0, 5, "bye")
+        })
         .unwrap_err();
     assert!(err.contains(OTHER_SESSION_ID), "the error names it: {err}");
     assert_eq!(app.input_box.buffer.value(), "hello");
 
     let focused = st["session_id"].as_str().unwrap().to_string();
     assert!(
-        app.apply_input_edit(0, 5, "bye", None, Some(version), Some(&focused))
-            .is_ok()
+        app.apply_input_edit(InputEdit {
+            session_id: Some(focused),
+            ..planned_edit(0, 5, "bye")
+        })
+        .is_ok()
     );
     assert_eq!(app.input_box.buffer.value(), "bye");
 }
@@ -4660,6 +4684,115 @@ fn loading_a_session_on_another_model_announces_the_swap() {
     let (event, data) = probe.try_recv_autocmd().expect(MODEL_CHANGED_EVENT);
     assert_eq!(event, MODEL_CHANGED_EVENT);
     assert_eq!(data["model"]["spec"], serde_json::json!(OPUS_SPEC));
+}
+
+/// A fast typist must not wake a handler per keystroke, so the event is
+/// coalesced onto the frame: whatever happened since the last tick arrives as
+/// one event carrying the final text.
+#[test]
+fn input_change_fires_once_per_tick() {
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    for c in "hi".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    let _ = app.tick();
+
+    let (event, data) = probe.try_recv_autocmd().expect(INPUT_CHANGED_EVENT);
+    assert_eq!(event, INPUT_CHANGED_EVENT);
+    assert_eq!(data["text"], serde_json::json!("hi"));
+    assert_eq!(data["cursor"], serde_json::json!(2));
+    assert_eq!(
+        data["source"],
+        serde_json::Value::Null,
+        "the user has no plugin name"
+    );
+    assert_eq!(
+        data["session_id"],
+        serde_json::json!(app.state.session.id.to_string())
+    );
+    assert_eq!(probe.try_recv_autocmd(), None);
+}
+
+/// A flat `"plugin"` would put two input plugins right back where they
+/// started: neither can tell the other's writes from its own, which is the
+/// loop guard this field exists to remove.
+#[test]
+fn input_change_names_the_plugin_that_wrote_it() {
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    app.apply_input_edit(planned_edit(0, 0, "hi")).unwrap();
+    let _ = app.tick();
+
+    let (_, data) = probe.try_recv_autocmd().expect(INPUT_CHANGED_EVENT);
+    assert_eq!(data["text"], serde_json::json!("hi"));
+    assert_eq!(data["source"], serde_json::json!(EDIT_PLUGIN));
+}
+
+/// Clearing the input is a change like any other, and retyping what was just
+/// sent has to be reported. Gating on a flag that only the typing paths set
+/// loses the clear, and then the retyped value compares equal to what Lua was
+/// last told, so a completion plugin stays dead until the user types something
+/// it has not seen before.
+#[test]
+fn resending_the_same_text_still_fires() {
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    for c in "hi".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    let _ = app.tick();
+    assert!(
+        probe.try_recv_autocmd().is_some(),
+        "the typing itself fires"
+    );
+
+    // Submitting fires a turn's worth of events alongside this one.
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    let _ = app.tick();
+    let data = next_input_change(&probe).expect("submitting empties the input, which is a change");
+    assert_eq!(data["text"], serde_json::json!(""));
+
+    for c in "hi".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    let _ = app.tick();
+    let data =
+        next_input_change(&probe).expect("the same text typed again is still a change from empty");
+    assert_eq!(data["text"], serde_json::json!("hi"));
+}
+
+fn next_input_change(probe: &maki_lua::test_support::RequestProbe) -> Option<serde_json::Value> {
+    while let Some((event, data)) = probe.try_recv_autocmd() {
+        if event == INPUT_CHANGED_EVENT {
+            return Some(data);
+        }
+    }
+    None
+}
+
+/// Moving around in the input is not a change: a completion plugin narrowing
+/// its list on every arrow key would flicker for no reason.
+#[test]
+fn moving_the_cursor_fires_nothing() {
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    app.update(Msg::Key(key(KeyCode::Char('a'))));
+    let _ = app.tick();
+    assert!(probe.try_recv_autocmd().is_some());
+
+    app.update(Msg::Key(key(KeyCode::Left)));
+    app.update(Msg::Key(key(KeyCode::Right)));
+    let _ = app.tick();
+    assert_eq!(probe.try_recv_autocmd(), None);
 }
 
 /// What `model_state` reports has to parse back into the same state, or a

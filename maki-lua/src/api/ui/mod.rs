@@ -10,8 +10,8 @@ use mlua::{Lua, Result as LuaResult, Table};
 use strum::VariantNames;
 
 use crate::api::util::command::{
-    Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, InputRequest,
-    Split, TitlePos, UiAction, WinCommand, WinEvent, ui_json_roundtrip, ui_send,
+    Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, InputEdit,
+    InputRequest, Split, TitlePos, UiAction, WinCommand, WinEvent, ui_json_roundtrip, ui_send,
 };
 use crate::api::util::convert::opt_bool;
 use crate::api::util::pair::{Pair, try_pair};
@@ -457,16 +457,18 @@ async fn input(lua: Lua, #[ctx] tx: flume::Sender<UiAction>) -> LuaResult<Pair<m
 async fn input_edit(
     lua: Lua,
     #[ctx] tx: flume::Sender<UiAction>,
+    #[ctx] plugin: Arc<str>,
     opts: Table,
 ) -> LuaResult<Pair<mlua::Value>> {
-    let req = InputRequest::Edit {
+    let req = InputRequest::Edit(InputEdit {
         start: opts.get("start")?,
         stop: opts.get("stop")?,
         text: opts.get::<Option<String>>("text")?.unwrap_or_default(),
         cursor: opts.get("cursor")?,
         version: opts.get("version")?,
         session_id: opts.get("session_id")?,
-    };
+        plugin,
+    });
     input_roundtrip(lua, &tx, req).await
 }
 
@@ -665,7 +667,7 @@ pub(crate) fn create_ui_table(
         action__register(&t, lua, tx.clone())?;
         open_editor__register(&t, lua, tx.clone())?;
         input__register(&t, lua, tx.clone())?;
-        input_edit__register(&t, lua, tx.clone())?;
+        input_edit__register(&t, lua, tx.clone(), Arc::clone(&plugin))?;
         open_win__register(&t, lua, tx)?;
     }
 
@@ -1521,10 +1523,11 @@ mod tests {
 
     const STALE_RANGE_ERR: &str = "stop 99 is past the end of the input (5)";
     const READ_SESSION_ID: &str = "11111111-1111-1111-1111-111111111111";
+    const INPUT_PLUGIN: &str = "test";
 
     /// Stands in for the focused session's input box: reads answer with a
     /// snapshot, edits answer with whatever {edit} decides.
-    fn ui_with_input(edit: fn(InputRequest) -> UiReply) -> Lua {
+    fn ui_with_input(edit: fn(InputEdit) -> UiReply) -> Lua {
         let (tx, rx) = flume::unbounded::<UiAction>();
         std::thread::spawn(move || {
             while let Ok(UiAction::Input { req, reply_tx }) = rx.recv() {
@@ -1537,38 +1540,28 @@ mod tests {
                         "line": 0,
                         "col": 5,
                     })),
-                    req => edit(req),
+                    InputRequest::Edit(edit_req) => edit(edit_req),
                 };
                 let _ = reply_tx.send(reply);
             }
         });
         let lua = Lua::new();
-        let t = create_ui_table(&lua, Some(tx), Arc::from("test")).unwrap();
+        let t = create_ui_table(&lua, Some(tx), Arc::from(INPUT_PLUGIN)).unwrap();
         lua.globals().set("ui", t).unwrap();
         lua
     }
 
     /// Echoes the request back, so a test can assert on what the UI would have
     /// been asked to do.
-    fn echo_edit(req: InputRequest) -> UiReply {
-        let InputRequest::Edit {
-            start,
-            stop,
-            text,
-            cursor,
-            version,
-            session_id,
-        } = req
-        else {
-            unreachable!()
-        };
+    fn echo_edit(edit: InputEdit) -> UiReply {
         Ok(serde_json::json!({
-            "start": start,
-            "stop": stop,
-            "text": text,
-            "cursor": cursor,
-            "version": version,
-            "session_id": session_id,
+            "start": edit.start,
+            "stop": edit.stop,
+            "text": edit.text,
+            "cursor": edit.cursor,
+            "version": edit.version,
+            "session_id": edit.session_id,
+            "plugin": edit.plugin,
         }))
     }
 
@@ -1603,6 +1596,20 @@ mod tests {
         assert_eq!(val["cursor"], serde_json::Value::Null);
         assert_eq!(val["version"], serde_json::Value::Null);
         assert_eq!(val["session_id"], serde_json::Value::Null);
+    }
+
+    /// Two input plugins cannot tell each other's writes apart from a flat
+    /// `"plugin"`, so the name has to be stamped on by the host rather than
+    /// left to the caller to pass honestly.
+    #[test]
+    fn input_edit_names_the_calling_plugin() {
+        let lua = ui_with_input(echo_edit);
+        let (val, err) = eval(
+            &lua,
+            r#"return ui.input_edit({ start = 0, stop = 0, text = "x" })"#,
+        );
+        assert_eq!(err, None);
+        assert_eq!(val["plugin"], INPUT_PLUGIN);
     }
 
     /// The version and the session are what make an edit planned against text

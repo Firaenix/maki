@@ -456,19 +456,27 @@ pub enum ModelRequest {
 }
 
 /// Offsets are flat byte counts into the whole input, newlines counted as one
-/// byte each, because Lua indexes strings by byte. `version` is the value
-/// counter the reader was handed, when the caller wants a stale edit refused,
-/// and `session_id` names the tab the offsets were read from.
+/// byte each, because Lua indexes strings by byte.
+#[derive(Default)]
+pub struct InputEdit {
+    pub start: usize,
+    pub stop: usize,
+    pub text: String,
+    /// Where to leave the cursor, the end of {text} when absent.
+    pub cursor: Option<usize>,
+    /// The value counter the reader was handed, when the caller wants an edit
+    /// planned against older text refused.
+    pub version: Option<u64>,
+    /// The tab the offsets were read from, refused once another is focused.
+    pub session_id: Option<String>,
+    /// Rides along on the `InputChanged` this edit fires, so one input plugin
+    /// can tell another's writes from its own.
+    pub plugin: Arc<str>,
+}
+
 pub enum InputRequest {
     Read,
-    Edit {
-        start: usize,
-        stop: usize,
-        text: String,
-        cursor: Option<usize>,
-        version: Option<u64>,
-        session_id: Option<String>,
-    },
+    Edit(InputEdit),
 }
 
 pub type UiReply = Result<serde_json::Value, String>;

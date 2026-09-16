@@ -1257,21 +1257,7 @@ impl<'t> EventLoop<'t> {
     fn handle_input_request(&mut self, req: InputRequest) -> UiReply {
         match req {
             InputRequest::Read => Ok(self.focused_app().input_snapshot()),
-            InputRequest::Edit {
-                start,
-                stop,
-                text,
-                cursor,
-                version,
-                session_id,
-            } => self.focused_app().apply_input_edit(
-                start,
-                stop,
-                &text,
-                cursor,
-                version,
-                session_id.as_deref(),
-            ),
+            InputRequest::Edit(edit) => self.focused_app().apply_input_edit(edit),
         }
     }
 

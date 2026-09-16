@@ -771,7 +771,7 @@ Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
 `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"TaskStatusChanged"`,
-`"TaskFocusChanged"`, and `"ModelChanged"`.
+`"TaskFocusChanged"`, `"ModelChanged"`, and `"InputChanged"`.
 
 Plugins can also fire their own events with `exec_autocmds`.
 
@@ -808,6 +808,14 @@ name the session now running or focused. What each event adds:
 - `"ModelChanged"`: `data.model` in the shape `maki.model.get` returns,
   plus `data.previous_spec`. Picking the model already in use stays
   quiet, and so does startup.
+- `"InputChanged"`: `data.text`, `data.cursor` and `data.version`, the
+  chat input as `maki.ui.input` reports it, so a handler can edit it
+  back without reading it again. Plus `data.source`, the name of the
+  plugin whose `maki.ui.input_edit` moved the value, or nil when the
+  user typed or pasted it, so a plugin can ignore its own writes
+  without a loop guard and still act on another plugin's. Coalesced to
+  one event per frame, and quiet when the text did not move, so moving
+  the cursor alone fires nothing.
 
 `"TurnEnd"` fires once per turn and only for the main session, so
 subagent turns never show up. A manual `/compact` ends its run without

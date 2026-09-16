@@ -65,8 +65,8 @@ use maki_agent::{
 use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
-    BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader,
-    PackCommand, PackPreparation, WinView,
+    BuiltinAction, EventHandle, HintReader, HintSnapshot, InputEdit, KeymapReader,
+    LuaCommandReader, PackCommand, PackPreparation, WinView,
 };
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
@@ -268,6 +268,13 @@ pub struct App {
     /// than the session's stored one: a restored session may name another
     /// model, and the event loop swaps the live one in on the first tick.
     announced_model_spec: String,
+    /// The value Lua was last told about. A fast typist would otherwise wake
+    /// every handler once per keystroke.
+    announced_input: String,
+    /// The plugin behind the pending change, None when the user made it.
+    /// Rides along on `InputChanged` so a plugin can tell its own writes from
+    /// another's instead of growing a loop guard.
+    input_source: Option<Arc<str>>,
     pub(super) keymap_reader: KeymapReader,
     pub(super) hint_reader: HintReader,
     hints: Watch<HintSnapshot>,
@@ -363,6 +370,8 @@ impl App {
             model_policy: Arc::clone(&model_policy),
             lua_event_handle,
             announced_model_spec: model.spec(),
+            announced_input: String::new(),
+            input_source: None,
             hints: Watch::seeded(hint_reader.load_full()),
             keymap_reader,
             hint_reader,
@@ -479,32 +488,66 @@ impl App {
     /// focus moved to between the read and the write.
     pub(crate) fn apply_input_edit(
         &mut self,
-        start: usize,
-        stop: usize,
-        text: &str,
-        cursor: Option<usize>,
-        version: Option<u64>,
-        session_id: Option<&str>,
+        edit: InputEdit,
     ) -> Result<serde_json::Value, String> {
         let focused = self.state.session.id.to_string();
-        if let Some(session_id) = session_id
-            && session_id != focused
+        if let Some(session_id) = &edit.session_id
+            && *session_id != focused
         {
             return Err(format!(
                 "input of session {session_id} is not focused (session {focused} is)"
             ));
         }
         let current = self.input_box.buffer.version();
-        if let Some(version) = version
+        if let Some(version) = edit.version
             && version != current
         {
             return Err(format!(
                 "input changed since version {version} (it is now {current})"
             ));
         }
-        self.input_box.replace_range(start, stop, text, cursor)?;
-        self.command_palette.sync(&self.input_box.buffer.value());
+        self.input_box
+            .replace_range(edit.start, edit.stop, &edit.text, edit.cursor)?;
+        self.input_changed(Some(edit.plugin));
         Ok(serde_json::json!(true))
+    }
+
+    /// The paths that keep the command palette in step with the input, and
+    /// the only ones that can name a source. Submit, discard, history recall
+    /// and `$EDITOR` change the value without coming through here; the tick
+    /// diff is what reports those.
+    fn input_changed(&mut self, source: Option<Arc<str>>) {
+        self.command_palette.sync(&self.input_box.buffer.value());
+        self.input_source = source;
+    }
+
+    /// One event per frame at most, and only when the text really moved, so
+    /// holding a key down does not wake a handler per keystroke and arrowing
+    /// around does not wake it at all.
+    fn tick_input_changed(&mut self) -> Dirty {
+        let value = self.input_box.buffer.value();
+        if value == self.announced_input {
+            self.input_source = None;
+            return Dirty::NO;
+        }
+        // The value is the trigger and the source is only a label, because a
+        // flag alone loses events rather than coalescing them: submit, discard,
+        // history recall, a draft restored on a session switch and $EDITOR all
+        // change the value without going through a path that could set one.
+        // Sending "hi", then typing "hi" again, would look like no change at
+        // all and leave a completion plugin dead until the next distinct value.
+        let source = self.input_source.take();
+        self.announced_input = value;
+        self.fire_session_autocmd(
+            "InputChanged",
+            serde_json::json!({
+                "text": self.announced_input,
+                "cursor": self.input_box.buffer.cursor_byte(),
+                "version": self.input_box.buffer.version(),
+                "source": source,
+            }),
+        );
+        Dirty::NO
     }
 
     pub(crate) fn record_recent_model(&mut self, spec: &str) {
@@ -771,10 +814,8 @@ impl App {
                 FilePickerModalAction::Consumed => vec![],
                 FilePickerModalAction::Select(path) => {
                     self.file_picker.close();
-                    if let InputAction::PaletteSync(val) =
-                        self.input_box.handle_paste_with_spaces(&path)
-                    {
-                        self.command_palette.sync(&val);
+                    if let InputAction::Changed = self.input_box.handle_paste_with_spaces(&path) {
+                        self.input_changed(None);
                     }
                     vec![]
                 }
@@ -998,8 +1039,8 @@ impl App {
                 return self.run_builtin(BuiltinAction::FilePicker);
             } else if key.code == KeyCode::Char('v') && self.image_paste_rx.is_empty() {
                 self.start_image_paste();
-            } else if let InputAction::PaletteSync(val) = self.input_box.handle_key(key) {
-                self.command_palette.sync(&val);
+            } else if let InputAction::Changed = self.input_box.handle_key(key) {
+                self.input_changed(None);
             }
             return vec![];
         }
@@ -1014,9 +1055,9 @@ impl App {
                 return self.execute_command(cmd, 0);
             }
             CommandAction::Complete(text) => {
-                self.command_palette.sync(&text);
                 self.input_box.set_input(text);
                 self.input_box.buffer.move_to_end();
+                self.input_changed(None);
                 return vec![];
             }
             CommandAction::Passthrough => {}
@@ -1025,8 +1066,8 @@ impl App {
         let streaming = self.status == Status::Streaming;
         match self.input_box.handle_key(key) {
             InputAction::Submit(sub) => self.handle_submit(sub),
-            InputAction::PaletteSync(val) => {
-                self.command_palette.sync(&val);
+            InputAction::Changed => {
+                self.input_changed(None);
                 vec![]
             }
             InputAction::Passthrough(key) => {
@@ -1826,6 +1867,7 @@ impl App {
             | self.usage_modal.poll(&self.usage_slot)
             | self.hints.poll(self.hint_reader.load_full())
             | self.tick_file_picker()
+            | self.tick_input_changed()
             | Dirty::any(self.chats.iter_mut().map(Chat::tick))
     }
 
@@ -1922,8 +1964,8 @@ impl App {
         if !self.is_main_chat() {
             return;
         }
-        if let InputAction::PaletteSync(val) = self.input_box.handle_paste(text) {
-            self.command_palette.sync(&val);
+        if let InputAction::Changed = self.input_box.handle_paste(text) {
+            self.input_changed(None);
         }
     }
 
