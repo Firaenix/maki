@@ -54,6 +54,7 @@ use crate::image;
 use crate::markdown::TRUNCATION_PREFIX;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
+use crate::text_buffer::TextBuffer;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::{PermissionManager, TaggedAnswer};
@@ -449,6 +450,61 @@ impl App {
             "supports_thinking": model.supports_thinking(),
             "supports_fast": model.supports_fast(),
         })
+    }
+
+    /// What `maki.ui.input` hands to Lua: text and offsets only. Render
+    /// geometry stays out of a text API, and the terminal cell the caret sits
+    /// in has no answer at all for half the modes the UI can be in.
+    pub(crate) fn input_snapshot(&self) -> serde_json::Value {
+        let buffer = &self.input_box.buffer;
+        let col = TextBuffer::char_to_byte(&buffer.lines()[buffer.y()], buffer.x());
+        serde_json::json!({
+            "session_id": self.state.session.id.to_string(),
+            "text": buffer.value(),
+            "cursor": buffer.cursor_byte(),
+            "version": buffer.version(),
+            "line": buffer.y(),
+            "col": col,
+        })
+    }
+
+    /// Refuses an edit the input has moved on from rather than landing it
+    /// somewhere else: another tab now focused, a version the buffer has left
+    /// behind, or a range it has outgrown. See
+    /// [`TextBuffer::replace_byte_range`].
+    ///
+    /// The session check is the one the version cannot stand in for: the
+    /// counter is per buffer and every buffer starts at 0, so two tabs typed
+    /// in about as much collide, and the edit would land in whichever one the
+    /// focus moved to between the read and the write.
+    pub(crate) fn apply_input_edit(
+        &mut self,
+        start: usize,
+        stop: usize,
+        text: &str,
+        cursor: Option<usize>,
+        version: Option<u64>,
+        session_id: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let focused = self.state.session.id.to_string();
+        if let Some(session_id) = session_id
+            && session_id != focused
+        {
+            return Err(format!(
+                "input of session {session_id} is not focused (session {focused} is)"
+            ));
+        }
+        let current = self.input_box.buffer.version();
+        if let Some(version) = version
+            && version != current
+        {
+            return Err(format!(
+                "input changed since version {version} (it is now {current})"
+            ));
+        }
+        self.input_box.replace_range(start, stop, text, cursor)?;
+        self.command_palette.sync(&self.input_box.buffer.value());
+        Ok(serde_json::json!(true))
     }
 
     pub(crate) fn record_recent_model(&mut self, spec: &str) {

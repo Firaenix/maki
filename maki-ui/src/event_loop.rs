@@ -30,9 +30,9 @@ use maki_lua::session_snapshot::{
     SessionSnapshot,
 };
 use maki_lua::{
-    EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, PackCommand,
-    PackPreparation, SessionEndReason, SessionRequest, TaskRequest, UiAction, UiAttachment,
-    UiReply,
+    EventHandle, HintReader, InputRequest, KeymapReader, LuaCommandReader, ModelRequest,
+    PackCommand, PackPreparation, SessionEndReason, SessionRequest, TaskRequest, UiAction,
+    UiAttachment, UiReply,
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
@@ -961,6 +961,9 @@ impl<'t> EventLoop<'t> {
             UiAction::Model { req, reply_tx } => {
                 let _ = reply_tx.send(self.handle_model_request(req));
             }
+            UiAction::Input { req, reply_tx } => {
+                let _ = reply_tx.send(self.handle_input_request(req));
+            }
             UiAction::Task { req, reply_tx } => {
                 let _ = reply_tx.send(self.handle_task_request(req));
             }
@@ -1246,6 +1249,29 @@ impl<'t> EventLoop<'t> {
                 })();
                 let _ = reply_tx.send(reply);
             }
+        }
+    }
+
+    /// The input a plugin reads and writes is the focused session's, the one
+    /// the user is typing into.
+    fn handle_input_request(&mut self, req: InputRequest) -> UiReply {
+        match req {
+            InputRequest::Read => Ok(self.focused_app().input_snapshot()),
+            InputRequest::Edit {
+                start,
+                stop,
+                text,
+                cursor,
+                version,
+                session_id,
+            } => self.focused_app().apply_input_edit(
+                start,
+                stop,
+                &text,
+                cursor,
+                version,
+                session_id.as_deref(),
+            ),
         }
     }
 

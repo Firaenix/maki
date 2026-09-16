@@ -84,6 +84,7 @@ const MULTIBYTE_ERROR_CHAR: &str = "é";
 const TRUST: &str = "/trust";
 const GATED_INIT_SOURCE: &str = "-- shipped by the project";
 const PREVIOUS_ANSWER: &str = "Previous answer to select";
+const OTHER_SESSION_ID: &str = "11111111-1111-1111-1111-111111111111";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -1993,6 +1994,73 @@ fn view_reports_the_reversed_input_cell_and_hides_the_hardware_cursor() {
 
     app.update(Msg::Key(kb::HELP.to_key_event()));
     assert_eq!(draw(&mut app), None, "{OVERLAY_TAKES_THE_CURSOR}");
+}
+
+/// A plugin slices `text` with the Lua string library, which counts bytes, so
+/// every offset in the snapshot has to be a byte offset.
+#[test]
+fn input_snapshot_offsets_are_byte_offsets() {
+    let mut app = test_app();
+    app.input_box.set_input("日本".into());
+    app.input_box.buffer.move_to_end();
+
+    let st = app.input_snapshot();
+    let text = st["text"].as_str().unwrap();
+    let cursor = st["cursor"].as_u64().unwrap() as usize;
+    assert_eq!(cursor, 6);
+    assert_eq!(&text[..cursor], "日本", "the offset has to slice the value");
+    assert_eq!(st["line"], 0);
+    assert_eq!(st["col"], 6);
+}
+
+/// The bounds check alone passes an edit the user has typed in front of: a
+/// plugin reads "hello" and plans to replace 0..5, the user presses home and
+/// types "x", and 5 still fits "xhello". Only the version catches it.
+#[test]
+fn an_input_edit_planned_against_an_older_value_fails_on_the_version() {
+    let mut app = test_app();
+    app.input_box.set_input("hello".into());
+    let planned = app.input_snapshot()["version"].as_u64().unwrap();
+
+    app.input_box.buffer.set_cursor_byte(0).unwrap();
+    app.input_box.buffer.push_char('x');
+
+    let err = app
+        .apply_input_edit(0, 5, "bye", None, Some(planned), None)
+        .unwrap_err();
+    assert!(err.contains("version"), "the error has to name why: {err}");
+    assert_eq!(app.input_box.buffer.value(), "xhello");
+
+    let fresh = app.input_snapshot()["version"].as_u64().unwrap();
+    assert!(
+        app.apply_input_edit(0, 6, "bye", None, Some(fresh), None)
+            .is_ok()
+    );
+    assert_eq!(app.input_box.buffer.value(), "bye");
+}
+
+/// Focus can move between the read and the write, and the version cannot tell
+/// the tabs apart: both buffers count from zero, so a tab typed in about as
+/// much agrees on a version while holding someone else's text.
+#[test]
+fn an_input_edit_naming_another_session_is_refused() {
+    let mut app = test_app();
+    app.input_box.set_input("hello".into());
+    let st = app.input_snapshot();
+    let version = st["version"].as_u64().unwrap();
+
+    let err = app
+        .apply_input_edit(0, 5, "bye", None, Some(version), Some(OTHER_SESSION_ID))
+        .unwrap_err();
+    assert!(err.contains(OTHER_SESSION_ID), "the error names it: {err}");
+    assert_eq!(app.input_box.buffer.value(), "hello");
+
+    let focused = st["session_id"].as_str().unwrap().to_string();
+    assert!(
+        app.apply_input_edit(0, 5, "bye", None, Some(version), Some(&focused))
+            .is_ok()
+    );
+    assert_eq!(app.input_box.buffer.value(), "bye");
 }
 
 /// When the picker gives up on a directory it cannot list, the flash is the

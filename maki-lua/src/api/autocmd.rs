@@ -150,8 +150,9 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
 /// `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 /// `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"TaskStatusChanged"`,
-/// `"TaskFocusChanged"`, and `"ModelChanged"`. Plugins can also fire their
-/// own events with `exec_autocmds`.
+/// `"TaskFocusChanged"`, and `"ModelChanged"`.
+///
+/// Plugins can also fire their own events with `exec_autocmds`.
 ///
 /// Every host event carries `data.session_id`. For `"SessionReset"` and
 /// `"SessionEnd"` that is the session being left behind, the other events

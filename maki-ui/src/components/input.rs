@@ -275,8 +275,29 @@ impl InputBox {
         self.pending_images.push(source);
     }
 
+    /// The way a plugin writes to the input. It carries the box's own state
+    /// the way the paste path does: the view follows the cursor again, and the
+    /// value stops counting as a recalled history entry, so the next history
+    /// key does not throw the edit away.
+    ///
+    /// Offsets are flat byte offsets into the value; see
+    /// [`TextBuffer::replace_byte_range`] for what they refuse.
+    pub fn replace_range(
+        &mut self,
+        start: usize,
+        stop: usize,
+        text: &str,
+        cursor: Option<usize>,
+    ) -> Result<(), String> {
+        self.buffer.replace_byte_range(start, stop, text, cursor)?;
+        self.follow_cursor = true;
+        self.history_index = None;
+        self.draft.clear();
+        Ok(())
+    }
+
     pub fn set_input(&mut self, s: String) {
-        self.buffer = TextBuffer::new(s);
+        self.buffer.set_value(s);
     }
 
     pub fn history_up(&mut self) {
@@ -1438,6 +1459,7 @@ mod tests {
     // leaving a hole behind. With only one content row the viewport has to
     // scroll down to that second row, or the reversed cell and the IME with it
     // end up off screen.
+    const CURSOR_ON_THE_EDIT: &str = "the cursor the edit moved has to be on screen";
     const WIDE_WRAP_LINE: &str = "a漢漢漢漢漢";
     const WIDE_WRAP_HEIGHT: u16 = 3;
     const WIDE_WRAP_SCROLL: u16 = 1;
@@ -1470,5 +1492,44 @@ mod tests {
             false,
         );
         assert_cursor_at(&rendered, None);
+    }
+
+    /// A plugin edit lands on a recalled history entry, so the value is the
+    /// user's own text again. Left in the browse state, the next history key
+    /// would put the entry back over the edit.
+    #[test]
+    fn a_plugin_edit_leaves_history_browsing() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        submit_text(&mut input, "recalled");
+        input.history_up();
+        assert_eq!(input.buffer.value(), "recalled");
+
+        input
+            .replace_range(0, "recalled".len(), "written", None)
+            .unwrap();
+        input.history_down();
+        assert_eq!(input.buffer.value(), "written");
+    }
+
+    /// A wheel scroll pins the view, so an edit has to bring the cursor back
+    /// into it the way typing does.
+    #[test]
+    fn a_plugin_edit_brings_the_view_back_to_the_cursor() {
+        const LINES: usize = 10;
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.handle_paste(&["a"; LINES].join("\n"));
+        let _ = render_cursor(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
+
+        input.scroll(LINES as i32);
+        assert_eq!(input.scroll_y(), 0, "the wheel scrolled back to the top");
+
+        let end = input.buffer.byte_len();
+        input.replace_range(end - 1, end, "b", None).unwrap();
+        let rendered = render_cursor(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
+        assert!(
+            input.scroll_y() > 0,
+            "the edit put the cursor on the last row, so the view has to follow"
+        );
+        assert!(rendered.cursor.is_some(), "{}", CURSOR_ON_THE_EDIT);
     }
 }

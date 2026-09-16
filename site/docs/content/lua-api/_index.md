@@ -771,8 +771,9 @@ Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
 `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"TaskStatusChanged"`,
-`"TaskFocusChanged"`, and `"ModelChanged"`. Plugins can also fire their
-own events with `exec_autocmds`.
+`"TaskFocusChanged"`, and `"ModelChanged"`.
+
+Plugins can also fire their own events with `exec_autocmds`.
 
 Every host event carries `data.session_id`. For `"SessionReset"` and
 `"SessionEnd"` that is the session being left behind, the other events
@@ -5370,6 +5371,98 @@ shell, on terminals that support the title stack.
 maki.ui.set_window_title("maki: " .. session_name)
 -- Give the title back to the shell:
 maki.ui.set_window_title("")
+```
+
+---
+
+### `maki.ui.input()` {#maki-ui-input}
+
+```lua
+maki.ui.input()
+```
+
+Reads what the user has typed in the chat input, and where the cursor
+is.
+
+Offsets are byte offsets into `text`, the same unit the Lua string
+library uses, so `text:sub(1, cursor)` is everything before the cursor
+and `text:sub(cursor + 1)` is everything after it. A newline counts as
+one byte, so an offset means the same thing however the input wraps.
+
+The returned table has:
+
+- `session_id` (string) the tab the value was read from. Hand it back
+  to `input_edit` so an edit cannot land in another tab the user
+  switched to in the meantime.
+- `text` (string) the whole value, newlines included.
+- `cursor` (integer) byte offset of the cursor into `text`.
+- `version` (integer) counter of changes to the value. Hand it back to
+  `input_edit` to have an edit fail when the value moved on.
+- `line` (integer) 0-based line the cursor is on, for when you care
+  about lines rather than offsets.
+- `col` (integer) byte offset of the cursor inside that line.
+
+**Returns:** (`table|nil`, `string|nil`) The input state, or nil and an error.
+
+**Example:**
+
+```lua
+local st = maki.ui.input()
+local before = st.text:sub(1, st.cursor)
+```
+
+---
+
+### `maki.ui.input_edit()` {#maki-ui-input_edit}
+
+```lua
+maki.ui.input_edit({opts})
+```
+
+Replaces a byte range of the chat input, as if the user had selected it
+and typed {text}. The cursor lands after the inserted text unless you
+say otherwise.
+
+A handler runs after the key that woke it, so by the time it writes, the
+user may have typed on, or switched tab. Four checks refuse an edit
+instead of landing it somewhere it was never meant to go:
+
+- `stop` past the end of the value fails.
+- `session_id`, when you pass the one `maki.ui.input` returned, fails
+  once another tab is focused. The version cannot stand in for it:
+  every tab counts from zero, so two tabs typed in about as much agree
+  on a version while holding different text.
+- `version`, when you pass the one `maki.ui.input` returned, fails as
+  soon as the value has changed at all. Without it an edit planned
+  against older text still applies wherever the offsets now point.
+- An offset inside a multi-byte character fails.
+
+Read again and retry on any of them.
+
+**Parameters:**
+
+- `{opts}` (`table`) Options:
+  - `start` (`integer`) byte offset the replaced range starts at.
+  - `stop` (`integer`) byte offset it ends at. `start == stop` inserts.
+  - `text` (`string`) what to put there, empty to delete the range.
+  - `cursor` (`integer|nil`) byte offset to leave the cursor at, default is the end of the inserted text.
+  - `version` (`integer|nil`) the version the offsets were planned against.
+  - `session_id` (`string|nil`) the session the offsets were read from.
+
+**Returns:** (`boolean|nil`, `string|nil`) `true` on success, or nil and an error.
+
+**Example:**
+
+```lua
+local st = maki.ui.input()
+-- Replace the "@src/ma" before the cursor with a full path:
+maki.ui.input_edit({
+  start = 8,
+  stop = st.cursor,
+  text = "src/main.rs",
+  version = st.version,
+  session_id = st.session_id,
+})
 ```
 
 

@@ -455,6 +455,22 @@ pub enum ModelRequest {
     },
 }
 
+/// Offsets are flat byte counts into the whole input, newlines counted as one
+/// byte each, because Lua indexes strings by byte. `version` is the value
+/// counter the reader was handed, when the caller wants a stale edit refused,
+/// and `session_id` names the tab the offsets were read from.
+pub enum InputRequest {
+    Read,
+    Edit {
+        start: usize,
+        stop: usize,
+        text: String,
+        cursor: Option<usize>,
+        version: Option<u64>,
+        session_id: Option<String>,
+    },
+}
+
 pub type UiReply = Result<serde_json::Value, String>;
 
 /// Viewport of the focused chat transcript, zero-based like the rest of the
@@ -504,6 +520,10 @@ pub enum UiAction {
     },
     Model {
         req: ModelRequest,
+        reply_tx: flume::Sender<UiReply>,
+    },
+    Input {
+        req: InputRequest,
         reply_tx: flume::Sender<UiReply>,
     },
     Task {
