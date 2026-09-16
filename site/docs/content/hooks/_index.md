@@ -198,27 +198,47 @@ skipped when its tool is called.
 This sees the tools registered so far, so run it from `init.lua`, which loads
 after the builtin plugins. It also misses MCP tools, which arrive when their
 server connects. Naming one slot directly has no such ordering rule: `set_slot`
-accepts a name before anything registers it.
+accepts a name before anything registers it, and what a layer is entitled to is
+weighed when the chain fires rather than when you register it.
 
 ## Plugin slots
 
 A plugin can define an extension point of its own with
 [`declare_slot`](/docs/lua-api/#maki-api-declare_slot). The declaring plugin
-owns the name and supplies the default, and anyone can wrap it with `set_slot`:
+owns the name and supplies the default, and wraps its own slot for free. A
+layer from any other plugin steers a chain the owner's callers trust, so it
+pays, and the owner sets the price, because the owner is the only one who knows
+what its default does with the arguments:
 
 ```lua
--- owner
+-- owner: layering this only rewrites text, so say so
 local render = maki.api.declare_slot("myplugin.render", function(text)
   return text:upper()
-end)
+end, { capability = {} })
 
--- anyone
+-- any other plugin, granted nothing
 maki.api.set_slot("myplugin.render", function(prev, text)
   return "[" .. prev(text) .. "]"
 end)
 
 -- render("hi") now returns "[HI]"
 ```
+
+`capability` is a list of permission names, and a layer needs all of them at
+once. An empty list is free for anyone. Leaving `capability` out charges every
+permission, which is what a tool declaring no capability charges: a slot that
+named no price has not promised its default exercises none, only that nobody
+asked. You can only name permissions your own plugin holds.
+
+The rule is the one the `tool.*` slots use, and it is read the same way: every
+call re-reads what each layer's plugin holds, so a layer registered by a plugin
+without the grant is skipped and the call carries on, and a reload that narrows
+a plugin's permissions costs it the layer on the next call.
+
+A slot name belongs to the plugin that declared it for as long as maki runs.
+Unloading the owner stops the chain firing, but does not free the name: nobody
+else can take it over, or re-declare it at a cheaper price and inherit the
+layers that trusted the old one.
 
 Names starting with `tool.` are reserved for maki, which fires them at points
 whose ordering it guarantees.

@@ -940,16 +940,27 @@ maki.api.exec_autocmds("MyEvent", {
 ### `maki.api.declare_slot()` {#maki-api-declare_slot}
 
 ```lua
-maki.api.declare_slot({name}, {default})
+maki.api.declare_slot({name}, {default}, {opts?})
 ```
 
 Create a named extension point owned by your plugin. You provide a
 {default} function, and other plugins can wrap it with layers using
-`set_slot`. The returned callable runs the full chain: outermost
-layer first, then inward, ending at {default}.
+`set_slot`. The returned callable runs the full chain: outermost layer
+first, then inward, ending at {default}.
+
+{opts} prices what a layer from another plugin pays to steer your chain.
+You set it, because you are the only one who knows what your default does
+with the arguments it is handed. Pass `{ capability = { "net" } }` to
+charge the permissions you name, all of them at once; `{ capability = {} }`
+to let anyone layer for free, which is the honest price for a slot whose
+arguments are inert; or leave {opts} out to charge every permission, what a
+tool declaring no capability charges. You can only name permissions your
+own plugin holds.
 
 Throws if another plugin already owns a slot with the same {name}, or
 if {name} starts with `"tool."` or `"ui."`, which the host fires itself.
+The name stays yours across an unload: nobody else can take it over, or
+re-declare it cheaper, while maki runs.
 
 The chain is async: the default and every layer may park (`maki.fs.*`,
 `maki.fn.jobwait`, `maki.agent.call_tool`, ...), and so does the
@@ -962,15 +973,17 @@ cancels the layers it is waiting on.
 
 - `{name}` (`string`) Unique slot name, e.g. `"myplugin.render"`.
 - `{default}` (`function`) Default implementation, called when no layers wrap it.
+- `{opts?}` (`table|nil`) `{ capability = { "net", ... } }`: what a layer from another plugin pays.
 
 **Returns:** (`function`) Callable that dispatches through all layers.
 
 **Example:**
 
 ```lua
+-- anyone may layer this one: it only uppercases the text it is given
 local render = maki.api.declare_slot("myplugin.render", function(text)
   return text:upper()
-end)
+end, { capability = {} })
 print(render("hello")) -- HELLO
 ```
 
@@ -1010,6 +1023,15 @@ table to replace the value, nothing to leave it alone, or
 tool declares, and a tool declaring none costs every permission. See
 [Hooks](/docs/hooks/).
 
+Wrapping a slot another plugin declared steers a chain that plugin's
+callers trust, so it costs whatever the owner priced it at in
+`declare_slot`: the capabilities it named, every permission if it named
+none, or nothing at all if it declared its arguments inert. Layering a slot
+you declared yourself is free. Like the `tool.*` slots, this is decided
+when the chain fires: the call skips a layer that is not entitled and
+carries on, and a reload that changes what you hold takes effect on the
+next call.
+
 **Parameters:**
 
 - `{name}` (`string`) Slot name to wrap.
@@ -1034,7 +1056,11 @@ maki.api.get_slots()
 List all known slots and their current state. Useful for debugging
 which plugins own or wrap each slot.
 
-**Returns:** (`table`) Map of slot name to `{ owner, declared, fillers }`.
+`capability` is the list of permissions a layer from another plugin pays,
+and is absent on a slot whose owner named no price, which costs every
+permission.
+
+**Returns:** (`table`) Map of slot name to `{ owner, declared, fillers, capability }`.
 
 **Example:**
 
