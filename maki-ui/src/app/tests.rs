@@ -139,6 +139,7 @@ fn build_app_with_session(
         lua_commands,
         KeymapReader::empty(),
         HintReader::empty(),
+        maki_lua::PlanActionReader::empty(),
         writer,
         UiConfig::default(),
         100,
@@ -967,6 +968,74 @@ fn plan_ready_does_not_fire_outside_plan_mode() {
     app.transition_plan(PlanTrigger::WriteDone);
 
     assert!(probe.try_recv_autocmd().is_none());
+}
+
+/// Nothing layers `ui.plan_form` on a stock install, so the form opens in the
+/// same frame the plan lands and never pays for a roundtrip.
+#[test]
+fn an_unowned_plan_form_opens_without_asking() {
+    let mut app = test_app();
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH));
+    app.transition_plan(PlanTrigger::WriteDone);
+
+    assert!(app.plan_form.is_visible());
+    assert!(app.plan_form_answer.is_none(), "nothing to wait for");
+}
+
+/// With a layer installed the form waits for the chain instead of flashing
+/// open in front of whatever the plugin is about to draw.
+#[test]
+fn an_owned_plan_form_waits_for_the_slot() {
+    let mut app = test_app();
+    let (handle, _probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+    app.plan_form_owner = Some(Arc::from("planner"));
+
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH));
+    app.transition_plan(PlanTrigger::WriteDone);
+
+    assert!(!app.plan_form.is_visible(), "the layer answers first");
+    assert!(app.plan_form_answer.is_some());
+}
+
+/// `true` is the chain reaching the host default: every layer deferred, so the
+/// built-in is what the user asked for. `false` means a plugin owns the draft.
+#[test_case(Some(true), true ; "every_layer_deferred")]
+#[test_case(Some(false), false ; "a_layer_took_the_surface")]
+#[test_case(None, true ; "host_went_away")]
+fn the_plan_form_slot_answer_drives_the_form(answer: Option<bool>, visible: bool) {
+    let mut app = test_app();
+    let (tx, rx) = flume::bounded(1);
+    app.plan_form_answer = Some(rx);
+
+    match answer {
+        Some(open) => tx.send(open).unwrap(),
+        None => drop(tx),
+    }
+    assert_eq!(app.tick_plan_form_slot(), Dirty::from(visible));
+
+    assert_eq!(app.plan_form.is_visible(), visible);
+    assert!(
+        app.plan_form_answer.is_none(),
+        "the answer is consumed once"
+    );
+}
+
+/// An unanswered chain leaves the form closed rather than guessing: the plugin
+/// is presumably mid-render, and the plan-toggle key still reopens the
+/// built-in.
+#[test]
+fn a_silent_plan_form_slot_leaves_the_form_closed() {
+    let mut app = test_app();
+    let (_tx, rx) = flume::bounded::<bool>(1);
+    app.plan_form_answer = Some(rx);
+
+    assert_eq!(app.tick_plan_form_slot(), Dirty::NO);
+
+    assert!(!app.plan_form.is_visible());
+    assert!(app.plan_form_answer.is_some(), "still waiting");
 }
 
 #[test]

@@ -14,6 +14,14 @@ use crate::api::util::dispatch::{DepthGuard, Reentry, call_swallowing};
 /// Slot names the host fires itself. A plugin declaring one would shadow a
 /// point whose firing order dispatch guarantees, so the namespace is closed.
 pub(crate) const HOST_PREFIX: &str = "tool.";
+/// The other closed namespace: built-in surfaces a plugin layers to take over.
+pub(crate) const UI_PREFIX: &str = "ui.";
+const HOST_PREFIXES: [&str; 2] = [HOST_PREFIX, UI_PREFIX];
+
+/// Fired when the agent finishes writing a plan. The default opens the
+/// built-in plan form, so a layer that answers without calling `prev` owns
+/// the surface for that draft.
+pub(crate) const PLAN_FORM_SLOT: &str = "ui.plan_form";
 
 const SEAM: &str = "slot";
 
@@ -247,6 +255,15 @@ pub(crate) fn host_slot_name(tool: &str, stage: HookStage) -> String {
     format!("{HOST_PREFIX}{tool}.{}", stage.as_str())
 }
 
+/// The plugin whose layer runs outermost on {name}, or `None` when nothing
+/// wraps it. Read off the authoritative map rather than a published index, so
+/// an unload narrows it in the same breath as [`SlotStore::clear_plugin`].
+pub(crate) fn slot_layer_owner(lua: &Lua, name: &str) -> Option<Arc<str>> {
+    let store = lua.app_data_ref::<SlotStore>()?;
+    let layer = store.slots.get(name)?.layers.last()?;
+    Some(Arc::clone(&layer.plugin))
+}
+
 /// The inverse of [`host_slot_name`]. `None` for any other name, including a
 /// `tool.` name whose suffix names no stage.
 pub(crate) fn host_slot_target(slot: &str) -> Option<(&str, HookStage)> {
@@ -306,7 +323,7 @@ fn make_callable(lua: &Lua, name: String) -> LuaResult<Function> {
 /// layer first, then inward, ending at {default}.
 ///
 /// Throws if another plugin already owns a slot with the same {name}, or
-/// if {name} starts with `"tool."`, which the host fires itself.
+/// if {name} starts with `"tool."` or `"ui."`, which the host fires itself.
 ///
 /// The chain is async: the default and every layer may park (`maki.fs.*`,
 /// `maki.fn.jobwait`, `maki.agent.call_tool`, ...), and so does the
@@ -330,9 +347,9 @@ fn declare_slot(
     name: String,
     default: Function,
 ) -> LuaResult<Function> {
-    if name.starts_with(HOST_PREFIX) {
+    if let Some(prefix) = HOST_PREFIXES.iter().find(|p| name.starts_with(**p)) {
         return Err(mlua::Error::runtime(format!(
-            "slot '{name}' is host owned: '{HOST_PREFIX}' names are fired by maki itself, \
+            "slot '{name}' is host owned: '{prefix}' names are fired by maki itself, \
              use set_slot to wrap one"
         )));
     }
@@ -365,6 +382,13 @@ fn declare_slot(
 /// Layers wrap in registration order, so the last one registered runs
 /// first and sees the value before the others do.
 ///
+/// Maki fires `ui.plan_form` when the agent finishes writing a plan. It
+/// takes `function(prev, ev)` with `ev = { path, session }`, and the
+/// default opens the built-in plan form. Answer without calling `prev` (or
+/// with `false`) to keep it closed and render the plan yourself; the layer
+/// goes away with your plugin, so an unload hands the form back. See
+/// [maki.plan](/docs/lua-api/#maki-plan).
+///
 /// Maki fires two slots per tool itself: `tool.<name>.input` before
 /// permissions look at the call, and `tool.<name>.output` on the text it
 /// produced. Both take `function(prev, value, ctx)` and answer with a
@@ -382,12 +406,20 @@ fn declare_slot(
 /// end)
 #[lua_fn]
 fn set_slot(lua: &Lua, #[ctx] plugin: Arc<str>, name: String, wrapper: Function) -> LuaResult<()> {
-    let mut store = slot_store_mut(lua)?;
-    store.slots.entry(name).or_default().layers.push(SlotLayer {
-        plugin: Arc::clone(&plugin),
-        func: wrapper,
-    });
-    store.publish();
+    let plan_form = name == PLAN_FORM_SLOT;
+    {
+        let mut store = slot_store_mut(lua)?;
+        store.slots.entry(name).or_default().layers.push(SlotLayer {
+            plugin: Arc::clone(&plugin),
+            func: wrapper,
+        });
+        store.publish();
+    }
+    if plan_form {
+        // The form reads its owner off the same snapshot as its menu rows,
+        // and that snapshot is only rebuilt when something asks for it.
+        crate::api::plan::republish_snapshot(lua)?;
+    }
     Ok(())
 }
 

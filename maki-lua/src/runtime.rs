@@ -41,7 +41,10 @@ use crate::api::r#fn::{JobEvent, JobOwner, JobStore, deliver_job_event};
 use crate::api::keymap::KeymapReader;
 use crate::api::keymap::{KeymapStore, KeymapWriter};
 use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
-use crate::api::slot::{LayeredTools, SlotStore, run_host_chain};
+use crate::api::plan::{
+    PlanActionHandlerMap, PlanActionReader, PlanActionWriter, republish_snapshot,
+};
+use crate::api::slot::{LayeredTools, PLAN_FORM_SLOT, SlotStore, run_host_chain};
 use crate::api::tool::{
     LuaTool, PendingRules, PendingTool, PendingTools, ToolCallReply, ToolPermission, resolve_rules,
 };
@@ -266,6 +269,29 @@ pub enum Request {
         /// Runs on the caller's slot instead of taking one of its own.
         /// See [`under_inflight_slot`].
         nested: bool,
+    },
+    /// Fires when the user picks a plugin-registered row on the plan form.
+    /// Fire-and-forget; the handler drives outcomes by calling
+    /// `maki.plan.implement` / `maki.plan.open_editor`.
+    RunPlanAction {
+        plugin: Arc<str>,
+        name: Arc<str>,
+        /// Absolute plan path.
+        path: String,
+        /// Value of the form's "parallel" checkbox when the user selected the row.
+        parallel: bool,
+        /// The session the plan belongs to, so the handler can name it back.
+        session: String,
+    },
+    /// Fires the `ui.plan_form` chain for a session whose plan just landed.
+    /// Only sent when the slot has a layer, so the common case never reaches
+    /// the request loop and the form opens without a roundtrip.
+    RunPlanFormSlot {
+        path: String,
+        session: String,
+        /// `true` once the chain reaches the host default, i.e. every layer
+        /// deferred and the built-in form should open.
+        reply: flume::Sender<bool>,
     },
     ComputeHeader {
         plugin: Arc<str>,
@@ -1971,6 +1997,7 @@ impl LuaRuntime {
         command_writer: LuaCommandWriter,
         keymap_writer: KeymapWriter,
         hint_writer: HintWriter,
+        plan_action_writer: PlanActionWriter,
         jit: bool,
         plugin_rules: Arc<PluginRuleStore>,
     ) -> Result<Self, PluginError> {
@@ -2020,6 +2047,8 @@ impl LuaRuntime {
         lua.set_app_data(keymap_writer);
         lua.set_app_data(HintStore::new());
         lua.set_app_data(hint_writer);
+        lua.set_app_data(PlanActionHandlerMap::new());
+        lua.set_app_data(plan_action_writer);
         lua.set_app_data(Arc::clone(&registry));
 
         let plugins: PluginMap = Rc::new(RefCell::new(HashMap::new()));
@@ -2142,6 +2171,21 @@ impl LuaRuntime {
             ) {
                 publish_command_snapshot(&map, &writer);
             }
+        }
+        if let Some(mut plan_map) = self.lua.app_data_mut::<PlanActionHandlerMap>()
+            && let Some(actions) = plan_map.remove(name)
+        {
+            for (_, entry) in actions {
+                if let Err(e) = self.lua.remove_registry_value(entry.handler) {
+                    tracing::warn!(plugin = name, error = %e, "failed to drop plan action handler key");
+                }
+            }
+        }
+        // Unconditional: the snapshot also carries the `ui.plan_form` owner,
+        // which the slot teardown above may have dropped even for a plugin
+        // that registered no rows.
+        if let Err(e) = republish_snapshot(&self.lua) {
+            tracing::warn!(plugin = name, error = %e, "failed to republish the plan surface");
         }
         if let Some(mut hints) = self.lua.app_data_mut::<PromptHintCallbacks>()
             && let Some(regs) = hints.remove(name)
@@ -3046,6 +3090,47 @@ fn layer_delegation<'a>(
     }
 }
 
+/// Asks the `ui.plan_form` chain whether the built-in plan form should open
+/// for the draft that just landed. `true` means every layer deferred and the
+/// chain reached the host default.
+///
+/// Any plugin may layer this: the form is chrome the user can always reopen
+/// with the plan-toggle key, not a tool call, so there is no authority to
+/// borrow. A layer that throws is skipped by the chain and the default runs,
+/// which makes the built-in form the failure mode rather than a dead surface.
+async fn run_plan_form_slot(lua: &Lua, path: String, session: String) -> bool {
+    let build = || -> mlua::Result<MultiValue> {
+        let ev = lua.create_table()?;
+        ev.set("path", path)?;
+        ev.set("session", session)?;
+        Ok(MultiValue::from_vec(vec![LuaValue::Table(ev)]))
+    };
+    let args = match build() {
+        Ok(args) => args,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not build the plan form slot event");
+            return true;
+        }
+    };
+    let chain = run_host_chain(lua, PLAN_FORM_SLOT, args, &|_| true);
+    match run_detached(lua, chain).await {
+        // `None` is "nothing layered it": the layer went away between the UI
+        // reading the snapshot and this request arriving.
+        Ok(None) => true,
+        // The host default hands the event table back, so a chain every layer
+        // deferred through answers truthy. A layer that returns nothing, or
+        // `false`, keeps the form closed and owns the surface.
+        Ok(Some(values)) => values
+            .into_iter()
+            .next()
+            .is_some_and(|v| !matches!(v, LuaValue::Nil | LuaValue::Boolean(false))),
+        Err(e) => {
+            tracing::warn!(error = %strip_traceback(&e), "plan form slot chain failed");
+            true
+        }
+    }
+}
+
 /// Fires a host-owned chain and reads back the one contract every host slot
 /// shares: a table replaces the value, `nil` leaves it alone, and
 /// `nil, reason` stops the call with a reason the model reads.
@@ -3291,6 +3376,7 @@ pub(crate) struct LuaThread {
     pub command_reader: LuaCommandReader,
     pub keymap_reader: KeymapReader,
     pub hint_reader: crate::api::util::command::HintReader,
+    pub plan_action_reader: PlanActionReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
     pub ui_attachment: UiAttachment,
 }
@@ -3315,6 +3401,7 @@ pub fn spawn(
     let (command_writer, command_reader) = LuaCommandWriter::new();
     let (keymap_writer, keymap_reader) = KeymapWriter::new();
     let (hint_writer, hint_reader) = HintWriter::new();
+    let (plan_action_writer, plan_action_reader) = PlanActionWriter::new();
 
     let handle = thread::Builder::new()
         .name("maki-lua".to_owned())
@@ -3329,6 +3416,7 @@ pub fn spawn(
                 command_writer,
                 keymap_writer,
                 hint_writer,
+                plan_action_writer,
                 jit,
                 plugin_rules,
             ) {
@@ -3544,6 +3632,56 @@ pub fn spawn(
                             drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
                             rt.clear_plugin(&plugin);
                             let _ = reply.send(());
+                        }
+                        Request::RunPlanAction {
+                            plugin,
+                            name,
+                            path,
+                            parallel,
+                            session,
+                        } => {
+                            let found = rt
+                                .lua
+                                .app_data_ref::<PlanActionHandlerMap>()
+                                .and_then(|m| {
+                                    let entry = m.get(&plugin)?.get(&name)?;
+                                    let func =
+                                        rt.lua.registry_value::<Function>(&entry.handler).ok()?;
+                                    Some((func, Arc::clone(&entry.id)))
+                                });
+                            if let Some((func, id)) = found {
+                                let lua = rt.lua.clone();
+                                ex.spawn(async move {
+                                    let run = async {
+                                        let opts = lua.create_table()?;
+                                        opts.set("id", id.as_ref())?;
+                                        opts.set("name", name.as_ref())?;
+                                        opts.set("session", session)?;
+                                        opts.set("path", path)?;
+                                        opts.set("parallel", parallel)?;
+                                        let thread = lua.create_thread(func)?;
+                                        thread.into_async::<()>(opts)?.await
+                                    };
+                                    if let Err(e) = run_command_scoped(&lua, 0, run).await {
+                                        tracing::warn!(plugin = %plugin, action = %name, error = %e, "plan action handler failed");
+                                    }
+                                })
+                                .detach();
+                            }
+                        }
+                        Request::RunPlanFormSlot {
+                            path,
+                            session,
+                            reply,
+                        } => {
+                            // Spawned rather than awaited: a layer may park,
+                            // and every other session is waiting on this
+                            // request loop.
+                            let lua = rt.lua.clone();
+                            ex.spawn(async move {
+                                let _ = reply.send(run_plan_form_slot(&lua, path, session).await);
+                            })
+                            .detach();
                         }
                         Request::RunCommand {
                             plugin,
@@ -3841,6 +3979,7 @@ pub fn spawn(
         command_reader,
         keymap_reader,
         hint_reader,
+        plan_action_reader,
         ui_action_rx,
         ui_attachment,
     })

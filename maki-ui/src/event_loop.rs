@@ -31,8 +31,8 @@ use maki_lua::session_snapshot::{
 };
 use maki_lua::{
     EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, PackCommand,
-    PackPreparation, SessionEndReason, SessionRequest, TaskRequest, UiAction, UiAttachment,
-    UiReply,
+    PackPreparation, PlanActionReader, PlanRequest, SessionEndReason, SessionRequest, TaskRequest,
+    UiAction, UiAttachment, UiReply,
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
@@ -99,6 +99,7 @@ pub struct EventLoopParams {
     pub lua_command_reader: LuaCommandReader,
     pub keymap_reader: KeymapReader,
     pub hint_reader: HintReader,
+    pub plan_action_reader: PlanActionReader,
     pub ui_action_rx: flume::Receiver<UiAction>,
     pub ui_attachment: UiAttachment,
     pub lua_event_handle: EventHandle,
@@ -380,6 +381,7 @@ struct SpawnCtx {
     lua_command_reader: LuaCommandReader,
     keymap_reader: KeymapReader,
     hint_reader: HintReader,
+    plan_action_reader: PlanActionReader,
     lua_event_handle: EventHandle,
     mcp_handle: Option<McpHandle>,
     mcp_config_errors: McpConfigErrors,
@@ -418,6 +420,7 @@ impl SpawnCtx {
             self.lua_command_reader.clone(),
             self.keymap_reader.clone(),
             self.hint_reader.clone(),
+            self.plan_action_reader.clone(),
             Arc::clone(&self.storage_writer),
             self.ui_config.clone(),
             self.input_history_size,
@@ -579,6 +582,7 @@ impl<'t> EventLoop<'t> {
             lua_command_reader,
             keymap_reader,
             hint_reader,
+            plan_action_reader,
             ui_action_rx,
             ui_attachment,
             lua_event_handle,
@@ -639,6 +643,7 @@ impl<'t> EventLoop<'t> {
             lua_command_reader,
             keymap_reader,
             hint_reader,
+            plan_action_reader,
             lua_event_handle,
             mcp_handle,
             mcp_config_errors,
@@ -964,6 +969,9 @@ impl<'t> EventLoop<'t> {
             UiAction::Task { req, reply_tx } => {
                 let _ = reply_tx.send(self.handle_task_request(req));
             }
+            UiAction::Plan { req, reply_tx } => {
+                self.handle_plan_request(req, reply_tx);
+            }
             UiAction::WinSaveView { reply_tx } => {
                 let _ = reply_tx.send(self.focused_app().win_view());
             }
@@ -1278,6 +1286,34 @@ impl<'t> EventLoop<'t> {
                 Ok(app.model_state())
             }
         }
+    }
+
+    /// Route a plan-surface request to the session it names, or the focused
+    /// one when it names none. Plan state is per session, so a plugin woken
+    /// by a background tab's `PlanReady` would otherwise read and implement
+    /// whatever the user happens to be looking at.
+    fn handle_plan_request(&mut self, req: PlanRequest, reply_tx: flume::Sender<UiReply>) {
+        let idx = match self.resolve_session_index(req.session()) {
+            Ok(idx) => idx,
+            Err(e) => {
+                let _ = reply_tx.send(Err(e));
+                return;
+            }
+        };
+        let actions = match req {
+            PlanRequest::Read { .. } => {
+                let _ = reply_tx.send(Ok(self.sessions[idx].app.plan_snapshot()));
+                return;
+            }
+            PlanRequest::Implement { clear_context, .. } => self.sessions[idx]
+                .app
+                .implement_plan_from_lua(clear_context),
+            PlanRequest::OpenEditor { .. } => self.sessions[idx].app.open_plan_editor_action(),
+        };
+        // Answered before dispatch: the caller asked whether the request
+        // landed, and implementing a plan streams for as long as it streams.
+        let _ = reply_tx.send(Ok(json!(true)));
+        self.dispatch(idx, actions);
     }
 
     fn handle_task_request(&mut self, req: TaskRequest) -> UiReply {

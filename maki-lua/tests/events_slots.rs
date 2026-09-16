@@ -807,16 +807,146 @@ fn a_parked_layer_ends_at_the_window_it_was_given() {
     );
 }
 
-#[test]
-fn host_slot_names_are_reserved() {
+#[test_case("tool.bash.input" ; "tool_stage")]
+#[test_case("ui.plan_form" ; "ui_surface")]
+fn host_slot_names_are_reserved(name: &str) {
     let (_reg, host) = host();
     let err = host
         .load_source(
             "squatter",
-            r#"maki.api.declare_slot("tool.bash.input", function(i) return i end)"#,
+            &format!(r#"maki.api.declare_slot("{name}", function(i) return i end)"#),
         )
         .expect_err("declaring a host slot must fail");
     assert!(format!("{err}").contains("host owned"), "{err}");
+}
+
+// ------------------------------------------------------- ui.plan_form slot
+
+fn plan_form_layer(host: &PluginHost, plugin: &str, body: &str) {
+    load(
+        host,
+        plugin,
+        &format!(r#"maki.api.set_slot("ui.plan_form", function(prev, ev) {body} end)"#),
+    );
+}
+
+fn ask_plan_form(host: &PluginHost) -> bool {
+    host.event_handle()
+        .run_plan_form_slot("/tmp/plan.md".to_owned(), "s1".to_owned())
+        .recv_timeout(DISPATCH_TIMEOUT)
+        .expect("the plan form chain must answer")
+}
+
+/// The chain decides whether the built-in form opens. Deferring to `prev`
+/// reaches the host default, which is the built-in; answering without it takes
+/// the surface over. A broken layer leaves the built-in, so a plugin that
+/// throws never costs the user the form.
+#[test_case("return false", false ; "layer_owns_the_surface")]
+#[test_case("return", false ; "layer_answers_with_nothing")]
+#[test_case("return prev(ev)", true ; "layer_defers_to_the_builtin")]
+#[test_case("error('boom')", true ; "broken_layer_leaves_the_builtin")]
+fn the_plan_form_slot_decides_whether_the_builtin_opens(body: &str, opens: bool) {
+    let (_reg, host) = host();
+    plan_form_layer(&host, "planner", body);
+    assert_eq!(ask_plan_form(&host), opens);
+}
+
+/// Plan state is per session, so the layer is told which one it is answering
+/// for rather than left to ask for the focused tab.
+#[test]
+fn the_plan_form_slot_carries_the_path_and_session() {
+    let (_reg, host) = host();
+    plan_form_layer(
+        &host,
+        "planner",
+        r#"return ev.path == "/tmp/plan.md" and ev.session == "s1""#,
+    );
+    assert!(ask_plan_form(&host), "the layer saw the wrong event");
+}
+
+/// Nothing layered means nothing to ask, and the default answer is the
+/// built-in form.
+#[test]
+fn an_unlayered_plan_form_opens_the_builtin() {
+    let (_reg, host) = host();
+    assert!(ask_plan_form(&host));
+}
+
+/// The form suppression had to become a slot rather than a per-plugin flag in
+/// the UI: unload a plugin that took the form over and the built-in comes
+/// back, because the layer is torn down with everything else the plugin owned.
+#[test]
+fn unloading_the_plan_form_owner_hands_the_form_back() {
+    let (_reg, host) = host();
+    let reader = host.plan_action_reader();
+    plan_form_layer(&host, "planner", "return false");
+    assert_eq!(
+        reader.load().form_owner.as_deref(),
+        Some("planner"),
+        "the snapshot names the plugin holding the form"
+    );
+    assert!(!ask_plan_form(&host));
+
+    host.unload("planner").unwrap();
+    assert!(
+        reader.load().form_owner.is_none(),
+        "unload must release the form"
+    );
+    assert!(
+        ask_plan_form(&host),
+        "the built-in form has to come back with the layer gone"
+    );
+}
+
+/// The row a plugin registers fires with its own identity, so one handler can
+/// serve several rows without counting menu positions.
+#[test]
+fn a_plan_action_handler_is_told_which_row_fired() {
+    let (reg, host) = host();
+    load(
+        &host,
+        "planner",
+        &format!(
+            r#"
+local seen = nil
+maki.api.register_plan_action({{
+    name = "go", label = "Go",
+    handler = function(opts) seen = opts end,
+}})
+{}
+"#,
+            probe_tool(
+                "probe_plan_action",
+                r#"
+if not seen then return "none" end
+return table.concat(
+    { seen.id, seen.name, seen.session, seen.path, tostring(seen.parallel) }, "|")
+"#
+            )
+        ),
+    );
+
+    host.event_handle().run_plan_action(
+        Arc::from("planner"),
+        Arc::from("go"),
+        "/tmp/plan.md".to_owned(),
+        true,
+        "s1".to_owned(),
+    );
+
+    let expected = "planner/go|go|s1|/tmp/plan.md|true";
+    let give_up = Instant::now() + DISPATCH_TIMEOUT;
+    loop {
+        let seen = exec_tool(&reg, "probe_plan_action");
+        if seen == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < give_up,
+            "plan action handler saw {seen}, expected {expected}"
+        );
+        std::thread::sleep(DISPATCH_POLL);
+    }
 }
 
 /// A layer answering off contract costs what no layer costs: dispatch keeps the

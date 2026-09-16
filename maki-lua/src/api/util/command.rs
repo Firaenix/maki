@@ -455,6 +455,31 @@ pub enum ModelRequest {
     },
 }
 
+/// The plan surface `maki.plan` drives. Plan state is per session, so every
+/// request names one; `None` means the focused session.
+pub enum PlanRequest {
+    /// Snapshot of the current plan: `{ mode, path, content, ready }`.
+    Read { session: Option<String> },
+    /// Fires the same code path as the built-in "Implement plan" (and
+    /// "Clear context and implement" when `clear_context = true`) rows.
+    Implement {
+        clear_context: bool,
+        session: Option<String>,
+    },
+    /// Opens the current plan file in `$EDITOR`.
+    OpenEditor { session: Option<String> },
+}
+
+impl PlanRequest {
+    pub fn session(&self) -> Option<&str> {
+        match self {
+            Self::Read { session }
+            | Self::Implement { session, .. }
+            | Self::OpenEditor { session } => session.as_deref(),
+        }
+    }
+}
+
 pub type UiReply = Result<serde_json::Value, String>;
 
 /// Viewport of the focused chat transcript, zero-based like the rest of the
@@ -504,6 +529,10 @@ pub enum UiAction {
     },
     Model {
         req: ModelRequest,
+        reply_tx: flume::Sender<UiReply>,
+    },
+    Plan {
+        req: PlanRequest,
         reply_tx: flume::Sender<UiReply>,
     },
     Task {

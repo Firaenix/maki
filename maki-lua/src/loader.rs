@@ -944,6 +944,10 @@ impl PluginHost {
         self.inner.hint_reader.clone()
     }
 
+    pub fn plan_action_reader(&self) -> crate::api::plan::PlanActionReader {
+        self.inner.plan_action_reader.clone()
+    }
+
     pub fn ui_action_rx(&self) -> flume::Receiver<UiAction> {
         self.inner.ui_action_rx.clone()
     }
@@ -975,6 +979,37 @@ impl EventHandle {
     #[doc(hidden)]
     pub fn disconnected_for_test() -> Self {
         Self::from_tx(flume::unbounded().0)
+    }
+
+    pub fn run_plan_action(
+        &self,
+        plugin: Arc<str>,
+        name: Arc<str>,
+        path: String,
+        parallel: bool,
+        session: String,
+    ) {
+        let _ = self.prio_tx.try_send(Request::RunPlanAction {
+            plugin,
+            name,
+            path,
+            parallel,
+            session,
+        });
+    }
+
+    /// Asks the `ui.plan_form` chain whether the built-in form should open.
+    /// The receiver answers `true` when every layer deferred; a full channel
+    /// or a host that has gone away leaves it empty, and the caller keeps the
+    /// form closed rather than racing a plugin that is already drawing.
+    pub fn run_plan_form_slot(&self, path: String, session: String) -> flume::Receiver<bool> {
+        let (reply, rx) = flume::bounded(1);
+        let _ = self.prio_tx.try_send(Request::RunPlanFormSlot {
+            path,
+            session,
+            reply,
+        });
+        rx
     }
 
     /// True when no runtime is draining requests. Production handles stay

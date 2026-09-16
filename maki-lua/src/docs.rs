@@ -56,6 +56,8 @@ pub fn api_docs() -> Vec<&'static ModuleDoc> {
         &api::pack::DOCS,
         &api::tool::DOCS,
         &api::autocmd::DOCS,
+        &api::plan::DOCS,
+        &api::plan::PLAN_ACTION_DOCS,
         &api::slot::DOCS,
         &api::agent::DOCS,
         &api::agent::SESSION_DOCS,
