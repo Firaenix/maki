@@ -453,6 +453,10 @@ pub enum ModelRequest {
         thinking: Option<String>,
         fast: Option<bool>,
     },
+    /// Re-run model discovery; `live` skips the on-disk cache (picker `R`).
+    Refresh {
+        live: bool,
+    },
 }
 
 pub type UiReply = Result<serde_json::Value, String>;
