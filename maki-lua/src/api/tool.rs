@@ -10,8 +10,7 @@ use flume::Sender;
 use maki_agent::permissions::{PluginRuleStore, is_universal_scope};
 use maki_agent::prompt::{PromptId, Slot, SlotKind, ValidNames};
 use maki_agent::reviewers::{
-    DEFAULT_HANDLER_TIMEOUT_MS, DEFAULT_TIMEOUT_MS as DEFAULT_REVIEW_TIMEOUT_MS, LinkCx,
-    LinkOutcome, ModelLink, ReviewCall, ReviewLink, ReviewerDef, Verdict,
+    DEFAULT_HANDLER_TIMEOUT_MS, LinkOutcome, ReviewCall, ReviewLink, ReviewerDef, Verdict,
 };
 use maki_agent::tools::Tool;
 use maki_agent::tools::registry::{RegisteredTool, ToolRegistry};
@@ -55,14 +54,16 @@ const NARGS_ERR: &str = r#"register_command: 'nargs' must be 0, 1, "?", "*", or 
 const PERMISSION_RULE_KEYS: &[&str] = &["tool", "scope", "effect"];
 const REVIEWER_KEYS: &[&str] = &[
     "name",
-    "model",
-    "policy",
     "handler",
     "tools",
     "timeout_ms",
     "order",
     "redirect_guidance",
 ];
+/// Reported on the verdict event: a reviewer that is registered and never
+/// answers looks exactly like one that keeps escalating.
+const NO_RUNTIME_NOTE: &str = "the Lua runtime is gone, so the handler could not be called";
+const HANDLER_GONE_NOTE: &str = "the handler stopped without answering";
 const MAX_HINT_CONTENT_SIZE: usize = 1024 * 1024;
 const DESCRIBE_TIMEOUT: Duration = Duration::from_secs(3);
 const PLAIN_HEADER_STYLE: &str = "tool";
@@ -229,23 +230,13 @@ struct LuaReviewHandler {
 }
 
 impl ReviewLink for LuaReviewHandler {
-    fn label(&self) -> &str {
-        "handler"
-    }
-
-    fn review<'a>(&'a self, call: &'a ReviewCall, _cx: LinkCx<'a>) -> BoxFuture<'a, LinkOutcome> {
-        Box::pin(async move {
-            let verdict = self.verdict(call).await;
-            LinkOutcome {
-                verdict,
-                ..LinkOutcome::default()
-            }
-        })
+    fn review<'a>(&'a self, call: &'a ReviewCall) -> BoxFuture<'a, LinkOutcome> {
+        Box::pin(async move { self.verdict(call).await })
     }
 }
 
 impl LuaReviewHandler {
-    async fn verdict(&self, request: &ReviewCall) -> Option<(Verdict, Option<String>)> {
+    async fn verdict(&self, request: &ReviewCall) -> LinkOutcome {
         {
             let attempt = request.attempt.as_ref().map(|a| {
                 serde_json::json!({
@@ -266,11 +257,8 @@ impl LuaReviewHandler {
                 "scopes": request.scopes,
                 "parseable": !request.force_prompt,
                 "cwd": request.cwd,
-                "opening_user_message": request.context.opening_user_message,
-                "task_user_message": request.context.task_user_message,
-                "last_user_message": request.context.recent_user_messages.last(),
-                "recent_user_messages": request.context.recent_user_messages,
-                "assistant_intent": request.context.assistant_intent,
+                "session": request.session,
+                "task": request.task,
                 "attempt": attempt,
             });
             let (reply_tx, reply_rx) = flume::bounded(1);
@@ -278,7 +266,8 @@ impl LuaReviewHandler {
             // timeout or cancel the detached Lua thread wakes from `cancel`
             // and stops instead of running past its caller.
             let (_trigger, cancel) = maki_agent::cancel::CancelToken::new();
-            self.tx
+            if self
+                .tx
                 .send(crate::runtime::Request::CallReviewHandler {
                     plugin: Arc::clone(&self.plugin),
                     name: Arc::clone(&self.name),
@@ -286,8 +275,24 @@ impl LuaReviewHandler {
                     cancel,
                     reply: reply_tx,
                 })
-                .ok()?;
-            let (verdict, reason) = reply_rx.recv_async().await.ok()??;
+                .is_err()
+            {
+                return LinkOutcome {
+                    verdict: None,
+                    no_verdict: Some(NO_RUNTIME_NOTE.to_owned()),
+                };
+            }
+            let Ok(reply) = reply_rx.recv_async().await else {
+                return LinkOutcome {
+                    verdict: None,
+                    no_verdict: Some(HANDLER_GONE_NOTE.to_owned()),
+                };
+            };
+            // A handler that answered nothing is escalating on purpose; the
+            // chain has nothing to report about it.
+            let Some((verdict, reason)) = reply else {
+                return LinkOutcome::default();
+            };
             let verdict = match verdict.as_str() {
                 "ALLOW" => Verdict::Allow,
                 "DENY" => Verdict::Deny,
@@ -298,10 +303,16 @@ impl LuaReviewHandler {
                         verdict = other,
                         "handler returned an unknown verdict, escalating"
                     );
-                    return None;
+                    return LinkOutcome {
+                        verdict: None,
+                        no_verdict: Some(format!("handler returned an unknown verdict: {other}")),
+                    };
                 }
             };
-            Some((verdict, reason))
+            LinkOutcome {
+                verdict: Some((verdict, reason)),
+                no_verdict: None,
+            }
         }
     }
 }
@@ -1005,26 +1016,27 @@ fn allow_is_delegated(
 /// human). Under yolo mode an unresolved chain denies with retry guidance
 /// instead of prompting, so the agent never stalls on a question.
 ///
-/// A link is either a model (`model` + `policy`: maki calls the model and
-/// parses its verdict) or a `handler` (your function computes the verdict:
-/// rulebooks, quotas, external approval systems, custom prompts). The
-/// handler receives one table — `tool`, `input` (decoded), `scopes` (for
-/// bash: the parsed command segments), `parseable`, `cwd`,
-/// `opening_user_message` (how the conversation started), `task_user_message`
-/// (the most recent substantive request, which short follow-ups continue),
-/// `last_user_message`, `recent_user_messages` (trailing user messages,
-/// oldest first; answers the user gave to the `question` tool count),
-/// `assistant_intent` (the agent's last text before the call: its own
-/// claim, not the user's), `attempt` (`{ count, history }` on repeats) — and
-/// returns `"ALLOW"|"DENY"|"ASK"` plus an optional reason; anything else
-/// escalates. Handlers may block (e.g. on `maki.ui.picker`); the outer
-/// chain waits at most `timeout_ms` and cancels the handler when the wait
-/// ends, so a slow handler cannot outlive its caller.
+/// A reviewer is your `handler` function and nothing else: rulebooks,
+/// quotas, external approval systems, a model you call yourself with
+/// `maki.model.complete`. It receives one table with `tool`, `input`
+/// (decoded, whole, never trimmed), `scopes` (for bash: the parsed command
+/// segments), `parseable`, `cwd`, `session` and `task` (whose turn issued
+/// the call; pass `session` to `maki.session.messages` to read the
+/// conversation behind it), and `attempt` (`{ count, history }` on
+/// repeats). It returns `"ALLOW"|"DENY"|"ASK"` plus an optional reason;
+/// anything else escalates. Handlers may block (e.g. on `maki.ui.picker`);
+/// the outer chain waits at most `timeout_ms` and cancels the handler when
+/// the wait ends, so a slow handler cannot outlive its caller.
+///
+/// A DENY reason reaches the agent as quoted data, stripped and bounded: it
+/// is text shaped by the input under review, so it is never handed over as
+/// instructions. Denials also spend the turn's review budget, and the turn
+/// ends once that budget is gone.
 ///
 /// One rule governs visibility: reviewers see the tools they name.
 /// Tools that never reach the permission layer (`question`, `todo_write`)
-/// are therefore only seen by reviewers naming them with a real pattern —
-/// the `"*"` default does not reach them — and for those calls anything
+/// are therefore only seen by reviewers naming them with a real pattern, as
+/// the `"*"` default does not reach them, and for those calls anything
 /// short of a DENY (allow, timeout, exhausted escalation) lets the tool
 /// run as usual. A goal plugin can e.g. deny the question tool while a
 /// goal is active, so the agent decides instead of stalling on the human.
@@ -1034,26 +1046,17 @@ fn allow_is_delegated(
 /// re-register on enable and `unregister_reviewer` on disable. A
 /// `/reload` drops the plugin's reviewers before the plugin runs again.
 ///
-/// The reviewer model receives the raw tool input, the permission scopes
-/// maki derived, the working directory, and the latest user message.
-///
 /// @param spec table Reviewer specification:
 ///   name       (string) Required. Unique per plugin; same name replaces.
-///   model      (string) Required. Model spec `provider/model-id`, e.g.
-///                       "anthropic/claude-haiku-4-5-20251001".
-///   policy     (string) Required with `model`. System-prompt policy text
-///                       the reviewer judges calls against.
-///   handler    (function) Alternative to `model`/`policy`: computes the
-///                       verdict itself. `function(call) -> verdict, reason?`
+///   handler    (function) Required. Computes the verdict:
+///                       `function(call) -> verdict, reason?`
 ///   tools      (table)  Optional. Tool filters matched against the tool
 ///                       key (`"bash"`, `"server.tool"`); `*` globs, e.g.
 ///                       `{ "bash", "myserver.*" }`. Default `{ "*" }`.
 ///                       Real patterns also opt permission-free tools
 ///                       into review (see above); the default does not.
-///   timeout_ms (integer) Optional. Per-call timeout; default 5000 for
-///                       model links, 300000 for handler links (they may
-///                       wait on a human). Handlers also receive the full
-///                       untruncated input, unlike model links.
+///   timeout_ms (integer) Optional. Per-call timeout; default 300000,
+///                       because a handler may wait on a human.
 ///   order      (integer) Optional. Chain position, lowest first; default 0.
 ///   redirect_guidance (string) Optional. Replaces the built-in "try a
 ///                       different approach" text when an unresolved chain
@@ -1062,11 +1065,6 @@ fn allow_is_delegated(
 /// @return
 /// @example
 /// maki.api.register_reviewer({
-///   name = "cheap",
-///   model = "anthropic/claude-haiku-4-5-20251001",
-///   policy = "ALLOW clearly read-only commands. Otherwise ASK.",
-/// })
-/// maki.api.register_reviewer({
 ///   name = "rulebook",
 ///   order = -1,
 ///   handler = function(call)
@@ -1074,6 +1072,18 @@ fn allow_is_delegated(
 ///       return "ALLOW"
 ///     end
 ///     return "ASK"
+///   end,
+/// })
+/// maki.api.register_reviewer({
+///   name = "cheap",
+///   handler = function(call)
+///     local answer = maki.model.complete({
+///       model = "anthropic/claude-haiku-4-5-20251001",
+///       system = "Reply ALLOW or DENY. Read-only commands are fine.",
+///       prompt = maki.json.encode(call.input),
+///       max_output_tokens = 64,
+///     })
+///     return answer and answer.text:match("^%u+") or "ASK"
 ///   end,
 /// })
 #[lua_fn]
@@ -1088,7 +1098,7 @@ fn register_reviewer(lua: &Lua, #[ctx] reviewers: ReviewerRegistry, spec: Table)
             .map_err(|_| mlua::Error::runtime("register_reviewer: spec keys must be strings"))?;
         if !REVIEWER_KEYS.contains(&key.as_str()) {
             return Err(mlua::Error::runtime(format!(
-                "register_reviewer: unknown key '{key}' (valid: name, model, policy, handler, tools, timeout_ms, order, redirect_guidance)"
+                "register_reviewer: unknown key '{key}' (valid: name, handler, tools, timeout_ms, order, redirect_guidance)"
             )));
         }
     }
@@ -1103,73 +1113,38 @@ fn register_reviewer(lua: &Lua, #[ctx] reviewers: ReviewerRegistry, spec: Table)
     let handler: Option<Function> = spec
         .get("handler")
         .map_err(|_| mlua::Error::runtime("register_reviewer: 'handler' must be a function"))?;
-    let model: Option<String> = spec
-        .get("model")
-        .map_err(|_| mlua::Error::runtime("register_reviewer: 'model' must be a string"))?;
-    let policy: Option<String> = spec
-        .get("policy")
-        .map_err(|_| mlua::Error::runtime("register_reviewer: 'policy' must be a string"))?;
-    let link: Arc<dyn ReviewLink> = match (handler, model, policy) {
-        (Some(func), None, None) => {
-            let name: Arc<str> = Arc::from(name.as_str());
-            let key = lua.create_registry_value(func)?;
-            let Some(tx) = lua
-                .app_data_ref::<ReviewerRequestTx>()
-                .map(|tx| tx.0.clone())
-            else {
-                return Err(mlua::Error::runtime(
-                    "register_reviewer: handler reviewers are unavailable in this host",
-                ));
-            };
-            let mut map = lua
-                .app_data_mut::<ReviewHandlerMap>()
-                .ok_or_else(|| mlua::Error::runtime("register_reviewer: not initialized"))?;
-            if let Some(old) = map
-                .0
-                .entry(Arc::clone(&reviewers.plugin))
-                .or_default()
-                .insert(Arc::clone(&name), key)
-            {
-                let _ = lua.remove_registry_value(old);
-            }
-            Arc::new(LuaReviewHandler {
-                tx,
-                plugin: Arc::clone(&reviewers.plugin),
-                name,
-            })
-        }
-        (None, Some(model), Some(policy)) => {
-            if let Some(mut map) = lua.app_data_mut::<ReviewHandlerMap>()
-                && let Some(handlers) = map.0.get_mut(&reviewers.plugin)
-                && let Some(old) = handlers.remove(name.as_str())
-            {
-                let _ = lua.remove_registry_value(old);
-            }
-            if !model.contains('/') {
-                return Err(mlua::Error::runtime(
-                    "register_reviewer: 'model' must be a provider/model-id spec",
-                ));
-            }
-            if policy.is_empty() {
-                return Err(mlua::Error::runtime(
-                    "register_reviewer: 'policy' must be non-empty",
-                ));
-            }
-            Arc::new(ModelLink {
-                spec: model,
-                policy,
-            })
-        }
-        (Some(_), _, _) => {
+    let Some(handler) = handler else {
+        return Err(mlua::Error::runtime(
+            "register_reviewer: 'handler' is required",
+        ));
+    };
+    let link: Arc<dyn ReviewLink> = {
+        let name: Arc<str> = Arc::from(name.as_str());
+        let key = lua.create_registry_value(handler)?;
+        let Some(tx) = lua
+            .app_data_ref::<ReviewerRequestTx>()
+            .map(|tx| tx.0.clone())
+        else {
             return Err(mlua::Error::runtime(
-                "register_reviewer: 'handler' excludes 'model' and 'policy'",
+                "register_reviewer: reviewers are unavailable in this host",
             ));
+        };
+        let mut map = lua
+            .app_data_mut::<ReviewHandlerMap>()
+            .ok_or_else(|| mlua::Error::runtime("register_reviewer: not initialized"))?;
+        if let Some(old) = map
+            .0
+            .entry(Arc::clone(&reviewers.plugin))
+            .or_default()
+            .insert(Arc::clone(&name), key)
+        {
+            let _ = lua.remove_registry_value(old);
         }
-        _ => {
-            return Err(mlua::Error::runtime(
-                "register_reviewer: needs either 'handler' or both 'model' and 'policy'",
-            ));
-        }
+        Arc::new(LuaReviewHandler {
+            tx,
+            plugin: Arc::clone(&reviewers.plugin),
+            name,
+        })
     };
     let tools: Vec<String> = match spec
         .get::<Option<Vec<String>>>("tools")
@@ -1196,11 +1171,7 @@ fn register_reviewer(lua: &Lua, #[ctx] reviewers: ReviewerRegistry, spec: Table)
     let timeout_ms = spec
         .get::<Option<u64>>("timeout_ms")
         .map_err(|_| mlua::Error::runtime("register_reviewer: 'timeout_ms' must be an integer"))?
-        .unwrap_or(if link.label() == "handler" {
-            DEFAULT_HANDLER_TIMEOUT_MS
-        } else {
-            DEFAULT_REVIEW_TIMEOUT_MS
-        });
+        .unwrap_or(DEFAULT_HANDLER_TIMEOUT_MS);
     if timeout_ms == 0 {
         return Err(mlua::Error::runtime(
             "register_reviewer: 'timeout_ms' must be positive",

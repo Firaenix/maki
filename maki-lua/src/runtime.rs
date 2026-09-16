@@ -237,6 +237,16 @@ pub enum Request {
     InstallSessionSnapshot {
         provider: crate::api::session::SessionSnapshotFn,
     },
+    /// Install a `SessionMessagesSlot`, the same deal for
+    /// `maki.session.messages`.
+    InstallSessionMessages {
+        provider: crate::api::session::SessionMessagesFn,
+    },
+    /// Install the sink `maki.model.complete` reports its spend to, so a
+    /// driver with no UI channel still bills what a plugin spent.
+    InstallModelSpend {
+        sink: crate::api::model::ModelSpendFn,
+    },
     /// Takes the package operations Lua recorded, leaving the queue empty.
     TakePackOps {
         reply: flume::Sender<Vec<crate::api::pack::PackOp>>,
@@ -3482,6 +3492,13 @@ pub fn spawn(
                         Request::InstallSessionSnapshot { provider } => {
                             rt.lua
                                 .set_app_data(crate::api::session::SessionSnapshotSlot(provider));
+                        }
+                        Request::InstallSessionMessages { provider } => {
+                            rt.lua
+                                .set_app_data(crate::api::session::SessionMessagesSlot(provider));
+                        }
+                        Request::InstallModelSpend { sink } => {
+                            rt.lua.set_app_data(crate::api::model::ModelSpendSlot(sink));
                         }
                         Request::LoadSource {
                             name,

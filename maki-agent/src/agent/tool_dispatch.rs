@@ -745,6 +745,16 @@ async fn run_local_tool(
     }
 }
 
+/// The turn whose review budget this call spends. A subagent shares its
+/// parent's `PermissionManager`, so the task id is what tells the two
+/// budgets apart.
+fn review_turn(ctx: &ToolContext) -> crate::permissions::ReviewTurn<'_> {
+    crate::permissions::ReviewTurn {
+        session: ctx.session_id.as_ref().map(SessionRef::as_str),
+        task: ctx.task_id.as_deref(),
+    }
+}
+
 /// Enforce permission for a native tool. MCP tools bypass this — they go
 /// through `execute_mcp_tool` which handles permission checking internally.
 ///
@@ -763,8 +773,7 @@ async fn enforce_permission(
     }
     let review = ReviewSource {
         input: Some(input),
-        context: &ctx.review_context,
-        timeouts: ctx.timeouts,
+        turn: review_turn(ctx),
     };
     if let Some(scopes) = inv.permission_scopes().await {
         let tool_key = ToolKey::native(name);
@@ -783,7 +792,7 @@ async fn enforce_permission(
             .map_err(|e| e.to_string())?;
     } else {
         ctx.permissions
-            .veto_review(name, review, &ctx.event_tx, &ctx.cancel)
+            .veto_review(name, Some(id), review, &ctx.event_tx, &ctx.cancel)
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -829,8 +838,7 @@ async fn execute_mcp_tool(
             ctx.mode.plan_path(),
             ReviewSource {
                 input: Some(input),
-                context: &ctx.review_context,
-                timeouts: ctx.timeouts,
+                turn: review_turn(ctx),
             },
         )
         .await

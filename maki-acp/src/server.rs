@@ -1267,6 +1267,7 @@ mod tests {
         let (out_tx, out_rx) = flume::unbounded();
         let handle = InteractiveHandle {
             tool_names: Vec::new(),
+            history: Arc::default(),
             input_tx: flume::unbounded().0,
             answer_tx,
             cancel_tx: flume::unbounded().0,

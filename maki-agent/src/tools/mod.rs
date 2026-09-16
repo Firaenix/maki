@@ -373,9 +373,6 @@ pub struct ToolContext {
     /// it for its own call only.
     pub live_sink: Option<flume::Sender<ToolLive>>,
     pub model_policy: Arc<ModelPolicy>,
-    /// What the reviewer chain reads intent from: the opening request,
-    /// trailing user messages, and the agent's stated next step.
-    pub review_context: Arc<crate::reviewers::ReviewContext>,
 }
 
 /// Live progress of a dispatched child tool, streamed while it runs.
@@ -599,7 +596,6 @@ pub fn interpreter_ctx(
         local_tools: LocalTools::default(),
         live_sink: None,
         model_policy: Arc::new(ModelPolicy::default()),
-        review_context: Arc::default(),
     }
 }
 

@@ -19,9 +19,11 @@ pub use agent::{
     is_instruction_file,
 };
 pub use cancel::{CancelMap, CancelToken, CancelTrigger};
+pub use completion::{Completion, CompletionRequest};
 pub use mailbox::{MailboxError, SessionMailbox};
 pub use maki_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOutputLines};
 pub mod command;
+pub mod completion;
 pub mod diff;
 pub mod permissions;
 pub mod prompt;

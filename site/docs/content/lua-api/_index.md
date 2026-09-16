@@ -521,26 +521,27 @@ shown to the agent), or ASK (escalate to the next reviewer, then the
 human). Under yolo mode an unresolved chain denies with retry guidance
 instead of prompting, so the agent never stalls on a question.
 
-A link is either a model (`model` + `policy`: maki calls the model and
-parses its verdict) or a `handler` (your function computes the verdict:
-rulebooks, quotas, external approval systems, custom prompts). The
-handler receives one table — `tool`, `input` (decoded), `scopes` (for
-bash: the parsed command segments), `parseable`, `cwd`,
-`opening_user_message` (how the conversation started), `task_user_message`
-(the most recent substantive request, which short follow-ups continue),
-`last_user_message`, `recent_user_messages` (trailing user messages,
-oldest first; answers the user gave to the `question` tool count),
-`assistant_intent` (the agent's last text before the call: its own
-claim, not the user's), `attempt` (`{ count, history }` on repeats) — and
-returns `"ALLOW"|"DENY"|"ASK"` plus an optional reason; anything else
-escalates. Handlers may block (e.g. on `maki.ui.picker`); the outer
-chain waits at most `timeout_ms` and cancels the handler when the wait
-ends, so a slow handler cannot outlive its caller.
+A reviewer is your `handler` function and nothing else: rulebooks,
+quotas, external approval systems, a model you call yourself with
+`maki.model.complete`. It receives one table with `tool`, `input`
+(decoded, whole, never trimmed), `scopes` (for bash: the parsed command
+segments), `parseable`, `cwd`, `session` and `task` (whose turn issued
+the call; pass `session` to `maki.session.messages` to read the
+conversation behind it), and `attempt` (`{ count, history }` on
+repeats). It returns `"ALLOW"|"DENY"|"ASK"` plus an optional reason;
+anything else escalates. Handlers may block (e.g. on `maki.ui.picker`);
+the outer chain waits at most `timeout_ms` and cancels the handler when
+the wait ends, so a slow handler cannot outlive its caller.
+
+A DENY reason reaches the agent as quoted data, stripped and bounded: it
+is text shaped by the input under review, so it is never handed over as
+instructions. Denials also spend the turn's review budget, and the turn
+ends once that budget is gone.
 
 One rule governs visibility: reviewers see the tools they name.
 Tools that never reach the permission layer (`question`, `todo_write`)
-are therefore only seen by reviewers naming them with a real pattern —
-the `"*"` default does not reach them — and for those calls anything
+are therefore only seen by reviewers naming them with a real pattern, as
+the `"*"` default does not reach them, and for those calls anything
 short of a DENY (allow, timeout, exhausted escalation) lets the tool
 run as usual. A goal plugin can e.g. deny the question tool while a
 goal is active, so the agent decides instead of stalling on the human.
@@ -550,28 +551,19 @@ the same `name` replaces the earlier entry, so a toggle command can
 re-register on enable and `unregister_reviewer` on disable. A
 `/reload` drops the plugin's reviewers before the plugin runs again.
 
-The reviewer model receives the raw tool input, the permission scopes
-maki derived, the working directory, and the latest user message.
-
 **Parameters:**
 
 - `{spec}` (`table`) Reviewer specification:
   - `name` (`string`) Required. Unique per plugin; same name replaces.
-  - `model` (`string`) Required. Model spec `provider/model-id`, e.g.
-    "anthropic/claude-haiku-4-5-20251001".
-  - `policy` (`string`) Required with `model`. System-prompt policy text
-    the reviewer judges calls against.
-  - `handler` (`function`) Alternative to `model`/`policy`: computes the
-    verdict itself. `function(call) -> verdict, reason?`
+  - `handler` (`function`) Required. Computes the verdict:
+    `function(call) -> verdict, reason?`
   - `tools` (`table`) Optional. Tool filters matched against the tool
     key (`"bash"`, `"server.tool"`); `*` globs, e.g.
     `{ "bash", "myserver.*" }`. Default `{ "*" }`.
     Real patterns also opt permission-free tools
     into review (see above); the default does not.
-  - `timeout_ms` (`integer`) Optional. Per-call timeout; default 5000 for
-    model links, 300000 for handler links (they may
-    wait on a human). Handlers also receive the full
-    untruncated input, unlike model links.
+  - `timeout_ms` (`integer`) Optional. Per-call timeout; default 300000,
+    because a handler may wait on a human.
   - `order` (`integer`) Optional. Chain position, lowest first; default 0.
   - `redirect_guidance` (`string`) Optional. Replaces the built-in "try a
     different approach" text when an unresolved chain
@@ -582,11 +574,6 @@ maki derived, the working directory, and the latest user message.
 
 ```lua
 maki.api.register_reviewer({
-  name = "cheap",
-  model = "anthropic/claude-haiku-4-5-20251001",
-  policy = "ALLOW clearly read-only commands. Otherwise ASK.",
-})
-maki.api.register_reviewer({
   name = "rulebook",
   order = -1,
   handler = function(call)
@@ -594,6 +581,18 @@ maki.api.register_reviewer({
       return "ALLOW"
     end
     return "ASK"
+  end,
+})
+maki.api.register_reviewer({
+  name = "cheap",
+  handler = function(call)
+    local answer = maki.model.complete({
+      model = "anthropic/claude-haiku-4-5-20251001",
+      system = "Reply ALLOW or DENY. Read-only commands are fine.",
+      prompt = maki.json.encode(call.input),
+      max_output_tokens = 64,
+    })
+    return answer and answer.text:match("^%u+") or "ASK"
   end,
 })
 ```
@@ -904,8 +903,8 @@ Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
 `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"TaskStatusChanged"`,
-`"TaskFocusChanged"`, and `"ModelChanged"`. Plugins can also fire their
-own events with `exec_autocmds`.
+`"TaskFocusChanged"`, `"ModelChanged"`, and `"ToolReviewed"`. Plugins can
+also fire their own events with `exec_autocmds`.
 
 Every host event carries `data.session_id`. For `"SessionReset"` and
 `"SessionEnd"` that is the session being left behind, the other events
@@ -940,6 +939,17 @@ name the session now running or focused. What each event adds:
 - `"ModelChanged"`: `data.model` in the shape `maki.model.get` returns,
   plus `data.previous_spec`. Picking the model already in use stays
   quiet, and so does startup.
+- `"ToolReviewed"`: one per reviewer that answered, with `data.tool`,
+  `data.tool_use_id`, `data.reviewer`, `data.verdict` (`"ALLOW"`,
+  `"DENY"`, `"ASK"`), `data.reason`, `data.scopes` (the permission scopes
+  maki derived), and `data.resolution`, which is what the chain did with
+  the answer: `"allowed"`, `"denied"`, `"escalated"` to the next
+  reviewer, `"prompted"` because the chain ran out, `"redirected"` under
+  yolo, or `"terminated"` because the turn's review budget ran out and
+  maki ended the turn. `data.reviewer` is empty for the synthetic
+  `"prompted"`, `"redirected"` and `"terminated"` events, which no
+  reviewer answered. Tokens a reviewer spent are reported by
+  `maki.model.complete`, not here.
 
 `"TurnEnd"` fires once per turn and only for the main session, so
 subagent turns never show up. A manual `/compact` ends its run without
@@ -3346,8 +3356,8 @@ maki.log.error("failed to connect to API")
 
 The model behind the focused session. Good for a keybind that flips
 between your two go-to models, or lifts thinking for one hard question.
-Without an interactive UI every function returns
-`nil, "no interactive UI attached"`.
+`get`, `available` and `set` return `nil, "no interactive UI attached"`
+without one; `complete` needs no UI, it calls a model itself.
 
 ---
 
@@ -3473,6 +3483,59 @@ endpoint may never report. Purely local -- no UI round-trip, no network
 ```lua
 local m, err = maki.model.info("anthropic/claude-opus-4-6")
 if m and m.subsidised_by then print(m.subsidised_by, m.pricing.input) end
+```
+
+---
+
+### `maki.model.complete()` {#maki-model-complete}
+
+```lua
+maki.model.complete({opts})
+```
+
+Asks a model one question and hands back what it said. No system prompt
+of maki's, no tools, no turn: this is the plain call a plugin needs to
+classify, summarise, or judge something on its own.
+
+The tokens are billed to the session like any other model call, so the
+spend shows up in the TUI status line, in `maki -p`'s result, and in sdk
+mode's usage. A reviewer firing on every tool call is exactly where an
+unnoticed bill grows, so it is never silent.
+
+The call is answered on the Lua thread, so it works with or without an
+interactive UI.
+
+**Parameters:**
+
+- `{opts}` (`table`) Options:
+  - `model` (`string`) Required. `"provider/model-id"`.
+  - `prompt` (`string`) The single user message to send.
+  - `messages` (`table`) Instead of `prompt`: `{role, content}` rows, where
+
+  `role` is `"user"` or `"assistant"`.
+
+  - `system` (`string`) System prompt. You own every word of it.
+  - `max_output_tokens` (`integer`) Output ceiling, default 1024. Raise it for
+
+  models that emit reasoning tokens whatever you ask: one that spends its
+
+
+  whole budget thinking answers with nothing and still bills.
+
+  - `timeout_ms` (`integer`) How long to wait, default 30000.
+
+**Returns:** (`table|nil`, `string|nil`) `{text, model, usage, cost, list_cost}`,
+  or nil and an error. `usage` carries the four token counts.
+
+**Example:**
+
+```lua
+local answer, err = maki.model.complete({
+  model = "anthropic/claude-haiku-4-5-20251001",
+  system = "Answer with one word.",
+  prompt = "Is `rm -rf /` safe?",
+  max_output_tokens = 16,
+})
 ```
 
 
@@ -3643,6 +3706,50 @@ local s = maki.session.read()
 if s.context_size > s.context_window * 0.8 then
   maki.ui.notify("context is nearly full")
 end
+```
+
+---
+
+### `maki.session.messages()` {#maki-session-messages}
+
+```lua
+maki.session.messages({opts?})
+```
+
+Reads the conversation: what the human said, what the agent said back,
+oldest first. This is how a plugin builds its own context, for a reviewer
+prompt or anything else, instead of taking one maki chose for it.
+
+Every row is `{role, kind, text, truncated}`:
+```text
+role     "user" | "assistant"
+kind     "typed"       the human typed it
+         "answer"      the human answered the `question` tool
+         "observation" the host or a plugin reported it
+         "said"        the assistant's own text
+truncated  the row was longer than 16KB and was cut
+```
+
+Tool calls and tool results are left out, `question` answers aside: those
+are the human's words, they just arrive as a tool result.
+
+Reads the focused session, or the one you name in `session`, which is
+what a reviewer handler passes from `call.session`.
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Options:
+  - `session` (`string?`) Session id; defaults to focused.
+  - `limit` (`integer?`) Keep only the newest {limit} rows, still oldest first.
+  - `role` (`string?`) `"user"` or `"assistant"`; both when absent.
+
+**Returns:** (`table|nil`, `string|nil`) Array of rows, or nil and an error.
+
+**Example:**
+
+```lua
+local rows = maki.session.messages({ session = call.session, limit = 4, role = "user" })
+local latest = rows[#rows]
 ```
 
 ---
