@@ -272,9 +272,12 @@ impl KeymapStore {
         replaced
     }
 
-    pub fn del(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+    /// Removes a binding only if {plugin} is the one that made it. A plugin
+    /// tearing down its own keys must not be able to take another plugin's
+    /// with them, and a key it never bound is not its to remove.
+    pub fn del(&mut self, key: KeyCode, modifiers: KeyModifiers, plugin: &str) {
         self.globals
-            .retain(|b| b.key != key || b.modifiers != modifiers);
+            .retain(|b| b.key != key || b.modifiers != modifiers || b.plugin.as_ref() != plugin);
     }
 
     /// The load is marked dead as well as emptied of keys. The snapshot loses
@@ -508,7 +511,8 @@ fn set(
 }
 
 /// Remove the mapping for {lhs} in {mode}. Does nothing if no mapping
-/// exists for that key.
+/// exists for that key, or if the mapping on it belongs to another plugin:
+/// you can only remove what you bound.
 ///
 /// @param mode string Mode letter (reserved for future modes).
 /// @param lhs string Key to unmap, in Vim notation.
@@ -516,10 +520,10 @@ fn set(
 /// maki.keymap.del("n", "<C-t>")
 #[lua_fn]
 fn del(lua: &Lua, #[ctx] plugin: Arc<str>, mode: String, lhs: String) -> LuaResult<()> {
-    let _ = (mode, &plugin);
+    let _ = mode;
     let (key, modifiers) = parse_key_notation(&lhs).map_err(mlua::Error::runtime)?;
     if let Some(mut store) = lua.app_data_mut::<KeymapStore>() {
-        store.del(key, modifiers);
+        store.del(key, modifiers, &plugin);
     }
     publish_keymap_snapshot(lua);
     Ok(())
@@ -640,7 +644,28 @@ mod tests {
         let mut store = KeymapStore::new();
 
         global(&mut store, &lua, KeyCode::Char('x'), PLUGIN);
-        store.del(KeyCode::Char('x'), NONE);
+        store.del(KeyCode::Char('x'), NONE, PLUGIN);
+        assert!(store.globals.is_empty());
+    }
+
+    /// The defect this exists to prevent: a plugin tearing down its own keys
+    /// must not take another plugin's binding with it, and any plugin could
+    /// otherwise unbind any key in the host.
+    #[test]
+    fn keymap_store_del_leaves_another_plugins_binding() {
+        let lua = Lua::new();
+        let mut store = KeymapStore::new();
+
+        global(&mut store, &lua, TAB, PLUGIN);
+
+        store.del(TAB, NONE, OTHER_PLUGIN);
+        assert_eq!(
+            store.globals.len(),
+            1,
+            "a plugin must not remove a key it did not bind"
+        );
+
+        store.del(TAB, NONE, PLUGIN);
         assert!(store.globals.is_empty());
     }
 
