@@ -40,7 +40,7 @@ use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::pack_review::{PackReview, PackReviewAction};
 use crate::components::permission_prompt::PermissionPrompt;
-use crate::components::plan_form::{PlanForm, PlanFormAction};
+use crate::components::plan_form::{PlanForm, PlanFormAction, builtin_rows};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
@@ -65,7 +65,7 @@ use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader,
-    PackCommand, PackPreparation, PlanActionReader, WinView,
+    PackCommand, PackPreparation, PlanFormRow, WinView,
 };
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
@@ -270,17 +270,10 @@ pub struct App {
     pub(super) keymap_reader: KeymapReader,
     pub(super) hint_reader: HintReader,
     hints: Watch<HintSnapshot>,
-    pub(super) plan_action_reader: PlanActionReader,
-    /// Last snapshot generation applied to `plan_form`; skips a rebuild
-    /// when no plugin actions have changed.
-    plan_actions_generation: u64,
-    /// The plugin layering `ui.plan_form`, mirrored from the same snapshot.
-    /// Nothing here outlives the plugin: the layer goes on unload and the
-    /// next snapshot hands the built-in form back.
-    plan_form_owner: Option<Arc<str>>,
-    /// In flight answer from the `ui.plan_form` chain. `Some` means a draft
-    /// landed while a layer was installed and the form is waiting on it.
-    plan_form_answer: Option<flume::Receiver<bool>>,
+    /// In flight answer from the `ui.plan_form*` chains. `Some` means a
+    /// draft landed and the form is waiting to hear whether it opens, and
+    /// with which rows.
+    pub(super) plan_form_answer: Option<flume::Receiver<Option<Vec<PlanFormRow>>>>,
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
@@ -298,7 +291,6 @@ impl App {
         lua_command_reader: LuaCommandReader,
         keymap_reader: KeymapReader,
         hint_reader: HintReader,
-        plan_action_reader: PlanActionReader,
         storage_writer: Arc<StorageWriter>,
         ui_config: UiConfig,
         input_history_size: usize,
@@ -377,9 +369,6 @@ impl App {
             hints: Watch::seeded(hint_reader.load_full()),
             keymap_reader,
             hint_reader,
-            plan_action_reader,
-            plan_actions_generation: 0,
-            plan_form_owner: None,
             plan_form_answer: None,
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
@@ -1785,76 +1774,52 @@ impl App {
             | self.model_picker.refresh()
             | self.usage_modal.poll(&self.usage_slot)
             | self.hints.poll(self.hint_reader.load_full())
-            | self.tick_plan_actions()
-            | self.tick_plan_form_slot()
+            | self.tick_plan_form()
             | self.tick_file_picker()
             | Dirty::any(self.chats.iter_mut().map(Chat::tick))
     }
 
-    /// Mirror the plan-action snapshot into the plan form when a plugin
-    /// (un)registered since the last tick.
-    fn tick_plan_actions(&mut self) -> Dirty {
-        let snapshot = self.plan_action_reader.load();
-        if snapshot.generation == self.plan_actions_generation {
-            return Dirty::NO;
-        }
-        let rows = snapshot
-            .actions
-            .iter()
-            .map(|a| crate::components::plan_form::PluginPlanRow {
-                plugin: a.plugin.clone(),
-                name: a.name.clone(),
-                id: a.id.clone(),
-                label: a.label.clone(),
-                desc: a.desc.clone(),
-                order: a.order,
-            })
-            .collect();
-        self.plan_form.set_plugin_rows(rows, snapshot.generation);
-        self.plan_form_owner = snapshot.form_owner.clone();
-        self.plan_actions_generation = snapshot.generation;
-        Dirty::YES
-    }
-
-    /// Open the form once the `ui.plan_form` chain reaches the host default.
-    /// A chain that never answers leaves the form closed, which is what a
-    /// plugin mid-render wants; the plan-toggle key still reopens it.
-    fn tick_plan_form_slot(&mut self) -> Dirty {
+    /// Open the form with the menu the `ui.plan_form*` chains answered with.
+    /// A chain that never answers leaves it closed, which is what a plugin
+    /// mid-render wants; the plan-toggle key still reopens it.
+    ///
+    /// Drained for every session rather than the focused one alone: a plan
+    /// that lands in a background tab has to reach its form too.
+    pub(crate) fn tick_plan_form(&mut self) -> Dirty {
         let Some(rx) = self.plan_form_answer.as_ref() else {
             return Dirty::NO;
         };
-        match rx.try_recv() {
-            Ok(open) => {
+        let rows = match rx.try_recv() {
+            // A layer took the surface over, so the host draws nothing.
+            Ok(None) => {
                 self.plan_form_answer = None;
-                if !open {
-                    return Dirty::NO;
-                }
-                self.plan_form.on_plan_ready();
-                Dirty::YES
+                return Dirty::NO;
             }
+            Ok(Some(rows)) => rows,
             // The host went away mid-question, so nobody is drawing the plan.
-            Err(flume::TryRecvError::Disconnected) => {
-                self.plan_form_answer = None;
-                self.plan_form.on_plan_ready();
-                Dirty::YES
-            }
-            Err(flume::TryRecvError::Empty) => Dirty::NO,
-        }
+            Err(flume::TryRecvError::Disconnected) => builtin_rows(),
+            Err(flume::TryRecvError::Empty) => return Dirty::NO,
+        };
+        self.plan_form_answer = None;
+        self.plan_form.open_with(rows);
+        Dirty::YES
     }
 
-    /// Show the built-in plan form, unless a plugin layers `ui.plan_form` and
-    /// gets to answer first. Asking costs a roundtrip, so the unlayered case
-    /// (every install by default) never pays for it.
+    /// Ask the `ui.plan_form*` chains what to draw for the draft that just
+    /// landed, starting from the host's own rows. With no path there is no
+    /// event to hand a layer, and with no host there is nobody to ask, so
+    /// either way the built-in form opens straight away.
     pub(super) fn offer_plan_form(&mut self, path: Option<&str>) {
-        let Some((_owner, path)) = self.plan_form_owner.as_ref().zip(path) else {
+        let Some(path) = path.filter(|_| !self.lua_event_handle.is_disconnected()) else {
             self.plan_form_answer = None;
-            self.plan_form.on_plan_ready();
+            self.plan_form.open_with(builtin_rows());
             return;
         };
-        self.plan_form_answer = Some(
-            self.lua_event_handle
-                .run_plan_form_slot(path.to_owned(), self.state.session.id.to_string()),
-        );
+        self.plan_form_answer = Some(self.lua_event_handle.open_plan_form(
+            path.to_owned(),
+            self.state.session.id.to_string(),
+            builtin_rows(),
+        ));
     }
 
     fn tick_file_picker(&mut self) -> Dirty {
@@ -1962,10 +1927,16 @@ impl App {
                 self.plan_form.hide();
                 vec![]
             }
-            PlanFormAction::OpenEditor => self.open_plan_editor_action(),
+            PlanFormAction::OpenEditor => match self.state.plan.path() {
+                Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
+                None => {
+                    self.flash(FLASH_NO_PLAN.into());
+                    vec![]
+                }
+            },
             PlanFormAction::Implement => self.implement_plan(false),
             PlanFormAction::ClearAndImplement => self.implement_plan(true),
-            PlanFormAction::Plugin { plugin, name } => {
+            PlanFormAction::Plugin { row } => {
                 // Snapshot the form's parallel flag before we reset, since the
                 // handler may want it and reset() runs after.
                 let parallel = self.plan_form.parallel();
@@ -1980,17 +1951,7 @@ impl App {
                 let session = self.state.session.id.to_string();
                 self.plan_form.reset();
                 self.lua_event_handle
-                    .run_plan_action(plugin, name, path, parallel, session);
-                vec![]
-            }
-        }
-    }
-
-    pub(crate) fn open_plan_editor_action(&mut self) -> Vec<Action> {
-        match self.state.plan.path() {
-            Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
-            None => {
-                self.flash(FLASH_NO_PLAN.into());
+                    .run_plan_action(session, row, path, parallel);
                 vec![]
             }
         }
@@ -2021,17 +1982,6 @@ impl App {
             "ready": ready,
             "content": content,
         })
-    }
-
-    /// Fire the same code path a built-in Implement / Clear-and-implement
-    /// row would. Used by `maki.plan.implement` and by plugin plan
-    /// actions that decide the plan is ready to execute. Silently no-op
-    /// when there is no ready plan, matching the built-in Hide branch.
-    pub(crate) fn implement_plan_from_lua(&mut self, clear_context: bool) -> Vec<Action> {
-        if self.state.plan.path().is_none() {
-            return vec![];
-        }
-        self.implement_plan(clear_context)
     }
 
     fn implement_plan(&mut self, clear_context: bool) -> Vec<Action> {

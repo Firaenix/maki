@@ -22,6 +22,9 @@ const HOST_PREFIXES: [&str; 2] = [HOST_PREFIX, UI_PREFIX];
 /// built-in plan form, so a layer that answers without calling `prev` owns
 /// the surface for that draft.
 pub(crate) const PLAN_FORM_SLOT: &str = "ui.plan_form";
+/// Fired just before the plan form opens. The default answers with the
+/// built-in rows, so a layer can add one, reorder them, or drop one.
+pub(crate) const PLAN_FORM_ACTIONS_SLOT: &str = "ui.plan_form.actions";
 
 const SEAM: &str = "slot";
 
@@ -255,15 +258,6 @@ pub(crate) fn host_slot_name(tool: &str, stage: HookStage) -> String {
     format!("{HOST_PREFIX}{tool}.{}", stage.as_str())
 }
 
-/// The plugin whose layer runs outermost on {name}, or `None` when nothing
-/// wraps it. Read off the authoritative map rather than a published index, so
-/// an unload narrows it in the same breath as [`SlotStore::clear_plugin`].
-pub(crate) fn slot_layer_owner(lua: &Lua, name: &str) -> Option<Arc<str>> {
-    let store = lua.app_data_ref::<SlotStore>()?;
-    let layer = store.slots.get(name)?.layers.last()?;
-    Some(Arc::clone(&layer.plugin))
-}
-
 /// The inverse of [`host_slot_name`]. `None` for any other name, including a
 /// `tool.` name whose suffix names no stage.
 pub(crate) fn host_slot_target(slot: &str) -> Option<(&str, HookStage)> {
@@ -286,6 +280,18 @@ pub(crate) async fn run_host_chain(
     args: MultiValue,
     allow_layer: &dyn Fn(&str) -> bool,
 ) -> LuaResult<Option<MultiValue>> {
+    run_host_chain_with(lua, name, identity_default(lua)?, args, allow_layer).await
+}
+
+/// [`run_host_chain`] with a default of the host's choosing, for a slot whose
+/// contract is "produce a value" rather than "rewrite the one it was passed".
+pub(crate) async fn run_host_chain_with(
+    lua: &Lua,
+    name: &str,
+    default: Function,
+    args: MultiValue,
+    allow_layer: &dyn Fn(&str) -> bool,
+) -> LuaResult<Option<MultiValue>> {
     let Some((_, layers)) = snapshot(lua, name) else {
         return Ok(None);
     };
@@ -297,7 +303,7 @@ pub(crate) async fn run_host_chain(
     if layers.is_empty() {
         return Ok(None);
     }
-    run_chain(lua, Arc::from(name), identity_default(lua)?, layers, args)
+    run_chain(lua, Arc::from(name), default, layers, args)
         .await
         .map(Some)
 }
@@ -382,11 +388,13 @@ fn declare_slot(
 /// Layers wrap in registration order, so the last one registered runs
 /// first and sees the value before the others do.
 ///
-/// Maki fires `ui.plan_form` when the agent finishes writing a plan. It
-/// takes `function(prev, ev)` with `ev = { path, session }`, and the
-/// default opens the built-in plan form. Answer without calling `prev` (or
-/// with `false`) to keep it closed and render the plan yourself; the layer
-/// goes away with your plugin, so an unload hands the form back. See
+/// Maki fires two slots around the plan form, both with
+/// `ev = { path, session }`. `ui.plan_form.actions` asks for the form's
+/// menu: the default answers with the built-in rows, so a layer appends,
+/// reorders, or drops one and returns the list. `ui.plan_form` asks
+/// whether the form opens at all: answer without calling `prev` (or with
+/// `false`) to keep it closed and render the plan yourself. Both go away
+/// with your plugin, so an unload hands the form back. See
 /// [maki.plan](/docs/lua-api/#maki-plan).
 ///
 /// Maki fires two slots per tool itself: `tool.<name>.input` before
@@ -406,20 +414,12 @@ fn declare_slot(
 /// end)
 #[lua_fn]
 fn set_slot(lua: &Lua, #[ctx] plugin: Arc<str>, name: String, wrapper: Function) -> LuaResult<()> {
-    let plan_form = name == PLAN_FORM_SLOT;
-    {
-        let mut store = slot_store_mut(lua)?;
-        store.slots.entry(name).or_default().layers.push(SlotLayer {
-            plugin: Arc::clone(&plugin),
-            func: wrapper,
-        });
-        store.publish();
-    }
-    if plan_form {
-        // The form reads its owner off the same snapshot as its menu rows,
-        // and that snapshot is only rebuilt when something asks for it.
-        crate::api::plan::republish_snapshot(lua)?;
-    }
+    let mut store = slot_store_mut(lua)?;
+    store.slots.entry(name).or_default().layers.push(SlotLayer {
+        plugin: Arc::clone(&plugin),
+        func: wrapper,
+    });
+    store.publish();
     Ok(())
 }
 

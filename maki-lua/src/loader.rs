@@ -13,7 +13,9 @@ use maki_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
 
 use crate::api::keymap::KeymapReader;
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
-use crate::api::util::command::{HintReader, LuaCommandReader, UiAction, UiAttachment};
+use crate::api::util::command::{
+    HintReader, LuaCommandReader, PlanFormRow, UiAction, UiAttachment,
+};
 use crate::error::PluginError;
 use crate::pack::DiscoveredPackage;
 use crate::plugin_permissions::{
@@ -944,10 +946,6 @@ impl PluginHost {
         self.inner.hint_reader.clone()
     }
 
-    pub fn plan_action_reader(&self) -> crate::api::plan::PlanActionReader {
-        self.inner.plan_action_reader.clone()
-    }
-
     pub fn ui_action_rx(&self) -> flume::Receiver<UiAction> {
         self.inner.ui_action_rx.clone()
     }
@@ -981,32 +979,32 @@ impl EventHandle {
         Self::from_tx(flume::unbounded().0)
     }
 
-    pub fn run_plan_action(
-        &self,
-        plugin: Arc<str>,
-        name: Arc<str>,
-        path: String,
-        parallel: bool,
-        session: String,
-    ) {
+    /// Runs the handler behind a plugin row of {session}'s plan form, named
+    /// by its position in the menu [`Self::open_plan_form`] built.
+    pub fn run_plan_action(&self, session: String, row: usize, path: String, parallel: bool) {
         let _ = self.prio_tx.try_send(Request::RunPlanAction {
-            plugin,
-            name,
+            session,
+            row,
             path,
             parallel,
-            session,
         });
     }
 
-    /// Asks the `ui.plan_form` chain whether the built-in form should open.
-    /// The receiver answers `true` when every layer deferred; a full channel
-    /// or a host that has gone away leaves it empty, and the caller keeps the
-    /// form closed rather than racing a plugin that is already drawing.
-    pub fn run_plan_form_slot(&self, path: String, session: String) -> flume::Receiver<bool> {
+    /// Asks the `ui.plan_form*` chains what to draw for a draft that just
+    /// landed, starting from the {rows} the host proposes. The receiver
+    /// answers `None` when a layer took the form over; if the host is gone it
+    /// disconnects, and the caller opens the built-in form.
+    pub fn open_plan_form(
+        &self,
+        path: String,
+        session: String,
+        rows: Vec<PlanFormRow>,
+    ) -> flume::Receiver<Option<Vec<PlanFormRow>>> {
         let (reply, rx) = flume::bounded(1);
-        let _ = self.prio_tx.try_send(Request::RunPlanFormSlot {
+        let _ = self.prio_tx.try_send(Request::OpenPlanForm {
             path,
             session,
+            rows,
             reply,
         });
         rx

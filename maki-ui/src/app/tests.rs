@@ -66,6 +66,7 @@ const THINKING_OPTIONS: &str = "thinking_options";
 const MODEL_CHANGED_EVENT: &str = "ModelChanged";
 const PLAN_READY_EVENT: &str = "PlanReady";
 const PLAN_DRAFT_PATH: &str = "/tmp/plan.md";
+const PLUGIN_ROW_LABEL: &str = "Commit and implement";
 const WALK_TIMEOUT: Duration = Duration::from_secs(5);
 const CURSOR_STAYS_HIDDEN: &str = "the hardware cursor must never be shown";
 const CURSOR_ON_SCREEN: &str = "the reported cursor must be on screen";
@@ -139,7 +140,6 @@ fn build_app_with_session(
         lua_commands,
         KeymapReader::empty(),
         HintReader::empty(),
-        maki_lua::PlanActionReader::empty(),
         writer,
         UiConfig::default(),
         100,
@@ -970,10 +970,10 @@ fn plan_ready_does_not_fire_outside_plan_mode() {
     assert!(probe.try_recv_autocmd().is_none());
 }
 
-/// Nothing layers `ui.plan_form` on a stock install, so the form opens in the
-/// same frame the plan lands and never pays for a roundtrip.
+/// With no Lua host there is nobody to ask, so the form opens in the same
+/// frame the plan lands and never pays for a roundtrip.
 #[test]
-fn an_unowned_plan_form_opens_without_asking() {
+fn a_plan_form_with_no_host_opens_without_asking() {
     let mut app = test_app();
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH));
@@ -983,38 +983,44 @@ fn an_unowned_plan_form_opens_without_asking() {
     assert!(app.plan_form_answer.is_none(), "nothing to wait for");
 }
 
-/// With a layer installed the form waits for the chain instead of flashing
-/// open in front of whatever the plugin is about to draw.
+/// With a host attached the form waits for the chains instead of flashing
+/// open in front of whatever a plugin is about to draw.
 #[test]
-fn an_owned_plan_form_waits_for_the_slot() {
+fn a_plan_form_with_a_host_waits_for_the_slots() {
     let mut app = test_app();
     let (handle, _probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
-    app.plan_form_owner = Some(Arc::from("planner"));
 
     app.state.mode = Mode::Plan;
     app.state.plan = PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH));
     app.transition_plan(PlanTrigger::WriteDone);
 
-    assert!(!app.plan_form.is_visible(), "the layer answers first");
+    assert!(!app.plan_form.is_visible(), "the chains answer first");
     assert!(app.plan_form_answer.is_some());
 }
 
-/// `true` is the chain reaching the host default: every layer deferred, so the
-/// built-in is what the user asked for. `false` means a plugin owns the draft.
-#[test_case(Some(true), true ; "every_layer_deferred")]
-#[test_case(Some(false), false ; "a_layer_took_the_surface")]
-#[test_case(None, true ; "host_went_away")]
-fn the_plan_form_slot_answer_drives_the_form(answer: Option<bool>, visible: bool) {
+/// Rows are the chain's answer: a list opens the form with it, and `None` is
+/// a layer having taken the surface over.
+#[test_case(Some(vec![]), true ; "an_empty_menu_falls_back_to_the_builtin")]
+#[test_case(Some(vec![PLUGIN_ROW_LABEL]), true ; "a_layer_shaped_the_menu")]
+#[test_case(None, false ; "a_layer_took_the_surface")]
+fn the_plan_form_slot_answer_drives_the_form(answer: Option<Vec<&str>>, visible: bool) {
     let mut app = test_app();
     let (tx, rx) = flume::bounded(1);
     app.plan_form_answer = Some(rx);
 
-    match answer {
-        Some(open) => tx.send(open).unwrap(),
-        None => drop(tx),
-    }
-    assert_eq!(app.tick_plan_form_slot(), Dirty::from(visible));
+    let rows = answer.map(|labels| {
+        labels
+            .into_iter()
+            .map(|label| maki_lua::PlanFormRow {
+                label: label.to_owned(),
+                desc: String::new(),
+                action: maki_lua::PlanRowAction::Plugin,
+            })
+            .collect()
+    });
+    tx.send(rows).unwrap();
+    assert_eq!(app.tick_plan_form(), Dirty::from(visible));
 
     assert_eq!(app.plan_form.is_visible(), visible);
     assert!(
@@ -1023,16 +1029,30 @@ fn the_plan_form_slot_answer_drives_the_form(answer: Option<bool>, visible: bool
     );
 }
 
+/// A host that dropped the reply cannot be drawing the plan either, so the
+/// built-in form is what is left.
+#[test]
+fn a_dropped_plan_form_answer_opens_the_builtin() {
+    let mut app = test_app();
+    let (tx, rx) = flume::bounded::<Option<Vec<maki_lua::PlanFormRow>>>(1);
+    app.plan_form_answer = Some(rx);
+    drop(tx);
+
+    assert_eq!(app.tick_plan_form(), Dirty::YES);
+    assert!(app.plan_form.is_visible());
+    assert!(app.plan_form_answer.is_none());
+}
+
 /// An unanswered chain leaves the form closed rather than guessing: the plugin
 /// is presumably mid-render, and the plan-toggle key still reopens the
 /// built-in.
 #[test]
 fn a_silent_plan_form_slot_leaves_the_form_closed() {
     let mut app = test_app();
-    let (_tx, rx) = flume::bounded::<bool>(1);
+    let (_tx, rx) = flume::bounded::<Option<Vec<maki_lua::PlanFormRow>>>(1);
     app.plan_form_answer = Some(rx);
 
-    assert_eq!(app.tick_plan_form_slot(), Dirty::NO);
+    assert_eq!(app.tick_plan_form(), Dirty::NO);
 
     assert!(!app.plan_form.is_visible());
     assert!(app.plan_form_answer.is_some(), "still waiting");

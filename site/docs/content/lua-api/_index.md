@@ -914,99 +914,6 @@ maki.api.exec_autocmds("MyEvent", {
 
 ---
 
-### `maki.api.register_plan_action()` {#maki-api-register_plan_action}
-
-```lua
-maki.api.register_plan_action({spec})
-```
-
-Add a row to the plan-mode form menu. The form appears when the agent
-finishes writing a plan; plugin rows sit alongside the built-in
-"Refine plan", "Clear context and implement", and "Implement plan"
-entries, sorted by `order`.
-
-Same `name` registered twice by the same plugin replaces in place, so
-a reload never stacks duplicates. Two different plugins can each
-register the same name because rows are keyed by `(plugin, name)`.
-
-Rows are sorted by `order`, then by plugin and action name, so the menu
-reads the same on every run.
-
-The handler runs on the Lua thread when the user picks the row. It
-receives `{ id, name, session, path, parallel }`: `id` and `name`
-identify the row that fired, so one handler can serve several rows, and
-`session` is the session the plan belongs to, to pass to
-`maki.plan.*`. Fire the built-in outcomes with `maki.plan.implement` or
-`maki.plan.open_editor`; returning without calling one just hides the
-form.
-
-**Parameters:**
-
-- `{spec}` (`table`) Action specification:
-  - `name` (`string`) Required. Unique per plugin.
-  - `label` (`string`) Required. Menu row title.
-  - `desc` (`string`) Optional. Second row shown under the title.
-  - `order` (`integer`) Optional. Position among rows (default 500). Built-ins are 0, 1000, 2000.
-  - `handler` (`function`) Required. Called with `{ id, name, session, path, parallel }`.
-
-**Returns:** (`string`) Stable id of the row, `"<plugin>/<name>"`.
-
-**Example:**
-
-```lua
-local id = maki.api.register_plan_action({
-  name = "commit-and-implement",
-  label = "Commit and implement",
-  desc  = "Commit the plan file first, then implement",
-  handler = function(opts)
-    if opts.id ~= id then return end
-    -- write the plan file to git etc.
-    maki.plan.implement({ session = opts.session })
-  end,
-})
-```
-
----
-
-### `maki.api.unregister_plan_action()` {#maki-api-unregister_plan_action}
-
-```lua
-maki.api.unregister_plan_action({name})
-```
-
-Remove one of this plugin's plan actions by name. Unknown names are a
-no-op so a toggle can call it unconditionally.
-
-**Parameters:**
-
-- `{name}` (`string`) The name the action was registered under.
-
-**Example:**
-
-```lua
-maki.api.unregister_plan_action("commit-and-implement")
-```
-
----
-
-### `maki.api.clear_plan_actions()` {#maki-api-clear_plan_actions}
-
-```lua
-maki.api.clear_plan_actions()
-```
-
-Drop every plan action this plugin registered. Companion to
-`unregister_plan_action` for disable toggles that don't want to name
-each action.
-
-**Example:**
-
-```lua
-maki.api.clear_plan_actions()
-```
-
----
-
 ### `maki.api.declare_slot()` {#maki-api-declare_slot}
 
 ```lua
@@ -1067,11 +974,13 @@ takes the seam down with it.
 Layers wrap in registration order, so the last one registered runs
 first and sees the value before the others do.
 
-Maki fires `ui.plan_form` when the agent finishes writing a plan. It
-takes `function(prev, ev)` with `ev = { path, session }`, and the
-default opens the built-in plan form. Answer without calling `prev` (or
-with `false`) to keep it closed and render the plan yourself; the layer
-goes away with your plugin, so an unload hands the form back. See
+Maki fires two slots around the plan form, both with
+`ev = { path, session }`. `ui.plan_form.actions` asks for the form's
+menu: the default answers with the built-in rows, so a layer appends,
+reorders, or drops one and returns the list. `ui.plan_form` asks
+whether the form opens at all: answer without calling `prev` (or with
+`false`) to keep it closed and render the plan yourself. Both go away
+with your plugin, so an unload hands the form back. See
 [maki.plan](/docs/lua-api/#maki-plan).
 
 Maki fires two slots per tool itself: `tool.<name>.input` before
@@ -1121,12 +1030,19 @@ end
 
 Plan-mode surface for plugins.
 
-Read the plan without touching session internals, fire the built-in
-implement and edit outcomes, and put your own rows on the plan form
-with `maki.api.register_plan_action`. To render the plan yourself
-instead, layer the host's `ui.plan_form` slot: the default opens the
-built-in form, so a layer that answers without calling `prev` keeps
-it closed for as long as your plugin is loaded.
+Read the plan without touching session internals, and shape what the
+plan form offers by layering the two slots maki fires around it.
+
+`ui.plan_form.actions` is the menu. The default answers with the
+built-in rows, each `{ label, desc, action }`, so a layer can append
+its own, reorder them, or drop one it does not want. A row carrying a
+`handler` is yours: the function runs on the Lua thread when the user
+picks it, with `{ session, path, parallel }`.
+
+`ui.plan_form` is the form itself. A layer that answers without
+calling `prev` keeps it closed and renders the plan however it likes.
+
+Both go away with your plugin, so an unload hands the form back.
 
 Every call takes an optional `session` and defaults to the focused
 tab. Plan state is per session, so a handler reacting to `PlanReady`
@@ -1134,6 +1050,24 @@ on a background tab has to pass `ev.data.session_id` through, or it
 reads whichever plan the user happens to be looking at.
 
 ```lua
+-- One more row, next to the built-in ones:
+maki.api.set_slot("ui.plan_form.actions", function(prev, ev)
+  local rows = prev(ev)
+  table.insert(rows, {
+    label = "Commit and implement",
+    desc = "Commit the plan file first, then implement it",
+    handler = function(opts)
+      maki.fn.system({ "git", "commit", "-am", "plan" })
+      local prompt = "Implement the plan at `" .. opts.path .. "`."
+      -- Fresh context, the way "Clear context and implement" does it:
+      maki.session.new({ prompt = prompt, focus = true })
+      -- ...or keep the context the plan was written in:
+      -- maki.session.prompt(prompt, { session = opts.session })
+    end,
+  })
+  return rows
+end)
+
 -- Own the plan UI for as long as this plugin is loaded:
 maki.api.set_slot("ui.plan_form", function(prev, ev)
   local plan = maki.plan.read({ session = ev.session })
@@ -1173,57 +1107,6 @@ if plan and plan.ready then
   print("plan at " .. plan.path)
   print(plan.content)
 end
-```
-
----
-
-### `maki.plan.implement()` {#maki-plan-implement}
-
-```lua
-maki.plan.implement({opts?})
-```
-
-Fire the same "implement the plan" code path a built-in row would.
-Call from a plan-action handler when it decides the plan is ready to
-execute. `clear_context = true` starts a fresh session first
-(equivalent to picking "Clear context and implement" from the
-built-in menu).
-
-**Parameters:**
-
-- `{opts?}` (`table?`) Options:
-  - `clear_context` (`boolean`) Default false. Start a fresh session before implementing.
-  - `session` (`string`) Session id; defaults to focused.
-
-**Returns:** (`boolean|nil`, `string|nil`) true once dispatched, or nil and an error.
-
-**Example:**
-
-```lua
-maki.plan.implement({ clear_context = true })
-```
-
----
-
-### `maki.plan.open_editor()` {#maki-plan-open_editor}
-
-```lua
-maki.plan.open_editor({opts?})
-```
-
-Open the current plan file in `$EDITOR`, same as the "edit plan"
-keybinding on the built-in form.
-
-**Parameters:**
-
-- `{opts?}` (`table?`) `session` (string?) Session id; defaults to focused.
-
-**Returns:** (`boolean|nil`, `string|nil`) true once dispatched, or nil and an error.
-
-**Example:**
-
-```lua
-maki.plan.open_editor()
 ```
 
 

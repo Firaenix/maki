@@ -58,7 +58,6 @@ pub(crate) fn create_maki_global(
         ui_action_tx.clone(),
     )?;
     autocmd::add_autocmd_methods(&api, lua, Arc::clone(&plugin))?;
-    plan::add_plan_action_methods(&api, lua, Arc::clone(&plugin))?;
     slot::add_slot_methods(&api, lua, Arc::clone(&plugin))?;
     maki.set("api", api)?;
     maki.set("env", env::create_env_table(lua, permissions)?)?;

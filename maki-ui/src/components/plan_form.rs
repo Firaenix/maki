@@ -1,11 +1,10 @@
-use std::sync::Arc;
-
 use crate::components::form::{render_form, selected_prefix};
 use crate::components::hint_line;
 use crate::components::keybindings::key;
 use crate::theme;
 
 use crossterm::event::{KeyCode, KeyEvent};
+use maki_lua::{PlanFormRow, PlanRowAction};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -26,64 +25,36 @@ const HINT_PAIRS: &[(&str, &str)] = &[
     (DISMISS_KEYS, "dismiss"),
 ];
 
-/// Built-in menu items expressed as row records so plugin rows can slot
-/// alongside them, sorted by the same `order` field. Numbers leave room
-/// between and after built-ins for plugin defaults (500) and future
-/// additions.
-const BUILTIN_REFINE_ORDER: i64 = 0;
-const BUILTIN_CLEAR_AND_IMPLEMENT_ORDER: i64 = 1_000;
-const BUILTIN_IMPLEMENT_ORDER: i64 = 2_000;
-
-/// The three built-in outcomes the form can produce; a fourth ("open
-/// editor") is a keybinding, not a row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BuiltinAction {
-    Refine,
-    ClearAndImplement,
-    Implement,
-}
-
-#[derive(Debug, Clone)]
-struct BuiltinRow {
-    label: &'static str,
-    desc: &'static str,
-    order: i64,
-    action: BuiltinAction,
-}
-
-const BUILTIN_ROWS: &[BuiltinRow] = &[
-    BuiltinRow {
-        label: "Refine plan",
-        desc: "  Dismiss and keep editing the plan",
-        order: BUILTIN_REFINE_ORDER,
-        action: BuiltinAction::Refine,
-    },
-    BuiltinRow {
-        label: "Clear context and implement",
-        desc: "  Start fresh session, then implement the plan",
-        order: BUILTIN_CLEAR_AND_IMPLEMENT_ORDER,
-        action: BuiltinAction::ClearAndImplement,
-    },
-    BuiltinRow {
-        label: "Implement plan",
-        desc: "  Keep current context, implement the plan",
-        order: BUILTIN_IMPLEMENT_ORDER,
-        action: BuiltinAction::Implement,
-    },
+/// The rows the host proposes, i.e. the menu on a stock install. They are
+/// what the `ui.plan_form.actions` chain starts from and what the form falls
+/// back to when no Lua host answers, so the two can never drift apart.
+const BUILTIN_ROWS: &[(&str, &str, PlanRowAction)] = &[
+    (
+        "Refine plan",
+        "  Dismiss and keep editing the plan",
+        PlanRowAction::Refine,
+    ),
+    (
+        "Clear context and implement",
+        "  Start fresh session, then implement the plan",
+        PlanRowAction::ClearAndImplement,
+    ),
+    (
+        "Implement plan",
+        "  Keep current context, implement the plan",
+        PlanRowAction::Implement,
+    ),
 ];
 
-/// One plugin-registered row, mirrored from the Lua snapshot each time the
-/// snapshot generation changes.
-#[derive(Debug, Clone)]
-pub struct PluginPlanRow {
-    pub plugin: Arc<str>,
-    pub name: Arc<str>,
-    /// `"<plugin>/<name>"`, the row's stable identity. Breaks `order` ties
-    /// here and travels to the Lua handler so it can tell its rows apart.
-    pub id: Arc<str>,
-    pub label: Arc<str>,
-    pub desc: Arc<str>,
-    pub order: i64,
+pub fn builtin_rows() -> Vec<PlanFormRow> {
+    BUILTIN_ROWS
+        .iter()
+        .map(|(label, desc, action)| PlanFormRow {
+            label: (*label).to_owned(),
+            desc: (*desc).to_owned(),
+            action: *action,
+        })
+        .collect()
 }
 
 // 2 borders + 1 empty line + 1 hint bar
@@ -97,36 +68,12 @@ pub enum PlanFormAction {
     Implement,
     OpenEditor,
     Hide,
-    /// Plugin-registered row picked; App dispatches to the Lua handler.
+    /// Plugin row picked, named by its position in the menu the
+    /// `ui.plan_form.actions` chain built; App dispatches it to Lua.
     /// The form hides after emitting this, same as the built-in outcomes.
     Plugin {
-        plugin: Arc<str>,
-        name: Arc<str>,
+        row: usize,
     },
-}
-
-#[derive(Debug, Clone)]
-enum RowSource {
-    Builtin(BuiltinAction),
-    Plugin(PluginPlanRow),
-}
-
-#[derive(Debug, Clone)]
-struct MenuRow {
-    label: String,
-    desc: String,
-    order: i64,
-    /// Breaks `order` ties after the built-in/plugin split. Built-ins use
-    /// their label, plugin rows their id, so the menu never depends on the
-    /// order rows arrived in.
-    tiebreak: Arc<str>,
-    source: RowSource,
-}
-
-impl MenuRow {
-    fn is_plugin(&self) -> bool {
-        matches!(self.source, RowSource::Plugin(_))
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,27 +87,19 @@ pub struct PlanForm {
     visibility: Visibility,
     selected: usize,
     parallel: bool,
-    /// Rows registered by plugins. Rebuilt on each snapshot generation
-    /// change so a removal takes effect the next frame.
-    plugin_rows: Vec<PluginPlanRow>,
-    /// Cached merged menu: built-ins + plugin rows sorted by order.
-    /// Recomputed when either side changes.
-    menu: Vec<MenuRow>,
-    plugin_snapshot_generation: u64,
+    /// The menu the `ui.plan_form.actions` chain answered with for the
+    /// current draft, or the host's own rows when nothing layered it.
+    menu: Vec<PlanFormRow>,
 }
 
 impl PlanForm {
     pub fn new() -> Self {
-        let mut form = Self {
+        Self {
             visibility: Visibility::Hidden,
             selected: 0,
             parallel: false,
-            plugin_rows: Vec::new(),
-            menu: Vec::new(),
-            plugin_snapshot_generation: 0,
-        };
-        form.rebuild_menu();
-        form
+            menu: builtin_rows(),
+        }
     }
 
     pub fn is_visible(&self) -> bool {
@@ -197,24 +136,22 @@ impl PlanForm {
         self.parallel
     }
 
-    /// Replace the plugin-row set. Called by App when the snapshot
-    /// generation advances. Clamps `selected` if the previously focused
-    /// row disappeared.
-    pub fn set_plugin_rows(&mut self, rows: Vec<PluginPlanRow>, generation: u64) {
-        if generation == self.plugin_snapshot_generation && rows.len() == self.plugin_rows.len() {
-            return;
-        }
-        self.plugin_snapshot_generation = generation;
-        self.plugin_rows = rows;
-        self.rebuild_menu();
-        if self.selected >= self.menu.len() {
-            self.selected = self.menu.len().saturating_sub(1);
-        }
+    /// Show the form with the menu the `ui.plan_form.actions` chain built
+    /// for this draft. Empty answers fall back to the host's own rows: a
+    /// plugin that wants no form keeps `ui.plan_form` closed instead.
+    pub fn open_with(&mut self, rows: Vec<PlanFormRow>) {
+        self.menu = if rows.is_empty() {
+            builtin_rows()
+        } else {
+            rows
+        };
+        self.on_plan_ready();
     }
 
     pub fn reset(&mut self) {
         self.visibility = Visibility::Hidden;
         self.selected = 0;
+        self.menu = builtin_rows();
     }
 
     pub fn hint_line(&self) -> Option<Line<'static>> {
@@ -267,58 +204,14 @@ impl PlanForm {
         }
     }
 
-    fn row_action(&self, index: usize) -> PlanFormAction {
-        let Some(row) = self.menu.get(index) else {
-            return PlanFormAction::Hide;
-        };
-        match &row.source {
-            RowSource::Builtin(BuiltinAction::Refine) => PlanFormAction::Hide,
-            RowSource::Builtin(BuiltinAction::ClearAndImplement) => {
-                PlanFormAction::ClearAndImplement
-            }
-            RowSource::Builtin(BuiltinAction::Implement) => PlanFormAction::Implement,
-            RowSource::Plugin(row) => PlanFormAction::Plugin {
-                plugin: Arc::clone(&row.plugin),
-                name: Arc::clone(&row.name),
-            },
+    fn row_action(&self, row: usize) -> PlanFormAction {
+        match self.menu.get(row).map(|r| r.action) {
+            Some(PlanRowAction::ClearAndImplement) => PlanFormAction::ClearAndImplement,
+            Some(PlanRowAction::Implement) => PlanFormAction::Implement,
+            Some(PlanRowAction::Plugin) => PlanFormAction::Plugin { row },
+            // Refine dismisses, and so does a pick off the end of the menu.
+            Some(PlanRowAction::Refine) | None => PlanFormAction::Hide,
         }
-    }
-
-    fn rebuild_menu(&mut self) {
-        let mut menu: Vec<MenuRow> = BUILTIN_ROWS
-            .iter()
-            .map(|b| MenuRow {
-                label: b.label.to_owned(),
-                desc: b.desc.to_owned(),
-                order: b.order,
-                tiebreak: Arc::from(b.label),
-                source: RowSource::Builtin(b.action),
-            })
-            .collect();
-        for row in &self.plugin_rows {
-            menu.push(MenuRow {
-                label: row.label.as_ref().to_owned(),
-                desc: if row.desc.is_empty() {
-                    String::new()
-                } else {
-                    format!("  {}", row.desc)
-                },
-                order: row.order,
-                tiebreak: Arc::clone(&row.id),
-                source: RowSource::Plugin(row.clone()),
-            });
-        }
-        // A total order, not just a stable sort: `order` defaults to 500 for
-        // every plugin row, and the rows arrive in whatever order the Lua
-        // snapshot was built in. A plugin row that ties with a built-in yields
-        // to it, so no registration can displace the menu the user knows.
-        menu.sort_by(|a, b| {
-            a.order
-                .cmp(&b.order)
-                .then_with(|| a.is_plugin().cmp(&b.is_plugin()))
-                .then_with(|| a.tiebreak.cmp(&b.tiebreak))
-        });
-        self.menu = menu;
     }
 
     pub fn view(&self, frame: &mut Frame, area: Rect) {
@@ -354,18 +247,13 @@ mod tests {
     use crate::components::key;
     use test_case::test_case;
 
-    fn plugin_row(name: &str, label: &str, order: i64) -> PluginPlanRow {
-        row_for("plug", name, label, order)
-    }
+    const PLUGIN_LABEL: &str = "Commit and implement";
 
-    fn row_for(plugin: &str, name: &str, label: &str, order: i64) -> PluginPlanRow {
-        PluginPlanRow {
-            plugin: Arc::from(plugin),
-            name: Arc::from(name),
-            id: Arc::from(format!("{plugin}/{name}").as_str()),
-            label: Arc::from(label),
-            desc: Arc::from(""),
-            order,
+    fn plugin_row(label: &str) -> PlanFormRow {
+        PlanFormRow {
+            label: label.to_owned(),
+            desc: String::new(),
+            action: PlanRowAction::Plugin,
         }
     }
 
@@ -545,109 +433,67 @@ mod tests {
         );
     }
 
-    // Plugin-row tests below cover the additions this PR brings to the form.
-    // Existing tests above are unchanged so any regression in built-in
-    // behavior surfaces at the same assertion.
+    // Chain-driven menu tests below cover the additions this PR brings to
+    // the form. Existing tests above are unchanged so any regression in
+    // built-in behavior surfaces at the same assertion.
 
-    /// `order` defaults to 500 for every plugin row, so ties are the common
-    /// case rather than the exotic one. Two plugins registering one row each
-    /// have to land in the same places whichever order the rows arrive in,
-    /// which is what a stable sort over hash-map iteration cannot promise.
+    /// The chain owns the order, so the form draws the list it was handed
+    /// rather than sorting it again behind the plugin's back.
     #[test]
-    fn tied_rows_sort_the_same_whatever_order_they_arrive_in() {
-        let rows = || {
-            vec![
-                row_for("zeta", "b", "Zeta B", 500),
-                row_for("alpha", "b", "Alpha B", 500),
-                row_for("alpha", "a", "Alpha A", 500),
-            ]
-        };
-        let labels = |rows: Vec<PluginPlanRow>| {
-            let mut form = PlanForm::new();
-            form.set_plugin_rows(rows, 1);
-            form.menu
-                .iter()
-                .map(|r| r.label.clone())
-                .collect::<Vec<_>>()
-        };
+    fn the_menu_is_drawn_in_the_order_the_chain_answered() {
+        let mut form = PlanForm::new();
+        let mut rows = builtin_rows();
+        rows.insert(0, plugin_row(PLUGIN_LABEL));
+        form.open_with(rows);
+        let labels: Vec<_> = form.menu.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels[0], PLUGIN_LABEL);
+        assert_eq!(labels[1], BUILTIN_ROWS[0].0);
+    }
 
-        let forward = labels(rows());
-        let mut reversed = rows();
-        reversed.reverse();
-        assert_eq!(forward, labels(reversed));
+    /// A pick names the row's position, which is where the chain stashed its
+    /// handler; nothing about the row has to survive the trip back to Lua.
+    #[test]
+    fn a_plugin_row_enter_names_its_position() {
+        let mut form = PlanForm::new();
+        let mut rows = builtin_rows();
+        rows.push(plugin_row(PLUGIN_LABEL));
+        let row = rows.len() - 1;
+        form.open_with(rows);
+        form.selected = row;
         assert_eq!(
-            forward[1..4],
-            ["Alpha A", "Alpha B", "Zeta B"],
-            "ties break on plugin then action name"
+            form.handle_key(key(KeyCode::Enter)),
+            PlanFormAction::Plugin { row }
         );
     }
 
-    /// A plugin row is free to sit on a built-in's `order`, and the built-in
-    /// has to keep its place.
+    /// A layer is free to drop a built-in row, and the outcome goes with it.
     #[test]
-    fn a_row_tied_with_a_builtin_sorts_after_it() {
+    fn a_chain_can_drop_a_builtin_row() {
         let mut form = PlanForm::new();
-        form.set_plugin_rows(
-            vec![row_for(
-                "aaa",
-                "tie",
-                "Tied row",
-                BUILTIN_CLEAR_AND_IMPLEMENT_ORDER,
-            )],
-            1,
-        );
-        assert_eq!(form.menu[1].label, "Clear context and implement");
-        assert_eq!(form.menu[2].label, "Tied row");
+        let rows = vec![builtin_rows().remove(0)];
+        form.open_with(rows);
+        assert_eq!(form.menu.len(), 1);
+        form.selected = 0;
+        assert_eq!(form.handle_key(key(KeyCode::Enter)), PlanFormAction::Hide);
     }
 
+    /// Emptying the menu would leave the user a form with nothing in it; a
+    /// plugin that wants no form keeps `ui.plan_form` closed instead.
     #[test]
-    fn plugin_row_sorted_between_builtins() {
+    fn an_empty_menu_falls_back_to_the_builtin_rows() {
         let mut form = PlanForm::new();
-        form.set_plugin_rows(vec![plugin_row("mid", "Middle row", 500)], 1);
-        // Refine(0), plugin(500), ClearAndImplement(1000), Implement(2000).
-        assert_eq!(form.menu.len(), 4);
-        assert_eq!(form.menu[1].label, "Middle row");
-    }
-
-    #[test]
-    fn plugin_row_enter_emits_plugin_action() {
-        let mut form = PlanForm::new();
-        form.set_plugin_rows(vec![plugin_row("do-it", "Do it", 500)], 1);
-        form.on_plan_ready();
-        form.selected = 1;
-        match form.handle_key(key(KeyCode::Enter)) {
-            PlanFormAction::Plugin { plugin, name } => {
-                assert_eq!(plugin.as_ref(), "plug");
-                assert_eq!(name.as_ref(), "do-it");
-            }
-            other => panic!("expected Plugin action, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn plugin_rows_replaced_when_generation_changes() {
-        let mut form = PlanForm::new();
-        form.set_plugin_rows(vec![plugin_row("a", "A", 500)], 1);
-        assert_eq!(form.menu.len(), 4);
-        form.set_plugin_rows(vec![], 2);
+        form.open_with(vec![]);
         assert_eq!(form.menu.len(), BUILTIN_ROWS.len());
     }
 
+    /// The menu belongs to one draft, so the next session starts from the
+    /// rows the host knows rather than the last plugin's.
     #[test]
-    fn selected_clamps_when_plugin_row_removed() {
+    fn reset_restores_the_builtin_menu() {
         let mut form = PlanForm::new();
-        form.set_plugin_rows(
-            vec![
-                plugin_row("a", "A", 500),
-                plugin_row("b", "B", 600),
-                plugin_row("c", "C", 700),
-            ],
-            1,
-        );
-        form.on_plan_ready();
-        form.selected = 5;
-        form.set_plugin_rows(vec![], 2);
-        assert!(form.selected < form.menu.len());
+        form.open_with(vec![plugin_row(PLUGIN_LABEL)]);
+        form.reset();
+        assert_eq!(form.menu, builtin_rows());
     }
 
     #[test]
@@ -655,10 +501,10 @@ mod tests {
         let mut form = PlanForm::new();
         form.on_plan_ready();
         let base = form.height();
-        form.set_plugin_rows(
-            vec![plugin_row("a", "A", 500), plugin_row("b", "B", 550)],
-            1,
-        );
+        let mut rows = builtin_rows();
+        rows.push(plugin_row(PLUGIN_LABEL));
+        rows.push(plugin_row("Another"));
+        form.open_with(rows);
         assert_eq!(form.height(), base + 2);
     }
 }

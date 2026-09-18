@@ -15,6 +15,10 @@ use crate::api::util::pair::{Pair, try_pair};
 pub(crate) const NO_UI_ERR: &str = "no interactive UI attached";
 pub(crate) const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
 
+const ROW_REFINE: &str = "refine";
+const ROW_CLEAR_AND_IMPLEMENT: &str = "clear_and_implement";
+const ROW_IMPLEMENT: &str = "implement";
+
 #[derive(Clone)]
 pub struct LuaCommandInfo {
     pub name: Arc<str>,
@@ -460,24 +464,57 @@ pub enum ModelRequest {
 pub enum PlanRequest {
     /// Snapshot of the current plan: `{ mode, path, content, ready }`.
     Read { session: Option<String> },
-    /// Fires the same code path as the built-in "Implement plan" (and
-    /// "Clear context and implement" when `clear_context = true`) rows.
-    Implement {
-        clear_context: bool,
-        session: Option<String>,
-    },
-    /// Opens the current plan file in `$EDITOR`.
-    OpenEditor { session: Option<String> },
 }
 
 impl PlanRequest {
     pub fn session(&self) -> Option<&str> {
         match self {
-            Self::Read { session }
-            | Self::Implement { session, .. }
-            | Self::OpenEditor { session } => session.as_deref(),
+            Self::Read { session } => session.as_deref(),
         }
     }
+}
+
+/// What picking a plan form row does. The built-ins name a host outcome;
+/// `Plugin` means the row came out of the `ui.plan_form.actions` chain and
+/// its handler is waiting on the Lua side, found by the row's position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanRowAction {
+    Refine,
+    ClearAndImplement,
+    Implement,
+    Plugin,
+}
+
+impl PlanRowAction {
+    /// The `action` tag a row carries in Lua. `None` for a plugin row, which
+    /// the chain identifies by its `handler` instead.
+    pub fn tag(self) -> Option<&'static str> {
+        match self {
+            Self::Refine => Some(ROW_REFINE),
+            Self::ClearAndImplement => Some(ROW_CLEAR_AND_IMPLEMENT),
+            Self::Implement => Some(ROW_IMPLEMENT),
+            Self::Plugin => None,
+        }
+    }
+
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            ROW_REFINE => Some(Self::Refine),
+            ROW_CLEAR_AND_IMPLEMENT => Some(Self::ClearAndImplement),
+            ROW_IMPLEMENT => Some(Self::Implement),
+            _ => None,
+        }
+    }
+}
+
+/// One row of the plan form menu. The host proposes its built-in rows, the
+/// `ui.plan_form.actions` chain hands back the list the form draws, and a
+/// row's index in that list is how a pick finds its Lua handler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanFormRow {
+    pub label: String,
+    pub desc: String,
+    pub action: PlanRowAction,
 }
 
 pub type UiReply = Result<serde_json::Value, String>;
