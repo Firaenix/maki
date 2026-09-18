@@ -13,7 +13,10 @@ use maki_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
 
 use crate::api::keymap::KeymapReader;
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
-use crate::api::util::command::{HintReader, LuaCommandReader, UiAction, UiAttachment};
+use crate::api::slot::{LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT};
+use crate::api::util::command::{
+    HintReader, LuaCommandReader, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction, UiAttachment,
+};
 use crate::error::PluginError;
 use crate::pack::DiscoveredPackage;
 use crate::plugin_permissions::{
@@ -929,6 +932,7 @@ impl PluginHost {
         EventHandle {
             tx: self.inner.tx.clone(),
             prio_tx: self.inner.prio_tx.clone(),
+            layered: Arc::clone(&self.inner.layered),
         }
     }
 
@@ -962,6 +966,9 @@ pub struct EventHandle {
     tx: flume::Sender<Request>,
     /// User-initiated requests bypass queued bulk work (session restores).
     prio_tx: flume::Sender<Request>,
+    /// Published by the Lua thread and read without touching it: whether
+    /// asking a chain can change the answer at all.
+    layered: Arc<LayeredTools>,
 }
 
 impl EventHandle {
@@ -969,12 +976,69 @@ impl EventHandle {
         Self {
             tx,
             prio_tx: flume::unbounded().0,
+            layered: Arc::default(),
         }
     }
 
     #[doc(hidden)]
     pub fn disconnected_for_test() -> Self {
         Self::from_tx(flume::unbounded().0)
+    }
+
+    /// Whether a plugin is layering either of the plan form slots. False on a
+    /// stock install, where the form opens in the frame the plan lands in: a
+    /// request loop busy with a `/reload` or a long tool call would otherwise
+    /// keep the user waiting for an answer that cannot differ.
+    pub fn plan_form_layered(&self) -> bool {
+        self.layered.layers_surface(PLAN_FORM_SLOT)
+            || self.layered.layers_surface(PLAN_FORM_ACTIONS_SLOT)
+    }
+
+    /// Runs the handler behind a plugin row of {session}'s plan form, named
+    /// by its position in the menu [`Self::open_plan_form`] built and the
+    /// {generation} that menu was published with.
+    ///
+    /// The receiver answers whether the row's built-in action still runs, and
+    /// disconnects when the pick never reached the host, so the caller can
+    /// tell the user instead of going quiet.
+    pub fn run_plan_action(
+        &self,
+        session: String,
+        generation: u64,
+        row: usize,
+        path: String,
+        parallel: bool,
+    ) -> flume::Receiver<PlanActionOutcome> {
+        let (reply, rx) = flume::bounded(1);
+        let _ = self.prio_tx.try_send(Request::RunPlanAction {
+            session,
+            generation,
+            row,
+            path,
+            parallel,
+            reply,
+        });
+        rx
+    }
+
+    /// Asks the `ui.plan_form*` chains what to draw for a draft that just
+    /// landed, starting from the {rows} the host proposes. The receiver
+    /// answers `None` when a layer took the form over, and disconnects when
+    /// the host is gone, which leaves the caller the built-in form.
+    pub fn open_plan_form(
+        &self,
+        path: String,
+        session: String,
+        rows: Vec<PlanFormRow>,
+    ) -> flume::Receiver<Option<PlanMenu>> {
+        let (reply, rx) = flume::bounded(1);
+        let _ = self.prio_tx.try_send(Request::OpenPlanForm {
+            path,
+            session,
+            rows,
+            reply,
+        });
+        rx
     }
 
     /// True when no runtime is draining requests. Production handles stay
@@ -994,7 +1058,15 @@ impl EventHandle {
         Self {
             tx: shared.clone(),
             prio_tx: shared,
+            layered: Arc::default(),
         }
+    }
+
+    /// The same handle, reporting {slots} as layered, for a test that drives
+    /// the UI without a host.
+    pub(crate) fn layering(mut self, slots: &[&str]) -> Self {
+        self.layered = Arc::new(LayeredTools::with_surfaces(slots));
+        self
     }
 
     pub fn run_command(&self, plugin: Arc<str>, command: Arc<str>, args: String, depth: u8) {
@@ -1314,7 +1386,11 @@ mod tests {
     fn run_command_sends_correct_request() {
         let (prio_tx, prio_rx) = flume::bounded(8);
         let (tx, _rx) = flume::bounded(8);
-        let handle = EventHandle { tx, prio_tx };
+        let handle = EventHandle {
+            tx,
+            prio_tx,
+            layered: Arc::default(),
+        };
         handle.run_command(
             Arc::from("myplugin"),
             Arc::from("/greet"),

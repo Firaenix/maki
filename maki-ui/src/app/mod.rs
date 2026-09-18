@@ -40,7 +40,7 @@ use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::pack_review::{PackReview, PackReviewAction};
 use crate::components::permission_prompt::PermissionPrompt;
-use crate::components::plan_form::{PlanForm, PlanFormAction};
+use crate::components::plan_form::{PlanForm, PlanFormAction, builtin_menu, builtin_rows};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
@@ -65,7 +65,8 @@ use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader,
-    PackCommand, PackPreparation, WinView,
+    PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, PackCommand, PackPreparation,
+    PlanActionOutcome, PlanMenu, PlanRowAction, WinView,
 };
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
@@ -92,6 +93,29 @@ const FLASH_REWIND: &str = "Press esc again to rewind...";
 const AUTH_EXPIRED_MSG: &str =
     "Token expired. Run `maki auth login` in another terminal, then press Enter to retry.";
 const FLASH_NO_PLAN: &str = "No plan file";
+const FLASH_PLAN_ACTION_LOST: &str = "The plugin host never took that plan action";
+const FLASH_PLAN_ACTION_FAILED: &str = "That plan action did not run";
+const FLASH_PLAN_FORM_SLOW: &str = "The plugin host was slow, opened the built-in plan form";
+/// What both plan waits add on top of the host's own budget. It covers the
+/// request queue a `/reload` or a long tool call holds, plus the executor
+/// getting round to the answer, neither of which the host's deadline starts
+/// counting until it has dequeued the request.
+const PLAN_FORM_QUEUE_SLACK_SECS: u64 = 10;
+/// How long the form waits on the `ui.plan_form*` chains before it gives up
+/// and opens the built-in one. Strictly longer than [`PLAN_FORM_SLOT_DEADLINE`],
+/// the whole budget the host gives both chains, so this only ever fires for a
+/// host that never answered at all: a legitimate answer that used every second
+/// it was allowed still beats it, and the user never sees
+/// [`FLASH_PLAN_FORM_SLOW`] for a layer that behaved.
+const PLAN_FORM_ANSWER_WAIT: Duration =
+    Duration::from_secs(PLAN_FORM_SLOT_DEADLINE.as_secs() + PLAN_FORM_QUEUE_SLACK_SECS);
+/// The same bound for a picked row's handler, derived the same way from
+/// [`PLAN_ROW_HANDLER_DEADLINE`], the whole budget the host gives one. It
+/// covers a pick that never reached the host, since the host cuts a parked
+/// handler off itself, and a handler that spent every second it was allowed
+/// still beats it.
+const PLAN_ACTION_ANSWER_WAIT: Duration =
+    Duration::from_secs(PLAN_ROW_HANDLER_DEADLINE.as_secs() + PLAN_FORM_QUEUE_SLACK_SECS);
 const FAST_UNSUPPORTED_MSG: &str = "Fast mode needs Anthropic Opus 4.6+ with an API key, or an eligible Codex model with a ChatGPT subscription";
 const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
 const FAST_ON_MSG: &str = "Fast mode: on";
@@ -202,6 +226,52 @@ pub(super) enum PendingInput {
     },
 }
 
+/// A plan form row picked by the user, waiting on the plugin handler behind
+/// it. `pick` is the form's pick counter at the moment of the press, and an
+/// answer that comes back under a different one belongs to a form the user
+/// has already left.
+pub(super) struct PlanAction {
+    pick: u64,
+    /// The built-in outcome the row kept, which runs after the handler.
+    then: Option<PlanRowAction>,
+    deadline: Instant,
+    answer: flume::Receiver<PlanActionOutcome>,
+}
+
+/// Everything the plan form has in flight, under one owner so that no reset
+/// path can retire half of it. A menu chain and a picked row's handler both
+/// answer on the Lua thread long after the key press that started them, and
+/// the session they were asked about may be gone by then.
+#[derive(Default)]
+pub(super) struct PlanAnswers {
+    /// In flight answer from the `ui.plan_form*` chains: whether the form
+    /// opens for the draft that landed, and with which rows. Given up on
+    /// after [`PLAN_FORM_ANSWER_WAIT`].
+    pub(super) form: Option<(Instant, flume::Receiver<Option<PlanMenu>>)>,
+    /// In flight answer from a picked plugin row.
+    pub(super) action: Option<PlanAction>,
+    /// Bumped by every pick the plan form makes, and by every path that walks
+    /// away from a draft. Without it an outcome from a pick nobody waits on
+    /// any more fires a second implement prompt on top of the one already
+    /// running, or one against a session the user never picked in.
+    pick: u64,
+}
+
+impl PlanAnswers {
+    /// Retires the answers in flight and the pick they belong to, returning
+    /// the pick a new one starts at. The counter only ever moves forward, so
+    /// anything stamped with an earlier pick can only miss from here on.
+    ///
+    /// Every reset path funnels through [`App::reset_ui_chrome`], which calls
+    /// this: a new one gets the invariant for free.
+    fn abandon(&mut self) -> u64 {
+        self.form = None;
+        self.action = None;
+        self.pick += 1;
+        self.pick
+    }
+}
+
 pub enum Msg {
     Key(KeyEvent),
     Paste(String),
@@ -270,6 +340,10 @@ pub struct App {
     pub(super) keymap_reader: KeymapReader,
     pub(super) hint_reader: HintReader,
     hints: Watch<HintSnapshot>,
+    pub(super) plan_answers: PlanAnswers,
+    /// Actions produced outside key handling, drained by the event loop. A
+    /// plan row handler answers long after the key press that started it.
+    pub(super) pending_actions: Vec<Action>,
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
@@ -365,6 +439,8 @@ impl App {
             hints: Watch::seeded(hint_reader.load_full()),
             keymap_reader,
             hint_reader,
+            plan_answers: PlanAnswers::default(),
+            pending_actions: Vec::new(),
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_answers: HashMap::new(),
@@ -1767,8 +1843,134 @@ impl App {
             | self.model_picker.refresh()
             | self.usage_modal.poll(&self.usage_slot)
             | self.hints.poll(self.hint_reader.load_full())
+            | self.tick_plan()
             | self.tick_file_picker()
             | Dirty::any(self.chats.iter_mut().map(Chat::tick))
+    }
+
+    /// Both halves of the plan surface the Lua host answers asynchronously:
+    /// the menu a draft opens with, and the built-in outcome a picked plugin
+    /// row still owes. Drained for every session, since a plan that lands in
+    /// a background tab has to reach its form too.
+    pub(crate) fn tick_plan(&mut self) -> Dirty {
+        self.tick_plan_form() | self.tick_plan_action()
+    }
+
+    /// Open the form with the menu the `ui.plan_form*` chains answered with.
+    /// A chain that answers to keep it closed leaves it closed, and the
+    /// plan-toggle key still reopens it. A chain that says nothing at all
+    /// runs out of [`PLAN_FORM_ANSWER_WAIT`] and leaves the built-in form.
+    pub(crate) fn tick_plan_form(&mut self) -> Dirty {
+        let Some((deadline, rx)) = self.plan_answers.form.as_ref() else {
+            return Dirty::NO;
+        };
+        let (answered, expired) = (rx.try_recv(), Instant::now() >= *deadline);
+        let (menu, slow) = match answered {
+            // A layer took the surface over, so the host draws nothing. The
+            // menu goes with it, since its rows answer for the draft they
+            // were built for.
+            Ok(None) => {
+                self.plan_answers.abandon();
+                self.plan_form.forget_menu();
+                return Dirty::from(self.plan_form.is_visible());
+            }
+            Ok(Some(menu)) => (menu, false),
+            // The host went away mid-question, so nobody is drawing the plan.
+            Err(flume::TryRecvError::Disconnected) => (builtin_menu(), false),
+            Err(flume::TryRecvError::Empty) if expired => (builtin_menu(), true),
+            Err(flume::TryRecvError::Empty) => return Dirty::NO,
+        };
+        self.plan_answers.abandon();
+        self.plan_form.open_with(menu);
+        if slow {
+            self.flash(FLASH_PLAN_FORM_SLOW.into());
+        }
+        Dirty::YES
+    }
+
+    /// The built-in outcome a picked plugin row kept, once its handler has
+    /// answered.
+    ///
+    /// A handler that says `false` is gating the row on a check of its own
+    /// and stays quiet. A handler that failed, or a pick that reached no
+    /// handler, left the user watching the menu vanish for nothing, and says
+    /// so.
+    fn tick_plan_action(&mut self) -> Dirty {
+        let Some(pending) = self.plan_answers.action.as_ref() else {
+            return Dirty::NO;
+        };
+        // "Lost" is the host never having taken the pick, which reads
+        // differently to the user than a handler that ran and failed.
+        let (answered, expired) = (
+            pending.answer.try_recv(),
+            Instant::now() >= pending.deadline,
+        );
+        let (outcome, lost) = match answered {
+            Ok(outcome) => (outcome, false),
+            Err(flume::TryRecvError::Disconnected) => (PlanActionOutcome::Failed, true),
+            Err(flume::TryRecvError::Empty) if expired => (PlanActionOutcome::Failed, true),
+            Err(flume::TryRecvError::Empty) => return Dirty::NO,
+        };
+        let pending = self.plan_answers.action.take().expect("checked above");
+        if pending.pick != self.plan_answers.pick {
+            // Running the outcome of a pick the user has navigated away from
+            // would be a second implement prompt behind the one they asked
+            // for, or one against a session they never picked in.
+            tracing::debug!(outcome = ?outcome, "dropping the answer of a stale plan form pick");
+            return Dirty::NO;
+        }
+        match outcome {
+            PlanActionOutcome::Proceed => {
+                let actions = match pending.then {
+                    Some(PlanRowAction::Implement) => self.implement_plan(false),
+                    Some(PlanRowAction::ClearAndImplement) => self.implement_plan(true),
+                    Some(PlanRowAction::Refine) | None => vec![],
+                };
+                self.pending_actions.extend(actions);
+            }
+            PlanActionOutcome::Vetoed => {}
+            PlanActionOutcome::Failed => self.flash(
+                if lost {
+                    FLASH_PLAN_ACTION_LOST
+                } else {
+                    FLASH_PLAN_ACTION_FAILED
+                }
+                .into(),
+            ),
+        }
+        Dirty::YES
+    }
+
+    /// Ask the `ui.plan_form*` chains what to draw for the draft that just
+    /// landed, starting from the host's own rows.
+    ///
+    /// Only asked when a plugin is layering one of them. With no layer the
+    /// chain answers with the host's own rows by construction, and the
+    /// roundtrip through a request loop that may be busy would cost a stock
+    /// install its form.
+    pub(super) fn offer_plan_form(&mut self, path: Option<&str>) {
+        // A new draft retires the pick the last one was waiting on, handler
+        // and built-in outcome both. The handler may well still be running,
+        // but its answer is stamped with a pick nobody waits on any more, so
+        // the outcome the row promised is gone and the user is told.
+        let lost_pick = self.plan_answers.action.is_some();
+        self.plan_answers.abandon();
+        if lost_pick {
+            self.flash(FLASH_PLAN_ACTION_LOST.into());
+        }
+        let Some(path) = path.filter(|_| self.lua_event_handle.plan_form_layered()) else {
+            self.plan_form.open_with(builtin_menu());
+            return;
+        };
+        // The last draft's menu is not this draft's, and the chain has not
+        // answered with one yet.
+        self.plan_form.forget_menu();
+        let answer = self.lua_event_handle.open_plan_form(
+            path.to_owned(),
+            self.state.session.id.to_string(),
+            builtin_rows(),
+        );
+        self.plan_answers.form = Some((Instant::now() + PLAN_FORM_ANSWER_WAIT, answer));
     }
 
     fn tick_file_picker(&mut self) -> Dirty {
@@ -1873,6 +2075,7 @@ impl App {
         match action {
             PlanFormAction::Consumed | PlanFormAction::Passthrough => vec![],
             PlanFormAction::Hide => {
+                self.plan_answers.abandon();
                 self.plan_form.hide();
                 vec![]
             }
@@ -1883,9 +2086,75 @@ impl App {
                     vec![]
                 }
             },
-            PlanFormAction::Implement => self.implement_plan(false),
-            PlanFormAction::ClearAndImplement => self.implement_plan(true),
+            PlanFormAction::Implement => {
+                self.plan_answers.abandon();
+                self.implement_plan(false)
+            }
+            PlanFormAction::ClearAndImplement => {
+                self.plan_answers.abandon();
+                self.implement_plan(true)
+            }
+            PlanFormAction::Plugin {
+                row,
+                generation,
+                then,
+            } => {
+                // Snapshot the parallel flag before reset() clears it, since
+                // the handler is told what it was.
+                let parallel = self.plan_form.parallel();
+                let path = self
+                    .state
+                    .plan
+                    .path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                // Plan state is per session, so the handler is told which one
+                // fired instead of assuming the focused tab.
+                let session = self.state.session.id.to_string();
+                self.plan_form.reset();
+                // The generation travels with the pick, so a chain that
+                // resumed late and installed its handlers over this menu
+                // cannot answer for the rows the user saw.
+                let answer = self
+                    .lua_event_handle
+                    .run_plan_action(session, generation, row, path, parallel);
+                let pick = self.plan_answers.abandon();
+                self.plan_answers.action = Some(PlanAction {
+                    pick,
+                    then,
+                    deadline: Instant::now() + PLAN_ACTION_ANSWER_WAIT,
+                    answer,
+                });
+                vec![]
+            }
         }
+    }
+
+    /// Snapshot of the current plan for `maki.plan.read()`. `content` stays
+    /// `None` when the plan is not ready or the file cannot be read, which an
+    /// empty plan is not.
+    pub(crate) fn plan_snapshot(&self) -> serde_json::Value {
+        let mode = if self.state.mode == Mode::Plan {
+            "plan"
+        } else {
+            "build"
+        };
+        let path = self.state.plan.path().map(|p| p.display().to_string());
+        let ready = self.state.plan.is_ready();
+        let content = if ready {
+            self.state
+                .plan
+                .path()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+        } else {
+            None
+        };
+        serde_json::json!({
+            "mode": mode,
+            "path": path,
+            "ready": ready,
+            "content": content,
+        })
     }
 
     fn implement_plan(&mut self, clear_context: bool) -> Vec<Action> {

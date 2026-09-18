@@ -83,10 +83,11 @@ impl App {
                     return;
                 }
                 self.state.plan.mark_ready();
-                self.plan_form.on_plan_ready();
+                let path = self.state.plan.path().map(|p| p.display().to_string());
+                self.offer_plan_form(path.as_deref());
                 // The path is the whole point here, so with no path we stay
                 // quiet instead of handing a plugin an empty one to open.
-                if let Some(path) = self.state.plan.path().map(|p| p.display().to_string()) {
+                if let Some(path) = path {
                     self.fire_session_autocmd("PlanReady", serde_json::json!({ "path": path }));
                 }
             }
@@ -102,6 +103,16 @@ impl App {
     pub(super) fn enter_plan(&mut self) {
         self.state.plan.allocate_path(&self.storage);
         self.state.mode = Mode::Plan;
+    }
+
+    /// The mode switch behind `maki.session.set_mode`, i.e. what Tab does
+    /// without the toggling. Build mode is what makes the next prompt an
+    /// implementation of the plan instead of another draft.
+    pub(crate) fn set_mode(&mut self, mode: Mode) {
+        match mode {
+            Mode::Plan => self.enter_plan(),
+            Mode::Build => self.state.mode = Mode::Build,
+        }
     }
 
     pub(super) fn toggle_mode(&mut self) -> Vec<super::Action> {

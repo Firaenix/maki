@@ -14,6 +14,17 @@ use crate::api::util::dispatch::{DepthGuard, Reentry, call_swallowing};
 /// Slot names the host fires itself. A plugin declaring one would shadow a
 /// point whose firing order dispatch guarantees, so the namespace is closed.
 pub(crate) const HOST_PREFIX: &str = "tool.";
+/// The other closed namespace: built-in surfaces a plugin layers to take over.
+pub(crate) const UI_PREFIX: &str = "ui.";
+const HOST_PREFIXES: [&str; 2] = [HOST_PREFIX, UI_PREFIX];
+
+/// Fired when the agent finishes writing a plan. The default opens the
+/// built-in plan form, so a layer that answers `false` owns the surface for
+/// that draft.
+pub(crate) const PLAN_FORM_SLOT: &str = "ui.plan_form";
+/// Fired just before the plan form opens. The default answers with the
+/// built-in rows.
+pub(crate) const PLAN_FORM_ACTIONS_SLOT: &str = "ui.plan_form.actions";
 
 const SEAM: &str = "slot";
 
@@ -65,6 +76,7 @@ impl SlotStore {
     /// layer a reload took away, or misses one it just added.
     fn publish(&self) {
         let mut stages = StageSets::default();
+        let mut surfaces = HashSet::new();
         for (name, entry) in &self.slots {
             if entry.layers.is_empty() {
                 continue;
@@ -72,8 +84,12 @@ impl SlotStore {
             if let Some((tool, stage)) = host_slot_target(name) {
                 stages[stage as usize].insert(Arc::from(tool));
             }
+            if name.starts_with(UI_PREFIX) {
+                surfaces.insert(Arc::from(name.as_str()));
+            }
         }
-        self.layered.0.store(Arc::new(stages));
+        self.layered.stages.store(Arc::new(stages));
+        self.layered.surfaces.store(Arc::new(surfaces));
     }
 }
 
@@ -81,16 +97,38 @@ type StageSets = [HashSet<Arc<str>>; HookStage::ALL.len()];
 
 /// Which tools have a layer on which stage, keyed by tool rather than by slot
 /// name so the check every tool call makes costs one atomic load and one
-/// lookup, with nothing formatted and nothing allocated.
+/// lookup, with nothing formatted and nothing allocated, plus which host
+/// surfaces have one at all.
 ///
 /// Owned by the runtime that created the [`SlotStore`], so two plugin hosts in
 /// one process each answer for their own layers.
 #[derive(Default)]
-pub struct LayeredTools(ArcSwap<StageSets>);
+pub struct LayeredTools {
+    stages: ArcSwap<StageSets>,
+    /// The `ui.` slots with at least one layer. The UI reads this before it
+    /// asks a chain anything, so a stock install draws its built-in surface
+    /// in the same frame instead of waiting on a roundtrip.
+    surfaces: ArcSwap<HashSet<Arc<str>>>,
+}
 
 impl LayeredTools {
     pub fn wraps(&self, tool: &str, stage: HookStage) -> bool {
-        self.0.load()[stage as usize].contains(tool)
+        self.stages.load()[stage as usize].contains(tool)
+    }
+
+    /// Whether any plugin is layering the host surface {slot}.
+    pub fn layers_surface(&self, slot: &str) -> bool {
+        self.surfaces.load().contains(slot)
+    }
+
+    /// Stands in for a plugin host with {slots} layered, for tests that drive
+    /// the UI without one.
+    #[doc(hidden)]
+    pub fn with_surfaces(slots: &[&str]) -> Self {
+        let this = Self::default();
+        this.surfaces
+            .store(Arc::new(slots.iter().map(|s| Arc::from(*s)).collect()));
+        this
     }
 }
 
@@ -125,6 +163,11 @@ fn identity_default(lua: &Lua) -> LuaResult<Function> {
     lua.create_function(|_, args: MultiValue| Ok(args))
 }
 
+/// Told which plugin answered with which values, at every hop of a chain, so
+/// the host can attribute parts of a produced value to the layer that put
+/// them there.
+pub(crate) type ChainObserver = Arc<dyn Fn(&Arc<str>, &MultiValue) + Send + Sync>;
+
 /// Everything a chain needs except its position in it. Bundled because
 /// `create_async_function` wants an owned copy per call, and the alternative is
 /// cloning four captures by hand at every hop.
@@ -134,6 +177,7 @@ struct Chain {
     name: Arc<str>,
     default: Function,
     layers: Arc<[SlotLayer]>,
+    observe: Option<ChainObserver>,
 }
 
 fn make_prev(chain: &Chain, rest: usize, state: &PrevCell) -> LuaResult<Function> {
@@ -201,7 +245,12 @@ fn invoke_chain(
             call_swallowing::<MultiValue>(&layer.func, layer_args, &chain.name, &layer.plugin)
                 .await;
         match (result, take_state(&state, PrevState::Expired)) {
-            (Some(r), _) => Ok(r),
+            (Some(r), _) => {
+                if let Some(observe) = &chain.observe {
+                    observe(&layer.plugin, &r);
+                }
+                Ok(r)
+            }
             (None, PrevState::Done(r)) => r,
             (None, PrevState::Armed) => invoke_chain(chain, idx - 1, args).await,
             (None, PrevState::Running | PrevState::Expired) => Err(mlua::Error::runtime(format!(
@@ -226,6 +275,7 @@ async fn run_chain(
     default: Function,
     layers: Arc<[SlotLayer]>,
     args: MultiValue,
+    observe: Option<ChainObserver>,
 ) -> LuaResult<MultiValue> {
     let _guard = DepthGuard::enter(lua, SEAM, &name, Reentry::Task).map_err(|_| {
         mlua::Error::runtime(format!(
@@ -238,6 +288,7 @@ async fn run_chain(
         name,
         default,
         layers,
+        observe,
     };
     invoke_chain(chain, depth, args).await
 }
@@ -269,6 +320,22 @@ pub(crate) async fn run_host_chain(
     args: MultiValue,
     allow_layer: &dyn Fn(&str) -> bool,
 ) -> LuaResult<Option<MultiValue>> {
+    run_host_chain_with(lua, name, identity_default(lua)?, args, allow_layer, None).await
+}
+
+/// [`run_host_chain`] with a default of the host's choosing, for a slot whose
+/// contract is "produce a value" instead of "rewrite the one it was passed",
+/// and an optional {observe} called with each layer's answer as the chain
+/// unwinds, innermost first. That is the only place a value can still be told
+/// apart from the layer that produced it.
+pub(crate) async fn run_host_chain_with(
+    lua: &Lua,
+    name: &str,
+    default: Function,
+    args: MultiValue,
+    allow_layer: &dyn Fn(&str) -> bool,
+    observe: Option<ChainObserver>,
+) -> LuaResult<Option<MultiValue>> {
     let Some((_, layers)) = snapshot(lua, name) else {
         return Ok(None);
     };
@@ -280,9 +347,22 @@ pub(crate) async fn run_host_chain(
     if layers.is_empty() {
         return Ok(None);
     }
-    run_chain(lua, Arc::from(name), identity_default(lua)?, layers, args)
+    run_chain(lua, Arc::from(name), default, layers, args, observe)
         .await
         .map(Some)
+}
+
+/// The plugins layering {name}, for a log line about a chain that failed as a
+/// whole and cannot name the layer that did it.
+pub(crate) fn layer_plugins(lua: &Lua, name: &str) -> String {
+    let Some((_, layers)) = snapshot(lua, name) else {
+        return String::new();
+    };
+    layers
+        .iter()
+        .map(|l| l.plugin.as_ref())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The callable closes over `name` only and reads the store on every call,
@@ -295,7 +375,7 @@ fn make_callable(lua: &Lua, name: String) -> LuaResult<Function> {
             let (default, layers) = snapshot(&lua, &name)
                 .and_then(|(default, layers)| Some((default?, layers)))
                 .ok_or_else(|| mlua::Error::runtime(format!("slot '{name}' is not declared")))?;
-            run_chain(&lua, name, default, layers, args).await
+            run_chain(&lua, name, default, layers, args, None).await
         }
     })
 }
@@ -306,7 +386,7 @@ fn make_callable(lua: &Lua, name: String) -> LuaResult<Function> {
 /// layer first, then inward, ending at {default}.
 ///
 /// Throws if another plugin already owns a slot with the same {name}, or
-/// if {name} starts with `"tool."`, which the host fires itself.
+/// if {name} starts with `"tool."` or `"ui."`, which the host fires itself.
 ///
 /// The chain is async: the default and every layer may park (`maki.fs.*`,
 /// `maki.fn.jobwait`, `maki.agent.call_tool`, ...), and so does the
@@ -330,10 +410,12 @@ fn declare_slot(
     name: String,
     default: Function,
 ) -> LuaResult<Function> {
-    if name.starts_with(HOST_PREFIX) {
+    if let Some(prefix) = HOST_PREFIXES.iter().find(|p| name.starts_with(**p)) {
         return Err(mlua::Error::runtime(format!(
-            "slot '{name}' is host owned: '{HOST_PREFIX}' names are fired by maki itself, \
-             use set_slot to wrap one"
+            "slot '{name}' is host owned: the '{prefix}' prefix is reserved for slots maki \
+             fires itself. Layer one with maki.api.set_slot('{name}', ...), or declare yours \
+             under a name of your own, e.g. '{plugin}.{}'",
+            name.trim_start_matches(prefix)
         )));
     }
     {
@@ -364,6 +446,11 @@ fn declare_slot(
 ///
 /// Layers wrap in registration order, so the last one registered runs
 /// first and sees the value before the others do.
+///
+/// Maki fires two slots around the plan form, both with
+/// `ev = { path, session }`. `ui.plan_form.actions` asks for the form's
+/// menu, and `ui.plan_form` asks whether the form opens at all. Both are
+/// documented under [maki.plan](/docs/lua-api/#maki-plan).
 ///
 /// Maki fires two slots per tool itself: `tool.<name>.input` before
 /// permissions look at the call, and `tool.<name>.output` on the text it

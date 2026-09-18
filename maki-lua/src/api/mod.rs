@@ -14,6 +14,7 @@ pub(crate) mod model;
 pub(crate) mod net;
 pub(crate) mod options;
 pub(crate) mod pack;
+pub(crate) mod plan;
 pub(crate) mod session;
 pub(crate) mod slot;
 pub(crate) mod split;
@@ -69,6 +70,7 @@ pub(crate) fn create_maki_global(
     maki.set("json", json::create_json_table(lua)?)?;
     maki.set("yaml", yaml::create_yaml_table(lua)?)?;
     maki.set("net", net::create_net_table(lua, permissions)?)?;
+    maki.set("plan", plan::create_plan_table(lua, ui_action_tx.clone())?)?;
     maki.set("text", text::create_text_table(lua)?)?;
     maki.set(
         "session",

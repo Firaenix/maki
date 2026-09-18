@@ -41,7 +41,14 @@ use crate::api::r#fn::{JobEvent, JobOwner, JobStore, deliver_job_event};
 use crate::api::keymap::KeymapReader;
 use crate::api::keymap::{KeymapStore, KeymapWriter};
 use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
-use crate::api::slot::{LayeredTools, SlotStore, run_host_chain};
+use crate::api::plan::{
+    PlanRowHandlers, RowOwners, clear_menu_generation, clear_plugin_rows, clear_session_rows,
+    install_row_handlers, row_handler_opts, rows_from_table, rows_to_table,
+};
+use crate::api::slot::{
+    ChainObserver, LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT, SlotStore, layer_plugins,
+    run_host_chain, run_host_chain_with,
+};
 use crate::api::tool::{
     LuaTool, PendingRules, PendingTool, PendingTools, ToolCallReply, ToolPermission, resolve_rules,
 };
@@ -49,7 +56,8 @@ use crate::api::ui::HintStore;
 use crate::api::ui::buf::{BufHandle, BufferStore};
 use crate::api::util::command::{CommandHandlerMap, HintWriter, publish_command_snapshot};
 use crate::api::util::command::{
-    LuaCommandReader, LuaCommandWriter, UiAction, UiAttachment, install_ui_attachment,
+    LuaCommandReader, LuaCommandWriter, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction,
+    UiAttachment, install_ui_attachment,
 };
 use crate::api::util::convert::{json_to_lua, lua_to_json_within};
 use crate::api::util::ctx::{LuaCtx, RestoreCtx};
@@ -113,6 +121,30 @@ const TURN_END_EVENT: &str = "TurnEnd";
 /// unbounded pass would never reach the reap.
 const FINAL_DRAIN_BUDGET: usize = 256;
 const SESSION_END_EVENT: &str = "SessionEnd";
+/// Wall clock the `ui.plan_form*` chains get, together, before the host stops
+/// waiting and opens the built-in form, generous because a layer may shell out
+/// or fetch before it decides. It rules out a parked layer stranding the user
+/// with a finished plan and no surface for it.
+///
+/// One budget covers both chains a draft fires, so this is also the whole
+/// wait the user can see and the number the UI's own fallback is derived
+/// from. Two budgets would add up to a host worst case no reader of either
+/// constant could predict.
+pub const PLAN_FORM_SLOT_DEADLINE: Duration = Duration::from_secs(5);
+/// What layering either `ui.plan_form*` chain costs. A layer decides what the
+/// menu says and what pressing Enter on a row does, up to a build-mode turn
+/// with every tool behind it, and it can keep a built-in row's wording while
+/// swapping the outcome under it. No narrower price would be honest.
+const PLAN_FORM_AUTHORITY: Authority = Authority::Unbounded;
+/// Wall clock a picked plan row's handler gets. The row's built-in action
+/// waits behind it, so a handler that parks for good would cost the user the
+/// outcome the row promised as well as the one the plugin wanted.
+///
+/// The whole budget a pick can take here, so the UI derives its own fallback
+/// from it rather than from a number of its own.
+pub const PLAN_ROW_HANDLER_DEADLINE: Duration = Duration::from_secs(30);
+const PLAN_HANDLERS_MISSING_ERR: &str = "plan row handlers not initialized";
+const PLAN_HANDLER_GONE_ERR: &str = "plan row handler was reaped";
 /// Without a cap, a runaway plugin OOM-kills the whole process.
 /// With one, it hits a catchable Lua error instead.
 pub(crate) const LUA_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
@@ -266,6 +298,33 @@ pub enum Request {
         /// Runs on the caller's slot instead of taking one of its own.
         /// See [`under_inflight_slot`].
         nested: bool,
+    },
+    /// Fires when the user picks a plugin row on the plan form. The row is
+    /// named by its position in the menu the chain built for that session,
+    /// plus the generation that menu was published with, so a pick only ever
+    /// reaches the handlers of the menu the user was looking at.
+    RunPlanAction {
+        session: String,
+        generation: u64,
+        row: usize,
+        /// Absolute plan path.
+        path: String,
+        /// Value of the form's "parallel" checkbox when the user picked the row.
+        parallel: bool,
+        /// Whether the row's built-in action still runs, and if not, whether
+        /// that was the handler's decision or the host failing to take the
+        /// pick at all.
+        reply: flume::Sender<PlanActionOutcome>,
+    },
+    /// Fires the two `ui.plan_form*` chains for a session whose plan just
+    /// landed: whether the built-in form opens, and with which rows.
+    OpenPlanForm {
+        path: String,
+        session: String,
+        /// The rows the host proposes, i.e. the bottom of the actions chain.
+        rows: Vec<PlanFormRow>,
+        /// The menu to draw, or `None` when a layer took the form over.
+        reply: flume::Sender<Option<PlanMenu>>,
     },
     ComputeHeader {
         plugin: Arc<str>,
@@ -1227,6 +1286,8 @@ async fn run_host_hook(lua: &Lua, hook: HostHook) {
             crate::api::autocmd::dispatch(lua.clone(), SESSION_END_EVENT.to_owned(), None, data)
                 .await;
             with_jobs(lua, |store| store.kill_session(lua, end.session));
+            // Nothing can pick from this session's plan form again.
+            clear_session_rows(lua, &end.session.to_string());
             if let Some((_, reply)) = end.wait {
                 let _ = reply.send(());
             }
@@ -1973,6 +2034,7 @@ impl LuaRuntime {
         hint_writer: HintWriter,
         jit: bool,
         plugin_rules: Arc<PluginRuleStore>,
+        layered: Arc<LayeredTools>,
     ) -> Result<Self, PluginError> {
         let lua = Lua::new();
         let compiler = install_compiler(&lua, jit);
@@ -2010,7 +2072,6 @@ impl LuaRuntime {
         lua.set_app_data(PluginOptionSpecs::default());
         lua.set_app_data(crate::api::pack::PackStore::default());
         lua.set_app_data(AutocmdStore::default());
-        let layered: Arc<LayeredTools> = Arc::default();
         lua.set_app_data(SlotStore::new(Arc::clone(&layered)));
         registry.set_hook(crate::hook::SlotHook {
             tx: tx.clone(),
@@ -2020,6 +2081,7 @@ impl LuaRuntime {
         lua.set_app_data(keymap_writer);
         lua.set_app_data(HintStore::new());
         lua.set_app_data(hint_writer);
+        lua.set_app_data(PlanRowHandlers::default());
         lua.set_app_data(Arc::clone(&registry));
 
         let plugins: PluginMap = Rc::new(RefCell::new(HashMap::new()));
@@ -2098,6 +2160,9 @@ impl LuaRuntime {
         if let Some(mut store) = self.lua.app_data_mut::<SlotStore>() {
             store.clear_plugin(name);
         }
+        // A row stays on screen with the layer that drew it gone, but its
+        // handler captured the permissions the user just revoked.
+        clear_plugin_rows(&self.lua, name);
         let mut revision_guard = None;
         if let Some(owner) = self.plugins.borrow_mut().remove(name) {
             revision_guard = owner.revision_guard;
@@ -3046,6 +3111,198 @@ fn layer_delegation<'a>(
     }
 }
 
+/// The event both `ui.plan_form*` chains see: which draft landed, and whose.
+fn plan_form_event(lua: &Lua, path: &str, session: &str) -> mlua::Result<MultiValue> {
+    let ev = lua.create_table()?;
+    ev.set("path", path)?;
+    ev.set("session", session)?;
+    Ok(MultiValue::from_vec(vec![LuaValue::Table(ev)]))
+}
+
+/// A `ui.plan_form*` chain that ended without an answer, logged with the
+/// plugins layering it, since a chain that never came back cannot say which
+/// of them parked.
+fn plan_chain_abandoned(lua: &Lua, slot: &str, reason: &str) {
+    tracing::warn!(
+        slot,
+        plugins = %layer_plugins(lua, slot),
+        reason,
+        "plan form slot chain abandoned, falling back to the built-in form"
+    );
+}
+
+/// Asks the `ui.plan_form` chain whether the built-in plan form should open
+/// for the draft that just landed. `true` means every layer deferred and the
+/// chain reached the host default.
+///
+/// Layering costs [`PLAN_FORM_AUTHORITY`], and a layer that throws or parks
+/// for good leaves the built-in form, never a dead surface.
+async fn plan_form_opens(
+    lua: &Lua,
+    plugins: &PluginMap,
+    gate: &Rc<InflightGate>,
+    deadline: Instant,
+    args: MultiValue,
+) -> bool {
+    let allow_layer = layer_delegation(plugins, PLAN_FORM_AUTHORITY, PLAN_FORM_SLOT);
+    let chain = run_host_chain(lua, PLAN_FORM_SLOT, args, &allow_layer);
+    match run_awaited(lua, gate, CancelToken::none(), deadline, chain).await {
+        // `None` is "nothing layered it", so there is nobody else to draw it.
+        Ok(Ok(None)) => true,
+        // The host default hands the event table back, so a chain every layer
+        // deferred through answers truthy. A layer that returns nothing, or
+        // `false`, keeps the form closed and owns the surface.
+        Ok(Ok(Some(values))) => values
+            .into_iter()
+            .next()
+            .is_some_and(|v| !matches!(v, LuaValue::Nil | LuaValue::Boolean(false))),
+        Ok(Err(e)) => {
+            tracing::warn!(
+                slot = PLAN_FORM_SLOT,
+                plugins = %layer_plugins(lua, PLAN_FORM_SLOT),
+                error = %strip_traceback(&e),
+                "plan form slot chain failed"
+            );
+            true
+        }
+        Err(reason) => {
+            plan_chain_abandoned(lua, PLAN_FORM_SLOT, reason);
+            true
+        }
+    }
+}
+
+/// Asks the `ui.plan_form.actions` chain for the menu the form draws, and
+/// stashes the handlers of the plugin rows that came back so a pick can find
+/// them, under the generation the form has to echo back.
+///
+/// The default answers with {proposed}, the host's own rows, which is also
+/// what a layer that throws, parks for good, or answers off contract leaves
+/// behind. Layering costs [`PLAN_FORM_AUTHORITY`], since a row decides what
+/// the agent does next.
+async fn plan_form_rows(
+    lua: &Lua,
+    plugins: &PluginMap,
+    gate: &Rc<InflightGate>,
+    deadline: Instant,
+    session: &str,
+    args: MultiValue,
+    proposed: Vec<PlanFormRow>,
+) -> PlanMenu {
+    let allow_layer = layer_delegation(plugins, PLAN_FORM_AUTHORITY, PLAN_FORM_ACTIONS_SLOT);
+    let host_rows = proposed.clone();
+    // Which layer put which handler in the menu, the one thing the answered
+    // table cannot say on its own.
+    let owners: Arc<Mutex<RowOwners>> = Arc::default();
+    let observer = Arc::clone(&owners);
+    let observe: ChainObserver = Arc::new(move |plugin: &Arc<str>, values: &MultiValue| {
+        if let Some(LuaValue::Table(table)) = values.iter().next() {
+            observer.lock().expect("row owners").observe(plugin, table);
+        }
+    });
+    let answered =
+        match lua.create_function(move |lua, _: MultiValue| rows_to_table(lua, &host_rows)) {
+            Ok(default) => {
+                let chain = run_host_chain_with(
+                    lua,
+                    PLAN_FORM_ACTIONS_SLOT,
+                    default,
+                    args,
+                    &allow_layer,
+                    Some(observe),
+                );
+                run_awaited(lua, gate, CancelToken::none(), deadline, chain).await
+            }
+            Err(e) => Ok(Err(e)),
+        };
+    let answered = match answered {
+        Ok(Ok(Some(values))) => match values.into_iter().next() {
+            Some(LuaValue::Table(table)) => {
+                let owners = owners.lock().expect("row owners");
+                rows_from_table(lua, table, &owners)
+                    .inspect_err(|e| {
+                        tracing::warn!(
+                            slot = PLAN_FORM_ACTIONS_SLOT,
+                            plugins = %layer_plugins(lua, PLAN_FORM_ACTIONS_SLOT),
+                            error = %e,
+                            "plan form actions slot answered off contract"
+                        );
+                    })
+                    .ok()
+            }
+            _ => None,
+        },
+        Ok(Ok(None)) => None,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                slot = PLAN_FORM_ACTIONS_SLOT,
+                plugins = %layer_plugins(lua, PLAN_FORM_ACTIONS_SLOT),
+                error = %strip_traceback(&e),
+                "plan form actions slot chain failed"
+            );
+            None
+        }
+        Err(reason) => {
+            plan_chain_abandoned(lua, PLAN_FORM_ACTIONS_SLOT, reason);
+            None
+        }
+    };
+    // A plugin that wants no form keeps `ui.plan_form` closed instead of
+    // answering with an empty menu.
+    let (rows, handlers) = answered
+        .filter(|answered| !answered.0.is_empty())
+        .unwrap_or_else(|| (proposed, Vec::new()));
+    match install_row_handlers(lua, session.to_owned(), handlers) {
+        Ok(generation) => PlanMenu { generation, rows },
+        Err(e) => {
+            // Nothing was stashed, so no row may go on claiming a handler: a
+            // pick would echo a generation that answers for nothing, and the
+            // built-in outcome the row named would go with it.
+            tracing::warn!(error = %e, "could not stash the plan form row handlers");
+            PlanMenu {
+                generation: 0,
+                rows: rows.into_iter().filter_map(without_handler).collect(),
+            }
+        }
+    }
+}
+
+/// A row the host could not stash a handler for. What is left is the built-in
+/// outcome it named, and a row that named none is one nobody can run.
+fn without_handler(mut row: PlanFormRow) -> Option<PlanFormRow> {
+    row.plugin = None;
+    row.action.is_some().then_some(row)
+}
+
+/// Both chains a landed plan fires, under one deadline: they run back to back
+/// for a single wait the user sees, so a budget each would let the host take
+/// twice what either constant says. `None` is a layer having taken the form
+/// over, so the host draws nothing for this draft.
+async fn open_plan_form(
+    lua: &Lua,
+    plugins: &PluginMap,
+    gate: &Rc<InflightGate>,
+    path: String,
+    session: &str,
+    rows: Vec<PlanFormRow>,
+) -> Option<PlanMenu> {
+    let deadline = Instant::now() + PLAN_FORM_SLOT_DEADLINE;
+    let args = match plan_form_event(lua, &path, session) {
+        Ok(args) => args,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not build the plan form slot event");
+            return Some(PlanMenu {
+                generation: 0,
+                rows,
+            });
+        }
+    };
+    if !plan_form_opens(lua, plugins, gate, deadline, args.clone()).await {
+        return None;
+    }
+    Some(plan_form_rows(lua, plugins, gate, deadline, session, args, rows).await)
+}
+
 /// Fires a host-owned chain and reads back the one contract every host slot
 /// shares: a table replaces the value, `nil` leaves it alone, and
 /// `nil, reason` stops the call with a reason the model reads.
@@ -3286,6 +3543,9 @@ async fn run_tool_call(
 pub(crate) struct LuaThread {
     pub tx: flume::Sender<Request>,
     pub prio_tx: flume::Sender<Request>,
+    /// Shared with the runtime on the Lua thread, so a handle can answer "is
+    /// anyone layering this" without a roundtrip.
+    pub layered: Arc<LayeredTools>,
     pub join: Option<JoinHandle<()>>,
     pub shutdown: Arc<AtomicBool>,
     pub command_reader: LuaCommandReader,
@@ -3306,6 +3566,8 @@ pub fn spawn(
     let (tx, rx) = flume::unbounded::<Request>();
     let (prio_tx, prio_rx) = flume::unbounded::<Request>();
     let tx_clone = tx.clone();
+    let layered: Arc<LayeredTools> = Arc::default();
+    let layered_thread = Arc::clone(&layered);
     let shutdown: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let shutdown_thread = Arc::clone(&shutdown);
     let (init_tx, init_rx) = flume::bounded::<Result<(), PluginError>>(1);
@@ -3331,6 +3593,7 @@ pub fn spawn(
                 hint_writer,
                 jit,
                 plugin_rules,
+                layered_thread,
             ) {
                 Ok(r) => {
                     let _ = init_tx.send(Ok(()));
@@ -3544,6 +3807,107 @@ pub fn spawn(
                             drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
                             rt.clear_plugin(&plugin);
                             let _ = reply.send(());
+                        }
+                        Request::RunPlanAction {
+                            session,
+                            generation,
+                            row,
+                            path,
+                            parallel,
+                            reply,
+                        } => {
+                            let found = rt
+                                .lua
+                                .app_data_ref::<PlanRowHandlers>()
+                                .ok_or(PLAN_HANDLERS_MISSING_ERR)
+                                .and_then(|handlers| {
+                                    let handler = handlers.handler(&session, generation, row)?;
+                                    let func = rt
+                                        .lua
+                                        .registry_value::<Function>(&handler.key)
+                                        .map_err(|_| PLAN_HANDLER_GONE_ERR)?;
+                                    Ok((Arc::clone(&handler.plugin), func))
+                                });
+                            match found {
+                                Ok((plugin, func)) => {
+                                    let lua = rt.lua.clone();
+                                    let gate = Rc::clone(&gate);
+                                    ex.spawn(async move {
+                                        let run = async {
+                                            let opts =
+                                                row_handler_opts(&lua, &session, &path, parallel)?;
+                                            let thread = lua.create_thread(func)?;
+                                            thread.into_async::<LuaValue>(opts)?.await
+                                        };
+                                        // Handler-then-action: the row's
+                                        // built-in outcome follows unless the
+                                        // handler answered `false` or failed.
+                                        let deadline =
+                                            Instant::now() + PLAN_ROW_HANDLER_DEADLINE;
+                                        let outcome = match run_awaited(
+                                            &lua,
+                                            &gate,
+                                            CancelToken::none(),
+                                            deadline,
+                                            run,
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(LuaValue::Boolean(false))) => {
+                                                PlanActionOutcome::Vetoed
+                                            }
+                                            Ok(Ok(_)) => PlanActionOutcome::Proceed,
+                                            Ok(Err(e)) => {
+                                                tracing::warn!(plugin = %plugin, row, error = %strip_traceback(&e), "plan form row handler failed");
+                                                PlanActionOutcome::Failed
+                                            }
+                                            Err(reason) => {
+                                                tracing::warn!(plugin = %plugin, row, reason, "plan form row handler abandoned");
+                                                PlanActionOutcome::Failed
+                                            }
+                                        };
+                                        let _ = reply.send(outcome);
+                                    })
+                                    .detach();
+                                }
+                                Err(reason) => {
+                                    tracing::warn!(
+                                        session,
+                                        generation,
+                                        row,
+                                        reason,
+                                        "plan form row pick reached no handler"
+                                    );
+                                    let _ = reply.send(PlanActionOutcome::Failed);
+                                }
+                            }
+                        }
+                        Request::OpenPlanForm {
+                            path,
+                            session,
+                            rows,
+                            reply,
+                        } => {
+                            // Spawned, not awaited: a layer may park, and
+                            // every other session is waiting on this request
+                            // loop.
+                            let lua = rt.lua.clone();
+                            let plugins = Rc::clone(&rt.plugins);
+                            let gate = Rc::clone(&gate);
+                            ex.spawn(async move {
+                                let menu =
+                                    open_plan_form(&lua, &plugins, &gate, path, &session, rows)
+                                        .await;
+                                let generation = menu.as_ref().map_or(0, |m| m.generation);
+                                if reply.send(menu).is_err() {
+                                    // The form gave up on this answer, or the
+                                    // session it was asked about is gone. The
+                                    // handlers stashed for a menu nobody will
+                                    // ever draw go with it.
+                                    clear_menu_generation(&lua, &session, generation);
+                                }
+                            })
+                            .detach();
                         }
                         Request::RunCommand {
                             plugin,
@@ -3836,6 +4200,7 @@ pub fn spawn(
     Ok(LuaThread {
         tx,
         prio_tx,
+        layered,
         join: Some(handle),
         shutdown,
         command_reader,

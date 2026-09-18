@@ -15,6 +15,10 @@ use crate::api::util::pair::{Pair, try_pair};
 pub(crate) const NO_UI_ERR: &str = "no interactive UI attached";
 pub(crate) const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
 
+const ROW_REFINE: &str = "refine";
+const ROW_CLEAR_AND_IMPLEMENT: &str = "clear_and_implement";
+const ROW_IMPLEMENT: &str = "implement";
+
 #[derive(Clone)]
 pub struct LuaCommandInfo {
     pub name: Arc<str>,
@@ -434,6 +438,13 @@ pub enum SessionRequest {
     Delete {
         id: String,
     },
+    /// Plan or build, for the live session {id} names: a plan form row fires
+    /// for the session its plan belongs to, which is not always the focused
+    /// one.
+    SetMode {
+        id: Option<String>,
+        mode: String,
+    },
     SetTitle {
         id: String,
         title: String,
@@ -453,6 +464,93 @@ pub enum ModelRequest {
         thinking: Option<String>,
         fast: Option<bool>,
     },
+}
+
+/// The plan surface `maki.plan` drives. Plan state is per session, so every
+/// request names one, and `None` means the focused session.
+pub enum PlanRequest {
+    /// Snapshot of the current plan: `{ mode, path, content, ready }`.
+    Read { session: Option<String> },
+}
+
+impl PlanRequest {
+    pub fn session(&self) -> Option<&str> {
+        match self {
+            Self::Read { session } => session.as_deref(),
+        }
+    }
+}
+
+/// The built-in outcome a plan form row names, which only the host can run.
+/// A row may carry one, a plugin handler, or both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanRowAction {
+    Refine,
+    ClearAndImplement,
+    Implement,
+}
+
+impl PlanRowAction {
+    /// The `action` tag a row carries in Lua.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Refine => ROW_REFINE,
+            Self::ClearAndImplement => ROW_CLEAR_AND_IMPLEMENT,
+            Self::Implement => ROW_IMPLEMENT,
+        }
+    }
+
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            ROW_REFINE => Some(Self::Refine),
+            ROW_CLEAR_AND_IMPLEMENT => Some(Self::ClearAndImplement),
+            ROW_IMPLEMENT => Some(Self::Implement),
+            _ => None,
+        }
+    }
+}
+
+/// One row of the plan form menu. The host proposes its built-in rows and the
+/// `ui.plan_form.actions` chain hands back the list the form draws.
+///
+/// `id` is what a layer targets a row by, so reordering or relabelling a row
+/// never moves its handler. A row with a `plugin` runs that plugin's handler
+/// first, and its `action` after, unless the handler said otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanFormRow {
+    pub id: String,
+    pub label: String,
+    pub desc: String,
+    /// The host outcome the row falls through to, if any.
+    pub action: Option<PlanRowAction>,
+    /// The plugin whose handler is stashed for this row, `None` on a pure
+    /// host row. Picking one names it, so its jobs and its log lines land on
+    /// the plugin that wrote it.
+    pub plugin: Option<Arc<str>>,
+}
+
+/// What became of a pick on a plan form row that carries a plugin handler.
+/// A veto says nothing to the user, while a failure is the user pressing a
+/// key and getting neither the handler nor the built-in outcome the row
+/// promised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanActionOutcome {
+    /// The handler ran, and the row's built-in action follows.
+    Proceed,
+    /// The handler ran and answered `false`, so the action is deliberately
+    /// dropped.
+    Vetoed,
+    /// The handler failed, ran out of its window, or was never reached at
+    /// all.
+    Failed,
+}
+/// The menu one draft's chain answered with. The form echoes `generation`
+/// back on a pick, so a chain that resumes late and installs its handlers
+/// over a menu already on screen cannot have a pick routed to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanMenu {
+    pub generation: u64,
+    pub rows: Vec<PlanFormRow>,
 }
 
 pub type UiReply = Result<serde_json::Value, String>;
@@ -504,6 +602,10 @@ pub enum UiAction {
     },
     Model {
         req: ModelRequest,
+        reply_tx: flume::Sender<UiReply>,
+    },
+    Plan {
+        req: PlanRequest,
         reply_tx: flume::Sender<UiReply>,
     },
     Task {

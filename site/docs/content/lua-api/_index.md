@@ -102,6 +102,7 @@ The rules:
 | [`maki`](#maki) | The global entry point. |
 | [`maki.pack`](#maki-pack) | Declare global packages and inspect package state. |
 | [`maki.api`](#maki-api) | Plugin registration. |
+| [`maki.plan`](#maki-plan) | Plan-mode surface for plugins. |
 | [`maki.agent`](#maki-agent) | Subagent primitives for plugins that need to talk to an LLM. |
 | [`maki.agent.Session`](#maki-agent-Session) | A subagent session with its own conversation history. |
 | [`maki.async`](#maki-async) | Tools for running things concurrently in Lua plugins. |
@@ -791,7 +792,8 @@ name the session now running or focused. What each event adds:
 - `"CompactionDone"`: `data.context_size_before`,
   `data.context_size_after`, and `data.context_window`.
 - `"PlanReady"`: `data.path`, the absolute path of the plan file the
-  agent just wrote. Fires once per draft.
+  agent just wrote. Fires once per draft. Plan state is per session, so
+  pass `data.session_id` to `maki.plan.read`.
 - `"SessionFocusChanged"`: `data.previous_session_id`, absent on the
   first focus at startup.
 - `"SessionStatusChanged"`: `data.status` (`"working"`, `"needs_input"`,
@@ -923,7 +925,7 @@ Create a named extension point owned by your plugin. You provide a
 layer first, then inward, ending at {default}.
 
 Throws if another plugin already owns a slot with the same {name}, or
-if {name} starts with `"tool."`, which the host fires itself.
+if {name} starts with `"tool."` or `"ui."`, which the host fires itself.
 
 The chain is async: the default and every layer may park (`maki.fs.*`,
 `maki.fn.jobwait`, `maki.agent.call_tool`, ...), and so does the
@@ -971,6 +973,11 @@ takes the seam down with it.
 Layers wrap in registration order, so the last one registered runs
 first and sees the value before the others do.
 
+Maki fires two slots around the plan form, both with
+`ev = { path, session }`. `ui.plan_form.actions` asks for the form's
+menu, and `ui.plan_form` asks whether the form opens at all. Both are
+documented under [maki.plan](/docs/lua-api/#maki-plan).
+
 Maki fires two slots per tool itself: `tool.<name>.input` before
 permissions look at the call, and `tool.<name>.output` on the text it
 produced. Both take `function(prev, value, ctx)` and answer with a
@@ -1010,6 +1017,90 @@ which plugins own or wrap each slot.
 ```lua
 for name, info in pairs(maki.api.get_slots()) do
   print(name, info.owner, info.declared)
+end
+```
+
+
+## maki.plan {#maki-plan}
+
+Plan-mode surface for plugins.
+
+Read the plan, and shape the plan form by layering the two slots maki
+fires around it. Plan state is per session, so every call takes an
+optional `session` and defaults to the focused tab.
+
+`ui.plan_form.actions` is the menu. The default answers with the
+built-in rows, each `{ id, label, desc, action }`, and a layer
+appends, reorders or drops them before returning the list. Every row
+needs an `id` no other row uses, since that is how a later layer finds
+it. Anything past the 32nd row is dropped.
+
+A row carrying a `handler` has that function called on the Lua thread
+with `{ session, path, parallel }` when the user picks it. The row's
+`action` runs after the handler returns, unless the handler returned
+`false` or failed, so copying a built-in row and adding a handler
+keeps the built-in outcome. Drop the `action` to replace it.
+
+`ui.plan_form` is the form itself. A layer that answers `false` keeps
+it closed and renders the plan however it likes.
+
+Layering either slot costs every permission, the price of steering a
+call whose reach nobody declared: a row decides what pressing Enter
+does, up to a build-mode turn with every tool behind it.
+
+Unloading your plugin hands the form back and reaps its row handlers.
+
+```lua
+-- A row of your own, next to the built-in ones:
+maki.api.set_slot("ui.plan_form.actions", function(prev, ev)
+  local rows = prev(ev)
+  table.insert(rows, {
+    id = "commit_and_implement",
+    label = "Commit and implement",
+    desc = "Commit the plan file first, then implement it",
+    handler = function(opts)
+      maki.fn.system({ "git", "commit", "-am", "plan" })
+      maki.session.set_mode("build", { session = opts.session })
+      maki.session.prompt("Implement " .. opts.path, { session = opts.session })
+    end,
+  })
+  return rows
+end)
+
+-- Render the plan yourself for as long as this plugin is loaded:
+maki.api.set_slot("ui.plan_form", function(prev, ev)
+  local plan = maki.plan.read({ session = ev.session })
+  return false
+end)
+```
+
+---
+
+### `maki.plan.read()` {#maki-plan-read}
+
+```lua
+maki.plan.read({opts?})
+```
+
+Read the current plan state. Returns `{ mode, path, content, ready }`:
+- `mode` is `"plan"` or `"build"`.
+- `path` is the absolute plan path once the session has one, else `nil`.
+- `ready` is `true` once the agent has written the plan file.
+- `content` is the file contents, `nil` when the plan is not ready or the
+  read failed.
+
+**Parameters:**
+
+- `{opts?}` (`table?`) `session` (string?) Session id, defaults to focused.
+
+**Returns:** (`table|nil`, `string|nil`) Plan snapshot table, or nil and an error.
+
+**Example:**
+
+```lua
+local plan, err = maki.plan.read({ session = id })
+if plan and plan.ready then
+  print(plan.path, plan.content)
 end
 ```
 
@@ -3635,6 +3726,35 @@ observation waits for the session's next agent run.
 
 ```lua
 maki.session.notify("[monitor] deploy failed", { session = id, wake = true })
+```
+
+---
+
+### `maki.session.set_mode()` {#maki-session-set_mode}
+
+```lua
+maki.session.set_mode({mode}, {opts?})
+```
+
+Switches a live session between plan and build mode. Entering plan mode
+allocates the session's plan file if it has none.
+
+A session that is mid-plan answers the next prompt with another draft of
+the plan. Set `"build"` first and that prompt implements it.
+
+**Parameters:**
+
+- `{mode}` (`string`) "build" or "plan".
+- `{opts?}` (`table?`) Options:
+  - `session` (`string`) id of a live session, defaults to the focused one.
+
+**Returns:** (`boolean|nil`, `string|nil`) true, or nil and an error.
+
+**Example:**
+
+```lua
+maki.session.set_mode("build", { session = opts.session })
+maki.session.prompt("Implement the plan at `" .. opts.path .. "`.", { session = opts.session })
 ```
 
 ---

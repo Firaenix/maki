@@ -14,8 +14,9 @@ use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use maki_agent::permissions::{PermissionAnswer, PermissionManager};
 use maki_agent::{
-    DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot,
-    McpSnapshotReader, SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
+    AgentMode, DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus,
+    McpSnapshot, McpSnapshotReader, SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    TurnCompleteEvent,
 };
 use maki_config::{Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
@@ -66,6 +67,17 @@ const THINKING_OPTIONS: &str = "thinking_options";
 const MODEL_CHANGED_EVENT: &str = "ModelChanged";
 const PLAN_READY_EVENT: &str = "PlanReady";
 const PLAN_DRAFT_PATH: &str = "/tmp/plan.md";
+/// The draft of the session a tab switch loads, which is not the one the
+/// abandoned pick was made against.
+const OTHER_PLAN_DRAFT_NAME: &str = "other-plan.md";
+const OTHER_PLAN_TEXT: &str = "the loaded session's own plan";
+const PLUGIN_ROW_LABEL: &str = "Commit and implement";
+const PLUGIN_ROW_ID: &str = "commit_and_implement";
+const PLUGIN_ROW_OWNER: &str = "planner";
+const PLAN_MENU_GENERATION: u64 = 7;
+/// Far enough from now that a deadline built from it is plainly in the future
+/// or plainly in the past, without any test having to wait for a clock.
+const WAIT_AHEAD: Duration = Duration::from_secs(60);
 const WALK_TIMEOUT: Duration = Duration::from_secs(5);
 const CURSOR_STAYS_HIDDEN: &str = "the hardware cursor must never be shown";
 const CURSOR_ON_SCREEN: &str = "the reported cursor must be on screen";
@@ -969,6 +981,532 @@ fn plan_ready_does_not_fire_outside_plan_mode() {
     app.transition_plan(PlanTrigger::WriteDone);
 
     assert!(probe.try_recv_autocmd().is_none());
+}
+
+/// With nothing layering the plan form there is nothing to ask, so a stock
+/// install opens it in the same frame the plan lands.
+#[test_case(false ; "no_host_at_all")]
+#[test_case(true ; "a_host_with_no_layer")]
+fn an_unlayered_plan_form_opens_without_asking(hosted: bool) {
+    let mut app = test_app();
+    let _probe = hosted.then(|| {
+        let (handle, probe) = maki_lua::test_support::probed_event_handle();
+        app.lua_event_handle = handle;
+        probe
+    });
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH));
+    app.transition_plan(PlanTrigger::WriteDone);
+
+    assert!(app.plan_form.is_visible());
+    assert!(app.plan_answers.form.is_none(), "nothing to wait for");
+}
+
+/// With a layer on the slot the form waits for the chain instead of flashing
+/// open in front of whatever the plugin is about to draw.
+#[test]
+fn a_layered_plan_form_waits_for_the_slots() {
+    let mut app = test_app();
+    let (handle, _probe) = maki_lua::test_support::probed_event_handle_layering_plan_form();
+    app.lua_event_handle = handle;
+
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH));
+    app.transition_plan(PlanTrigger::WriteDone);
+
+    assert!(!app.plan_form.is_visible(), "the chains answer first");
+    assert!(app.plan_answers.form.is_some());
+}
+
+fn plugin_row(id: &str) -> maki_lua::PlanFormRow {
+    maki_lua::PlanFormRow {
+        id: id.to_owned(),
+        label: PLUGIN_ROW_LABEL.to_owned(),
+        desc: String::new(),
+        action: None,
+        plugin: Some(Arc::from(PLUGIN_ROW_OWNER)),
+    }
+}
+
+fn plan_menu(rows: Vec<maki_lua::PlanFormRow>) -> maki_lua::PlanMenu {
+    maki_lua::PlanMenu {
+        generation: PLAN_MENU_GENERATION,
+        rows,
+    }
+}
+
+/// Arms the form's answer slot with a wait that has not run out yet.
+fn awaiting_plan_form(app: &mut App) -> flume::Sender<Option<maki_lua::PlanMenu>> {
+    let (tx, rx) = flume::bounded(1);
+    app.plan_answers.form = Some((Instant::now() + WAIT_AHEAD, rx));
+    tx
+}
+
+/// The chain's answer: a list of rows opens the form with it, and `None` is
+/// a layer having taken the surface over.
+#[test_case(Some(vec![]), true ; "an_empty_menu_falls_back_to_the_builtin")]
+#[test_case(Some(vec![PLUGIN_ROW_ID]), true ; "a_layer_shaped_the_menu")]
+#[test_case(None, false ; "a_layer_took_the_surface")]
+fn the_plan_form_slot_answer_drives_the_form(answer: Option<Vec<&str>>, visible: bool) {
+    let mut app = test_app();
+    let tx = awaiting_plan_form(&mut app);
+
+    let menu = answer.map(|ids| plan_menu(ids.into_iter().map(plugin_row).collect()));
+    tx.send(menu).unwrap();
+    assert_eq!(app.tick_plan_form(), Dirty::from(visible));
+
+    assert_eq!(app.plan_form.is_visible(), visible);
+    assert!(
+        app.plan_answers.form.is_none(),
+        "the answer is consumed once"
+    );
+}
+
+/// A layer that took the surface over for this draft must not leave the last
+/// draft's rows behind, or the plan-toggle key shows a menu whose handlers
+/// answer for a plan that is no longer on screen.
+#[test]
+fn a_layer_taking_the_surface_drops_the_previous_menu() {
+    let mut app = test_app();
+    app.plan_form
+        .open_with(plan_menu(vec![plugin_row(PLUGIN_ROW_ID)]));
+    let tx = awaiting_plan_form(&mut app);
+
+    tx.send(None).unwrap();
+    assert_eq!(app.tick_plan_form(), Dirty::YES);
+
+    assert_eq!(app.plan_form.menu(), &builtin_menu());
+}
+
+/// A host that dropped the reply cannot be drawing the plan either, so the
+/// built-in form is what is left.
+#[test]
+fn a_dropped_plan_form_answer_opens_the_builtin() {
+    let mut app = test_app();
+    let tx = awaiting_plan_form(&mut app);
+    drop(tx);
+
+    assert_eq!(app.tick_plan_form(), Dirty::YES);
+    assert!(app.plan_form.is_visible());
+    assert!(app.plan_answers.form.is_none());
+}
+
+/// An unanswered chain leaves the form closed while there is still time on
+/// the clock, and the plan-toggle key reopens the built-in in the meantime.
+#[test]
+fn a_silent_plan_form_slot_leaves_the_form_closed() {
+    let mut app = test_app();
+    let _tx = awaiting_plan_form(&mut app);
+
+    assert_eq!(app.tick_plan_form(), Dirty::NO);
+
+    assert!(!app.plan_form.is_visible());
+    assert!(app.plan_answers.form.is_some(), "still waiting");
+}
+
+/// The host bounds the chains, but not the queue in front of them, where a
+/// `/reload` or a long tool call can leave the draft with no surface at all.
+#[test]
+fn a_plan_form_answer_that_never_comes_falls_back_to_the_builtin() {
+    let mut app = test_app();
+    let (_tx, rx) = flume::bounded::<Option<maki_lua::PlanMenu>>(1);
+    app.plan_answers.form = Some((Instant::now() - WAIT_AHEAD, rx));
+
+    assert_eq!(app.tick_plan_form(), Dirty::YES);
+
+    assert!(app.plan_form.is_visible());
+    assert_eq!(app.plan_form.menu(), &builtin_menu());
+    assert_eq!(app.status_bar.flash_text(), Some(FLASH_PLAN_FORM_SLOW));
+}
+
+/// Arms the pick slot with a wait that has not run out yet, as a live pick
+/// of a plugin row that kept {then}.
+fn awaiting_plan_action(
+    app: &mut App,
+    then: Option<maki_lua::PlanRowAction>,
+) -> flume::Sender<PlanActionOutcome> {
+    let (tx, rx) = flume::bounded(1);
+    let pick = app.plan_answers.abandon();
+    app.plan_answers.action = Some(PlanAction {
+        pick,
+        then,
+        deadline: Instant::now() + WAIT_AHEAD,
+        answer: rx,
+    });
+    tx
+}
+
+/// Handler-then-action: the built-in outcome the row kept runs once the
+/// handler answers, and the actions it produces are picked up by the event
+/// loop instead of being lost with the tick that made them.
+#[test]
+fn a_plugin_row_handler_that_agrees_runs_the_builtin_action() {
+    let mut app = test_app();
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
+    let tx = awaiting_plan_action(&mut app, Some(maki_lua::PlanRowAction::Implement));
+
+    tx.send(PlanActionOutcome::Proceed).unwrap();
+    assert_eq!(app.tick(), Dirty::YES);
+
+    assert_eq!(app.state.mode, Mode::Build, "implementing is build mode");
+    assert!(
+        !app.pending_actions.is_empty(),
+        "the implement prompt has to reach the event loop"
+    );
+}
+
+/// A handler that says no keeps the built-in outcome from running, which is
+/// what lets a plugin gate a built-in row on a check of its own. A veto says
+/// nothing to the user.
+#[test]
+fn a_plugin_row_handler_that_declines_drops_the_builtin_action() {
+    let mut app = test_app();
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
+    let tx = awaiting_plan_action(&mut app, Some(maki_lua::PlanRowAction::Implement));
+
+    tx.send(PlanActionOutcome::Vetoed).unwrap();
+    assert_eq!(app.tick(), Dirty::YES);
+
+    assert_eq!(app.state.mode, Mode::Plan);
+    assert!(app.pending_actions.is_empty());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        None,
+        "a veto is not a failure to report"
+    );
+}
+
+/// A handler that failed is not one that declined: the user pressed a key,
+/// the menu vanished, and neither outcome happened.
+#[test]
+fn a_plugin_row_handler_that_failed_is_flashed() {
+    let mut app = test_app();
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
+    let tx = awaiting_plan_action(&mut app, Some(maki_lua::PlanRowAction::Implement));
+
+    tx.send(PlanActionOutcome::Failed).unwrap();
+    assert_eq!(app.tick(), Dirty::YES);
+
+    assert_eq!(app.state.mode, Mode::Plan);
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(FLASH_PLAN_ACTION_FAILED),
+        "a failed pick must not look like a veto"
+    );
+}
+
+/// The user pressed a key and the menu vanished, so a pick the host never
+/// took has to say so.
+#[test]
+fn a_pick_the_host_never_took_is_flashed() {
+    let mut app = test_app();
+    let tx = awaiting_plan_action(&mut app, None);
+    drop(tx);
+
+    assert_eq!(app.tick(), Dirty::YES);
+
+    assert!(app.plan_answers.action.is_none());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(FLASH_PLAN_ACTION_LOST),
+        "a dropped pick must not be silent"
+    );
+}
+
+/// A handler parked past the window the UI gives it reads like one that
+/// never reached the host, since the form is gone either way.
+#[test]
+fn a_parked_plan_row_handler_gives_up_and_flashes() {
+    let mut app = test_app();
+    let (_tx, rx) = flume::bounded(1);
+    let pick = app.plan_answers.abandon();
+    app.plan_answers.action = Some(PlanAction {
+        pick,
+        then: Some(maki_lua::PlanRowAction::Implement),
+        deadline: Instant::now() - WAIT_AHEAD,
+        answer: rx,
+    });
+
+    assert_eq!(app.tick(), Dirty::YES);
+
+    assert!(app.plan_answers.action.is_none());
+    assert!(
+        app.pending_actions.is_empty(),
+        "the outcome the row kept does not run in the handler's place"
+    );
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(FLASH_PLAN_ACTION_LOST),
+        "a pick that ran out of time must not be silent"
+    );
+}
+
+/// A pick of a plugin row that kept the implement outcome, stamped with
+/// {pick} so a test can re-arm the same one the user made.
+fn plan_pick_action(pick: u64, answer: flume::Receiver<PlanActionOutcome>) -> PlanAction {
+    PlanAction {
+        pick,
+        then: Some(maki_lua::PlanRowAction::Implement),
+        deadline: Instant::now() + WAIT_AHEAD,
+        answer,
+    }
+}
+
+/// The handler answers long after the key press, and the user may have picked
+/// something else by then. Without this, a built-in row picked while a
+/// handler is parked implements the plan once immediately and once more when
+/// the handler comes back.
+#[test]
+fn a_stale_pick_answer_cannot_fire_a_second_implement() {
+    let mut app = test_app();
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
+    let (tx, rx) = flume::bounded(1);
+    let pick = app.plan_answers.abandon();
+    app.plan_answers.action = Some(plan_pick_action(pick, rx.clone()));
+
+    // The user reopens the form and picks a built-in row while the handler is
+    // still parked.
+    app.plan_form.open_with(builtin_menu());
+    let immediate = app.handle_plan_form_action(PlanFormAction::Implement);
+    assert!(!immediate.is_empty(), "the built-in row runs straight away");
+
+    // Re-armed the way a path that only cleared the form would leave it: the
+    // pick the answer carries is the half that retires it.
+    app.plan_answers.action = Some(plan_pick_action(pick, rx));
+    tx.send(PlanActionOutcome::Proceed).unwrap();
+    let _ = app.tick();
+
+    assert!(
+        app.pending_actions.is_empty(),
+        "the stale answer must not implement the plan a second time"
+    );
+    assert!(
+        app.plan_answers.action.is_none(),
+        "and is consumed for good"
+    );
+}
+
+/// A `/new` while a handler is parked: the draft the row was picked from is
+/// gone and the session it would implement in is not the one the user picked
+/// in, so the answer submits nothing.
+#[test]
+fn a_pick_answered_after_a_session_reset_submits_nothing() {
+    let mut app = test_app();
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
+    let (tx, rx) = flume::bounded(1);
+    let pick = app.plan_answers.abandon();
+    app.plan_answers.action = Some(plan_pick_action(pick, rx.clone()));
+    let before = app.state.session.id;
+
+    app.reset_session();
+    assert_ne!(app.state.session.id, before, "a reset is a new session");
+    assert!(
+        app.plan_answers.action.is_none(),
+        "the reset retires the pick in flight"
+    );
+
+    // Re-armed the way a reset path that only cleared the form would leave
+    // it: the pick the answer carries is the other half of the invariant.
+    app.plan_answers.action = Some(plan_pick_action(pick, rx));
+    tx.send(PlanActionOutcome::Proceed).unwrap();
+    let _ = app.tick();
+
+    assert!(
+        app.pending_actions.is_empty(),
+        "an unrequested implement must not reach the event loop"
+    );
+    assert_eq!(
+        app.state.mode,
+        Mode::Plan,
+        "and the fresh session stays in plan mode"
+    );
+}
+
+/// The same hole through a tab switch, which swaps the session in place. The
+/// menu answer goes with the pick: re-opening the abandoned draft's menu on
+/// the loaded session would hand it rows whose handlers answer for a plan it
+/// never had.
+#[test]
+fn a_pick_answered_after_another_session_loaded_submits_nothing() {
+    let mut app = test_app();
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
+    let (tx, rx) = flume::bounded(1);
+    let pick = app.plan_answers.abandon();
+    app.plan_answers.action = Some(plan_pick_action(pick, rx.clone()));
+    let _menu_tx = awaiting_plan_form(&mut app);
+
+    // The session the user switched to is planning too, with a draft of its
+    // own, so an implement that leaked into it would be plain to see.
+    let tmp = TempDir::new().unwrap();
+    let other_draft = tmp.path().join(OTHER_PLAN_DRAFT_NAME);
+    fs::write(&other_draft, OTHER_PLAN_TEXT).unwrap();
+    let mut loaded = AppSession::new(TEST_MODEL_SPEC, TEST_CWD);
+    loaded.push_message(Message::user("hello".into()));
+    loaded.meta.mode = Some(StoredMode::Plan);
+    loaded.meta.plan_path = Some(other_draft.display().to_string());
+    loaded.meta.plan_written = true;
+    let model = app.state.model.clone();
+    app.apply_loaded_session(loaded, &model);
+    assert!(
+        app.plan_answers.form.is_none(),
+        "the abandoned draft's menu answer does not follow the user"
+    );
+
+    app.plan_answers.action = Some(plan_pick_action(pick, rx));
+    tx.send(PlanActionOutcome::Proceed).unwrap();
+    let _ = app.tick();
+
+    assert!(
+        app.pending_actions.is_empty(),
+        "nothing is submitted against the session that was loaded"
+    );
+    assert_eq!(
+        app.state.mode,
+        Mode::Plan,
+        "the loaded session keeps planning"
+    );
+    assert_eq!(
+        app.state.plan,
+        PlanState::Ready(other_draft),
+        "and keeps the draft it was loaded with"
+    );
+}
+
+/// The host gives both `ui.plan_form*` chains one budget, and this wait sits
+/// strictly outside it. A layer that answers on the last second it was
+/// allowed still gets its menu drawn, instead of a discarded menu and a
+/// "slow host" flash for a host that did nothing wrong.
+#[test]
+fn the_plan_form_fallback_outlasts_the_host_budget() {
+    let mut app = test_app();
+    let (_tx, rx) = flume::bounded::<Option<maki_lua::PlanMenu>>(1);
+    // Armed one whole host budget ago, so the chains have just run out of
+    // their own time and the answer is still on its way.
+    let armed = Instant::now() - PLAN_FORM_SLOT_DEADLINE;
+    app.plan_answers.form = Some((armed + PLAN_FORM_ANSWER_WAIT, rx));
+
+    assert_eq!(app.tick_plan_form(), Dirty::NO);
+
+    assert!(app.plan_answers.form.is_some(), "still waiting on the host");
+    assert!(!app.plan_form.is_visible());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        None,
+        "a host inside its budget is not a slow host"
+    );
+}
+
+/// The same for a picked row: the host gives the handler its own budget, and
+/// this wait sits strictly outside it. A handler that answers on the last
+/// second it was allowed still gets the outcome its row kept, instead of a
+/// lost-pick flash for a handler that behaved.
+#[test]
+fn the_plan_action_fallback_outlasts_the_handler_budget() {
+    let mut app = test_app();
+    let (_tx, rx) = flume::bounded(1);
+    let pick = app.plan_answers.abandon();
+    // Armed one whole handler budget ago, so the handler has just run out of
+    // its own time and the answer is still on its way.
+    let armed = Instant::now() - PLAN_ROW_HANDLER_DEADLINE;
+    app.plan_answers.action = Some(PlanAction {
+        pick,
+        then: Some(maki_lua::PlanRowAction::Implement),
+        deadline: armed + PLAN_ACTION_ANSWER_WAIT,
+        answer: rx,
+    });
+
+    assert_eq!(app.tick_plan_action(), Dirty::NO);
+
+    assert!(
+        app.plan_answers.action.is_some(),
+        "still waiting on the handler"
+    );
+    assert_eq!(
+        app.status_bar.flash_text(),
+        None,
+        "a handler inside its budget has not lost the pick"
+    );
+}
+
+/// A draft landing while a pick is in flight retires it, handler and built-in
+/// outcome both, because the menu the row came from answered for the draft
+/// before this one. Every other way a pick is lost says so, and this one was
+/// the user's own key press.
+#[test]
+fn a_new_draft_flashes_the_pick_it_retires() {
+    let mut app = test_app();
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH));
+    let (tx, rx) = flume::bounded(1);
+    let pick = app.plan_answers.abandon();
+    app.plan_answers.action = Some(plan_pick_action(pick, rx.clone()));
+
+    app.transition_plan(PlanTrigger::WriteDone);
+
+    assert!(
+        app.plan_answers.action.is_none(),
+        "the new draft retires the pick"
+    );
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(FLASH_PLAN_ACTION_LOST),
+        "the outcome the row promised cannot go quietly"
+    );
+
+    // The handler was still running and answers anyway, carrying the pick the
+    // draft retired.
+    app.plan_answers.action = Some(plan_pick_action(pick, rx));
+    tx.send(PlanActionOutcome::Proceed).unwrap();
+    let _ = app.tick();
+
+    assert!(
+        app.pending_actions.is_empty(),
+        "the answer of a retired pick implements nothing"
+    );
+    assert_eq!(app.state.mode, Mode::Plan, "and the session keeps planning");
+}
+
+/// The mode a row handler sets is the one the next prompt runs in.
+#[test]
+fn set_mode_build_then_prompt_reaches_build_mode() {
+    let mut app = test_app();
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
+
+    app.set_mode(Mode::Build);
+
+    let actions = app.handle_submit(Submission {
+        text: "Implement the plan".to_owned(),
+        images: vec![],
+    });
+    let Some(Action::SendMessage(input)) = actions.into_iter().next() else {
+        panic!("submitting must start a turn");
+    };
+    assert_eq!(input.mode, AgentMode::Build);
+}
+
+/// The other half: a plan-mode session that only gets prompted rewrites the
+/// plan, which is the bug the mode call closes.
+#[test]
+fn prompting_without_set_mode_stays_in_plan_mode() {
+    let mut app = test_app();
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Ready(PathBuf::from(PLAN_DRAFT_PATH));
+
+    let actions = app.handle_submit(Submission {
+        text: "Implement the plan".to_owned(),
+        images: vec![],
+    });
+    let Some(Action::SendMessage(input)) = actions.into_iter().next() else {
+        panic!("submitting must start a turn");
+    };
+    assert!(matches!(input.mode, AgentMode::Plan(_)));
 }
 
 #[test]

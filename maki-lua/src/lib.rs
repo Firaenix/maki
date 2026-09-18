@@ -18,8 +18,9 @@ pub use api::pack::{Declared, PackOp};
 pub use api::session::SessionSnapshotFn;
 pub use api::util::command::{
     Anchor, Axis, Border, BuiltinAction, Dimension, Edge, FloatConfig, FloatConfigPatch,
-    HintReader, HintSnapshot, LuaCommandInfo, LuaCommandReader, ModelRequest, SessionRequest,
-    Split, TaskRequest, TitlePos, UiAction, UiAttachment, UiReply, WinCommand, WinEvent, WinView,
+    HintReader, HintSnapshot, LuaCommandInfo, LuaCommandReader, ModelRequest, PlanActionOutcome,
+    PlanFormRow, PlanMenu, PlanRequest, PlanRowAction, SessionRequest, Split, TaskRequest,
+    TitlePos, UiAction, UiAttachment, UiReply, WinCommand, WinEvent, WinView,
 };
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
@@ -34,7 +35,10 @@ pub use pack::{
     lockfile_path, prepare_pack_command, sanitize_message, site_dir,
 };
 pub use plugin_permissions::{Permission, PluginPermissions, Requested};
-pub use runtime::{KILL_GRACE, MAX_INFLIGHT_TOOLS, RestoreItem, RestoreReason, WARM_TOOL_CAP};
+pub use runtime::{
+    KILL_GRACE, MAX_INFLIGHT_TOOLS, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE,
+    RestoreItem, RestoreReason, WARM_TOOL_CAP,
+};
 pub use session_snapshot::{SessionQueueSnapshot, SessionSnapshot};
 
 pub mod test_support {
@@ -148,6 +152,13 @@ pub mod test_support {
     pub fn probed_event_handle() -> (crate::EventHandle, RequestProbe) {
         let (tx, rx) = flume::unbounded();
         (crate::EventHandle::probed_for_test(tx), RequestProbe(rx))
+    }
+
+    /// [`probed_event_handle`] for a host with a plugin layering the plan
+    /// form, the one case the UI has to ask a chain before it draws.
+    pub fn probed_event_handle_layering_plan_form() -> (crate::EventHandle, RequestProbe) {
+        let (handle, probe) = probed_event_handle();
+        (handle.layering(&[crate::api::slot::PLAN_FORM_SLOT]), probe)
     }
 
     pub fn keymap_reader_with(entries: Vec<KeymapEntry>) -> KeymapReader {

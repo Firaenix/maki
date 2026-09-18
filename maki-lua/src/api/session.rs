@@ -230,6 +230,33 @@ fn notify(_lua: &Lua, text: String, opts: Option<Table>) -> LuaResult<Pair<bool>
     Ok((Some(true), None))
 }
 
+/// Switches a live session between plan and build mode. Entering plan mode
+/// allocates the session's plan file if it has none.
+///
+/// A session that is mid-plan answers the next prompt with another draft of
+/// the plan. Set `"build"` first and that prompt implements it.
+///
+/// @param mode string "build" or "plan".
+/// @param opts table? Options:
+///   session (string) id of a live session, defaults to the focused one.
+/// @return (boolean|nil, string|nil) true, or nil and an error.
+/// @example
+/// maki.session.set_mode("build", { session = opts.session })
+/// maki.session.prompt("Implement the plan at `" .. opts.path .. "`.", { session = opts.session })
+#[lua_fn]
+async fn set_mode(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    mode: String,
+    opts: Option<Table>,
+) -> LuaResult<Pair<Value>> {
+    let id = match opts {
+        Some(opts) => opts.get("session")?,
+        None => None,
+    };
+    roundtrip(lua, tx, SessionRequest::SetMode { id, mode }).await
+}
+
 /// Renames a session, live or stored.
 ///
 /// @param opts table Required fields: id (string) session to rename;
@@ -257,7 +284,7 @@ lua_table! {
     /// attached"` without a UI. `notify` instead targets a live agent mailbox
     /// directly, so it also works under ACP and SDK frontends.
     "maki.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), live(tx), current(tx), read(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), set_title(tx)]
+    DOCS [list(tx), live(tx), current(tx), read(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), set_mode(tx), set_title(tx)]
 }
 
 #[cfg(test)]
@@ -327,6 +354,38 @@ mod tests {
         checker.join().unwrap();
         assert_eq!(err, None);
         assert_eq!(val, "queued");
+    }
+
+    /// Mode is per session like the plan it drives, so a row handler firing
+    /// for a background tab has to be able to name it.
+    #[test_case(r#"return session.set_mode('build', { session = 'abc' })"#, Some("abc"), "build" ; "explicit_session_id")]
+    #[test_case("return session.set_mode('plan')", None, "plan" ; "defaults_to_focused")]
+    fn set_mode_forwards_the_mode_and_session_id(
+        code: &str,
+        expected_id: Option<&str>,
+        expected_mode: &str,
+    ) {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_session(Some(tx));
+        let expected_id = expected_id.map(str::to_owned);
+        let expected_mode = expected_mode.to_owned();
+        let checker = std::thread::spawn(move || {
+            let Ok(UiAction::Session {
+                req: SessionRequest::SetMode { id, mode },
+                reply_tx,
+            }) = rx.recv()
+            else {
+                panic!("expected set_mode request");
+            };
+            assert_eq!(id, expected_id);
+            assert_eq!(mode, expected_mode);
+            reply_tx.send(Ok(json!(true))).unwrap();
+        });
+        let (val, err): (bool, Option<String>) =
+            smol::block_on(lua.load(code).eval_async()).unwrap();
+        checker.join().unwrap();
+        assert_eq!(err, None);
+        assert!(val);
     }
 
     #[test]

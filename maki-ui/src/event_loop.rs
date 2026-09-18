@@ -31,8 +31,8 @@ use maki_lua::session_snapshot::{
 };
 use maki_lua::{
     EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, PackCommand,
-    PackPreparation, SessionEndReason, SessionRequest, TaskRequest, UiAction, UiAttachment,
-    UiReply,
+    PackPreparation, PlanRequest, SessionEndReason, SessionRequest, TaskRequest, UiAction,
+    UiAttachment, UiReply,
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
@@ -51,6 +51,7 @@ use crate::agent::{
     AgentHandles, ModelSlot, ModelSlots,
     shared_queue::{Compaction, QueueItem, QueuedInput},
 };
+use crate::app::mode::Mode;
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::tasks::{TaskStatus, diff_task_states};
 use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
@@ -71,6 +72,7 @@ const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 const NOT_LIVE_ERR: &str = "session not live";
 const PACK_PREPARING: &str = "Checking packages...";
 const PACK_BUSY_ERR: &str = "a package command is already running";
+const UNKNOWN_MODE_ERR: &str = "unknown mode; expected \"build\" or \"plan\"";
 const PACK_PANIC_ERR: &str = "the package command stopped unexpectedly";
 
 /// Tabs carry their in-memory sessions so `/reload` reopens them without a
@@ -321,6 +323,14 @@ impl Focus {
 
 fn parse_session_id(id: &str) -> Result<MakiId, String> {
     id.parse().map_err(|e: MakiIdParseError| e.to_string())
+}
+
+fn parse_mode(mode: &str) -> Result<Mode, String> {
+    match mode {
+        MODE_BUILD => Ok(Mode::Build),
+        MODE_PLAN => Ok(Mode::Plan),
+        other => Err(format!("{UNKNOWN_MODE_ERR}, got {other:?}")),
+    }
 }
 
 struct SessionRuntime {
@@ -847,7 +857,8 @@ impl<'t> EventLoop<'t> {
     /// Only the focused session is drawn, so only it can owe a frame; focusing
     /// another is an event, and events always repaint. Background sessions
     /// still drain their floats, or a plugin writing to a window nobody is
-    /// looking at would lose the output.
+    /// looking at would lose the output, and their plan form, or a draft in a
+    /// background tab would sit unanswered until the user focused it.
     fn tick(&mut self) -> Dirty {
         let mut dirty = Dirty::NO;
         for (i, rt) in self.sessions.iter_mut().enumerate() {
@@ -855,7 +866,15 @@ impl<'t> EventLoop<'t> {
                 dirty |= rt.app.tick();
             } else {
                 let _ = rt.app.float_mgr.tick();
+                let _ = rt.app.tick_plan();
             }
+        }
+        // A plan form row outlives the key press that picked it: its handler
+        // runs on the Lua thread, and the built-in outcome the row kept
+        // follows only once that answers.
+        for i in 0..self.sessions.len() {
+            let actions = std::mem::take(&mut self.sessions[i].app.pending_actions);
+            self.dispatch(i, actions);
         }
         dirty
     }
@@ -963,6 +982,9 @@ impl<'t> EventLoop<'t> {
             }
             UiAction::Task { req, reply_tx } => {
                 let _ = reply_tx.send(self.handle_task_request(req));
+            }
+            UiAction::Plan { req, reply_tx } => {
+                let _ = reply_tx.send(self.handle_plan_request(req));
             }
             UiAction::WinSaveView { reply_tx } => {
                 let _ = reply_tx.send(self.focused_app().win_view());
@@ -1230,6 +1252,17 @@ impl<'t> EventLoop<'t> {
                     .map(|()| json!(true));
                 let _ = reply_tx.send(reply);
             }
+            // Resolved by id like the rest: a plan form row asking for build
+            // mode fires for the session whose plan landed, which may be in
+            // the background.
+            SessionRequest::SetMode { id, mode } => {
+                let reply = parse_mode(&mode).and_then(|mode| {
+                    let idx = self.resolve_session_index(id.as_deref())?;
+                    self.sessions[idx].app.set_mode(mode);
+                    Ok(json!(true))
+                });
+                let _ = reply_tx.send(reply);
+            }
             SessionRequest::SetTitle { id, title } => {
                 let title = normalize_title(&title);
                 let reply = (|| {
@@ -1280,6 +1313,16 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    /// Route a plan-surface request to the session it names, or the focused
+    /// one when it names none. Plan state is per session, so a plugin woken
+    /// by a background tab's `PlanReady` would otherwise read the wrong plan.
+    fn handle_plan_request(&mut self, req: PlanRequest) -> UiReply {
+        let idx = self.resolve_session_index(req.session())?;
+        match req {
+            PlanRequest::Read { .. } => Ok(self.sessions[idx].app.plan_snapshot()),
+        }
+    }
+
     fn handle_task_request(&mut self, req: TaskRequest) -> UiReply {
         match req {
             TaskRequest::List => Ok(json!(self.focused_app().tasks())),
@@ -1326,7 +1369,7 @@ impl<'t> EventLoop<'t> {
             cwd: app.state.session.cwd.clone(),
             title: Some(app.state.session.title.clone()),
             model: app.state.model.spec(),
-            mode: if app.state.mode == crate::app::mode::Mode::Plan {
+            mode: if app.state.mode == Mode::Plan {
                 MODE_PLAN
             } else {
                 MODE_BUILD

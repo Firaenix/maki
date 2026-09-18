@@ -170,7 +170,8 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// - `"CompactionDone"`: `data.context_size_before`,
 ///   `data.context_size_after`, and `data.context_window`.
 /// - `"PlanReady"`: `data.path`, the absolute path of the plan file the
-///   agent just wrote. Fires once per draft.
+///   agent just wrote. Fires once per draft. Plan state is per session, so
+///   pass `data.session_id` to `maki.plan.read`.
 /// - `"SessionFocusChanged"`: `data.previous_session_id`, absent on the
 ///   first focus at startup.
 /// - `"SessionStatusChanged"`: `data.status` (`"working"`, `"needs_input"`,

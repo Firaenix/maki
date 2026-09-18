@@ -188,6 +188,11 @@ impl App {
         self.last_esc = None;
         self.restoring = Arc::new(AtomicBool::new(false));
         self.plan_form.reset();
+        // The draft this chrome belonged to is gone, and the Lua thread still
+        // owes answers about it. Retiring them here is what keeps a handler
+        // that comes back after a `/new`, a rewind or a tab switch from
+        // implementing a plan in a session the user never picked in.
+        self.plan_answers.abandon();
     }
 
     pub(crate) fn restore_display(&mut self) {
