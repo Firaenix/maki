@@ -71,6 +71,19 @@ struct FloatWindow {
     last_content: Rect,
     cursor: usize,
     visible: bool,
+    /// Whether the window asked for focus when it opened. A window that did
+    /// not is never handed focus later either: it is up while the user types
+    /// somewhere else, and focusing it would turn it into a key sink.
+    opened_focused: bool,
+    /// Set by [`render_window`] while the frame paints this window into a
+    /// rect with cells in it, and moved to `on_screen` when the frame ends.
+    painting: bool,
+    /// Whether the last frame really put this window on screen. `visible` is
+    /// the plugin's own switch and says nothing about geometry: a
+    /// plugin-supplied width or height of zero paints nothing, and a claim on
+    /// a window nobody can see is a key taken from the user with no footer to
+    /// tell them where it went.
+    on_screen: bool,
     event_tx: flume::Sender<WinEvent>,
     cmd_rx: flume::Receiver<WinCommand>,
 }
@@ -156,6 +169,12 @@ impl FloatManager {
     /// The one path windows take to leave the manager. Routing every removal
     /// here is what keeps the close event, the window list, and `focused_id`
     /// from ever drifting apart.
+    ///
+    /// Focus given up by a closing window goes to the topmost window that
+    /// asked for focus when it opened, and to nothing if there is none. A
+    /// window opened `focus = false` is up while the user works somewhere
+    /// else: handing it the keyboard would turn a popup that takes five keys
+    /// into one that takes every key and drops the rest.
     fn remove_windows(&mut self, should_remove: impl Fn(&FloatWindow) -> bool) {
         let focus_lost = self
             .focused_id
@@ -175,7 +194,7 @@ impl FloatManager {
                 .windows
                 .iter()
                 .rev()
-                .find(|w| w.config.split != Split::Panel)
+                .find(|w| w.opened_focused && w.config.split != Split::Panel)
                 .map(|w| w.id);
             self.focused_rect = None;
         }
@@ -211,6 +230,9 @@ impl FloatManager {
             last_content: Rect::default(),
             cursor: 0,
             visible,
+            opened_focused: focus,
+            painting: false,
+            on_screen: false,
             event_tx,
             cmd_rx,
         };
@@ -226,19 +248,41 @@ impl FloatManager {
     /// Runs for backgrounded sessions too, or a plugin writing to a window
     /// nobody is looking at would lose its output.
     pub fn tick(&mut self) -> Dirty {
-        let mut closed_ids = Vec::new();
         let mut dirty = Dirty::NO;
-
         for win in &mut self.windows {
             if let Some(lines) = win.buf.read_if_dirty() {
                 win.cached_lines = lines;
                 win.bring_cursor_into_view();
                 dirty = Dirty::YES;
             }
+        }
+        dirty | self.drain_commands()
+    }
 
+    /// Applies what the plugins asked of their windows since the last look and
+    /// removes the ones that asked to close.
+    ///
+    /// Run before key dispatch as well as on tick: a plugin closes its window
+    /// on the Lua thread, and until that command is drained the window is
+    /// still here, still claiming its keys, and the next key would be taken
+    /// from the user by a window that is on its way out and hands it to a loop
+    /// that has already stopped reading.
+    ///
+    /// A patch that carried a `zindex` re-sorts the list, because z-order is
+    /// what decides both who is drawn in front and who answers a claimed key:
+    /// a window raised over another and left where it was opened would be drawn
+    /// in front while the one underneath went on taking the key. The sort is
+    /// stable, so windows sharing a `zindex` keep open order.
+    fn drain_commands(&mut self) -> Dirty {
+        let mut closed_ids = Vec::new();
+        let mut dirty = Dirty::NO;
+        let mut restack = false;
+
+        for win in &mut self.windows {
             loop {
                 match win.cmd_rx.try_recv() {
                     Ok(WinCommand::SetConfig(patch)) => {
+                        restack |= patch.zindex.is_some();
                         win.config.apply_patch(patch);
                     }
                     Ok(WinCommand::SetCursor(row)) => {
@@ -255,6 +299,10 @@ impl FloatManager {
                 }
                 dirty = Dirty::YES;
             }
+        }
+
+        if restack {
+            self.windows.sort_by_key(|w| w.config.zindex);
         }
 
         if !closed_ids.is_empty() {
@@ -276,19 +324,53 @@ impl FloatManager {
             .any(|win| win.visible && win.config.needs_input)
     }
 
-    pub fn handle_key(&mut self, key_event: KeyEvent) -> bool {
-        let Some(fid) = self.focused_id else {
+    /// The focused window is handed every key, ahead of every overlay the host
+    /// owns: it is the thing the user is looking at and typing into.
+    pub fn handle_focused_key(&self, key_event: KeyEvent) -> bool {
+        let Some(win) = self
+            .focused_id
+            .and_then(|fid| self.windows.iter().find(|w| w.id == fid))
+        else {
             return false;
         };
-        let Some(win) = self.windows.iter().find(|w| w.id == fid) else {
-            return false;
-        };
+        send_key(win, key_event)
+    }
 
-        let key_str = key_event_to_string(&key_event);
-        if !key_str.is_empty() {
-            let _ = win.event_tx.try_send(WinEvent::Key { key: key_str });
-        }
-        true
+    /// The keys an unfocused window declared at open, which it takes only
+    /// after every overlay the host owns has passed: a claim is up while the
+    /// user goes on working under it, so it must not outrank a modal opened
+    /// over it. A key it does claim is consumed here and never also reaches
+    /// the chat input under it, a plugin binding, or a built-in key.
+    ///
+    /// Nothing has to be released. The claim list lives on the window, so it
+    /// goes when the window does, through the one removal path, and a list can
+    /// never outlive what the user can see.
+    pub fn handle_claimed_key(&mut self, key_event: KeyEvent) -> bool {
+        // The frame this key was pressed in repaints whatever this drops, so
+        // the debt is already owed and there is nothing to report.
+        let _ = self.drain_commands();
+        let Some(win) = self.claimant(key_event) else {
+            return false;
+        };
+        send_key(win, key_event)
+    }
+
+    /// The topmost window on screen claiming {key}. `windows` is sorted by
+    /// `zindex`, so walking it backwards is the order the user sees, front
+    /// first, and a popup opened over a popup answers the key.
+    ///
+    /// Being on screen is the whole gate, and it means the last frame painted
+    /// this window into a rect with cells in it. A window sized to nothing, one
+    /// that has not painted yet and a float the plugin hid all paint nothing,
+    /// so all three advertise nothing. Otherwise a window nobody can see would
+    /// hold keys for the rest of the run while drawing no footer to say so, and
+    /// unlike a `maki.keymap.set` binding a claim appears in no list the user
+    /// can read.
+    fn claimant(&self, key: KeyEvent) -> Option<&FloatWindow> {
+        self.windows
+            .iter()
+            .rev()
+            .find(|w| w.on_screen && w.config.keys.contains(&(key.code, key.modifiers)))
     }
 
     pub fn handle_paste(&self, text: &str) -> bool {
@@ -328,21 +410,31 @@ impl FloatManager {
             })
     }
 
-    /// Deliberately blind to `visible`: `view` paints every float whatever
-    /// that flag says, and a window that is drawn but left out of the stack
-    /// would land right on top of whoever took its slot.
+    /// A hidden float is not painted, so it takes no stack room either and the
+    /// windows behind it close the gap the way they do when one goes away for
+    /// good. Leaving it in the sum would hold a slot nobody can see open.
     fn stacks(win: &FloatWindow) -> bool {
-        win.config.stack && win.config.split == Split::None
+        win.visible && win.config.stack && win.config.split == Split::None
     }
 
     /// {caret} is the cell the frame being painted put the chat input caret
     /// on, so an [`Anchor::InputCaret`] window follows it through wraps and
     /// resizes with nobody re-placing it.
+    ///
+    /// A hidden float is skipped whole: `visible` is the plugin's switch for
+    /// being on screen at all, so hiding one takes it off the screen and its
+    /// claims with it, instead of leaving a popup drawn with a footer whose
+    /// keys fall through to the chat input.
+    ///
+    /// The last float pass of the frame, so it is also where the frame's
+    /// painting is settled: the splits and panels drawn earlier have already
+    /// marked themselves, and what every window did this frame becomes what it
+    /// did on the last one, which is what a claim is weighed against.
     pub fn view(&mut self, frame: &mut Frame, area: Rect, caret: Option<Position>) -> Rect {
         let mut union = Rect::default();
 
         for idx in 0..self.windows.len() {
-            if self.windows[idx].config.split != Split::None {
+            if self.windows[idx].config.split != Split::None || !self.windows[idx].visible {
                 continue;
             }
             let popup = resolve_rect(
@@ -356,6 +448,10 @@ impl FloatManager {
             }
             self.render_window(frame, idx, popup);
             union = union_rect(union, popup);
+        }
+
+        for win in &mut self.windows {
+            win.on_screen = std::mem::take(&mut win.painting);
         }
 
         union
@@ -410,9 +506,12 @@ impl FloatManager {
         self.render_window(frame, idx, rect);
     }
 
+    /// Every caller resolves {popup} first and skips a window it left with no
+    /// cells, so reaching here is what puts a window on screen this frame.
     fn render_window(&mut self, frame: &mut Frame, idx: usize, popup: Rect) {
         let t = theme::current();
         let win = &mut self.windows[idx];
+        win.painting = true;
 
         frame.render_widget(Clear, popup);
 
@@ -565,6 +664,18 @@ impl FloatManager {
     pub fn close_all(&mut self) {
         self.remove_windows(|_| true);
     }
+}
+
+/// Hands {key_event} to {win} and reports the key spent. A key with no
+/// spelling is spent all the same: the window it was routed to is the thing
+/// the user is aiming at, and passing it on would run a built-in binding
+/// behind a modal float.
+fn send_key(win: &FloatWindow, key_event: KeyEvent) -> bool {
+    let key = key_event_to_string(&key_event);
+    if !key.is_empty() {
+        let _ = win.event_tx.try_send(WinEvent::Key { key });
+    }
+    true
 }
 
 fn hint_footer<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Line<'static> {
@@ -795,6 +906,7 @@ impl Overlay for FloatManager {
 mod tests {
     use super::*;
     use crate::repaint::expect::{OWED, QUIET};
+    use crossterm::event::{KeyCode, KeyModifiers};
     use maki_agent::SnapshotSpan;
     use maki_lua::{Dimension, FloatConfigPatch};
     use test_case::test_case;
@@ -805,6 +917,11 @@ mod tests {
     const EXPECT_PASTE_TRUE: &str = "handle_paste should return true when focused";
     const EXPECT_PASTE_FALSE: &str = "handle_paste should return false with no focus";
     const PASTE_TEXT: &str = "hello";
+    const CLAIM_NOT_DELIVERED: &str = "the window a key was claimed for never got it";
+    const CLAIM_LEAKED: &str = "a key nobody claimed was taken from what is underneath";
+    const EXPECT_PAINTED: &str = "a float with cells to fill must be on screen after a frame";
+    const EXPECT_HIDDEN_UNPAINTED: &str =
+        "a hidden float must be off the screen, footer, claims and all";
     const EXPECT_MODAL: &str = "expected a focused float to be modal";
     const EXPECT_NOT_MODAL: &str = "expected a focused split to not be modal";
     const NO_STACK_OFFSET: u16 = 0;
@@ -1270,6 +1387,28 @@ mod tests {
         );
     }
 
+    /// A hidden float is not drawn, so it holds no slot either: the float
+    /// behind it takes the rows it had, the way it would if it had closed.
+    #[test]
+    fn a_hidden_stacked_float_gives_up_its_slot() {
+        let mut mgr = FloatManager::new();
+        let first = open_float(&mut mgr, stack_config(Anchor::NE, true));
+        let hidden = open_float(
+            &mut mgr,
+            FloatConfig {
+                visible: false,
+                ..stack_config(Anchor::NE, true)
+            },
+        );
+        let last = open_float(&mut mgr, stack_config(Anchor::NE, true));
+
+        assert_eq!(
+            rows_by_id(&mgr),
+            vec![(first, 1), (hidden, 1), (last, 6)],
+            "{EXPECT_STACK_CLOSES_GAP}",
+        );
+    }
+
     #[test]
     fn plain_float_neither_shifts_nor_joins_the_stack() {
         let mut mgr = FloatManager::new();
@@ -1467,7 +1606,7 @@ mod tests {
             crossterm::event::KeyCode::Char('a'),
             crossterm::event::KeyModifiers::NONE,
         );
-        let handled = mgr.handle_key(key_event);
+        let handled = mgr.handle_focused_key(key_event);
         assert!(handled, "true when a window has focus");
 
         let evt = event_rx.drain().find(|e| matches!(e, WinEvent::Key { .. }));
@@ -1482,9 +1621,252 @@ mod tests {
             crossterm::event::KeyModifiers::NONE,
         );
         assert!(
-            !mgr.handle_key(key_event),
-            "handle_key should return false with no windows"
+            !mgr.handle_focused_key(key_event),
+            "handle_focused_key should return false with no windows"
         );
+        assert!(
+            !mgr.handle_claimed_key(key_event),
+            "handle_claimed_key should return false with no windows"
+        );
+    }
+
+    /// One frame, which is what arms a claim: a window takes only the keys it
+    /// declared *and* painted for.
+    fn paint(mgr: &mut FloatManager) {
+        let area = Rect::new(0, 0, 80, 40);
+        render_into(mgr, area, |m, f| {
+            m.view(f, area, NO_CARET);
+        });
+    }
+
+    /// An unfocused window that declared {claims}, as the completion popup
+    /// opens one: the user goes on typing into the chat input under it. The
+    /// command end comes back because dropping it closes the window.
+    fn open_claiming(
+        mgr: &mut FloatManager,
+        claims: &[(KeyCode, KeyModifiers)],
+        zindex: u16,
+    ) -> WinChannels {
+        let (event_tx, cmd_rx, event_rx, cmd_tx) = make_channels();
+        let config = FloatConfig {
+            zindex,
+            keys: claims.to_vec(),
+            ..FloatConfig::default()
+        };
+        mgr.open(make_buf(&["x"]), config, false, event_tx, cmd_rx);
+        paint(mgr);
+        (event_rx, cmd_tx)
+    }
+
+    fn took_a_key(events: &flume::Receiver<WinEvent>) -> bool {
+        events.drain().any(|e| matches!(e, WinEvent::Key { .. }))
+    }
+
+    /// The one gap the layer machinery existed to close: an unfocused window
+    /// has to be able to take the keys its footer advertises, and the key must
+    /// not also reach whatever is underneath.
+    #[test]
+    fn an_unfocused_window_takes_the_keys_it_claimed() {
+        let mut mgr = FloatManager::new();
+        let (events, _cmd_tx) = open_claiming(&mut mgr, &[(KeyCode::Tab, KeyModifiers::NONE)], 50);
+
+        assert!(mgr.handle_claimed_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(took_a_key(&events), "{CLAIM_NOT_DELIVERED}");
+    }
+
+    /// Everything else goes on to the chat input, which is where the user is
+    /// typing while the popup is up.
+    #[test]
+    fn an_unfocused_window_leaves_every_other_key_alone() {
+        let mut mgr = FloatManager::new();
+        let (events, _cmd_tx) = open_claiming(&mut mgr, &[(KeyCode::Tab, KeyModifiers::NONE)], 50);
+
+        assert!(!mgr.handle_claimed_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)));
+        assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
+    }
+
+    /// Modifiers are compared exactly, the way a keymap binding is, so a
+    /// window claiming `<C-n>` never answers a bare `n` the user typed.
+    #[test]
+    fn a_claim_answers_only_its_own_modifiers() {
+        let mut mgr = FloatManager::new();
+        let (events, _cmd_tx) =
+            open_claiming(&mut mgr, &[(KeyCode::Char('n'), KeyModifiers::CONTROL)], 50);
+
+        assert!(!mgr.handle_claimed_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)));
+        assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
+    }
+
+    /// Two popups claiming one key is the ordinary stacking question, and the
+    /// answer is the one the user is looking at.
+    #[test]
+    fn the_topmost_claiming_window_takes_the_key() {
+        let mut mgr = FloatManager::new();
+        let (under, _under_tx) = open_claiming(&mut mgr, &[(KeyCode::Esc, KeyModifiers::NONE)], 10);
+        let (over, _over_tx) = open_claiming(&mut mgr, &[(KeyCode::Esc, KeyModifiers::NONE)], 90);
+
+        assert!(mgr.handle_claimed_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(took_a_key(&over), "{CLAIM_NOT_DELIVERED}");
+        assert!(!took_a_key(&under), "{CLAIM_LEAKED}");
+    }
+
+    /// Raising a popup over another is one `set_config` away, and z-order
+    /// decides the claim as well as the paint order. Without the re-sort the
+    /// window drawn in front watched the one underneath go on answering its
+    /// key.
+    #[test]
+    fn raising_a_window_moves_the_claim_with_it() {
+        let mut mgr = FloatManager::new();
+        let (under, under_tx) =
+            open_claiming(&mut mgr, &[(KeyCode::Enter, KeyModifiers::NONE)], 10);
+        let (over, _over_tx) = open_claiming(&mut mgr, &[(KeyCode::Enter, KeyModifiers::NONE)], 90);
+
+        under_tx
+            .send(WinCommand::SetConfig(FloatConfigPatch {
+                zindex: Some(99),
+                ..FloatConfigPatch::default()
+            }))
+            .unwrap();
+
+        assert!(mgr.handle_claimed_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(took_a_key(&under), "{CLAIM_NOT_DELIVERED}");
+        assert!(!took_a_key(&over), "{CLAIM_LEAKED}");
+    }
+
+    /// The sort is stable, so a patch that only levels two windows leaves the
+    /// one opened later in front, which is where the user has been seeing it.
+    #[test]
+    fn levelling_the_zindex_keeps_open_order() {
+        let mut mgr = FloatManager::new();
+        let (under, under_tx) = open_claiming(&mut mgr, &[(KeyCode::Tab, KeyModifiers::NONE)], 10);
+        let (over, _over_tx) = open_claiming(&mut mgr, &[(KeyCode::Tab, KeyModifiers::NONE)], 90);
+
+        under_tx
+            .send(WinCommand::SetConfig(FloatConfigPatch {
+                zindex: Some(90),
+                ..FloatConfigPatch::default()
+            }))
+            .unwrap();
+
+        assert!(mgr.handle_claimed_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(took_a_key(&over), "{CLAIM_NOT_DELIVERED}");
+        assert!(!took_a_key(&under), "{CLAIM_LEAKED}");
+    }
+
+    /// What bounds a claim, and the whole reason there is nothing to release:
+    /// the list lives on the window and goes out with it.
+    #[test]
+    fn a_claim_dies_with_the_window() {
+        let mut mgr = FloatManager::new();
+        let (events, _cmd_tx) = open_claiming(&mut mgr, &[(KeyCode::Tab, KeyModifiers::NONE)], 50);
+
+        mgr.close_all();
+
+        assert!(!mgr.handle_claimed_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
+    }
+
+    /// The close runs on the Lua thread, so between it and the next tick the
+    /// window is still in the list. A key claimed there would be handed to a
+    /// loop that has stopped reading and lost, which is why dispatch drains
+    /// the commands first.
+    #[test]
+    fn a_window_closing_this_instant_claims_nothing() {
+        let mut mgr = FloatManager::new();
+        let (events, cmd_tx) = open_claiming(&mut mgr, &[(KeyCode::Enter, KeyModifiers::NONE)], 50);
+
+        cmd_tx.send(WinCommand::Close).unwrap();
+
+        assert!(!mgr.handle_claimed_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
+        assert!(!mgr.is_open(), "{EXPECT_CLOSED}");
+    }
+
+    /// A window opened hidden is not on screen yet, so the keys it advertises
+    /// are advertised to nobody.
+    #[test]
+    fn a_hidden_window_claims_nothing() {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, event_rx, _cmd_tx) = make_channels();
+        let config = FloatConfig {
+            visible: false,
+            keys: vec![(KeyCode::Tab, KeyModifiers::NONE)],
+            ..FloatConfig::default()
+        };
+        mgr.open(make_buf(&["x"]), config, false, event_tx, cmd_rx);
+        paint(&mut mgr);
+
+        assert!(!mgr.handle_claimed_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(!took_a_key(&event_rx), "{CLAIM_LEAKED}");
+    }
+
+    /// The other half of the same rule: a window the plugin hides is not drawn
+    /// either. While it was, `win:hide()` left a popup on screen advertising
+    /// `Esc close` in its footer with the Esc falling through to the chat input
+    /// underneath.
+    #[test]
+    fn hiding_a_window_takes_it_off_the_screen_and_out_of_the_claim() {
+        let mut mgr = FloatManager::new();
+        let (events, cmd_tx) = open_claiming(&mut mgr, &[(KeyCode::Esc, KeyModifiers::NONE)], 50);
+        assert!(mgr.windows[0].on_screen, "{EXPECT_PAINTED}");
+
+        cmd_tx.send(WinCommand::SetVisible(false)).unwrap();
+        let _ = mgr.tick();
+        let area = Rect::new(0, 0, 80, 40);
+        render_into(&mut mgr, area, |m, f| {
+            assert_eq!(
+                m.view(f, area, NO_CARET),
+                Rect::default(),
+                "{EXPECT_HIDDEN_UNPAINTED}"
+            );
+        });
+
+        assert!(!mgr.windows[0].on_screen, "{EXPECT_HIDDEN_UNPAINTED}");
+        assert!(!mgr.handle_claimed_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
+    }
+
+    /// `visible` is the plugin's own flag and says nothing about geometry. A
+    /// window sized to nothing paints nothing, so it can advertise nothing,
+    /// and a claim it kept would take `<CR>` and `<Esc>` from the user for the
+    /// rest of the run with no footer anywhere to say where they went.
+    #[test]
+    fn a_window_sized_to_nothing_claims_nothing() {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, event_rx, _cmd_tx) = make_channels();
+        let config = FloatConfig {
+            width: Dimension::Abs(0),
+            height: Dimension::Abs(0),
+            keys: vec![(KeyCode::Enter, KeyModifiers::NONE)],
+            ..FloatConfig::default()
+        };
+        mgr.open(make_buf(&["x"]), config, false, event_tx, cmd_rx);
+        paint(&mut mgr);
+
+        assert!(!mgr.handle_claimed_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(!took_a_key(&event_rx), "{CLAIM_LEAKED}");
+    }
+
+    /// A claim is armed by the frame that painted it, so a window opened
+    /// between two frames holds nothing yet: until the user can see it, the
+    /// key still belongs to whatever was already on screen.
+    #[test]
+    fn a_window_that_has_not_painted_yet_claims_nothing() {
+        let mut mgr = FloatManager::new();
+        let (event_tx, cmd_rx, event_rx, _cmd_tx) = make_channels();
+        let config = FloatConfig {
+            keys: vec![(KeyCode::Tab, KeyModifiers::NONE)],
+            ..FloatConfig::default()
+        };
+        mgr.open(make_buf(&["x"]), config, false, event_tx, cmd_rx);
+
+        assert!(!mgr.handle_claimed_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(!took_a_key(&event_rx), "{CLAIM_LEAKED}");
+
+        paint(&mut mgr);
+
+        assert!(mgr.handle_claimed_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert!(took_a_key(&event_rx), "{CLAIM_NOT_DELIVERED}");
     }
 
     #[test]
@@ -1691,7 +2073,7 @@ mod tests {
             crossterm::event::KeyCode::Char('x'),
             crossterm::event::KeyModifiers::NONE,
         );
-        mgr.handle_key(key_event);
+        mgr.handle_focused_key(key_event);
 
         let win1_keys: Vec<_> = erx1
             .drain()
@@ -1930,9 +2312,10 @@ mod tests {
         assert_eq!(mgr.tick(), Dirty::NO, "{QUIET}");
     }
 
-    /// `visible` only gates panel windows in [`FloatManager::panel_reqs`]; a
-    /// popup is drawn either way, spinner spans and all, so gating the cadence
-    /// on it would freeze a plugin's spinner instead of saving frames.
+    /// A hidden window is not painted, and the cadence is what notices it
+    /// asking to come back: [`FloatManager::tick`] is the only thing that
+    /// drains the commands, so going idle over a hidden window would leave its
+    /// `SetVisible(true)` unread and the window hidden for good.
     #[test]
     fn cadence_spins_while_any_window_is_open_visible_or_not() {
         let mut mgr = FloatManager::new();
@@ -1947,7 +2330,7 @@ mod tests {
         assert_eq!(
             mgr.cadence(),
             Cadence::SPINNER,
-            "an invisible window still counts as open, so the loop keeps painting it"
+            "an invisible window still counts as open, so the loop keeps draining it"
         );
 
         mgr.close_all();
@@ -1990,8 +2373,8 @@ mod tests {
             crossterm::event::KeyModifiers::NONE,
         );
         assert!(
-            !mgr.handle_key(key_event),
-            "no windows remain, so handle_key must return false",
+            !mgr.handle_focused_key(key_event),
+            "no windows remain, so handle_focused_key must return false",
         );
     }
 
@@ -2036,6 +2419,9 @@ mod tests {
             last_content: Rect::default(),
             cursor: 0,
             visible: true,
+            opened_focused: true,
+            painting: false,
+            on_screen: false,
             event_tx,
             cmd_rx,
         }
@@ -2173,7 +2559,7 @@ mod tests {
         }
     }
 
-    fn open_split(mgr: &mut FloatManager, dir: Split, extent: u16, focus: bool) -> SplitChannels {
+    fn open_split(mgr: &mut FloatManager, dir: Split, extent: u16, focus: bool) -> WinChannels {
         let (event_tx, cmd_rx, event_rx, cmd_tx) = make_channels();
         mgr.open(
             make_buf(&["split"]),
@@ -2185,7 +2571,7 @@ mod tests {
         (event_rx, cmd_tx)
     }
 
-    type SplitChannels = (flume::Receiver<WinEvent>, flume::Sender<WinCommand>);
+    type WinChannels = (flume::Receiver<WinEvent>, flume::Sender<WinCommand>);
 
     fn render_into(
         mgr: &mut FloatManager,
@@ -2310,13 +2696,35 @@ mod tests {
     fn removing_focused_window_recovers_focus_to_survivor() {
         let mut mgr = FloatManager::new();
         let (tx1, rx1, _erx1, _ctx1) = make_channels();
-        mgr.open(make_buf(&["a"]), FloatConfig::default(), false, tx1, rx1);
+        mgr.open(make_buf(&["a"]), FloatConfig::default(), true, tx1, rx1);
         let survivor = mgr.windows[0].id;
 
         let _ = open_split(&mut mgr, Split::Below, 5, true);
 
         mgr.remove_windows(|w| w.config.split == Split::Below);
         assert_eq!(mgr.focused_id, Some(survivor), "{EXPECT_FOCUS_RECOVERS}");
+    }
+
+    const EXPECT_NO_PROMOTION: &str =
+        "a window opened unfocused must never be handed focus, or it swallows every key";
+
+    /// The completion popup is up while the user types into the chat input
+    /// underneath. Handing it the focus a closing modal gave up would turn it
+    /// into a key sink: it is handed every key, looks up the few it knows, and
+    /// drops the rest, so typing stops arriving with nothing to show why.
+    #[test]
+    fn a_window_opened_unfocused_is_never_handed_focus() {
+        let mut mgr = FloatManager::new();
+        let (events, _cmd_tx) = open_claiming(&mut mgr, &[(KeyCode::Tab, KeyModifiers::NONE)], 50);
+        let (tx, rx, _erx, _ctx) = make_channels();
+        mgr.open(make_buf(&["modal"]), make_config(), true, tx, rx);
+        let modal = mgr.windows.last().expect(EXPECT_OPEN).id;
+
+        mgr.remove_windows(|w| w.id == modal);
+
+        assert_eq!(mgr.focused_id, None, "{EXPECT_NO_PROMOTION}");
+        assert!(!mgr.handle_focused_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)));
+        assert!(!took_a_key(&events), "{CLAIM_LEAKED}");
     }
 
     const EXPECT_ZERO_RECT_NOOP: &str =

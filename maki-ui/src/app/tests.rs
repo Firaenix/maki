@@ -4931,13 +4931,7 @@ fn install_override(
     key: KeyCode,
     modifiers: KeyModifiers,
 ) -> maki_lua::test_support::RequestProbe {
-    app.keymap_reader = maki_lua::test_support::keymap_reader_with(vec![maki_lua::KeymapEntry {
-        key,
-        modifiers,
-        desc: "plugin override".into(),
-        plugin: Arc::from("test-plugin"),
-        id: 1,
-    }]);
+    app.keymap_reader = maki_lua::test_support::keymap_reader_with(vec![(key, modifiers)]);
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
     probe
@@ -4954,28 +4948,29 @@ fn override_shadows_builtin_ctrl_when_no_overlay_open() {
     let actions = app.update(Msg::Key(kb::HELP.to_key_event()));
 
     assert!(actions.is_empty());
-    assert!(probe.try_recv().is_some(), "{OVERRIDE_DISPATCHED}");
+    assert!(probe.try_recv_keybind().is_some(), "{OVERRIDE_DISPATCHED}");
     assert!(
         !app.help_modal.is_open(),
         "override must consume the key before the built-in HELP handler runs"
     );
 }
 
+/// A plugin that binds Ctrl+C and then parks, or never answers, would leave
+/// the user with no way out of the app. Quitting is resolved before any
+/// plugin sees the key, the way suspending already was.
 #[test]
-fn override_shadows_quit_builtin() {
+fn override_does_not_shadow_quit() {
     let mut app = test_app();
     app.status = Status::Idle;
     let probe = install_override(&mut app, kb::QUIT.code, kb::QUIT.modifiers);
 
-    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    app.update(Msg::Key(kb::QUIT.to_key_event()));
 
-    assert!(actions.is_empty());
-    assert!(probe.try_recv().is_some(), "{OVERRIDE_DISPATCHED}");
-    assert_eq!(
-        app.exit_request,
-        ExitRequest::None,
-        "override must consume Ctrl+C before the built-in quit handler runs"
+    assert!(
+        probe.try_recv_keybind().is_none(),
+        "{OVERRIDE_NOT_DISPATCHED}"
     );
+    assert_eq!(app.exit_request, ExitRequest::Success);
 }
 
 #[test]
@@ -4987,7 +4982,7 @@ fn override_shadows_tab_mode_toggle() {
     let actions = app.update(Msg::Key(key(KeyCode::Tab)));
 
     assert!(actions.is_empty());
-    assert!(probe.try_recv().is_some(), "{OVERRIDE_DISPATCHED}");
+    assert!(probe.try_recv_keybind().is_some(), "{OVERRIDE_DISPATCHED}");
     assert_eq!(
         app.state.mode, initial_mode,
         "override must consume Tab before the built-in mode toggle runs"
@@ -5002,7 +4997,7 @@ fn override_shadows_esc_builtin() {
     let actions = app.update(Msg::Key(key(KeyCode::Esc)));
 
     assert!(actions.is_empty());
-    assert!(probe.try_recv().is_some(), "{OVERRIDE_DISPATCHED}");
+    assert!(probe.try_recv_keybind().is_some(), "{OVERRIDE_DISPATCHED}");
     assert!(
         app.last_esc.is_none(),
         "override must consume Esc before the built-in esc handler runs"
@@ -5021,7 +5016,10 @@ fn override_does_not_shadow_suspend() {
         actions.iter().any(|a| matches!(a, Action::Suspend)),
         "suspend is non-remappable: override must not shadow Ctrl+Z"
     );
-    assert!(probe.try_recv().is_none(), "{OVERRIDE_NOT_DISPATCHED}");
+    assert!(
+        probe.try_recv_keybind().is_none(),
+        "{OVERRIDE_NOT_DISPATCHED}"
+    );
 }
 
 #[test]
@@ -5050,7 +5048,10 @@ fn plan_toggle_beats_override_when_open_and_after_dismiss() {
         app.plan_form.is_visible(),
         "Ctrl+T must reopen the dismissed plan form despite the override"
     );
-    assert!(probe.try_recv().is_none(), "{OVERRIDE_NOT_DISPATCHED}");
+    assert!(
+        probe.try_recv_keybind().is_none(),
+        "{OVERRIDE_NOT_DISPATCHED}"
+    );
 }
 
 #[test]
@@ -5068,7 +5069,159 @@ fn streaming_cancel_wins_over_quit_override() {
     );
     assert_eq!(app.status, Status::Idle);
     assert_eq!(app.exit_request, ExitRequest::None);
-    assert!(probe.try_recv().is_none(), "{OVERRIDE_NOT_DISPATCHED}");
+    assert!(
+        probe.try_recv_keybind().is_none(),
+        "{OVERRIDE_NOT_DISPATCHED}"
+    );
+}
+
+const CLAIM_DELIVERED: &str = "the popup that claimed the key must be handed it";
+const CLAIM_NOT_DELIVERED: &str = "the popup must not be handed a key it never claimed";
+
+/// Opens an unfocused float claiming {keys}, the way the completion popup
+/// does: the user goes on typing into the chat input under it. The command end
+/// comes back because dropping it is what closes the window.
+///
+/// One frame is painted before it returns, because a claim is only live for a
+/// window the last frame put on screen.
+fn open_claiming_popup_keys(
+    app: &mut App,
+    keys: &[(KeyCode, KeyModifiers)],
+) -> (flume::Receiver<WinEvent>, flume::Sender<WinCommand>) {
+    let (event_tx, event_rx) = flume::bounded::<WinEvent>(8);
+    let (cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+    let config = FloatConfig {
+        keys: keys.to_vec(),
+        ..FloatConfig::default()
+    };
+    app.float_mgr
+        .open(Arc::new(SharedBuf::new()), config, false, event_tx, cmd_rx);
+    let _ = draw_to_buffer(app);
+    (event_rx, cmd_tx)
+}
+
+fn open_claiming_popup(
+    app: &mut App,
+    key: KeyCode,
+    modifiers: KeyModifiers,
+) -> (flume::Receiver<WinEvent>, flume::Sender<WinCommand>) {
+    open_claiming_popup_keys(app, &[(key, modifiers)])
+}
+
+fn took_a_key(events: &flume::Receiver<WinEvent>) -> bool {
+    events.drain().any(|e| matches!(e, WinEvent::Key { .. }))
+}
+
+/// The gap every layer, scope and priority rule existed to close: a popup the
+/// user is not focused on has to take the keys its footer advertises, and the
+/// chat input under it must not also see them.
+#[test]
+fn a_key_an_unfocused_popup_claimed_never_reaches_the_chat_input() {
+    const TYPED: char = '@';
+    let mut app = test_app();
+    let (events, _cmd_tx) = open_claiming_popup(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+    app.update(Msg::Key(key(KeyCode::Char(TYPED))));
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert!(actions.is_empty(), "no turn was sent");
+    assert_eq!(app.input_box.buffer.value(), TYPED.to_string());
+    assert!(took_a_key(&events), "{CLAIM_DELIVERED}");
+}
+
+/// Everything the popup did not claim is still the chat input's, which is the
+/// whole point of leaving it unfocused: the user keeps typing.
+#[test]
+fn a_key_no_popup_claimed_still_reaches_the_chat_input() {
+    const TYPED: char = 'a';
+    let mut app = test_app();
+    let (events, _cmd_tx) = open_claiming_popup(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+
+    app.update(Msg::Key(key(KeyCode::Char(TYPED))));
+
+    assert_eq!(app.input_box.buffer.value(), TYPED.to_string());
+    assert!(!took_a_key(&events), "{CLAIM_NOT_DELIVERED}");
+}
+
+/// A claim is not a priority. The popup is up while the user works under it,
+/// so the modal they opened over it is what they are aiming at: an Enter
+/// answered by the popup would insert a completion row and leave the file
+/// picker waiting on a key that never comes. The claim is the popup's again
+/// as soon as the modal is gone.
+#[test]
+fn a_modal_opened_over_a_popup_outranks_the_keys_it_claimed() {
+    let mut app = test_app();
+    let claims = [
+        (KeyCode::Enter, KeyModifiers::NONE),
+        (KeyCode::Esc, KeyModifiers::NONE),
+    ];
+    let (events, _cmd_tx) = open_claiming_popup_keys(&mut app, &claims);
+
+    app.update(Msg::Key(kb::FILE_PICKER.to_key_event()));
+    assert!(
+        app.file_picker.is_open(),
+        "an unclaimed key still reaches the built-in that opens the modal"
+    );
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(!took_a_key(&events), "{CLAIM_NOT_DELIVERED}");
+
+    app.file_picker.close();
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(took_a_key(&events), "{CLAIM_DELIVERED}");
+}
+
+/// The command palette is one of those overlays, so it is answered with the
+/// rest of them and above every claim: the `/` command the user is typing keeps
+/// its own Tab and Enter whatever a popup declared. The bundled completion
+/// popup closes itself on a leading `/`, but that answer arrives a Lua round
+/// trip after the keystroke, so the rule has to hold in the host.
+#[test]
+fn the_command_palette_outranks_the_keys_a_popup_claimed() {
+    let mut app = test_app();
+    let claims = [
+        (KeyCode::Enter, KeyModifiers::NONE),
+        (KeyCode::Tab, KeyModifiers::NONE),
+    ];
+    let (events, _cmd_tx) = open_claiming_popup_keys(&mut app, &claims);
+
+    type_slash(&mut app);
+    app.update(Msg::Key(key(KeyCode::Char('n'))));
+    assert!(app.command_palette.is_active(), "the palette is up");
+
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    assert!(
+        app.input_box.buffer.value().starts_with("/new"),
+        "Tab completed the command instead of moving a popup row"
+    );
+
+    let actions = app.update(Msg::Key(key(KeyCode::Enter)));
+    assert!(
+        matches!(&actions[0], Action::RestartAgent(h) if h.is_empty()),
+        "Enter ran the command the user was typing"
+    );
+    assert!(!took_a_key(&events), "{CLAIM_NOT_DELIVERED}");
+}
+
+/// What bounds a claim, and why there is nothing to release: the list lives on
+/// the window, so the built-in key comes back the moment the window does not.
+#[test]
+fn a_popup_that_closed_gives_its_keys_back() {
+    let mut app = test_app();
+    let mode = app.state.mode;
+    let (_events, cmd_tx) = open_claiming_popup(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+
+    app.update(Msg::Key(key(KeyCode::Tab)));
+    assert_eq!(app.state.mode, mode, "the popup had the key");
+
+    drop(cmd_tx);
+    let _ = app.float_mgr.tick();
+    app.update(Msg::Key(key(KeyCode::Tab)));
+
+    assert_ne!(
+        app.state.mode, mode,
+        "the built-in binding has the key back"
+    );
 }
 
 #[test]
@@ -5101,7 +5254,78 @@ fn streaming_cancel_wins_over_esc_override() {
         "built-in cancel must win while streaming even when Esc is overridden"
     );
     assert_eq!(app.status, Status::Idle);
-    assert!(probe.try_recv().is_none(), "{OVERRIDE_NOT_DISPATCHED}");
+    assert!(
+        probe.try_recv_keybind().is_none(),
+        "{OVERRIDE_NOT_DISPATCHED}"
+    );
+}
+
+/// The same key, claimed by a popup instead of bound globally: it puts
+/// `Esc close` in its own footer, so taking the key from it leaves the user
+/// pressing Esc at a popup that will not go away while the flash tells them to
+/// press again - and the second press destroys the turn they were reading.
+/// The popup takes the first Esc, and the next one, with the popup gone, arms
+/// the cancel. No conditional reservation, just the order of the chain.
+#[test]
+fn a_popup_claiming_esc_closes_before_the_streaming_cancel_is_armed() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let (events, cmd_tx) = open_claiming_popup(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert!(actions.is_empty(), "the popup took the Esc");
+    assert!(took_a_key(&events), "{CLAIM_DELIVERED}");
+    assert_eq!(app.status, Status::Streaming);
+    assert!(
+        app.last_esc.is_none(),
+        "the cancel is not armed while the popup is the thing in front"
+    );
+
+    // The popup answers its own Esc by closing, which is what hands the key
+    // back for the press the user was reaching for.
+    drop(cmd_tx);
+    let _ = app.float_mgr.tick();
+    app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert!(app.last_esc.is_some(), "the second Esc arms the cancel");
+    assert_eq!(app.status, Status::Streaming, "and not in one press");
+}
+
+/// With nothing on screen the first Esc arms the cancel on its own, which is
+/// the behaviour the popup above borrows for one press and gives back.
+#[test]
+fn the_first_esc_arms_the_streaming_cancel_with_no_popup_up() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+
+    app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert!(app.last_esc.is_some(), "the cancel is armed");
+    assert_eq!(app.status, Status::Streaming, "and not taken in one press");
+}
+
+/// The list a plugin is refused and the list the host answers itself are one
+/// list. A key on one and not the other is either a binding that can never
+/// fire or a plugin binding the host silently preempts, and the two drifted
+/// once already.
+#[test]
+fn the_keys_a_plugin_cannot_bind_are_the_keys_the_host_answers_itself() {
+    let app = test_app();
+    let reserved: Vec<(KeyCode, KeyModifiers)> = [kb::QUIT, kb::SUSPEND]
+        .iter()
+        .map(|b| (b.code, b.modifiers))
+        .collect();
+
+    assert_eq!(reserved, maki_lua::RESERVED_KEYS.to_vec());
+    for (code, modifiers) in maki_lua::RESERVED_KEYS {
+        assert!(
+            app.reserved_by_host(KeyEvent::new(code, modifiers)),
+            "the host has to answer {code:?} itself, whatever a plugin bound"
+        );
+    }
 }
 
 #[test]
@@ -5724,10 +5948,11 @@ fn next_input_change(probe: &maki_lua::test_support::RequestProbe) -> Option<ser
     None
 }
 
-/// Moving around in the input is not a change: a completion plugin narrowing
-/// its list on every arrow key would flicker for no reason.
+/// A caret that ends the frame where it started moved nothing, so the frame
+/// is silent. Coalescing is the whole point: a plugin narrowing a list on
+/// every arrow key would flicker for no reason.
 #[test]
-fn moving_the_cursor_fires_nothing() {
+fn a_cursor_back_where_it_started_fires_nothing() {
     let mut app = test_app();
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
@@ -5740,6 +5965,48 @@ fn moving_the_cursor_fires_nothing() {
     app.update(Msg::Key(key(KeyCode::Right)));
     let _ = app.tick();
     assert_eq!(probe.try_recv_autocmd(), None);
+}
+
+/// A popup anchored to what the caret sits in has no other way to learn the
+/// caret left it. Without this the `@` completion popup stays on screen
+/// holding `<CR>`, `<Tab>` and `<Esc>` for a mention the user arrowed out of,
+/// and the next Enter is swallowed instead of sending the message.
+#[test]
+fn moving_the_cursor_alone_fires_a_cursor_only_change() {
+    const MENTION: &str = "@src";
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    for c in MENTION.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    let _ = app.tick();
+    let data = next_input_change(&probe).expect(INPUT_CHANGED_EVENT);
+    assert_eq!(
+        data["cursor_only"],
+        serde_json::json!(false),
+        "typing moved the text"
+    );
+
+    app.update(Msg::Key(key(KeyCode::Home)));
+    let _ = app.tick();
+
+    let data = next_input_change(&probe).expect(INPUT_CHANGED_EVENT);
+    assert_eq!(data["text"], serde_json::json!(MENTION));
+    assert_eq!(data["cursor"], serde_json::json!(0));
+    assert_eq!(data["cursor_only"], serde_json::json!(true));
+    assert_eq!(
+        data["source"],
+        serde_json::Value::Null,
+        "a caret the user moved names no writer"
+    );
+    let _ = app.tick();
+    assert_eq!(
+        next_input_change(&probe),
+        None,
+        "a frame that moved neither the caret nor the text stays silent"
+    );
 }
 
 /// What `model_state` reports has to parse back into the same state, or a

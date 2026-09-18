@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
+use crossterm::event::{KeyCode, KeyModifiers};
 use maki_agent::SharedBuf;
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
@@ -323,6 +324,12 @@ pub struct FloatConfig {
     /// Opt in to corner stacking: the UI offsets this window past the other
     /// stacked windows sharing its anchor. Open time only, so no patch field.
     pub stack: bool,
+    /// The keys this window takes while it is on screen without being
+    /// focused, parsed from the same notation `maki.keymap.set` reads. A
+    /// focused window is handed every key and declares none. Open time only,
+    /// so no patch field: the list the user sees in the footer is the list
+    /// the window opened with, and it dies with the window.
+    pub keys: Vec<(KeyCode, KeyModifiers)>,
 }
 
 impl Default for FloatConfig {
@@ -346,6 +353,7 @@ impl Default for FloatConfig {
             visible: true,
             needs_input: false,
             stack: false,
+            keys: Vec::new(),
         }
     }
 }

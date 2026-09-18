@@ -3,12 +3,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crossterm::event::{KeyCode, KeyModifiers};
 use humantime::format_duration;
 use maki_highlight::{DEFAULT_COLOR_NAME, SegmentColor};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Lua, Result as LuaResult, Table};
 use strum::VariantNames;
 
+use crate::api::keymap::{parse_key_notation, reject_reserved};
 use crate::api::util::command::{
     Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, InputEdit,
     InputRequest, Split, TitlePos, UiAction, WinCommand, WinEvent, ui_json_roundtrip, ui_send,
@@ -25,6 +27,13 @@ use win::WinHandle;
 
 /// `fg`, `bg` and six modifiers.
 const UI_STYLE_FIELDS: usize = 8;
+
+/// A focused window is handed every key the host does not answer itself, so a
+/// list of keys to take on top of that claims nothing it does not already
+/// have. Refused rather than ignored: a plugin writing one has the wrong model
+/// of who is reading the keyboard, and that is worth an error it can read.
+const FOCUSED_CLAIM_ERR: &str =
+    "a focused window already receives every key, so `keys` belongs to `focus = false` windows";
 
 pub(crate) struct HintStore {
     hints: BTreeMap<Arc<str>, Vec<(String, String)>>,
@@ -54,6 +63,39 @@ impl HintStore {
             .iter()
             .map(|(k, v)| (Arc::clone(k), v.clone()))
             .collect()
+    }
+}
+
+/// The windows each plugin has open, so unloading it can take them down.
+///
+/// A window is the one thing a plugin puts on screen that the host cannot
+/// otherwise revoke. The handle lives in the plugin's module table, and a
+/// module nobody references any more goes only when the Lua collector next
+/// runs. Until then the float is on screen with its key loop cancelled along
+/// with the load, and every key it claimed is swallowed on the way to a
+/// channel nobody reads: `/reload` would leave the user's `<CR>` doing
+/// nothing until a collection they cannot ask for.
+#[derive(Default)]
+pub(crate) struct WinStore {
+    open: BTreeMap<Arc<str>, Vec<flume::Sender<WinCommand>>>,
+}
+
+impl WinStore {
+    /// Drops the windows that have already gone on the way in, so a plugin
+    /// opening and closing one per keystroke does not grow this for the run.
+    fn track(&mut self, plugin: Arc<str>, cmd_tx: flume::Sender<WinCommand>) {
+        let windows = self.open.entry(plugin).or_default();
+        windows.retain(|tx| !tx.is_disconnected());
+        windows.push(cmd_tx);
+    }
+
+    /// The same command the plugin's own `win:close()` sends, so the window
+    /// leaves by the one path every other window leaves by and the plugin's
+    /// loop still hears the close it is waiting on.
+    pub fn close_plugin(&mut self, plugin: &str) {
+        for tx in self.open.remove(plugin).unwrap_or_default() {
+            let _ = tx.try_send(WinCommand::Close);
+        }
     }
 }
 
@@ -357,6 +399,11 @@ fn set_window_title(
 /// `"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
 /// `"prev_chat"`, `"next_chat"`, `"model_picker"`.
 ///
+/// Sending the user's turn is not on the list. A key a popup should hold only
+/// while it is on screen is one to declare in `maki.ui.open_win`'s `keys`: the
+/// host routes it to that window and hands it back the moment the window
+/// closes.
+///
 /// For slash commands rather than keybound actions, see
 /// `maki.api.run_command`.
 ///
@@ -513,6 +560,28 @@ async fn open_editor(
     Ok(reply_rx.recv_async().await.unwrap_or(-1))
 }
 
+/// The keys an unfocused window takes while it is on screen, parsed with the
+/// notation parser `maki.keymap.set` uses so the two can never drift.
+///
+/// Every key is parsed before the window is opened, so a typo leaves the
+/// plugin with no window rather than a window holding half a list.
+fn parse_claimed_keys(opts: &Table, focus: bool) -> LuaResult<Vec<(KeyCode, KeyModifiers)>> {
+    let Some(keys) = opts.get::<Option<Table>>("keys")? else {
+        return Ok(Vec::new());
+    };
+    if focus {
+        return Err(mlua::Error::runtime(FOCUSED_CLAIM_ERR));
+    }
+    keys.sequence_values::<String>()
+        .map(|lhs| {
+            let lhs = lhs?;
+            let (key, modifiers) = parse_key_notation(&lhs).map_err(mlua::Error::runtime)?;
+            reject_reserved(&lhs, key, modifiers)?;
+            Ok((key, modifiers))
+        })
+        .collect()
+}
+
 /// Opens a floating or split window that displays the contents of {buf}.
 /// Returns a Win handle you can use to receive events, update layout,
 /// and close the window when you are done.
@@ -535,6 +604,7 @@ async fn open_editor(
 ///   - split (string): dock the window to an edge instead of floating. One of "above", "below", "left", "right", "panel", or "" (floating, default).
 ///   - order (integer): paint order among split windows at the same edge. Default 50.
 ///   - focus (boolean): whether the window takes keyboard focus on open. Default true.
+///   - keys (table): key notation this window takes while it is on screen, e.g. `{ "<Tab>", "<CR>" }`. For an unfocused window only, since a focused one is handed every key already, and passing both is an error. A claimed key goes to this window's `recv` and is consumed there, so the chat input under it and any `maki.keymap.set` binding never see it. The claims last exactly as long as the window, so there is nothing to release, and `<C-c>` and `<C-z>` are refused here the way they are in `maki.keymap.set`. The window has to be on screen to take a key: one that is hidden, or sized to nothing, claims nothing. The host's own overlays are answered first, so a picker or the slash command palette opened over the window holds the keys until it closes, and unloading the plugin closes the window and the claims with it. `<S-Tab>` cannot be claimed: it parses as Shift+Tab while terminals deliver BackTab, so the claim would never fire.
 ///   - visible (boolean): whether the window is initially visible. Default true.
 ///   - needs_input (boolean): whether the window means the session needs user input. Default false.
 ///   - stack (boolean): offset the window past the other stacked windows sharing its anchor, in open order, with a one row gap. Closing one moves the rest up. Floating windows only. Default false.
@@ -551,8 +621,9 @@ async fn open_editor(
 /// })
 #[lua_fn]
 fn open_win(
-    _lua: &Lua,
+    lua: &Lua,
     #[ctx] tx: flume::Sender<UiAction>,
+    #[ctx] plugin: Arc<str>,
     buf: mlua::AnyUserData,
     opts: Table,
 ) -> LuaResult<WinHandle> {
@@ -563,6 +634,7 @@ fn open_win(
     let reserved_bottom: usize = opts.get("reserved_bottom").unwrap_or(0);
     let reserved_top: usize = opts.get("reserved_top").unwrap_or(0);
     let focus = opt_bool(&opts, "focus").unwrap_or(true);
+    let keys = parse_claimed_keys(&opts, focus)?;
     let zindex: u16 = opts.get("zindex").unwrap_or(50);
 
     let width = parse_dimension(&opts, "width", Dimension::Percent(60));
@@ -597,6 +669,7 @@ fn open_win(
         visible,
         needs_input,
         stack,
+        keys,
     };
 
     let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -627,6 +700,13 @@ fn open_win(
         event_tx,
         cmd_rx,
     });
+
+    // Stamped with the plugin that opened it so unloading that plugin closes
+    // it, the way its keymaps and hints are cleared. Without the stamp the
+    // host has no name on the window and nothing to revoke.
+    if let Some(mut store) = lua.app_data_mut::<WinStore>() {
+        store.track(plugin, cmd_tx.clone());
+    }
 
     Ok(WinHandle::new(event_rx, cmd_tx, est_w, est_h, visible))
 }
@@ -679,7 +759,7 @@ pub(crate) fn create_ui_table(
         open_editor__register(&t, lua, tx.clone())?;
         input__register(&t, lua, tx.clone())?;
         input_edit__register(&t, lua, tx.clone(), Arc::clone(&plugin))?;
-        open_win__register(&t, lua, tx)?;
+        open_win__register(&t, lua, tx, Arc::clone(&plugin))?;
     }
 
     let p = Arc::clone(&plugin);
@@ -956,6 +1036,67 @@ mod tests {
         tbl.raw_set("footer", entries).unwrap();
 
         assert!(parse_footer(&tbl).is_err());
+    }
+
+    /// A window with {claims} in its `keys`, as `open_win` reads it.
+    fn claim_opts(lua: &Lua, claims: &[&str]) -> Table {
+        let opts = lua.create_table().unwrap();
+        let keys = lua.create_table().unwrap();
+        for (i, key) in claims.iter().enumerate() {
+            keys.raw_set(i + 1, *key).unwrap();
+        }
+        opts.raw_set("keys", keys).unwrap();
+        opts
+    }
+
+    #[test]
+    fn claimed_keys_are_parsed_in_the_notation_keymaps_use() {
+        let lua = Lua::new();
+        let opts = claim_opts(&lua, &["<Tab>", "<C-n>"]);
+
+        assert_eq!(
+            parse_claimed_keys(&opts, false).unwrap(),
+            vec![
+                (KeyCode::Tab, KeyModifiers::NONE),
+                (KeyCode::Char('n'), KeyModifiers::CONTROL),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_window_with_no_keys_claims_none() {
+        let lua = Lua::new();
+        let opts = lua.create_table().unwrap();
+
+        assert!(parse_claimed_keys(&opts, true).unwrap().is_empty());
+    }
+
+    /// The same two keys `maki.keymap.set` refuses, from the same list. A
+    /// window claiming one would publish a key the host answers first, which
+    /// is a popup that never sees it and a user who cannot quit.
+    #[test_case("<C-c>" ; "quit")]
+    #[test_case("<C-z>" ; "suspend")]
+    fn a_window_cannot_claim_a_key_the_host_reserves(lhs: &str) {
+        let lua = Lua::new();
+        let opts = claim_opts(&lua, &[lhs]);
+
+        let err = parse_claimed_keys(&opts, false).unwrap_err().to_string();
+        assert!(
+            err.contains(lhs),
+            "the error has to name the key, got: {err}"
+        );
+    }
+
+    /// A focused window is handed every key already, so a list of keys to take
+    /// on top of that is an author with the wrong model of who is reading the
+    /// keyboard, not a redundant option to quietly drop.
+    #[test]
+    fn claiming_keys_on_a_focused_window_is_an_error() {
+        let lua = Lua::new();
+        let opts = claim_opts(&lua, &["<Tab>"]);
+
+        let err = parse_claimed_keys(&opts, true).unwrap_err().to_string();
+        assert!(err.contains(FOCUSED_CLAIM_ERR), "got: {err}");
     }
 
     #[test]
@@ -1531,6 +1672,47 @@ mod tests {
         store.set(Arc::from("plug"), vec![("a".into(), "b".into())]);
         store.set(Arc::from("plug"), vec![]);
         assert!(store.snapshot_entries().is_empty());
+    }
+
+    const WIN_PLUGIN: &str = "plug";
+    const OTHER_WIN_PLUGIN: &str = "other";
+    const WINDOW_LEFT_OPEN: &str =
+        "unloading a plugin has to close the window it left on screen holding keys";
+    const WINDOW_TAKEN_DOWN: &str = "another plugin's window must survive the unload";
+
+    /// What `/reload` costs without this: the float stays up with its key loop
+    /// cancelled, so every key it claimed is taken from the user and dropped
+    /// until the Lua collector happens to run.
+    #[test]
+    fn unloading_a_plugin_closes_the_windows_it_opened() {
+        let mut store = WinStore::default();
+        let (mine, mine_rx) = flume::unbounded::<WinCommand>();
+        let (theirs, theirs_rx) = flume::unbounded::<WinCommand>();
+        store.track(Arc::from(WIN_PLUGIN), mine);
+        store.track(Arc::from(OTHER_WIN_PLUGIN), theirs);
+
+        store.close_plugin(WIN_PLUGIN);
+
+        assert!(
+            matches!(mine_rx.try_recv(), Ok(WinCommand::Close)),
+            "{WINDOW_LEFT_OPEN}"
+        );
+        assert!(theirs_rx.try_recv().is_err(), "{WINDOW_TAKEN_DOWN}");
+    }
+
+    /// A popup opened and closed on every keystroke must not grow the list it
+    /// is tracked in for the rest of the run.
+    #[test]
+    fn a_window_already_gone_is_forgotten_on_the_next_open() {
+        let mut store = WinStore::default();
+        let (gone, gone_rx) = flume::unbounded::<WinCommand>();
+        store.track(Arc::from(WIN_PLUGIN), gone);
+        drop(gone_rx);
+
+        let (live, _live_rx) = flume::unbounded::<WinCommand>();
+        store.track(Arc::from(WIN_PLUGIN), live);
+
+        assert_eq!(store.open[WIN_PLUGIN].len(), 1);
     }
 
     const STALE_RANGE_ERR: &str = "stop 99 is past the end of the input (5)";

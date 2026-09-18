@@ -40,7 +40,7 @@ use crate::api::create_maki_global;
 use crate::api::r#fn::{JobEvent, JobOwner, JobStore, deliver_job_event};
 use crate::api::fs::publish_walks;
 use crate::api::keymap::KeymapReader;
-use crate::api::keymap::{KeymapStore, KeymapWriter};
+use crate::api::keymap::{KeybindTicket, KeymapStore, KeymapWriter};
 use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
 use crate::api::plan::{
     PlanRowHandlers, RowOwners, clear_menu_generation, clear_plugin_rows, clear_session_rows,
@@ -53,8 +53,8 @@ use crate::api::slot::{
 use crate::api::tool::{
     LuaTool, PendingRules, PendingTool, PendingTools, ToolCallReply, ToolPermission, resolve_rules,
 };
-use crate::api::ui::HintStore;
 use crate::api::ui::buf::{BufHandle, BufferStore};
+use crate::api::ui::{HintStore, WinStore};
 use crate::api::util::command::{CommandHandlerMap, HintWriter, publish_command_snapshot};
 use crate::api::util::command::{
     LuaCommandReader, LuaCommandWriter, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction,
@@ -105,6 +105,12 @@ const OPT_LEVEL_JIT: u8 = 2;
 const OPT_LEVEL_DEBUGGABLE: u8 = 1;
 const DEBUG_INFO_FULL: u8 = 2;
 const ASYNC_RUN_DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
+/// How long a keystroke waits for its handler before the host stops holding
+/// one of the plugin's in-flight slots and one drain-barrier slot for it. Long
+/// enough for a handler that makes a round-trip or two, short enough that eight
+/// parked ones do not take the plugin's keys away for the rest of the run, nor
+/// a picker left open hold up a `/reload`.
+const KEYBIND_TICKET_HOLD: Duration = Duration::from_secs(10);
 /// Async tasks spawned during restore may spawn further tasks; cap the rounds.
 const RESTORE_SPAWN_ROUNDS: usize = 8;
 /// Keeps a buggy plugin's restore task from freezing the lua loop.
@@ -408,7 +414,7 @@ pub enum Request {
         fallback: Option<Box<ClickFallback>>,
     },
     RunKeybindCallback {
-        id: u64,
+        ticket: KeybindTicket,
     },
     Describe {
         plugin: Arc<str>,
@@ -1905,6 +1911,78 @@ fn spawn_deferred_callback(
     .detach();
 }
 
+/// Runs a keybind callback. The host consumed the key to get here, and the key
+/// is spent whatever the handler does with it.
+///
+/// The return value is not read, and a handler that raises is logged and
+/// nothing more. Replaying a key because a plugin has a bug is strictly worse
+/// than dropping it: seconds later the UI is not the one the user pressed it
+/// against, and a `<CR>` landing on the permission prompt that opened in the
+/// meantime approves its default answer. Fall-through is the host's decision,
+/// taken on the UI thread before any of this runs.
+///
+/// The budget slot and the handler are two tasks, because they are two
+/// lifetimes. A key that opens a float and loops on `win:recv()` runs for as
+/// long as the user keeps it up, and a deadline on the handler would close the
+/// session browser under them. The ticket goes once the handler is done or
+/// after [`KEYBIND_TICKET_HOLD`], whichever is first: holding it to the end
+/// means eight presses that park take every key the plugin binds away for the
+/// rest of the run.
+///
+/// A [`GateGuard`] rides along with the ticket, the way [`run_host_hook`] takes
+/// one, so a `/reload` waiting on [`drain_barrier`] cannot land in the middle
+/// of a handler. It is bounded by the same hold rather than by the handler,
+/// because a picker the user left open would otherwise hold the barrier for as
+/// long as it is on screen - which is why a command handler takes no guard at
+/// all.
+fn spawn_keybind_callback(
+    lua: &Lua,
+    ex: &Rc<smol::LocalExecutor<'_>>,
+    gate: &Rc<InflightGate>,
+    ticket: KeybindTicket,
+) {
+    let key = ticket.key();
+    if !ticket.plugin_live() {
+        tracing::warn!(?key, plugin = %ticket.plugin(), "keybind key dropped: plugin unloaded");
+        return;
+    }
+    let func = match lua.registry_value::<Function>(ticket.callback()) {
+        Ok(func) => func,
+        Err(e) => {
+            tracing::warn!(?key, error = %e, "keybind key dropped: callback missing");
+            return;
+        }
+    };
+    // Dropped when the handler returns, which is how the task below learns it
+    // may hand the slot back before the hold lapses.
+    let (done_tx, done_rx) = flume::bounded::<()>(1);
+    let handler_lua = lua.clone();
+    let plugin = Arc::clone(ticket.plugin());
+    ex.spawn(async move {
+        let _done = done_tx;
+        if let Err(e) = run_detached(&handler_lua, func.call_async::<LuaValue>(())).await {
+            tracing::warn!(?key, plugin = %plugin, error = %strip_traceback(&e), "keybind callback failed, key spent");
+        }
+    })
+    .detach();
+    let gate = Rc::clone(gate);
+    ex.spawn(async move {
+        let _guard = GateGuard::new(&gate);
+        let _ticket = ticket;
+        futures_lite::future::or(
+            async {
+                let _ = done_rx.recv_async().await;
+            },
+            async {
+                smol::Timer::after(KEYBIND_TICKET_HOLD).await;
+                tracing::warn!(?key, "keybind handler outlived its budget slot");
+            },
+        )
+        .await;
+    })
+    .detach();
+}
+
 fn spawn_async_task(
     lua: &Lua,
     ex: &Rc<smol::LocalExecutor<'_>>,
@@ -2082,6 +2160,7 @@ impl LuaRuntime {
         lua.set_app_data(KeymapStore::new());
         lua.set_app_data(keymap_writer);
         lua.set_app_data(HintStore::new());
+        lua.set_app_data(WinStore::default());
         lua.set_app_data(hint_writer);
         lua.set_app_data(PlanRowHandlers::default());
         lua.set_app_data(Arc::clone(&registry));
@@ -2453,6 +2532,12 @@ impl LuaRuntime {
         let env = self.build_env(maki, require_root).map_err(&map_err)?;
 
         drop(self.drop_plugin_keys(&name));
+        // The one place a name `clear_plugin` tombstoned comes back live, so
+        // a handler of the load being replaced cannot publish bindings that
+        // fire for a load that is gone.
+        if let Some(mut store) = self.lua.app_data_mut::<KeymapStore>() {
+            store.revive(&name);
+        }
 
         // Chunks run in order against one environment, so a later file sees
         // what an earlier one registered. The first failure stops the rest.
@@ -2594,12 +2679,9 @@ impl LuaRuntime {
         let revision_guard = self.drop_plugin_keys(plugin);
         with_packs(&self.lua, |packs| packs.active.remove(plugin));
         if let Some(mut store) = self.lua.app_data_mut::<KeymapStore>() {
-            let keys = store.clear_plugin(plugin);
+            store.clear_plugin(plugin);
             let entries = store.snapshot_entries();
             drop(store);
-            for key in keys {
-                let _ = self.lua.remove_registry_value(key);
-            }
             if let Some(writer) = self.lua.app_data_ref::<KeymapWriter>() {
                 writer.publish(entries);
             }
@@ -2611,6 +2693,12 @@ impl LuaRuntime {
             if let Some(writer) = self.lua.app_data_ref::<HintWriter>() {
                 writer.publish(entries);
             }
+        }
+        // Last of the revocations, and the only one the user can see: a float
+        // left up by an unloaded plugin still holds the keys it claimed, with
+        // the loop that answered them cancelled along with the load.
+        if let Some(mut store) = self.lua.app_data_mut::<WinStore>() {
+            store.close_plugin(plugin);
         }
         drop(revision_guard);
     }
@@ -4169,19 +4257,8 @@ pub fn spawn(
                             })
                             .detach();
                         }
-                        Request::RunKeybindCallback { id } => {
-                            let func = rt.lua.app_data_ref::<KeymapStore>().and_then(|store| {
-                                let key = store.callback_for_id(id)?;
-                                rt.lua.registry_value::<Function>(key).ok()
-                            });
-                            if let Some(func) = func {
-                                let lua = rt.lua.clone();
-                                ex.spawn(async move {
-                                    if let Err(e) = run_detached(&lua, func.call_async::<()>(())).await {
-                                        tracing::warn!(keybind_id = id, error = %e, "keybind callback failed");
-                                    }
-                                }).detach();
-                            }
+                        Request::RunKeybindCallback { ticket } => {
+                            spawn_keybind_callback(&rt.lua, &ex, &gate, ticket);
                         }
                     }
                 }

@@ -815,9 +815,14 @@ name the session now running or focused. What each event adds:
   chat input as `maki.ui.input` reports it. `data.source` is the plugin
   name when that plugin's `maki.ui.input_edit` was the frame's sole
   writer, and nil otherwise, so ignoring your own name never drops a
-  change. At most one event per frame and only when the text moved, so
-  moving the cursor alone fires nothing. Focusing another session
-  republishes the input that tab holds.
+  change. A caret the user moved names no writer, the same as any
+  change nobody claimed. `data.cursor_only` is true when the caret
+  moved and the text did not, which is how a popup anchored to what
+  the caret sits in learns it has left; handlers that only watch the
+  text return on it. At most one event per frame and only when the
+  caret or the text moved, so a frame that moved neither fires
+  nothing. Focusing another session republishes the input that tab
+  holds.
 - `"FileIndexReady"`: `data.root`, the absolute directory that was
   walked, `data.files`, how many paths the walk left, and `data.crashed`
   and `data.truncated`, the two ways that list is not the whole tree.
@@ -3241,6 +3246,11 @@ end
 Key mappings, modeled after `vim.keymap`. If you have written a
 Neovim keymap plugin before, this will feel familiar.
 
+`set` claims a key for the rest of the run. A key a popup should own
+only while it is on screen belongs in the `keys` of
+`maki.ui.open_win`, which routes it to that window and hands it back
+when the window closes.
+
 ```lua
 maki.keymap.set("n", "<C-t>", function()
   print("hello")
@@ -3259,11 +3269,26 @@ Bind a key to a Lua function, just like `vim.keymap.set`. Only
 normal mode (`"n"`) is supported right now. If {lhs} is already
 mapped, the old binding is replaced and a warning is logged.
 
+The binding is global and lasts until `del` or the plugin unloads. For a
+key a popup should own only while it is on screen, declare it in the
+`keys` of `maki.ui.open_win` instead: the host routes it to that window
+and hands it back when the window closes.
+
+A handler that runs owns the key. Its return value is not read, and a
+handler that raises is logged with the key spent all the same: a keystroke
+replayed once the UI has moved on lands somewhere the user never aimed it.
+The key reaches the binding underneath only when the host could not
+dispatch it at all, which it settles before any of your Lua runs.
+
+`<C-c>` and `<C-z>` are the two keys no binding takes: quitting and
+suspending have to work whatever a plugin is doing. Binding one is an
+error rather than a mapping that never fires.
+
 **Parameters:**
 
 - `{mode}` (`string`) Mode letter. Currently only `"n"` is accepted.
 - `{lhs}` (`string`) Key in Vim notation, e.g. `"<C-t>"`, `"<Space>"`, `"a"`.
-- `{rhs}` (`function`) Called when the key is pressed.
+- `{rhs}` (`function`) Called when the key is pressed. Its return value is not read.
 - `{opts?}` (`table?`) Options:
   - `desc` (`string`) short description shown in the keymap list.
 
@@ -3956,10 +3981,12 @@ local _, err = maki.task.focus("main")
 
 Text transformation utilities.
 
-Helper functions for converting between text formats.
+Helper functions for converting between text formats, and the fuzzy
+matcher the built-in pickers rank with.
 
 ```lua
 local md = maki.text.html_to_markdown(html)
+local hits = maki.text.fuzzy_list("mrs", names, { limit = 10 })
 ```
 
 ---
@@ -3985,6 +4012,89 @@ Useful for cleaning up web content fetched with `maki.webfetch`.
 local md, err = maki.text.html_to_markdown("<h1>Hello</h1><p>world</p>")
 if err then return end
 print(md) -- "# Hello\n\nworld"
+```
+
+---
+
+### `maki.text.fuzzy()` {#maki-text-fuzzy}
+
+```lua
+maki.text.fuzzy({needle}, {haystack}, {opts?})
+```
+
+Scores {needle} against {haystack} with the fuzzy matcher the built-in
+pickers rank with. {needle} is one fuzzy pattern, spaces included.
+
+A higher score is a better match. Scores compare only between haystacks
+scored against the same needle. An empty needle matches everything with a
+score of 0.
+
+The second return value is where the match landed, in the shape
+`maki.fs.fuzzy_files` reports: 1-based inclusive `{ from, to }` byte
+ranges of {haystack}, ascending, with characters that touch coalesced into
+one range. `haystack:sub(from, to)` is the matched text, whatever the
+characters took to encode.
+
+Pure computation, so it needs no plugin permission.
+
+**Parameters:**
+
+- `{needle}` (`string`) What the user typed.
+- `{haystack}` (`string`) The candidate to score it against.
+- `{opts?}` (`table?`) Options:
+  - `paths` (`boolean`) rank {haystack} as a path, the way the file picker does, favouring the last segment. Off by default, which is how the model, command and list pickers rank.
+
+**Returns:** (`integer|nil`, `table|nil`) Score and matched byte ranges, or nil when the needle does not match.
+
+**Example:**
+
+```lua
+local score, at = maki.text.fuzzy("mrs", "maki-ui/src/main.rs", { paths = true })
+if score then print(("maki-ui/src/main.rs"):sub(at[1][1], at[1][2])) end
+```
+
+---
+
+### `maki.text.fuzzy_list()` {#maki-text-fuzzy_list}
+
+```lua
+maki.text.fuzzy_list({needle}, {haystacks}, {opts?})
+```
+
+Scores {needle} against every entry of {haystacks} and returns only the
+ones that matched, best first. One call filters a list as the user types.
+
+Entries that score the same keep the order they were given in, so a caller
+that sorted its candidates first (by mtime, say) keeps that order for an
+empty needle.
+
+Each result is `{ text, index, score, highlights? }`. `index` is a 1-based
+position in {haystacks}, `highlights` holds byte ranges, as in `fuzzy`. A
+Lua string is a byte string, so an entry that is not valid UTF-8 is
+skipped rather than failing the call over one candidate.
+
+To rank files, use `maki.fs.fuzzy_files`. It queries an index the host
+already keeps, so no list of candidates has to cross into Lua.
+
+Pure computation, so it needs no plugin permission.
+
+**Parameters:**
+
+- `{needle}` (`string`) What the user typed.
+- `{haystacks}` (`table`) Array of candidate strings.
+- `{opts?}` (`table?`) Options:
+  - `limit` (`integer`) keep at most this many results.
+  - `paths` (`boolean`) rank candidates as paths, the way the file picker does. Off by default.
+  - `highlights` (`boolean`) also return where the query matched, off by default since it costs a second pass.
+
+**Returns:** (`table`) Array of `{ text, index, score, highlights? }`, best first.
+
+**Example:**
+
+```lua
+for _, m in ipairs(maki.text.fuzzy_list(query, names, { limit = 10 })) do
+  print(m.text, m.score)
+end
 ```
 
 
@@ -5437,6 +5547,11 @@ Valid names: `"file_picker"`, `"search"`, `"help"`,
 `"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
 `"prev_chat"`, `"next_chat"`, `"model_picker"`.
 
+Sending the user's turn is not on the list. A key a popup should hold only
+while it is on screen is one to declare in `maki.ui.open_win`'s `keys`: the
+host routes it to that window and hands it back the moment the window
+closes.
+
 For slash commands rather than keybound actions, see
 `maki.api.run_command`.
 
@@ -5514,6 +5629,7 @@ and close the window when you are done.
   - `split` (`string`) dock the window to an edge instead of floating. One of "above", "below", "left", "right", "panel", or "" (floating, default).
   - `order` (`integer`) paint order among split windows at the same edge. Default 50.
   - `focus` (`boolean`) whether the window takes keyboard focus on open. Default true.
+  - `keys` (`table`) key notation this window takes while it is on screen, e.g. `{ "<Tab>", "<CR>" }`. For an unfocused window only, since a focused one is handed every key already, and passing both is an error. A claimed key goes to this window's `recv` and is consumed there, so the chat input under it and any `maki.keymap.set` binding never see it. The claims last exactly as long as the window, so there is nothing to release, and `<C-c>` and `<C-z>` are refused here the way they are in `maki.keymap.set`. The window has to be on screen to take a key: one that is hidden, or sized to nothing, claims nothing. The host's own overlays are answered first, so a picker or the slash command palette opened over the window holds the keys until it closes, and unloading the plugin closes the window and the claims with it. `<S-Tab>` cannot be claimed: it parses as Shift+Tab while terminals deliver BackTab, so the claim would never fire.
   - `visible` (`boolean`) whether the window is initially visible. Default true.
   - `needs_input` (`boolean`) whether the window means the session needs user input. Default false.
   - `stack` (`boolean`) offset the window past the other stacked windows sharing its anchor, in open order, with a one row gap. Closing one moves the rest up. Floating windows only. Default false.

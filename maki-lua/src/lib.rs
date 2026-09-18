@@ -11,7 +11,9 @@ pub(crate) mod plugin_permissions;
 mod runtime;
 pub mod session_snapshot;
 
-pub use api::keymap::{KeymapEntry, KeymapReader, KeymapSnapshot};
+pub use api::keymap::{
+    KeybindTicket, KeymapEntry, KeymapReader, KeymapSnapshot, RESERVED_KEYS, is_reserved,
+};
 pub use api::net::set_allowed_private_hosts;
 pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
 pub use api::pack::{Declared, PackOp};
@@ -43,14 +45,19 @@ pub use runtime::{
 pub use session_snapshot::{SessionQueueSnapshot, SessionSnapshot};
 
 pub mod test_support {
+    use std::sync::Arc;
+
     use crate::KeymapReader;
     use crate::SessionEndReason;
-    use crate::api::keymap::{KeymapEntry, KeymapWriter};
+    use crate::api::keymap::KeymapWriter;
     use crate::api::util::command::{
         HintEntries, HintReader, HintWriter, LuaCommandInfo, LuaCommandReader, LuaCommandWriter,
     };
     pub use crate::api::util::dispatch::MAX_HOOK_DEPTH;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use maki_storage::id::MakiId;
+
+    const TEST_PLUGIN: &str = "test-plugin";
 
     pub struct LuaCommandWriterHandle(LuaCommandWriter);
 
@@ -116,6 +123,20 @@ pub mod test_support {
             None
         }
 
+        /// Next key handed to a plugin binding, skipping other requests. The
+        /// chat input fires an autocmd of its own on every keystroke, so a
+        /// test that types cannot tell a dispatched binding from an announced
+        /// edit without this.
+        pub fn try_recv_keybind(&self) -> Option<KeyEvent> {
+            use crate::runtime::Request;
+            while let Ok(req) = self.0.try_recv() {
+                if let Request::RunKeybindCallback { ticket } = req {
+                    return Some(ticket.key());
+                }
+            }
+            None
+        }
+
         /// Next queued restore item, skipping other requests.
         pub fn try_recv_restore_item(&self) -> Option<crate::RestoreItem> {
             use crate::runtime::Request;
@@ -162,9 +183,21 @@ pub mod test_support {
         (handle.layering(&[crate::api::slot::PLAN_FORM_SLOT]), probe)
     }
 
-    pub fn keymap_reader_with(entries: Vec<KeymapEntry>) -> KeymapReader {
+    /// Publishes {binds} as one plugin's global keymap. The Lua state the
+    /// callbacks come from is dropped here: a host test hands the binding back
+    /// to a probe instead of calling it.
+    pub fn keymap_reader_with(binds: Vec<(KeyCode, KeyModifiers)>) -> KeymapReader {
+        let lua = mlua::Lua::new();
+        let mut store = crate::api::keymap::KeymapStore::new();
+        let plugin: Arc<str> = Arc::from(TEST_PLUGIN);
+        for (key, modifiers) in binds {
+            let callback = lua
+                .create_registry_value(lua.create_function(|_, ()| Ok(())).unwrap())
+                .unwrap();
+            store.set(key, modifiers, callback, Arc::clone(&plugin), String::new());
+        }
         let (writer, reader) = KeymapWriter::new();
-        writer.publish(entries);
+        writer.publish(store.snapshot_entries());
         reader
     }
 }

@@ -9,9 +9,9 @@ use include_dir::{Dir, File, include_dir};
 use maki_agent::SessionEndReason;
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::{ToolRegistry, ToolSource};
-use maki_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
+use maki_config::{GatedFile, PluginFileConfig, PluginsConfig, ProjectConfig, RawConfig};
 
-use crate::api::keymap::KeymapReader;
+use crate::api::keymap::{KeybindTicket, KeymapReader};
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
 use crate::api::slot::{LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT};
 use crate::api::util::command::{
@@ -146,6 +146,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
         name: "code_execution",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/code_execution"),
+    },
+    BundledPlugin {
+        name: "completion",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/completion"),
     },
     BundledPlugin {
         name: "view_image",
@@ -318,12 +322,25 @@ impl PluginHost {
         self.inner.prio_tx = flume::unbounded().0;
     }
 
-    /// Boots the runtime and loads every default bundled plugin into `registry`.
-    /// For callers like tests and docgen that want the full builtin set
-    /// without building a config.
+    /// Boots the runtime and loads every bundled plugin into `registry`, the
+    /// ones that ship switched off included. For callers like tests and
+    /// docgen that want the full builtin set without building a config, and
+    /// which have to document an opt-in plugin's options too.
     pub fn with_all_builtins(registry: Arc<ToolRegistry>) -> Result<Self, PluginError> {
+        let opt_in: HashMap<String, PluginFileConfig> = maki_config::OPTIONAL_BUILTINS
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_owned(),
+                    PluginFileConfig {
+                        enabled: Some(true),
+                        ..PluginFileConfig::default()
+                    },
+                )
+            })
+            .collect();
         let mut host = Self::new(registry)?;
-        host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))?;
+        host.load_builtins(&PluginsConfig::from_plugins(opt_in))?;
         Ok(host)
     }
 
@@ -1240,9 +1257,12 @@ impl EventHandle {
         Some(reply_rx)
     }
 
-    pub fn run_keybind_callback(&self, id: u64) -> bool {
+    /// Whether the keystroke reached the Lua thread's queue. `false` says the
+    /// host is gone, which the caller answers by running the built-in binding
+    /// for the key in the same keystroke.
+    pub fn run_keybind_callback(&self, ticket: KeybindTicket) -> bool {
         self.prio_tx
-            .try_send(Request::RunKeybindCallback { id })
+            .try_send(Request::RunKeybindCallback { ticket })
             .is_ok()
     }
 }
@@ -1251,6 +1271,7 @@ impl EventHandle {
 mod tests {
     use super::*;
     use crate::api::util::command::{LuaCommandInfo, LuaCommandWriter};
+    use crossterm::event::{KeyCode, KeyEvent};
     use maki_agent::prompt::{PromptId, ResolvedSlots, Slot};
     use maki_agent::tools::ToolRegistry;
     use std::time::Instant;
@@ -1476,53 +1497,134 @@ mod tests {
         assert!(reader.load().generation > 0);
     }
 
-    /// End-to-end: a plugin registers a keymap override, the override is published
-    /// to the snapshot, EventHandle::run_keybind_callback dispatches the request,
-    /// the runtime resolves the Function by id from the registry, and the callback
-    /// executes with an observable side effect. This is the load-bearing path the
-    /// dispatch reorder and the dead-host fallback rest on; unit tests only cover
-    /// the layers in isolation.
+    const FIRED_COMMAND: &str = "/fired";
+    const KEYBIND_NEVER_RAN: &str = "the keybind callback never registered its command";
+    const KEYBIND_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// Waits for the command a keybind callback registers, which is how a test
+    /// on this side of the channel sees that the handler ran.
+    fn wait_for_fired_command(host: &PluginHost) {
+        let deadline = Instant::now() + KEYBIND_TIMEOUT;
+        while !host
+            .command_reader()
+            .load()
+            .commands
+            .iter()
+            .any(|c| c.name.as_ref() == FIRED_COMMAND)
+        {
+            assert!(Instant::now() < deadline, "{KEYBIND_NEVER_RAN}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// End-to-end: a plugin registers a keymap override, the override is
+    /// published to the snapshot, `dispatch` hands the binding it matched to
+    /// `run_keybind_callback`, and the runtime calls it with an observable
+    /// side effect. Unit tests only cover the pieces in isolation.
     #[test]
     fn keybind_callback_runs_end_to_end() {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
             "kb",
-            r#"
+            &format!(
+                r#"
             maki.keymap.set("n", "<C-g>", function()
-                maki.api.register_command({
-                    name = "/fired",
+                maki.api.register_command({{
+                    name = "{FIRED_COMMAND}",
                     description = "callback ran",
                     handler = function() end,
-                })
-            end, { desc = "test override" })
-            "#,
+                }})
+            end, {{ desc = "test override" }})
+            "#
+            ),
         )
         .unwrap();
 
-        let snap = host.keymap_reader().load();
-        assert_eq!(snap.entries.len(), 1, "override published to snapshot");
-        let entry = &snap.entries[0];
-        assert_eq!(entry.desc, "test override");
+        let reader = host.keymap_reader();
+        let key = {
+            let snap = reader.load();
+            assert_eq!(snap.entries.len(), 1, "override published to snapshot");
+            let entry = &snap.entries[0];
+            assert_eq!(entry.desc, "test override");
+            KeyEvent::new(entry.key, entry.modifiers)
+        };
         assert!(
             host.command_reader().load().commands.is_empty(),
             "callback has not fired yet"
         );
 
         let handle = host.event_handle();
-        handle.run_keybind_callback(entry.id);
+        assert!(reader.dispatch(key, |ticket| handle.run_keybind_callback(ticket)));
+        wait_for_fired_command(&host);
+    }
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            let cmds = &host.command_reader().load().commands;
-            if cmds.iter().any(|c| c.name.as_ref() == "/fired") {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "keybind callback did not register /fired within 2s"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+    /// `<C-c>` never reaches a binding, so accepting one publishes a mapping
+    /// with a `desc` in the keymap list that can never fire.
+    #[test]
+    fn binding_a_key_the_host_reserves_is_refused() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let err = host
+            .load_source(
+                "kb",
+                r#"maki.keymap.set("n", "<C-c>", function() end, { desc = "quit" })"#,
+            )
+            .expect_err("Ctrl+C is the host's");
+        assert!(err.to_string().contains("reserved"), "got: {err}");
+        assert!(host.keymap_reader().load().entries.is_empty());
+    }
+
+    /// A handler that raises is logged and its key is spent: handing the key
+    /// back seconds later lands it in a UI the user never pressed it against.
+    /// What the host owes is that the raise wedges nothing.
+    #[test]
+    fn a_keybind_that_raises_leaves_the_plugin_dispatching() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "kb",
+            &format!(
+                r#"
+            maki.keymap.set("n", "<C-g>", function() error("boom") end)
+            maki.keymap.set("n", "<C-h>", function()
+              maki.api.register_command({{
+                name = "{FIRED_COMMAND}",
+                description = "the next key still ran",
+                handler = function() end,
+              }})
+            end)
+            "#
+            ),
+        )
+        .unwrap();
+
+        let reader = host.keymap_reader();
+        let handle = host.event_handle();
+        let key_of = |code: char| {
+            let snap = reader.load();
+            let entry = snap
+                .entries
+                .iter()
+                .find(|e| e.key == KeyCode::Char(code))
+                .expect("both keys published");
+            KeyEvent::new(entry.key, entry.modifiers)
+        };
+
+        assert!(reader.dispatch(key_of('g'), |t| handle.run_keybind_callback(t)));
+        assert!(reader.dispatch(key_of('h'), |t| handle.run_keybind_callback(t)));
+
+        wait_for_fired_command(&host);
+    }
+
+    /// Unloading has to take the bindings with it, or a `/reload` leaves keys
+    /// claimed by callbacks that are gone.
+    #[test]
+    fn clearing_a_plugin_takes_its_bindings() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source("kb", r#"maki.keymap.set("n", "<C-g>", function() end)"#)
+            .unwrap();
+        assert_eq!(host.keymap_reader().load().entries.len(), 1);
+
+        host.unload("kb").unwrap();
+        assert!(host.keymap_reader().load().entries.is_empty());
     }
 
     #[test]
@@ -2159,10 +2261,9 @@ mod bundled_manifests {
         let mut drift = Vec::new();
         // `lib` is the one bundled directory that never loads on its own, so it
         // ships no manifest and its modules answer to whoever requires them.
-        for plugin in BUNDLED_PLUGINS
-            .iter()
-            .filter(|p| DEFAULT_BUILTINS.contains(&p.name))
-        {
+        for plugin in BUNDLED_PLUGINS.iter().filter(|p| {
+            DEFAULT_BUILTINS.contains(&p.name) || maki_config::OPTIONAL_BUILTINS.contains(&p.name)
+        }) {
             let declared = bundled_permissions(plugin).expect("every builtin ships a plugin.toml");
             // Each permission paired with the usage demanding it, so a failure
             // points at something to go look at.

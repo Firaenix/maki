@@ -67,7 +67,7 @@ use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, InputEdit, KeymapReader,
     LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, PackCommand,
-    PackPreparation, PlanActionOutcome, PlanMenu, PlanRowAction, WinView,
+    PackPreparation, PlanActionOutcome, PlanMenu, PlanRowAction, WinView, is_reserved,
 };
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
@@ -161,6 +161,10 @@ pub(crate) const INPUT_NOT_LIVE_ERR: &str =
 /// [`App::input_changed`], and each of them bumps the buffer's version, which
 /// strands the name on a value that is gone instead of pinning it on their
 /// write.
+///
+/// A caret the user moved sets no writer at all: only an edit passes through
+/// [`App::input_changed`], so a cursor-only frame is reported unlabelled,
+/// which is what the rule already says about a change nobody claimed.
 #[derive(Default)]
 enum InputWriter {
     #[default]
@@ -390,6 +394,10 @@ pub struct App {
     /// The value Lua was last told about. A fast typist would otherwise wake
     /// every handler once per keystroke.
     announced_input: String,
+    /// The caret Lua was last told about, diffed alongside the value so a
+    /// caret that moved on its own is reported once and a frame that moved
+    /// neither is silent.
+    announced_cursor: usize,
     input_writer: InputWriter,
     /// Whether this frame's tick already fired `InputChanged`, so the focus
     /// announcement drained below it does not repeat that value. A tab that
@@ -496,6 +504,7 @@ impl App {
             lua_event_handle,
             announced_model_spec: model.spec(),
             announced_input: String::new(),
+            announced_cursor: 0,
             input_writer: InputWriter::Untouched,
             input_fired_this_frame: false,
             hints: Watch::seeded(hint_reader.load_full()),
@@ -655,12 +664,19 @@ impl App {
         self.input_writer = self.input_writer.take().merge(writer);
     }
 
-    /// One event per frame at most, and only when the text really moved, so
-    /// holding a key down wakes a handler once and arrowing around leaves it
-    /// asleep.
+    /// One event per frame at most, and only when the caret or the text
+    /// really moved, so holding a key down wakes a handler once and a frame
+    /// that moved nothing leaves it asleep.
+    ///
+    /// A caret that moved on its own fires too, with `cursor_only` set. An
+    /// input plugin anchored to what the caret is sitting in has no other way
+    /// to learn it left: a popup on an `@` mention would stay up holding
+    /// `<CR>` for a mention the user has arrowed out of.
     fn tick_input_changed(&mut self) -> Dirty {
         let value = self.input_box.buffer.value();
-        self.input_fired_this_frame = value != self.announced_input;
+        let cursor = self.input_box.buffer.cursor_byte();
+        self.input_fired_this_frame =
+            value != self.announced_input || cursor != self.announced_cursor;
         if !self.input_fired_this_frame {
             self.input_writer = InputWriter::Untouched;
             return Dirty::NO;
@@ -673,8 +689,10 @@ impl App {
             .input_writer
             .take()
             .into_source(self.input_box.buffer.version());
+        let cursor_only = value == self.announced_input;
         self.announced_input = value;
-        self.fire_input_changed(source);
+        self.announced_cursor = cursor;
+        self.fire_input_changed(source, cursor_only);
         Dirty::NO
     }
 
@@ -690,23 +708,28 @@ impl App {
     /// one is the common case - would announce nothing, and handlers would go
     /// on acting on the text of the tab they came from while `maki.ui.input`
     /// already answers with this one's.
+    ///
+    /// It is never `cursor_only`: the whole input changed hands, so a handler
+    /// that only watches the text has to see it.
     pub(crate) fn announce_input(&mut self) {
         self.input_writer = InputWriter::Untouched;
         if mem::take(&mut self.input_fired_this_frame) {
             return;
         }
         self.announced_input = self.input_box.buffer.value();
-        self.fire_input_changed(None);
+        self.announced_cursor = self.input_box.buffer.cursor_byte();
+        self.fire_input_changed(None, false);
     }
 
-    fn fire_input_changed(&mut self, source: Option<Arc<str>>) {
+    fn fire_input_changed(&mut self, source: Option<Arc<str>>, cursor_only: bool) {
         self.fire_session_autocmd(
             "InputChanged",
             serde_json::json!({
                 "text": self.announced_input,
-                "cursor": self.input_box.buffer.cursor_byte(),
+                "cursor": self.announced_cursor,
                 "version": self.input_box.buffer.version(),
                 "source": source,
+                "cursor_only": cursor_only,
             }),
         );
     }
@@ -939,7 +962,12 @@ impl App {
             return Some(vec![]);
         }
 
-        if self.float_mgr.handle_key(key) {
+        // A focused plugin window is the thing the user is typing into, so it
+        // goes ahead of the rest. The keys an *unfocused* window claimed are
+        // settled far below, after every modal here: a claim is up while the
+        // user works under it, and a popup that holds `<CR>` must not answer
+        // the Enter meant for the file picker opened over it.
+        if self.float_mgr.handle_focused_key(key) {
             return Some(vec![]);
         }
 
@@ -1062,6 +1090,35 @@ impl App {
             return Some(self.run_builtin(BuiltinAction::PlanToggle));
         }
 
+        // The command palette is the host's overlay over the chat input, so it
+        // is answered here with the rest of them rather than below the claims:
+        // a plugin holding `<Tab>` or `<CR>` must not take them from the `/`
+        // command the user is typing into. Last in the pass, because every
+        // modal above is drawn over it.
+        //
+        // Ctrl keys pass it by, as they always did: `Ctrl+C` closes it and the
+        // rest belong to the input box and the built-in bindings. So does every
+        // key in a subagent chat, where there is no input to complete.
+        if self.is_main_chat() && !is_ctrl(&key) {
+            match self
+                .command_palette
+                .handle_key(key, &self.input_box.buffer.value())
+            {
+                CommandAction::Consumed => return Some(vec![]),
+                CommandAction::Execute(cmd) => {
+                    self.input_box.discard();
+                    return Some(self.execute_command(cmd, 0));
+                }
+                CommandAction::Complete(text) => {
+                    self.input_box.set_input(text);
+                    self.input_box.buffer.move_to_end();
+                    self.input_changed(InputWriter::Anyone);
+                    return Some(vec![]);
+                }
+                CommandAction::Passthrough => {}
+            }
+        }
+
         None
     }
 
@@ -1113,6 +1170,22 @@ impl App {
         vec![]
     }
 
+    /// One chain, in one order: `Ctrl+Z`, then the focused plugin window, then
+    /// the host's own overlays and modals, then the keys an unfocused window
+    /// claimed, then `Esc` while the agent streams, then a plugin's global
+    /// bindings, then the built-in keys.
+    ///
+    /// A focused window is above the overlays because it is the window the
+    /// user is in. A claim is below them because it is not: the popup it
+    /// belongs to is up while the user works underneath, so a modal opened
+    /// over it outranks it, and the claim comes back the moment the modal
+    /// closes. The command palette is one of those overlays, answered in
+    /// [`Self::dispatch_overlay`] with the rest, so a plugin's claim on
+    /// `<Tab>` or `<CR>` leaves the `/` command being typed alone.
+    ///
+    /// Every step either answers the key or passes it on untouched, and no key
+    /// is ever handed back after the fact, because a keystroke replayed into a
+    /// UI that has moved on lands somewhere the user never aimed it.
     fn handle_key(&mut self, key: KeyEvent) -> Vec<Action> {
         self.clear_selection_unless_pending_copy();
 
@@ -1124,9 +1197,11 @@ impl App {
             return actions;
         }
 
-        if !(self.status == Status::Streaming && is_streaming_stop_key(key))
-            && self.dispatch_override(key)
-        {
+        if self.float_mgr.handle_claimed_key(key) {
+            return vec![];
+        }
+
+        if !self.reserved_by_host(key) && self.dispatch_override(key) {
             return vec![];
         }
 
@@ -1166,17 +1241,43 @@ impl App {
         self.handle_main_chat_key(key)
     }
 
+    /// The keys the host answers before any plugin *binding* sees them.
+    ///
+    /// `Ctrl+C` is how the user leaves, and the app has to stay leavable
+    /// whatever a plugin bound or how badly its handler is stuck. `Ctrl+Z` is
+    /// resolved above every step of the chain, for the same reason. Both come
+    /// from [`maki_lua::RESERVED_KEYS`], the list `maki.keymap.set` refuses
+    /// and the list a window's `keys` refuses, so neither can be bound nor
+    /// claimed.
+    ///
+    /// A focused plugin window is handed `Ctrl+C` all the same, before this
+    /// runs: being handed every key is what focus is, and the bundled pickers
+    /// answer it by closing, which is how the user gets back to a chat they
+    /// can quit from. `Ctrl+Z` is the one key not even a focused window sees,
+    /// because suspending cannot wait on a plugin reading its events.
+    ///
+    /// `Esc` joins them while the agent runs, because stopping a turn is the
+    /// other thing a user cannot be made to wait for. A popup that put
+    /// `Esc close` in its own footer is already past this: an unfocused window
+    /// takes its claims in [`FloatManager::handle_claimed_key`], which runs
+    /// above, so the popup takes the first `Esc` and the next one, with the
+    /// popup gone, arms the cancel.
+    fn reserved_by_host(&self, key: KeyEvent) -> bool {
+        is_reserved(key) || (self.status == Status::Streaming && key.code == KeyCode::Esc)
+    }
+
+    /// Whether a plugin binding claimed {key}. The binding the keymap matched
+    /// travels with the request, so one dropped on the Lua thread cannot leave
+    /// this having consumed a key nothing will act on.
+    ///
+    /// `false` is the only fall-through there is, and it is answered here, in
+    /// the keystroke the user pressed: no binding matched, the plugin has too
+    /// many callbacks in flight, or its load is gone. The built-in binding
+    /// then runs below, with the UI exactly as the user left it. Nothing comes
+    /// back from the Lua thread to be replayed.
     fn dispatch_override(&self, key: KeyEvent) -> bool {
-        let snap = self.keymap_reader.load();
-        for entry in &snap.entries {
-            if entry.key == key.code
-                && entry.modifiers == key.modifiers
-                && self.lua_event_handle.run_keybind_callback(entry.id)
-            {
-                return true;
-            }
-        }
-        false
+        self.keymap_reader
+            .dispatch(key, |bind| self.lua_event_handle.run_keybind_callback(bind))
     }
 
     fn handle_main_chat_key(&mut self, key: KeyEvent) -> Vec<Action> {
@@ -1201,24 +1302,6 @@ impl App {
                 self.input_changed(InputWriter::Anyone);
             }
             return vec![];
-        }
-
-        match self
-            .command_palette
-            .handle_key(key, &self.input_box.buffer.value())
-        {
-            CommandAction::Consumed => return vec![],
-            CommandAction::Execute(cmd) => {
-                self.input_box.discard();
-                return self.execute_command(cmd, 0);
-            }
-            CommandAction::Complete(text) => {
-                self.input_box.set_input(text);
-                self.input_box.buffer.move_to_end();
-                self.input_changed(InputWriter::Anyone);
-                return vec![];
-            }
-            CommandAction::Passthrough => {}
         }
 
         let streaming = self.status == Status::Streaming;
@@ -2390,10 +2473,6 @@ impl App {
         actions.extend(self.start_from_queue(&msg));
         actions
     }
-}
-
-fn is_streaming_stop_key(key: KeyEvent) -> bool {
-    key::QUIT.matches(key) || key.code == KeyCode::Esc
 }
 
 fn sync_search_highlight(modal: &SearchModal, chat: &mut Chat) {

@@ -193,9 +193,14 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///   chat input as `maki.ui.input` reports it. `data.source` is the plugin
 ///   name when that plugin's `maki.ui.input_edit` was the frame's sole
 ///   writer, and nil otherwise, so ignoring your own name never drops a
-///   change. At most one event per frame and only when the text moved, so
-///   moving the cursor alone fires nothing. Focusing another session
-///   republishes the input that tab holds.
+///   change. A caret the user moved names no writer, the same as any
+///   change nobody claimed. `data.cursor_only` is true when the caret
+///   moved and the text did not, which is how a popup anchored to what
+///   the caret sits in learns it has left; handlers that only watch the
+///   text return on it. At most one event per frame and only when the
+///   caret or the text moved, so a frame that moved neither fires
+///   nothing. Focusing another session republishes the input that tab
+///   holds.
 /// - `"FileIndexReady"`: `data.root`, the absolute directory that was
 ///   walked, `data.files`, how many paths the walk left, and `data.crashed`
 ///   and `data.truncated`, the two ways that list is not the whole tree.
