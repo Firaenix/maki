@@ -5299,7 +5299,7 @@ and close the window when you are done.
   - `height` (`integer|string`) window height. Integer for absolute rows; "N%" for percent of terminal height. Default "70%".
   - `row` (`integer?`) row offset from the anchor corner. Negative values move up.
   - `col` (`integer?`) column offset from the anchor corner.
-  - `anchor` (`string`) corner the (row, col) offset is relative to. One of "NW" (default), "NE", "SW", "SE".
+  - `anchor` (`string`) corner the (row, col) offset is relative to. One of "NW" (default), "NE", "SW", "SE". Or "caret", which ignores row and col and sits the window on the chat input cursor instead: the host puts it on the roomier side of the caret, trims the height to what fits there, keeps the whole width on screen, and re-places it every frame, so it follows wraps and resizes. Whenever nothing owns the caret, because a form, a permission prompt, a picker or a modal has the input box, it falls back to the default placement.
   - `border` (`string`) border style. One of "rounded" (default), "single", "double", "none".
   - `title` (`string`) text shown in the top border. Default "".
   - `title_pos` (`string`) title alignment. One of "left" (default), "center", "right".
@@ -5409,6 +5409,10 @@ The returned table has:
 - `line` (integer) 0-based line the cursor is on, for when you care
   about lines rather than offsets.
 - `col` (integer) byte offset of the cursor inside that line.
+
+To put a window on the caret, open it with `anchor = "caret"` rather
+than placing one yourself: the host knows where the caret is drawn on
+every frame, so the window follows it through wraps and resizes.
 
 **Returns:** (`table|nil`, `string|nil`) The input state, or nil and an error.
 
@@ -5546,7 +5550,7 @@ Updates the window layout on the fly. Only the fields you include in
   - `title_pos` (`string`) title alignment, "left", "center", or "right".
   - `footer` (`table`) key-hint pairs `{{key, label}, ...}` shown in the bottom border.
   - `border` (`string`) "rounded", "single", "double", or "none".
-  - `anchor` (`string`) corner origin, "NW", "NE", "SW", or "SE".
+  - `anchor` (`string`) corner origin, "NW", "NE", "SW", "SE", or "caret".
   - `width` (`integer|string`) new width; integer or "N%".
   - `height` (`integer|string`) new height; integer or "N%".
   - `zindex` (`integer`) stacking order.

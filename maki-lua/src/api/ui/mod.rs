@@ -406,6 +406,10 @@ async fn input_roundtrip(
 ///   about lines rather than offsets.
 /// - `col` (integer) byte offset of the cursor inside that line.
 ///
+/// To put a window on the caret, open it with `anchor = "caret"` rather
+/// than placing one yourself: the host knows where the caret is drawn on
+/// every frame, so the window follows it through wraps and resizes.
+///
 /// @return (table|nil, string|nil) The input state, or nil and an error.
 /// @example
 /// local st = maki.ui.input()
@@ -512,7 +516,7 @@ async fn open_editor(
 ///   - height (integer|string): window height. Integer for absolute rows; "N%" for percent of terminal height. Default "70%".
 ///   - row (integer?): row offset from the anchor corner. Negative values move up.
 ///   - col (integer?): column offset from the anchor corner.
-///   - anchor (string): corner the (row, col) offset is relative to. One of "NW" (default), "NE", "SW", "SE".
+///   - anchor (string): corner the (row, col) offset is relative to. One of "NW" (default), "NE", "SW", "SE". Or "caret", which ignores row and col and sits the window on the chat input cursor instead: the host puts it on the roomier side of the caret, trims the height to what fits there, keeps the whole width on screen, and re-places it every frame, so it follows wraps and resizes. Whenever nothing owns the caret, because a form, a permission prompt, a picker or a modal has the input box, it falls back to the default placement.
 ///   - border (string): border style. One of "rounded" (default), "single", "double", "none".
 ///   - title (string): text shown in the top border. Default "".
 ///   - title_pos (string): title alignment. One of "left" (default), "center", "right".
@@ -1010,6 +1014,7 @@ mod tests {
     #[test_case("NE", Anchor::NE ; "ne")]
     #[test_case("SW", Anchor::SW ; "sw")]
     #[test_case("SE", Anchor::SE ; "se")]
+    #[test_case("caret", Anchor::Caret ; "caret")]
     #[test_case("garbage", Anchor::NW ; "invalid_falls_back_to_default")]
     fn parse_anchor_cases(input: &str, expected: Anchor) {
         let lua = Lua::new();

@@ -172,6 +172,9 @@ pub enum Anchor {
     NE,
     SW,
     SE,
+    /// The cell the chat input cursor is drawn in. The host does the
+    /// placement, so a plugin never has to hold a terminal coordinate.
+    Caret,
 }
 
 impl Anchor {
@@ -180,6 +183,7 @@ impl Anchor {
             "NE" => Self::NE,
             "SW" => Self::SW,
             "SE" => Self::SE,
+            "caret" => Self::Caret,
             _ => Self::NW,
         }
     }
@@ -751,6 +755,7 @@ mod tests {
     #[test_case("NE" => Anchor::NE ; "ne")]
     #[test_case("SW" => Anchor::SW ; "sw")]
     #[test_case("SE" => Anchor::SE ; "se")]
+    #[test_case("caret" => Anchor::Caret ; "caret")]
     #[test_case("garbage" => Anchor::NW ; "unknown_defaults_nw")]
     fn anchor_parse(s: &str) -> Anchor {
         Anchor::parse(s)

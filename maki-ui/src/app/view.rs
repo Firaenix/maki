@@ -50,7 +50,7 @@ impl App {
         self.render_splits(frame, &layout);
         let mut overlay_rect = self.render_picker_overlays(frame, &layout);
         self.render_status_bar(frame, layout.status_area, render_chat);
-        overlay_rect = self.render_top_modals(frame, overlay_rect);
+        overlay_rect = self.render_top_modals(frame, overlay_rect, cursor);
         self.register_zones(&layout, overlay_rect);
         self.apply_selection(frame, render_chat);
         cursor
@@ -262,7 +262,15 @@ impl App {
         overlay_rect
     }
 
-    fn render_top_modals(&mut self, frame: &mut Frame, mut overlay_rect: Rect) -> Rect {
+    /// {caret} is the cell `render_bottom_panel` just reversed, so a float
+    /// anchored to the caret is placed against this frame rather than the
+    /// last one.
+    fn render_top_modals(
+        &mut self,
+        frame: &mut Frame,
+        mut overlay_rect: Rect,
+        caret: Option<Position>,
+    ) -> Rect {
         let full = frame.area();
         let r = self.btw_modal.view(frame, full);
         if r.width > 0 {
@@ -287,7 +295,7 @@ impl App {
                 overlay_rect = r;
             }
         }
-        let r = self.float_mgr.view(frame, full);
+        let r = self.float_mgr.view(frame, full, caret);
         if r.width > 0 {
             overlay_rect = r;
         }
