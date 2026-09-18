@@ -16,6 +16,17 @@ use crate::api::util::dispatch::{DepthGuard, Reentry, call_swallowing};
 /// Slot names the host fires itself. A plugin declaring one would shadow a
 /// point whose firing order dispatch guarantees, so the namespace is closed.
 pub(crate) const HOST_PREFIX: &str = "tool.";
+/// The other closed namespace: built-in surfaces a plugin layers to take over.
+pub(crate) const UI_PREFIX: &str = "ui.";
+const HOST_PREFIXES: [&str; 2] = [HOST_PREFIX, UI_PREFIX];
+
+/// Fired when the agent finishes writing a plan. The default opens the
+/// built-in plan form, so a layer that answers without calling `prev` owns
+/// the surface for that draft.
+pub(crate) const PLAN_FORM_SLOT: &str = "ui.plan_form";
+/// Fired just before the plan form opens. The default answers with the
+/// built-in rows, so a layer can add one, reorder them, or drop one.
+pub(crate) const PLAN_FORM_ACTIONS_SLOT: &str = "ui.plan_form.actions";
 
 const SEAM: &str = "slot";
 
@@ -321,6 +332,18 @@ pub(crate) async fn run_host_chain(
     args: MultiValue,
     allow_layer: &dyn Fn(&str) -> bool,
 ) -> LuaResult<Option<MultiValue>> {
+    run_host_chain_with(lua, name, identity_default(lua)?, args, allow_layer).await
+}
+
+/// [`run_host_chain`] with a default of the host's choosing, for a slot whose
+/// contract is "produce a value" rather than "rewrite the one it was passed".
+pub(crate) async fn run_host_chain_with(
+    lua: &Lua,
+    name: &str,
+    default: Function,
+    args: MultiValue,
+    allow_layer: &dyn Fn(&str) -> bool,
+) -> LuaResult<Option<MultiValue>> {
     let Some((_, _, layers)) = snapshot(lua, name) else {
         return Ok(None);
     };
@@ -332,7 +355,7 @@ pub(crate) async fn run_host_chain(
     if layers.is_empty() {
         return Ok(None);
     }
-    run_chain(lua, Arc::from(name), identity_default(lua)?, layers, args)
+    run_chain(lua, Arc::from(name), default, layers, args)
         .await
         .map(Some)
 }
@@ -360,7 +383,7 @@ fn make_callable(lua: &Lua, name: String) -> LuaResult<Function> {
 /// chain: outermost layer first, then inward, ending at {default}.
 ///
 /// Throws if another plugin already owns a slot with the same {name}, or
-/// if {name} starts with `"tool."`, which the host fires itself.
+/// if {name} starts with `"tool."` or `"ui."`, which the host fires itself.
 ///
 /// The chain is async: the default and every layer may park (`maki.fs.*`,
 /// `maki.fn.jobwait`, `maki.agent.call_tool`, ...), and so does the
@@ -384,9 +407,9 @@ fn declare_slot(
     name: String,
     default: Function,
 ) -> LuaResult<Function> {
-    if name.starts_with(HOST_PREFIX) {
+    if let Some(prefix) = HOST_PREFIXES.iter().find(|p| name.starts_with(**p)) {
         return Err(mlua::Error::runtime(format!(
-            "slot '{name}' is host owned: '{HOST_PREFIX}' names are fired by maki itself, \
+            "slot '{name}' is host owned: '{prefix}' names are fired by maki itself, \
              use set_slot to wrap one"
         )));
     }
@@ -418,6 +441,15 @@ fn declare_slot(
 ///
 /// Layers wrap in registration order, so the last one registered runs
 /// first and sees the value before the others do.
+///
+/// Maki fires two slots around the plan form, both with
+/// `ev = { path, session }`. `ui.plan_form.actions` asks for the form's
+/// menu: the default answers with the built-in rows, so a layer appends,
+/// reorders, or drops one and returns the list. `ui.plan_form` asks
+/// whether the form opens at all: answer without calling `prev` (or with
+/// `false`) to keep it closed and render the plan yourself. Both go away
+/// with your plugin, so an unload hands the form back. See
+/// [maki.plan](/docs/lua-api/#maki-plan).
 ///
 /// Maki fires two slots per tool itself: `tool.<name>.input` before
 /// permissions look at the call, and `tool.<name>.output` on the text it

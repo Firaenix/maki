@@ -83,10 +83,11 @@ impl App {
                     return;
                 }
                 self.state.plan.mark_ready();
-                self.plan_form.on_plan_ready();
+                let path = self.state.plan.path().map(|p| p.display().to_string());
+                self.offer_plan_form(path.as_deref());
                 // The path is the whole point here, so with no path we stay
                 // quiet instead of handing a plugin an empty one to open.
-                if let Some(path) = self.state.plan.path().map(|p| p.display().to_string()) {
+                if let Some(path) = path {
                     self.fire_session_autocmd("PlanReady", serde_json::json!({ "path": path }));
                 }
             }

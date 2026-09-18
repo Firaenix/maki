@@ -13,7 +13,9 @@ use maki_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
 
 use crate::api::keymap::KeymapReader;
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
-use crate::api::util::command::{HintReader, LuaCommandReader, UiAction, UiAttachment};
+use crate::api::util::command::{
+    HintReader, LuaCommandReader, PlanFormRow, UiAction, UiAttachment,
+};
 use crate::error::PluginError;
 use crate::pack::DiscoveredPackage;
 use crate::plugin_permissions::{
@@ -143,6 +145,10 @@ static BUNDLED_PLUGINS: &[BundledPlugin] = &[
     BundledPlugin {
         name: "code_execution",
         dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/code_execution"),
+    },
+    BundledPlugin {
+        name: "completion",
+        dir: include_dir!("$CARGO_MANIFEST_DIR/../plugins/completion"),
     },
     BundledPlugin {
         name: "view_image",
@@ -977,6 +983,37 @@ impl EventHandle {
         Self::from_tx(flume::unbounded().0)
     }
 
+    /// Runs the handler behind a plugin row of {session}'s plan form, named
+    /// by its position in the menu [`Self::open_plan_form`] built.
+    pub fn run_plan_action(&self, session: String, row: usize, path: String, parallel: bool) {
+        let _ = self.prio_tx.try_send(Request::RunPlanAction {
+            session,
+            row,
+            path,
+            parallel,
+        });
+    }
+
+    /// Asks the `ui.plan_form*` chains what to draw for a draft that just
+    /// landed, starting from the {rows} the host proposes. The receiver
+    /// answers `None` when a layer took the form over; if the host is gone it
+    /// disconnects, and the caller opens the built-in form.
+    pub fn open_plan_form(
+        &self,
+        path: String,
+        session: String,
+        rows: Vec<PlanFormRow>,
+    ) -> flume::Receiver<Option<Vec<PlanFormRow>>> {
+        let (reply, rx) = flume::bounded(1);
+        let _ = self.prio_tx.try_send(Request::OpenPlanForm {
+            path,
+            session,
+            rows,
+            reply,
+        });
+        rx
+    }
+
     /// True when no runtime is draining requests. Production handles stay
     /// connected for the host's lifetime; the disconnected-for-test handle
     /// and a host whose thread has shut down both report true. Callers use
@@ -1098,6 +1135,21 @@ impl EventHandle {
         let _ = self
             .tx
             .try_send(Request::InstallSessionSnapshot { provider });
+    }
+
+    /// Same arrangement for `maki.session.messages`: headless drivers read
+    /// the agent's live history mirror, the UI answers from its event loop.
+    pub fn install_session_messages(&self, provider: crate::api::session::SessionMessagesFn) {
+        let _ = self
+            .tx
+            .try_send(Request::InstallSessionMessages { provider });
+    }
+
+    /// Where `maki.model.complete` reports what it spent. The UI takes it
+    /// over its action channel instead, so only headless drivers install
+    /// one.
+    pub fn install_model_spend(&self, sink: crate::api::model::ModelSpendFn) {
+        let _ = self.tx.try_send(Request::InstallModelSpend { sink });
     }
 
     /// Queue the kill of session-owned jobs and the `SessionEnd` dispatch,

@@ -63,6 +63,7 @@ permission raises `permission denied: '<name>' not granted for this plugin`.
 - `net`: outbound network requests
 - `run`: starting processes
 - `env`: reading the process environment, where secrets live
+- `reviewers`: registering reviewers that intercept permission prompts
 
 Grants come from a `plugin.toml` next to the Lua file (for
 `~/.config/maki/init.lua` that is `~/.config/maki/plugin.toml`):
@@ -76,6 +77,7 @@ fs_write = true
 net = true
 run = true
 env = true
+reviewers = true
 ```
 
 The rules:
@@ -102,6 +104,7 @@ The rules:
 | [`maki`](#maki) | The global entry point. |
 | [`maki.pack`](#maki-pack) | Declare global packages and inspect package state. |
 | [`maki.api`](#maki-api) | Plugin registration. |
+| [`maki.plan`](#maki-plan) | Plan-mode surface for plugins. |
 | [`maki.agent`](#maki-agent) | Subagent primitives for plugins that need to talk to an LLM. |
 | [`maki.agent.Session`](#maki-agent-Session) | A subagent session with its own conversation history. |
 | [`maki.async`](#maki-async) | Tools for running things concurrently in Lua plugins. |
@@ -506,6 +509,136 @@ maki.api.register_permission_rule({
 
 ---
 
+### `maki.api.register_reviewer()` {#maki-api-register_reviewer}
+
+```lua
+maki.api.register_reviewer({spec})
+```
+
+Register a reviewer for permission prompts. When a tool call would
+prompt the human, registered reviewers are asked first, in chain
+order: each answers ALLOW (run it), DENY (block it, with the reason
+shown to the agent), or ASK (escalate to the next reviewer, then the
+human). Under yolo mode an unresolved chain denies with retry guidance
+instead of prompting, so the agent never stalls on a question.
+
+A reviewer is your `handler` function and nothing else: rulebooks,
+quotas, external approval systems, a model you call yourself with
+`maki.model.complete`. It receives one table with `tool`, `input`
+(decoded, whole, never trimmed), `scopes` (for bash: the parsed command
+segments), `parseable`, `cwd`, `session` and `task` (whose turn issued
+the call; pass `session` to `maki.session.messages` to read the
+conversation behind it), and `attempt` (`{ count, history }` on
+repeats). It returns `"ALLOW"|"DENY"|"ASK"` plus an optional reason;
+anything else escalates. Handlers may block (e.g. on `maki.ui.picker`);
+the outer chain waits at most `timeout_ms` and cancels the handler when
+the wait ends, so a slow handler cannot outlive its caller.
+
+A DENY reason reaches the agent as quoted data, stripped and bounded: it
+is text shaped by the input under review, so it is never handed over as
+instructions. Denials also spend the turn's review budget, and the turn
+ends once that budget is gone.
+
+One rule governs visibility: reviewers see the tools they name.
+Tools that never reach the permission layer (`question`, `todo_write`)
+are therefore only seen by reviewers naming them with a real pattern, as
+the `"*"` default does not reach them, and for those calls anything
+short of a DENY (allow, timeout, exhausted escalation) lets the tool
+run as usual. A goal plugin can e.g. deny the question tool while a
+goal is active, so the agent decides instead of stalling on the human.
+
+Registration is live: it takes effect immediately and re-registering
+the same `name` replaces the earlier entry, so a toggle command can
+re-register on enable and `unregister_reviewer` on disable. A
+`/reload` drops the plugin's reviewers before the plugin runs again.
+
+**Parameters:**
+
+- `{spec}` (`table`) Reviewer specification:
+  - `name` (`string`) Required. Unique per plugin; same name replaces.
+  - `handler` (`function`) Required. Computes the verdict:
+    `function(call) -> verdict, reason?`
+  - `tools` (`table`) Optional. Tool filters matched against the tool
+    key (`"bash"`, `"server.tool"`); `*` globs, e.g.
+    `{ "bash", "myserver.*" }`. Default `{ "*" }`.
+    Real patterns also opt permission-free tools
+    into review (see above); the default does not.
+  - `timeout_ms` (`integer`) Optional. Per-call timeout; default 300000,
+    because a handler may wait on a human.
+  - `order` (`integer`) Optional. Chain position, lowest first; default 0.
+  - `redirect_guidance` (`string`) Optional. Replaces the built-in "try a
+    different approach" text when an unresolved chain
+    denies under yolo, so the agent hears your
+    plugin's voice (e.g. restate the goal).
+
+**Example:**
+
+```lua
+maki.api.register_reviewer({
+  name = "rulebook",
+  order = -1,
+  handler = function(call)
+    if call.tool == "bash" and call.scopes[1]:find("^git ") then
+      return "ALLOW"
+    end
+    return "ASK"
+  end,
+})
+maki.api.register_reviewer({
+  name = "cheap",
+  handler = function(call)
+    local answer = maki.model.complete({
+      model = "anthropic/claude-haiku-4-5-20251001",
+      system = "Reply ALLOW or DENY. Read-only commands are fine.",
+      prompt = maki.json.encode(call.input),
+      max_output_tokens = 64,
+    })
+    return answer and answer.text:match("^%u+") or "ASK"
+  end,
+})
+```
+
+---
+
+### `maki.api.unregister_reviewer()` {#maki-api-unregister_reviewer}
+
+```lua
+maki.api.unregister_reviewer({name})
+```
+
+Remove one of this plugin's reviewers by name. Unknown names are a
+no-op, so a toggle can call it unconditionally; `clear_reviewers`
+drops all of the plugin's reviewers at once.
+
+**Parameters:**
+
+- `{name}` (`string`) The `name` the reviewer was registered under.
+
+**Example:**
+
+```lua
+maki.api.unregister_reviewer("goal-no-questions")
+```
+
+---
+
+### `maki.api.clear_reviewers()` {#maki-api-clear_reviewers}
+
+```lua
+maki.api.clear_reviewers()
+```
+
+Drop every reviewer this plugin registered, effective immediately.
+The counterpart of `register_reviewer` for disable toggles.
+
+**Example:**
+
+```lua
+maki.api.clear_reviewers()
+```
+
+---
+
 ### `maki.api.register_command()` {#maki-api-register_command}
 
 ```lua
@@ -771,8 +904,10 @@ Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
 `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"TaskStatusChanged"`,
-`"TaskFocusChanged"`, and `"ModelChanged"`. Plugins can also fire their
-own events with `exec_autocmds`.
+`"TaskFocusChanged"`, `"ModelChanged"`, `"ToolReviewed"`, and
+`"InputChanged"`.
+
+Plugins can also fire their own events with `exec_autocmds`.
 
 Every host event carries `data.session_id`. For `"SessionReset"` and
 `"SessionEnd"` that is the session being left behind, the other events
@@ -791,7 +926,9 @@ name the session now running or focused. What each event adds:
 - `"CompactionDone"`: `data.context_size_before`,
   `data.context_size_after`, and `data.context_window`.
 - `"PlanReady"`: `data.path`, the absolute path of the plan file the
-  agent just wrote. Fires once per draft.
+  agent just wrote. Fires once per draft. Plan state is per session, so
+  pass `data.session_id` to `maki.plan.read` rather than letting it
+  default to the focused tab.
 - `"SessionFocusChanged"`: `data.previous_session_id`, absent on the
   first focus at startup.
 - `"SessionStatusChanged"`: `data.status` (`"working"`, `"needs_input"`,
@@ -807,6 +944,25 @@ name the session now running or focused. What each event adds:
 - `"ModelChanged"`: `data.model` in the shape `maki.model.get` returns,
   plus `data.previous_spec`. Picking the model already in use stays
   quiet, and so does startup.
+- `"ToolReviewed"`: one per reviewer that answered, with `data.tool`,
+  `data.tool_use_id`, `data.reviewer`, `data.verdict` (`"ALLOW"`,
+  `"DENY"`, `"ASK"`), `data.reason`, `data.scopes` (the permission scopes
+  maki derived), and `data.resolution`, which is what the chain did with
+  the answer: `"allowed"`, `"denied"`, `"escalated"` to the next
+  reviewer, `"prompted"` because the chain ran out, `"redirected"` under
+  yolo, or `"terminated"` because the turn's review budget ran out and
+  maki ended the turn. `data.reviewer` is empty for the synthetic
+  `"prompted"`, `"redirected"` and `"terminated"` events, which no
+  reviewer answered. Tokens a reviewer spent are reported by
+  `maki.model.complete`, not here.
+- `"InputChanged"`: `data.text`, `data.cursor` and `data.version`, the
+  chat input as `maki.ui.input` reports it, so a handler can edit it
+  back without reading it again. Plus `data.source`, the name of the
+  plugin whose `maki.ui.input_edit` moved the value, or nil when the
+  user typed or pasted it, so a plugin can ignore its own writes
+  without a loop guard and still act on another plugin's. Coalesced to
+  one event per frame, and quiet when the text did not move, so moving
+  the cursor alone fires nothing.
 
 `"TurnEnd"` fires once per turn and only for the main session, so
 subagent turns never show up. A manual `/compact` ends its run without
@@ -924,7 +1080,7 @@ plugin holds every permission. The returned callable runs the full
 chain: outermost layer first, then inward, ending at {default}.
 
 Throws if another plugin already owns a slot with the same {name}, or
-if {name} starts with `"tool."`, which the host fires itself.
+if {name} starts with `"tool."` or `"ui."`, which the host fires itself.
 
 The chain is async: the default and every layer may park (`maki.fs.*`,
 `maki.fn.jobwait`, `maki.agent.call_tool`, ...), and so does the
@@ -972,6 +1128,15 @@ takes the seam down with it.
 Layers wrap in registration order, so the last one registered runs
 first and sees the value before the others do.
 
+Maki fires two slots around the plan form, both with
+`ev = { path, session }`. `ui.plan_form.actions` asks for the form's
+menu: the default answers with the built-in rows, so a layer appends,
+reorders, or drops one and returns the list. `ui.plan_form` asks
+whether the form opens at all: answer without calling `prev` (or with
+`false`) to keep it closed and render the plan yourself. Both go away
+with your plugin, so an unload hands the form back. See
+[maki.plan](/docs/lua-api/#maki-plan).
+
 Maki fires two slots per tool itself: `tool.<name>.input` before
 permissions look at the call, and `tool.<name>.output` on the text it
 produced. Both take `function(prev, value, ctx)` and answer with a
@@ -1018,6 +1183,90 @@ which plugins own or wrap each slot.
 ```lua
 for name, info in pairs(maki.api.get_slots()) do
   print(name, info.owner, info.declared)
+end
+```
+
+
+## maki.plan {#maki-plan}
+
+Plan-mode surface for plugins.
+
+Read the plan without touching session internals, and shape what the
+plan form offers by layering the two slots maki fires around it.
+
+`ui.plan_form.actions` is the menu. The default answers with the
+built-in rows, each `{ label, desc, action }`, so a layer can append
+its own, reorder them, or drop one it does not want. A row carrying a
+`handler` is yours: the function runs on the Lua thread when the user
+picks it, with `{ session, path, parallel }`.
+
+`ui.plan_form` is the form itself. A layer that answers without
+calling `prev` keeps it closed and renders the plan however it likes.
+
+Both go away with your plugin, so an unload hands the form back.
+
+Every call takes an optional `session` and defaults to the focused
+tab. Plan state is per session, so a handler reacting to `PlanReady`
+on a background tab has to pass `ev.data.session_id` through, or it
+reads whichever plan the user happens to be looking at.
+
+```lua
+-- One more row, next to the built-in ones:
+maki.api.set_slot("ui.plan_form.actions", function(prev, ev)
+  local rows = prev(ev)
+  table.insert(rows, {
+    label = "Commit and implement",
+    desc = "Commit the plan file first, then implement it",
+    handler = function(opts)
+      maki.fn.system({ "git", "commit", "-am", "plan" })
+      local prompt = "Implement the plan at `" .. opts.path .. "`."
+      -- Fresh context, the way "Clear context and implement" does it:
+      maki.session.new({ prompt = prompt, focus = true })
+      -- ...or keep the context the plan was written in:
+      -- maki.session.prompt(prompt, { session = opts.session })
+    end,
+  })
+  return rows
+end)
+
+-- Own the plan UI for as long as this plugin is loaded:
+maki.api.set_slot("ui.plan_form", function(prev, ev)
+  local plan = maki.plan.read({ session = ev.session })
+  -- render plan.content in your own window
+  return false
+end)
+```
+
+---
+
+### `maki.plan.read()` {#maki-plan-read}
+
+```lua
+maki.plan.read({opts?})
+```
+
+Read the current plan state without reaching into session internals.
+Returns `{ mode, path, content, ready }`:
+- `mode` is `"plan"` or `"build"`.
+- `path` is the absolute plan path when in plan mode, else `nil`.
+- `content` is the file contents when `ready` is true, else `nil`
+  (`nil` distinguishes "not ready" and "read failed" from an empty
+  plan).
+- `ready` is `true` once the agent has written the plan file.
+
+**Parameters:**
+
+- `{opts?}` (`table?`) `session` (string?) Session id; defaults to focused.
+
+**Returns:** (`table|nil`, `string|nil`) Plan snapshot table, or nil and an error.
+
+**Example:**
+
+```lua
+local plan, err = maki.plan.read({ session = id })
+if plan and plan.ready then
+  print("plan at " .. plan.path)
+  print(plan.content)
 end
 ```
 
@@ -3109,7 +3358,8 @@ maki.keymap.del({mode}, {lhs})
 ```
 
 Remove the mapping for {lhs} in {mode}. Does nothing if no mapping
-exists for that key.
+exists for that key, or if the mapping on it belongs to another plugin:
+you can only remove what you bound.
 
 **Parameters:**
 
@@ -3221,8 +3471,8 @@ maki.log.error("failed to connect to API")
 
 The model behind the focused session. Good for a keybind that flips
 between your two go-to models, or lifts thinking for one hard question.
-Without an interactive UI every function returns
-`nil, "no interactive UI attached"`.
+`get`, `available` and `set` return `nil, "no interactive UI attached"`
+without one; `complete` needs no UI, it calls a model itself.
 
 ---
 
@@ -3348,6 +3598,85 @@ endpoint may never report. Purely local -- no UI round-trip, no network
 ```lua
 local m, err = maki.model.info("anthropic/claude-opus-4-6")
 if m and m.subsidised_by then print(m.subsidised_by, m.pricing.input) end
+```
+
+---
+
+### `maki.model.refresh()` {#maki-model-refresh}
+
+```lua
+maki.model.refresh({opts?})
+```
+
+Re-run model discovery. The list `available()` returns and the model
+picker read from the same slot this refreshes. With `live = true` the
+on-disk discovery cache is skipped and every provider is re-probed (what
+`R` does in the picker); otherwise the cached replay-then-background-
+refresh path runs.
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Optional fields: `live` (boolean) force live re-probe.
+
+**Returns:** (`boolean|nil`, `string|nil`) `true`, or nil and an error.
+
+**Example:**
+
+```lua
+maki.model.refresh({ live = true })
+```
+
+---
+
+### `maki.model.complete()` {#maki-model-complete}
+
+```lua
+maki.model.complete({opts})
+```
+
+Asks a model one question and hands back what it said. No system prompt
+of maki's, no tools, no turn: this is the plain call a plugin needs to
+classify, summarise, or judge something on its own.
+
+The tokens are billed to the session like any other model call, so the
+spend shows up in the TUI status line, in `maki -p`'s result, and in sdk
+mode's usage. A reviewer firing on every tool call is exactly where an
+unnoticed bill grows, so it is never silent.
+
+The call is answered on the Lua thread, so it works with or without an
+interactive UI.
+
+**Parameters:**
+
+- `{opts}` (`table`) Options:
+  - `model` (`string`) Required. `"provider/model-id"`.
+  - `prompt` (`string`) The single user message to send.
+  - `messages` (`table`) Instead of `prompt`: `{role, content}` rows, where
+
+  `role` is `"user"` or `"assistant"`.
+
+  - `system` (`string`) System prompt. You own every word of it.
+  - `max_output_tokens` (`integer`) Output ceiling, default 1024. Raise it for
+
+  models that emit reasoning tokens whatever you ask: one that spends its
+
+
+  whole budget thinking answers with nothing and still bills.
+
+  - `timeout_ms` (`integer`) How long to wait, default 30000.
+
+**Returns:** (`table|nil`, `string|nil`) `{text, model, usage, cost, list_cost}`,
+  or nil and an error. `usage` carries the four token counts.
+
+**Example:**
+
+```lua
+local answer, err = maki.model.complete({
+  model = "anthropic/claude-haiku-4-5-20251001",
+  system = "Answer with one word.",
+  prompt = "Is `rm -rf /` safe?",
+  max_output_tokens = 16,
+})
 ```
 
 
@@ -3518,6 +3847,50 @@ local s = maki.session.read()
 if s.context_size > s.context_window * 0.8 then
   maki.ui.notify("context is nearly full")
 end
+```
+
+---
+
+### `maki.session.messages()` {#maki-session-messages}
+
+```lua
+maki.session.messages({opts?})
+```
+
+Reads the conversation: what the human said, what the agent said back,
+oldest first. This is how a plugin builds its own context, for a reviewer
+prompt or anything else, instead of taking one maki chose for it.
+
+Every row is `{role, kind, text, truncated}`:
+```text
+role     "user" | "assistant"
+kind     "typed"       the human typed it
+         "answer"      the human answered the `question` tool
+         "observation" the host or a plugin reported it
+         "said"        the assistant's own text
+truncated  the row was longer than 16KB and was cut
+```
+
+Tool calls and tool results are left out, `question` answers aside: those
+are the human's words, they just arrive as a tool result.
+
+Reads the focused session, or the one you name in `session`, which is
+what a reviewer handler passes from `call.session`.
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Options:
+  - `session` (`string?`) Session id; defaults to focused.
+  - `limit` (`integer?`) Keep only the newest {limit} rows, still oldest first.
+  - `role` (`string?`) `"user"` or `"assistant"`; both when absent.
+
+**Returns:** (`table|nil`, `string|nil`) Array of rows, or nil and an error.
+
+**Example:**
+
+```lua
+local rows = maki.session.messages({ session = call.session, limit = 4, role = "user" })
+local latest = rows[#rows]
 ```
 
 ---
@@ -5298,7 +5671,7 @@ and close the window when you are done.
   - `height` (`integer|string`) window height. Integer for absolute rows; "N%" for percent of terminal height. Default "70%".
   - `row` (`integer?`) row offset from the anchor corner. Negative values move up.
   - `col` (`integer?`) column offset from the anchor corner.
-  - `anchor` (`string`) corner the (row, col) offset is relative to. One of "NW" (default), "NE", "SW", "SE".
+  - `anchor` (`string`) corner the (row, col) offset is relative to. One of "NW" (default), "NE", "SW", "SE". Or "caret", which ignores row and col and sits the window on the chat input cursor instead: the host puts it on the roomier side of the caret, trims the height to what fits there, keeps the whole width on screen, and re-places it every frame, so it follows wraps and resizes. Whenever nothing owns the caret, because a form, a permission prompt, a picker or a modal has the input box, it falls back to the default placement.
   - `border` (`string`) border style. One of "rounded" (default), "single", "double", "none".
   - `title` (`string`) text shown in the top border. Default "".
   - `title_pos` (`string`) title alignment. One of "left" (default), "center", "right".
@@ -5380,6 +5753,102 @@ maki.ui.set_window_title("maki: " .. session_name)
 maki.ui.set_window_title("")
 ```
 
+---
+
+### `maki.ui.input()` {#maki-ui-input}
+
+```lua
+maki.ui.input()
+```
+
+Reads what the user has typed in the chat input, and where the cursor
+is.
+
+Offsets are byte offsets into `text`, the same unit the Lua string
+library uses, so `text:sub(1, cursor)` is everything before the cursor
+and `text:sub(cursor + 1)` is everything after it. A newline counts as
+one byte, so an offset means the same thing however the input wraps.
+
+The returned table has:
+
+- `session_id` (string) the tab the value was read from. Hand it back
+  to `input_edit` so an edit cannot land in another tab the user
+  switched to in the meantime.
+- `text` (string) the whole value, newlines included.
+- `cursor` (integer) byte offset of the cursor into `text`.
+- `version` (integer) counter of changes to the value. Hand it back to
+  `input_edit` to have an edit fail when the value moved on.
+- `line` (integer) 0-based line the cursor is on, for when you care
+  about lines rather than offsets.
+- `col` (integer) byte offset of the cursor inside that line.
+
+To put a window on the caret, open it with `anchor = "caret"` rather
+than placing one yourself: the host knows where the caret is drawn on
+every frame, so the window follows it through wraps and resizes.
+
+**Returns:** (`table|nil`, `string|nil`) The input state, or nil and an error.
+
+**Example:**
+
+```lua
+local st = maki.ui.input()
+local before = st.text:sub(1, st.cursor)
+```
+
+---
+
+### `maki.ui.input_edit()` {#maki-ui-input_edit}
+
+```lua
+maki.ui.input_edit({opts})
+```
+
+Replaces a byte range of the chat input, as if the user had selected it
+and typed {text}. The cursor lands after the inserted text unless you
+say otherwise.
+
+A handler runs after the key that woke it, so by the time it writes, the
+user may have typed on, or switched tab. Four checks refuse an edit
+instead of landing it somewhere it was never meant to go:
+
+- `stop` past the end of the value fails.
+- `session_id`, when you pass the one `maki.ui.input` returned, fails
+  once another tab is focused. The version cannot stand in for it:
+  every tab counts from zero, so two tabs typed in about as much agree
+  on a version while holding different text.
+- `version`, when you pass the one `maki.ui.input` returned, fails as
+  soon as the value has changed at all. Without it an edit planned
+  against older text still applies wherever the offsets now point.
+- An offset inside a multi-byte character fails.
+
+Read again and retry on any of them.
+
+**Parameters:**
+
+- `{opts}` (`table`) Options:
+  - `start` (`integer`) byte offset the replaced range starts at.
+  - `stop` (`integer`) byte offset it ends at. `start == stop` inserts.
+  - `text` (`string`) what to put there, empty to delete the range.
+  - `cursor` (`integer|nil`) byte offset to leave the cursor at, default is the end of the inserted text.
+  - `version` (`integer|nil`) the version the offsets were planned against.
+  - `session_id` (`string|nil`) the session the offsets were read from.
+
+**Returns:** (`boolean|nil`, `string|nil`) `true` on success, or nil and an error.
+
+**Example:**
+
+```lua
+local st = maki.ui.input()
+-- Replace the "@src/ma" before the cursor with a full path:
+maki.ui.input_edit({
+  start = 8,
+  stop = st.cursor,
+  text = "src/main.rs",
+  version = st.version,
+  session_id = st.session_id,
+})
+```
+
 
 ## maki.ui.Win {#maki-ui-Win}
 
@@ -5453,7 +5922,7 @@ Updates the window layout on the fly. Only the fields you include in
   - `title_pos` (`string`) title alignment, "left", "center", or "right".
   - `footer` (`table`) key-hint pairs `{{key, label}, ...}` shown in the bottom border.
   - `border` (`string`) "rounded", "single", "double", or "none".
-  - `anchor` (`string`) corner origin, "NW", "NE", "SW", or "SE".
+  - `anchor` (`string`) corner origin, "NW", "NE", "SW", "SE", or "caret".
   - `width` (`integer|string`) new width; integer or "N%".
   - `height` (`integer|string`) new height; integer or "N%".
   - `zindex` (`integer`) stacking order.

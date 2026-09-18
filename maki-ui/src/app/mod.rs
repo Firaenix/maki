@@ -40,7 +40,7 @@ use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::pack_review::{PackReview, PackReviewAction};
 use crate::components::permission_prompt::PermissionPrompt;
-use crate::components::plan_form::{PlanForm, PlanFormAction};
+use crate::components::plan_form::{PlanForm, PlanFormAction, builtin_rows};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
@@ -54,6 +54,7 @@ use crate::image;
 use crate::markdown::TRUNCATION_PREFIX;
 use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
+use crate::text_buffer::TextBuffer;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use maki_agent::permissions::{PermissionManager, TaggedAnswer};
@@ -64,8 +65,8 @@ use maki_agent::{
 use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
-    BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader,
-    PackCommand, PackPreparation, WinView,
+    BuiltinAction, EventHandle, HintReader, HintSnapshot, InputEdit, KeymapReader,
+    LuaCommandReader, ModelSpend, PackCommand, PackPreparation, PlanFormRow, WinView,
 };
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
@@ -267,9 +268,20 @@ pub struct App {
     /// than the session's stored one: a restored session may name another
     /// model, and the event loop swaps the live one in on the first tick.
     announced_model_spec: String,
+    /// The value Lua was last told about. A fast typist would otherwise wake
+    /// every handler once per keystroke.
+    announced_input: String,
+    /// The plugin behind the pending change, None when the user made it.
+    /// Rides along on `InputChanged` so a plugin can tell its own writes from
+    /// another's instead of growing a loop guard.
+    input_source: Option<Arc<str>>,
     pub(super) keymap_reader: KeymapReader,
     pub(super) hint_reader: HintReader,
     hints: Watch<HintSnapshot>,
+    /// In flight answer from the `ui.plan_form*` chains. `Some` means a
+    /// draft landed and the form is waiting to hear whether it opens, and
+    /// with which rows.
+    pub(super) plan_form_answer: Option<flume::Receiver<Option<Vec<PlanFormRow>>>>,
     pub(crate) restore_event_tx: Option<maki_agent::EventSender>,
     pub(super) restoring: Arc<AtomicBool>,
     subagent_answers: HashMap<String, flume::Sender<String>>,
@@ -362,9 +374,12 @@ impl App {
             model_policy: Arc::clone(&model_policy),
             lua_event_handle,
             announced_model_spec: model.spec(),
+            announced_input: String::new(),
+            input_source: None,
             hints: Watch::seeded(hint_reader.load_full()),
             keymap_reader,
             hint_reader,
+            plan_form_answer: None,
             restore_event_tx: None,
             restoring: Arc::new(AtomicBool::new(false)),
             subagent_answers: HashMap::new(),
@@ -451,6 +466,106 @@ impl App {
         })
     }
 
+    /// What `maki.ui.input` hands to Lua: text and offsets only. Render
+    /// geometry stays out of a text API, and the terminal cell the caret sits
+    /// in has no answer at all for half the modes the UI can be in.
+    pub(crate) fn input_snapshot(&self) -> serde_json::Value {
+        let buffer = &self.input_box.buffer;
+        let col = TextBuffer::char_to_byte(&buffer.lines()[buffer.y()], buffer.x());
+        serde_json::json!({
+            "session_id": self.state.session.id.to_string(),
+            "text": buffer.value(),
+            "cursor": buffer.cursor_byte(),
+            "version": buffer.version(),
+            "line": buffer.y(),
+            "col": col,
+        })
+    }
+
+    /// Refuses an edit the input has moved on from rather than landing it
+    /// somewhere else: another tab now focused, a version the buffer has left
+    /// behind, or a range it has outgrown. See
+    /// [`TextBuffer::replace_byte_range`].
+    ///
+    /// The session check is the one the version cannot stand in for: the
+    /// counter is per buffer and every buffer starts at 0, so two tabs typed
+    /// in about as much collide, and the edit would land in whichever one the
+    /// focus moved to between the read and the write.
+    pub(crate) fn apply_input_edit(
+        &mut self,
+        edit: InputEdit,
+    ) -> Result<serde_json::Value, String> {
+        let focused = self.state.session.id.to_string();
+        if let Some(session_id) = &edit.session_id
+            && *session_id != focused
+        {
+            return Err(format!(
+                "input of session {session_id} is not focused (session {focused} is)"
+            ));
+        }
+        let current = self.input_box.buffer.version();
+        if let Some(version) = edit.version
+            && version != current
+        {
+            return Err(format!(
+                "input changed since version {version} (it is now {current})"
+            ));
+        }
+        self.input_box
+            .replace_range(edit.start, edit.stop, &edit.text, edit.cursor)?;
+        self.input_changed(Some(edit.plugin));
+        Ok(serde_json::json!(true))
+    }
+
+    /// The paths that keep the command palette in step with the input, and
+    /// the only ones that can name a source. Submit, discard, history recall
+    /// and `$EDITOR` change the value without coming through here; the tick
+    /// diff is what reports those.
+    fn input_changed(&mut self, source: Option<Arc<str>>) {
+        self.command_palette.sync(&self.input_box.buffer.value());
+        self.input_source = source;
+    }
+
+    /// One event per frame at most, and only when the text really moved, so
+    /// holding a key down does not wake a handler per keystroke and arrowing
+    /// around does not wake it at all.
+    fn tick_input_changed(&mut self) -> Dirty {
+        let value = self.input_box.buffer.value();
+        if value == self.announced_input {
+            self.input_source = None;
+            return Dirty::NO;
+        }
+        // The value is the trigger and the source is only a label, because a
+        // flag alone loses events rather than coalescing them: submit, discard,
+        // history recall, a draft restored on a session switch and $EDITOR all
+        // change the value without going through a path that could set one.
+        // Sending "hi", then typing "hi" again, would look like no change at
+        // all and leave a completion plugin dead until the next distinct value.
+        let source = self.input_source.take();
+        self.announced_input = value;
+        self.fire_session_autocmd(
+            "InputChanged",
+            serde_json::json!({
+                "text": self.announced_input,
+                "cursor": self.input_box.buffer.cursor_byte(),
+                "version": self.input_box.buffer.version(),
+                "source": source,
+            }),
+        );
+        Dirty::NO
+    }
+
+    /// A `maki.model.complete` call spends real tokens on a real model, so
+    /// it is billed and attributed like any other call rather than
+    /// disappearing into whatever the plugin was doing. A reviewer firing on
+    /// every tool call is exactly the bill that must not go unseen.
+    pub(crate) fn handle_model_spend(&mut self, spend: &ModelSpend) {
+        self.state.token_usage += spend.usage;
+        add_cost(&mut self.state.cost, spend.cost);
+        self.state
+            .session_mut()
+            .add_model_usage(&spend.model, spend.usage.billed(spend.cost));
+    }
     pub(crate) fn record_recent_model(&mut self, spec: &str) {
         let recents = maki_storage::model::push_recent(&self.storage, spec)
             .into_iter()
@@ -715,10 +830,8 @@ impl App {
                 FilePickerModalAction::Consumed => vec![],
                 FilePickerModalAction::Select(path) => {
                     self.file_picker.close();
-                    if let InputAction::PaletteSync(val) =
-                        self.input_box.handle_paste_with_spaces(&path)
-                    {
-                        self.command_palette.sync(&val);
+                    if let InputAction::Changed = self.input_box.handle_paste_with_spaces(&path) {
+                        self.input_changed(None);
                     }
                     vec![]
                 }
@@ -773,6 +886,7 @@ impl App {
                 ModelPickerAction::UnassignTier(spec, tier) => {
                     vec![Action::UnassignTier(spec, tier)]
                 }
+                ModelPickerAction::Refresh => vec![Action::RefreshModelsLive],
                 ModelPickerAction::Close => vec![],
             });
         }
@@ -782,10 +896,10 @@ impl App {
                 LoginPickerAction::Consumed => vec![],
                 LoginPickerAction::Close => vec![],
                 LoginPickerAction::Authenticated { model_spec } => {
-                    vec![Action::ChangeModel(model_spec), Action::RefreshModels]
+                    vec![Action::ChangeModel(model_spec), Action::RefreshModelsLive]
                 }
                 LoginPickerAction::Configured { slug } => {
-                    vec![Action::RefreshProvider { slug }, Action::RefreshModels]
+                    vec![Action::RefreshProvider { slug }, Action::RefreshModelsLive]
                 }
             });
         }
@@ -942,8 +1056,8 @@ impl App {
                 return self.run_builtin(BuiltinAction::FilePicker);
             } else if key.code == KeyCode::Char('v') && self.image_paste_rx.is_empty() {
                 self.start_image_paste();
-            } else if let InputAction::PaletteSync(val) = self.input_box.handle_key(key) {
-                self.command_palette.sync(&val);
+            } else if let InputAction::Changed = self.input_box.handle_key(key) {
+                self.input_changed(None);
             }
             return vec![];
         }
@@ -958,9 +1072,9 @@ impl App {
                 return self.execute_command(cmd, 0);
             }
             CommandAction::Complete(text) => {
-                self.command_palette.sync(&text);
                 self.input_box.set_input(text);
                 self.input_box.buffer.move_to_end();
+                self.input_changed(None);
                 return vec![];
             }
             CommandAction::Passthrough => {}
@@ -969,8 +1083,8 @@ impl App {
         let streaming = self.status == Status::Streaming;
         match self.input_box.handle_key(key) {
             InputAction::Submit(sub) => self.handle_submit(sub),
-            InputAction::PaletteSync(val) => {
-                self.command_palette.sync(&val);
+            InputAction::Changed => {
+                self.input_changed(None);
                 vec![]
             }
             InputAction::Passthrough(key) => {
@@ -1769,8 +1883,53 @@ impl App {
             | self.model_picker.refresh()
             | self.usage_modal.poll(&self.usage_slot)
             | self.hints.poll(self.hint_reader.load_full())
+            | self.tick_plan_form()
             | self.tick_file_picker()
+            | self.tick_input_changed()
             | Dirty::any(self.chats.iter_mut().map(Chat::tick))
+    }
+
+    /// Open the form with the menu the `ui.plan_form*` chains answered with.
+    /// A chain that never answers leaves it closed, which is what a plugin
+    /// mid-render wants; the plan-toggle key still reopens it.
+    ///
+    /// Drained for every session rather than the focused one alone: a plan
+    /// that lands in a background tab has to reach its form too.
+    pub(crate) fn tick_plan_form(&mut self) -> Dirty {
+        let Some(rx) = self.plan_form_answer.as_ref() else {
+            return Dirty::NO;
+        };
+        let rows = match rx.try_recv() {
+            // A layer took the surface over, so the host draws nothing.
+            Ok(None) => {
+                self.plan_form_answer = None;
+                return Dirty::NO;
+            }
+            Ok(Some(rows)) => rows,
+            // The host went away mid-question, so nobody is drawing the plan.
+            Err(flume::TryRecvError::Disconnected) => builtin_rows(),
+            Err(flume::TryRecvError::Empty) => return Dirty::NO,
+        };
+        self.plan_form_answer = None;
+        self.plan_form.open_with(rows);
+        Dirty::YES
+    }
+
+    /// Ask the `ui.plan_form*` chains what to draw for the draft that just
+    /// landed, starting from the host's own rows. With no path there is no
+    /// event to hand a layer, and with no host there is nobody to ask, so
+    /// either way the built-in form opens straight away.
+    pub(super) fn offer_plan_form(&mut self, path: Option<&str>) {
+        let Some(path) = path.filter(|_| !self.lua_event_handle.is_disconnected()) else {
+            self.plan_form_answer = None;
+            self.plan_form.open_with(builtin_rows());
+            return;
+        };
+        self.plan_form_answer = Some(self.lua_event_handle.open_plan_form(
+            path.to_owned(),
+            self.state.session.id.to_string(),
+            builtin_rows(),
+        ));
     }
 
     fn tick_file_picker(&mut self) -> Dirty {
@@ -1866,8 +2025,8 @@ impl App {
         if !self.is_main_chat() {
             return;
         }
-        if let InputAction::PaletteSync(val) = self.input_box.handle_paste(text) {
-            self.command_palette.sync(&val);
+        if let InputAction::Changed = self.input_box.handle_paste(text) {
+            self.input_changed(None);
         }
     }
 
@@ -1887,7 +2046,52 @@ impl App {
             },
             PlanFormAction::Implement => self.implement_plan(false),
             PlanFormAction::ClearAndImplement => self.implement_plan(true),
+            PlanFormAction::Plugin { row } => {
+                // Snapshot the form's parallel flag before we reset, since the
+                // handler may want it and reset() runs after.
+                let parallel = self.plan_form.parallel();
+                let path = self
+                    .state
+                    .plan
+                    .path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                // Plan state is per session, so the handler is told which one
+                // fired rather than left to assume the focused tab.
+                let session = self.state.session.id.to_string();
+                self.plan_form.reset();
+                self.lua_event_handle
+                    .run_plan_action(session, row, path, parallel);
+                vec![]
+            }
         }
+    }
+
+    /// Snapshot of the current plan for `maki.plan.read()`. `content`
+    /// stays `None` when the plan is not ready or the file cannot be
+    /// read, so a caller can tell the two apart from an empty plan.
+    pub(crate) fn plan_snapshot(&self) -> serde_json::Value {
+        let mode = if self.state.mode == Mode::Plan {
+            "plan"
+        } else {
+            "build"
+        };
+        let path = self.state.plan.path().map(|p| p.display().to_string());
+        let ready = self.state.plan.is_ready();
+        let content = if ready {
+            self.state
+                .plan
+                .path()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+        } else {
+            None
+        };
+        serde_json::json!({
+            "mode": mode,
+            "path": path,
+            "ready": ready,
+            "content": content,
+        })
     }
 
     fn implement_plan(&mut self, clear_context: bool) -> Vec<Action> {

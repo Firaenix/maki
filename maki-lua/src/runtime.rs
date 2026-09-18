@@ -41,7 +41,13 @@ use crate::api::r#fn::{JobEvent, JobOwner, JobStore, deliver_job_event};
 use crate::api::keymap::KeymapReader;
 use crate::api::keymap::{KeymapStore, KeymapWriter};
 use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
-use crate::api::slot::{LayeredTools, SlotStore, run_host_chain};
+use crate::api::plan::{
+    PlanRowHandlers, install_row_handlers, row_handler_opts, rows_from_table, rows_to_table,
+};
+use crate::api::slot::{
+    LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT, SlotStore, run_host_chain,
+    run_host_chain_with,
+};
 use crate::api::tool::{
     LuaTool, PendingRules, PendingTool, PendingTools, ToolCallReply, ToolPermission, resolve_rules,
 };
@@ -49,7 +55,7 @@ use crate::api::ui::HintStore;
 use crate::api::ui::buf::{BufHandle, BufferStore};
 use crate::api::util::command::{CommandHandlerMap, HintWriter, publish_command_snapshot};
 use crate::api::util::command::{
-    LuaCommandReader, LuaCommandWriter, UiAction, UiAttachment, install_ui_attachment,
+    LuaCommandReader, LuaCommandWriter, PlanFormRow, UiAction, UiAttachment, install_ui_attachment,
 };
 use crate::api::util::convert::{json_to_lua, lua_to_json_within};
 use crate::api::util::ctx::{LuaCtx, RestoreCtx};
@@ -237,6 +243,16 @@ pub enum Request {
     InstallSessionSnapshot {
         provider: crate::api::session::SessionSnapshotFn,
     },
+    /// Install a `SessionMessagesSlot`, the same deal for
+    /// `maki.session.messages`.
+    InstallSessionMessages {
+        provider: crate::api::session::SessionMessagesFn,
+    },
+    /// Install the sink `maki.model.complete` reports its spend to, so a
+    /// driver with no UI channel still bills what a plugin spent.
+    InstallModelSpend {
+        sink: crate::api::model::ModelSpendFn,
+    },
     /// Takes the package operations Lua recorded, leaving the queue empty.
     TakePackOps {
         reply: flume::Sender<Vec<crate::api::pack::PackOp>>,
@@ -267,6 +283,28 @@ pub enum Request {
         /// See [`under_inflight_slot`].
         nested: bool,
     },
+    /// Fires when the user picks a plugin row on the plan form. The row is
+    /// named by its position in the menu the chain built for that session,
+    /// which is where its handler was stashed. Fire-and-forget: the handler
+    /// drives whatever outcome it wants through `maki.session.*`.
+    RunPlanAction {
+        session: String,
+        row: usize,
+        /// Absolute plan path.
+        path: String,
+        /// Value of the form's "parallel" checkbox when the user picked the row.
+        parallel: bool,
+    },
+    /// Fires the two `ui.plan_form*` chains for a session whose plan just
+    /// landed: whether the built-in form opens, and with which rows.
+    OpenPlanForm {
+        path: String,
+        session: String,
+        /// The rows the host proposes, i.e. the bottom of the actions chain.
+        rows: Vec<PlanFormRow>,
+        /// The menu to draw, or `None` when a layer took the form over.
+        reply: flume::Sender<Option<Vec<PlanFormRow>>>,
+    },
     ComputeHeader {
         plugin: Arc<str>,
         tool: Arc<str>,
@@ -285,6 +323,15 @@ pub enum Request {
     RunHook {
         run: HookRun,
         reply: flume::Sender<Verdict>,
+    },
+    CallReviewHandler {
+        plugin: Arc<str>,
+        name: Arc<str>,
+        request: Value,
+        /// Fires when the caller's timeout/cancel wins the outer race, so the
+        /// detached Lua handler can drop its RegistryKey and skip the reply.
+        cancel: CancelToken,
+        reply: flume::Sender<Option<(String, Option<String>)>>,
     },
     ClearPlugin {
         plugin: Arc<str>,
@@ -2001,6 +2048,8 @@ impl LuaRuntime {
         })?;
 
         lua.set_app_data(CommandHandlerMap::new());
+        lua.set_app_data(crate::api::tool::ReviewHandlerMap::default());
+        lua.set_app_data(crate::api::tool::ReviewerRequestTx(tx.clone()));
         lua.set_app_data(JobStore::new());
         lua.set_app_data(SpawnQueue::new());
         lua.set_app_data(DeferQueue::new());
@@ -2020,6 +2069,7 @@ impl LuaRuntime {
         lua.set_app_data(keymap_writer);
         lua.set_app_data(HintStore::new());
         lua.set_app_data(hint_writer);
+        lua.set_app_data(PlanRowHandlers::default());
         lua.set_app_data(Arc::clone(&registry));
 
         let plugins: PluginMap = Rc::new(RefCell::new(HashMap::new()));
@@ -2130,6 +2180,17 @@ impl LuaRuntime {
                     && let Err(e) = self.lua.remove_registry_value(sk)
                 {
                     tracing::warn!(plugin = name, error = %e, "failed to drop lua describe key");
+                }
+            }
+        }
+        if let Some(mut review_map) = self
+            .lua
+            .app_data_mut::<crate::api::tool::ReviewHandlerMap>()
+            && let Some(handlers) = review_map.0.remove(name)
+        {
+            for (_, key) in handlers {
+                if let Err(e) = self.lua.remove_registry_value(key) {
+                    tracing::warn!(plugin = name, error = %e, "failed to drop review handler key");
                 }
             }
         }
@@ -2369,6 +2430,7 @@ impl LuaRuntime {
             &self.lua,
             Arc::clone(&self.pending),
             Arc::clone(&pending_rules),
+            Arc::clone(&self.plugin_rules),
             Arc::clone(&name),
             self.ui_action_tx.clone(),
             &permissions,
@@ -3056,6 +3118,105 @@ fn layer_delegation<'a>(
     }
 }
 
+/// The event both `ui.plan_form*` chains see: which draft landed, and whose.
+fn plan_form_event(lua: &Lua, path: &str, session: &str) -> mlua::Result<MultiValue> {
+    let ev = lua.create_table()?;
+    ev.set("path", path)?;
+    ev.set("session", session)?;
+    Ok(MultiValue::from_vec(vec![LuaValue::Table(ev)]))
+}
+
+/// Asks the `ui.plan_form` chain whether the built-in plan form should open
+/// for the draft that just landed. `true` means every layer deferred and the
+/// chain reached the host default.
+///
+/// Any plugin may layer this: the form is chrome the user can always reopen
+/// with the plan-toggle key, not a tool call, so there is no authority to
+/// borrow. A layer that throws is skipped by the chain and the default runs,
+/// which makes the built-in form the failure mode rather than a dead surface.
+async fn plan_form_opens(lua: &Lua, args: MultiValue) -> bool {
+    let chain = run_host_chain(lua, PLAN_FORM_SLOT, args, &|_| true);
+    match run_detached(lua, chain).await {
+        // `None` is "nothing layered it", so there is nobody else to draw it.
+        Ok(None) => true,
+        // The host default hands the event table back, so a chain every layer
+        // deferred through answers truthy. A layer that returns nothing, or
+        // `false`, keeps the form closed and owns the surface.
+        Ok(Some(values)) => values
+            .into_iter()
+            .next()
+            .is_some_and(|v| !matches!(v, LuaValue::Nil | LuaValue::Boolean(false))),
+        Err(e) => {
+            tracing::warn!(error = %strip_traceback(&e), "plan form slot chain failed");
+            true
+        }
+    }
+}
+
+/// Asks the `ui.plan_form.actions` chain for the menu the form draws, and
+/// stashes the handlers of the plugin rows that came back so a pick can find
+/// them by position.
+///
+/// The default answers with {proposed}, the host's own rows, which is also
+/// what a layer that throws or answers off contract leaves behind: a menu
+/// short of a row nobody can explain is worse than the one the user knows.
+async fn plan_form_rows(
+    lua: &Lua,
+    session: &str,
+    args: MultiValue,
+    proposed: Vec<PlanFormRow>,
+) -> Vec<PlanFormRow> {
+    let host_rows = proposed.clone();
+    let answered = match lua
+        .create_function(move |lua, _: MultiValue| rows_to_table(lua, &host_rows))
+    {
+        Ok(default) => {
+            let chain = run_host_chain_with(lua, PLAN_FORM_ACTIONS_SLOT, default, args, &|_| true);
+            run_detached(lua, chain).await
+        }
+        Err(e) => Err(e),
+    };
+    let (rows, handlers) = match answered {
+        Ok(Some(values)) => match values.into_iter().next() {
+            Some(LuaValue::Table(table)) => rows_from_table(lua, table).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "plan form actions slot answered off contract");
+                (proposed, Vec::new())
+            }),
+            _ => (proposed, Vec::new()),
+        },
+        Ok(None) => (proposed, Vec::new()),
+        Err(e) => {
+            tracing::warn!(error = %strip_traceback(&e), "plan form actions slot chain failed");
+            (proposed, Vec::new())
+        }
+    };
+    if let Err(e) = install_row_handlers(lua, session.to_owned(), handlers) {
+        tracing::warn!(error = %e, "could not stash the plan form row handlers");
+    }
+    rows
+}
+
+/// Both chains a landed plan fires. `None` is a layer having taken the form
+/// over, so the host draws nothing for this draft.
+async fn open_plan_form(
+    lua: &Lua,
+    path: String,
+    session: String,
+    rows: Vec<PlanFormRow>,
+) -> Option<Vec<PlanFormRow>> {
+    let args = match plan_form_event(lua, &path, &session) {
+        Ok(args) => args,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not build the plan form slot event");
+            return Some(rows);
+        }
+    };
+    if !plan_form_opens(lua, args.clone()).await {
+        return None;
+    }
+    Some(plan_form_rows(lua, &session, args, rows).await)
+}
+
 /// Fires a host-owned chain and reads back the one contract every host slot
 /// shares: a table replaces the value, `nil` leaves it alone, and
 /// `nil, reason` stops the call with a reason the model reads.
@@ -3470,6 +3631,13 @@ pub fn spawn(
                             rt.lua
                                 .set_app_data(crate::api::session::SessionSnapshotSlot(provider));
                         }
+                        Request::InstallSessionMessages { provider } => {
+                            rt.lua
+                                .set_app_data(crate::api::session::SessionMessagesSlot(provider));
+                        }
+                        Request::InstallModelSpend { sink } => {
+                            rt.lua.set_app_data(crate::api::model::ModelSpendSlot(sink));
+                        }
                         Request::LoadSource {
                             name,
                             chunks,
@@ -3555,6 +3723,49 @@ pub fn spawn(
                             rt.clear_plugin(&plugin);
                             let _ = reply.send(());
                         }
+                        Request::RunPlanAction {
+                            session,
+                            row,
+                            path,
+                            parallel,
+                        } => {
+                            let found = rt.lua.app_data_ref::<PlanRowHandlers>().and_then(|h| {
+                                rt.lua
+                                    .registry_value::<Function>(h.handler(&session, row)?)
+                                    .ok()
+                            });
+                            if let Some(func) = found {
+                                let lua = rt.lua.clone();
+                                ex.spawn(async move {
+                                    let run = async {
+                                        let opts =
+                                            row_handler_opts(&lua, &session, &path, parallel)?;
+                                        let thread = lua.create_thread(func)?;
+                                        thread.into_async::<()>(opts)?.await
+                                    };
+                                    if let Err(e) = run_command_scoped(&lua, 0, run).await {
+                                        tracing::warn!(row, error = %e, "plan form row handler failed");
+                                    }
+                                })
+                                .detach();
+                            }
+                        }
+                        Request::OpenPlanForm {
+                            path,
+                            session,
+                            rows,
+                            reply,
+                        } => {
+                            // Spawned rather than awaited: a layer may park,
+                            // and every other session is waiting on this
+                            // request loop.
+                            let lua = rt.lua.clone();
+                            ex.spawn(async move {
+                                let _ =
+                                    reply.send(open_plan_form(&lua, path, session, rows).await);
+                            })
+                            .detach();
+                        }
                         Request::RunCommand {
                             plugin,
                             command,
@@ -3615,6 +3826,63 @@ pub fn spawn(
                             ex.spawn(async move {
                                 let verdict = run_hook(&lua, &plugins, &gate, run).await;
                                 let _ = reply.send(verdict);
+                            })
+                            .detach();
+                        }
+                        Request::CallReviewHandler {
+                            plugin,
+                            name,
+                            request,
+                            cancel,
+                            reply,
+                        } => {
+                            let func = rt
+                                .lua
+                                .app_data_ref::<crate::api::tool::ReviewHandlerMap>()
+                                .and_then(|m| {
+                                    let key = m.0.get(&plugin)?.get(&name)?;
+                                    rt.lua.registry_value::<Function>(key).ok()
+                                });
+                            let Some(func) = func else {
+                                let _ = reply.send(None);
+                                continue;
+                            };
+                            // Deliberately not gate-tracked: a handler may
+                            // park on a human prompt, and reload must not
+                            // wait for it. Cancellation is what ends a
+                            // handler whose caller has walked away, so the
+                            // detached task cannot outlive the outer race.
+                            let lua = rt.lua.clone();
+                            ex.spawn(async move {
+                                let run = run_detached(&lua, async {
+                                    let arg =
+                                        crate::api::util::convert::json_to_lua(&lua, &request)?;
+                                    let thread = lua.create_thread(func)?;
+                                    thread
+                                        .into_async::<(Option<String>, Option<String>)>(arg)?
+                                        .await
+                                });
+                                let raced = cancel.race(run).await;
+                                match raced {
+                                    Err(_) => {
+                                        tracing::info!(
+                                            plugin = %plugin,
+                                            reviewer = %name,
+                                            "review handler dropped after caller cancel"
+                                        );
+                                    }
+                                    Ok(result) => {
+                                        let out = match result {
+                                            Ok((Some(verdict), reason)) => Some((verdict, reason)),
+                                            Ok((None, _)) => None,
+                                            Err(e) => {
+                                                tracing::warn!(plugin = %plugin, reviewer = %name, error = %e, "review handler failed");
+                                                None
+                                            }
+                                        };
+                                        let _ = reply.send(out);
+                                    }
+                                }
                             })
                             .detach();
                         }

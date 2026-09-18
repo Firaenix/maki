@@ -260,6 +260,12 @@ maki.setup({
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 | `timeout_secs` | integer | `30` | 5 | Script execution time budget in seconds; waiting on tool calls does not count. A call's `timeout` param overrides it. |
 
+### `plugins.completion`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `max_items` | integer | `10` | 1 | Rows the completion popup shows at once. |
+
 ### `plugins.edit`
 
 | Field | Type | Default | Min | Description |

@@ -10,8 +10,8 @@ use mlua::{Lua, Result as LuaResult, Table};
 use strum::VariantNames;
 
 use crate::api::util::command::{
-    Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, Split,
-    TitlePos, UiAction, WinCommand, WinEvent, ui_send,
+    Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, InputEdit,
+    InputRequest, Split, TitlePos, UiAction, WinCommand, WinEvent, ui_json_roundtrip, ui_send,
 };
 use crate::api::util::convert::opt_bool;
 use crate::api::util::pair::{Pair, try_pair};
@@ -377,6 +377,105 @@ fn action(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, name: String) -> LuaRe
     Ok((Some(true), None))
 }
 
+async fn input_roundtrip(
+    lua: Lua,
+    tx: &flume::Sender<UiAction>,
+    req: InputRequest,
+) -> LuaResult<Pair<mlua::Value>> {
+    ui_json_roundtrip(&lua, Some(tx), |reply_tx| UiAction::Input { req, reply_tx }).await
+}
+
+/// Reads what the user has typed in the chat input, and where the cursor
+/// is.
+///
+/// Offsets are byte offsets into `text`, the same unit the Lua string
+/// library uses, so `text:sub(1, cursor)` is everything before the cursor
+/// and `text:sub(cursor + 1)` is everything after it. A newline counts as
+/// one byte, so an offset means the same thing however the input wraps.
+///
+/// The returned table has:
+///
+/// - `session_id` (string) the tab the value was read from. Hand it back
+///   to `input_edit` so an edit cannot land in another tab the user
+///   switched to in the meantime.
+/// - `text` (string) the whole value, newlines included.
+/// - `cursor` (integer) byte offset of the cursor into `text`.
+/// - `version` (integer) counter of changes to the value. Hand it back to
+///   `input_edit` to have an edit fail when the value moved on.
+/// - `line` (integer) 0-based line the cursor is on, for when you care
+///   about lines rather than offsets.
+/// - `col` (integer) byte offset of the cursor inside that line.
+///
+/// To put a window on the caret, open it with `anchor = "caret"` rather
+/// than placing one yourself: the host knows where the caret is drawn on
+/// every frame, so the window follows it through wraps and resizes.
+///
+/// @return (table|nil, string|nil) The input state, or nil and an error.
+/// @example
+/// local st = maki.ui.input()
+/// local before = st.text:sub(1, st.cursor)
+#[lua_fn]
+async fn input(lua: Lua, #[ctx] tx: flume::Sender<UiAction>) -> LuaResult<Pair<mlua::Value>> {
+    input_roundtrip(lua, &tx, InputRequest::Read).await
+}
+
+/// Replaces a byte range of the chat input, as if the user had selected it
+/// and typed {text}. The cursor lands after the inserted text unless you
+/// say otherwise.
+///
+/// A handler runs after the key that woke it, so by the time it writes, the
+/// user may have typed on, or switched tab. Four checks refuse an edit
+/// instead of landing it somewhere it was never meant to go:
+///
+/// - `stop` past the end of the value fails.
+/// - `session_id`, when you pass the one `maki.ui.input` returned, fails
+///   once another tab is focused. The version cannot stand in for it:
+///   every tab counts from zero, so two tabs typed in about as much agree
+///   on a version while holding different text.
+/// - `version`, when you pass the one `maki.ui.input` returned, fails as
+///   soon as the value has changed at all. Without it an edit planned
+///   against older text still applies wherever the offsets now point.
+/// - An offset inside a multi-byte character fails.
+///
+/// Read again and retry on any of them.
+///
+/// @param opts table Options:
+///   `start` (integer) byte offset the replaced range starts at.
+///   `stop` (integer) byte offset it ends at. `start == stop` inserts.
+///   `text` (string) what to put there, empty to delete the range.
+///   `cursor` (integer|nil) byte offset to leave the cursor at, default is the end of the inserted text.
+///   `version` (integer|nil) the version the offsets were planned against.
+///   `session_id` (string|nil) the session the offsets were read from.
+/// @return (boolean|nil, string|nil) `true` on success, or nil and an error.
+/// @example
+/// local st = maki.ui.input()
+/// -- Replace the "@src/ma" before the cursor with a full path:
+/// maki.ui.input_edit({
+///   start = 8,
+///   stop = st.cursor,
+///   text = "src/main.rs",
+///   version = st.version,
+///   session_id = st.session_id,
+/// })
+#[lua_fn]
+async fn input_edit(
+    lua: Lua,
+    #[ctx] tx: flume::Sender<UiAction>,
+    #[ctx] plugin: Arc<str>,
+    opts: Table,
+) -> LuaResult<Pair<mlua::Value>> {
+    let req = InputRequest::Edit(InputEdit {
+        start: opts.get("start")?,
+        stop: opts.get("stop")?,
+        text: opts.get::<Option<String>>("text")?.unwrap_or_default(),
+        cursor: opts.get("cursor")?,
+        version: opts.get("version")?,
+        session_id: opts.get("session_id")?,
+        plugin,
+    });
+    input_roundtrip(lua, &tx, req).await
+}
+
 /// Opens {path} in the user's `$EDITOR` (e.g. vim, nano) and waits for
 /// it to close. This suspends the TUI while the editor is running.
 /// Returns the editor's exit code so you can check if the user saved.
@@ -417,7 +516,7 @@ async fn open_editor(
 ///   - height (integer|string): window height. Integer for absolute rows; "N%" for percent of terminal height. Default "70%".
 ///   - row (integer?): row offset from the anchor corner. Negative values move up.
 ///   - col (integer?): column offset from the anchor corner.
-///   - anchor (string): corner the (row, col) offset is relative to. One of "NW" (default), "NE", "SW", "SE".
+///   - anchor (string): corner the (row, col) offset is relative to. One of "NW" (default), "NE", "SW", "SE". Or "caret", which ignores row and col and sits the window on the chat input cursor instead: the host puts it on the roomier side of the caret, trims the height to what fits there, keeps the whole width on screen, and re-places it every frame, so it follows wraps and resizes. Whenever nothing owns the caret, because a form, a permission prompt, a picker or a modal has the input box, it falls back to the default placement.
 ///   - border (string): border style. One of "rounded" (default), "single", "double", "none".
 ///   - title (string): text shown in the top border. Default "".
 ///   - title_pos (string): title alignment. One of "left" (default), "center", "right".
@@ -554,7 +653,7 @@ lua_table! {
         buf, theme_color, theme_style, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
         manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
-        manual set_window_title,
+        manual set_window_title, manual input, manual input_edit,
     ]
 }
 
@@ -571,6 +670,8 @@ pub(crate) fn create_ui_table(
         set_window_title__register(&t, lua, tx.clone())?;
         action__register(&t, lua, tx.clone())?;
         open_editor__register(&t, lua, tx.clone())?;
+        input__register(&t, lua, tx.clone())?;
+        input_edit__register(&t, lua, tx.clone(), Arc::clone(&plugin))?;
         open_win__register(&t, lua, tx)?;
     }
 
@@ -771,6 +872,8 @@ fn markdown_lines_to_lua(lua: &Lua, lines: &[maki_markdown::render::Line]) -> Lu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::util::command::UiReply;
+    use crate::api::util::convert::lua_to_json;
     use maki_highlight::StyledSegment;
     use mlua::Lua;
     use test_case::test_case;
@@ -911,6 +1014,7 @@ mod tests {
     #[test_case("NE", Anchor::NE ; "ne")]
     #[test_case("SW", Anchor::SW ; "sw")]
     #[test_case("SE", Anchor::SE ; "se")]
+    #[test_case("caret", Anchor::Caret ; "caret")]
     #[test_case("garbage", Anchor::NW ; "invalid_falls_back_to_default")]
     fn parse_anchor_cases(input: &str, expected: Anchor) {
         let lua = Lua::new();
@@ -1420,5 +1524,128 @@ mod tests {
         store.set(Arc::from("plug"), vec![("a".into(), "b".into())]);
         store.set(Arc::from("plug"), vec![]);
         assert!(store.snapshot_entries().is_empty());
+    }
+
+    const STALE_RANGE_ERR: &str = "stop 99 is past the end of the input (5)";
+    const READ_SESSION_ID: &str = "11111111-1111-1111-1111-111111111111";
+    const INPUT_PLUGIN: &str = "test";
+
+    /// Stands in for the focused session's input box: reads answer with a
+    /// snapshot, edits answer with whatever {edit} decides.
+    fn ui_with_input(edit: fn(InputEdit) -> UiReply) -> Lua {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        std::thread::spawn(move || {
+            while let Ok(UiAction::Input { req, reply_tx }) = rx.recv() {
+                let reply = match req {
+                    InputRequest::Read => Ok(serde_json::json!({
+                        "session_id": READ_SESSION_ID,
+                        "text": "hello",
+                        "cursor": 5,
+                        "version": 7,
+                        "line": 0,
+                        "col": 5,
+                    })),
+                    InputRequest::Edit(edit_req) => edit(edit_req),
+                };
+                let _ = reply_tx.send(reply);
+            }
+        });
+        let lua = Lua::new();
+        let t = create_ui_table(&lua, Some(tx), Arc::from(INPUT_PLUGIN)).unwrap();
+        lua.globals().set("ui", t).unwrap();
+        lua
+    }
+
+    /// Echoes the request back, so a test can assert on what the UI would have
+    /// been asked to do.
+    fn echo_edit(edit: InputEdit) -> UiReply {
+        Ok(serde_json::json!({
+            "start": edit.start,
+            "stop": edit.stop,
+            "text": edit.text,
+            "cursor": edit.cursor,
+            "version": edit.version,
+            "session_id": edit.session_id,
+            "plugin": edit.plugin,
+        }))
+    }
+
+    fn eval(lua: &Lua, script: &str) -> (serde_json::Value, Option<String>) {
+        let (val, err): (mlua::Value, Option<String>) =
+            smol::block_on(lua.load(script).eval_async()).unwrap();
+        (lua_to_json(lua, &val).unwrap(), err)
+    }
+
+    #[test]
+    fn input_reports_text_cursor_and_version() {
+        let lua = ui_with_input(echo_edit);
+        let (val, err) = eval(&lua, "return ui.input()");
+        assert_eq!(err, None);
+        assert_eq!(val["text"], "hello");
+        assert_eq!(val["cursor"], 5);
+        assert_eq!(val["version"], 7);
+        assert_eq!(val["session_id"], READ_SESSION_ID);
+    }
+
+    #[test]
+    fn input_edit_forwards_the_range_and_defaults_the_cursor() {
+        let lua = ui_with_input(echo_edit);
+        let (val, err) = eval(
+            &lua,
+            r#"return ui.input_edit({ start = 1, stop = 3, text = "xy" })"#,
+        );
+        assert_eq!(err, None);
+        assert_eq!(val["start"], 1);
+        assert_eq!(val["stop"], 3);
+        assert_eq!(val["text"], "xy");
+        assert_eq!(val["cursor"], serde_json::Value::Null);
+        assert_eq!(val["version"], serde_json::Value::Null);
+        assert_eq!(val["session_id"], serde_json::Value::Null);
+    }
+
+    /// Two input plugins cannot tell each other's writes apart from a flat
+    /// `"plugin"`, so the name has to be stamped on by the host rather than
+    /// left to the caller to pass honestly.
+    #[test]
+    fn input_edit_names_the_calling_plugin() {
+        let lua = ui_with_input(echo_edit);
+        let (val, err) = eval(
+            &lua,
+            r#"return ui.input_edit({ start = 0, stop = 0, text = "x" })"#,
+        );
+        assert_eq!(err, None);
+        assert_eq!(val["plugin"], INPUT_PLUGIN);
+    }
+
+    /// The version and the session are what make an edit planned against text
+    /// that has moved on fail, so both have to reach the UI rather than being
+    /// dropped with the other opts.
+    #[test]
+    fn input_edit_forwards_the_version_and_the_session() {
+        let lua = ui_with_input(echo_edit);
+        let (val, err) = eval(
+            &lua,
+            r#"local st = ui.input()
+               return ui.input_edit({
+                 start = 0, stop = 5, text = "x",
+                 version = st.version, session_id = st.session_id,
+               })"#,
+        );
+        assert_eq!(err, None);
+        assert_eq!(val["version"], 7);
+        assert_eq!(val["session_id"], READ_SESSION_ID);
+    }
+
+    /// A handler writes after the key that woke it, so a range the user has
+    /// typed past comes back as an error rather than landing somewhere else.
+    #[test]
+    fn input_edit_answers_a_stale_range_in_the_error_slot() {
+        let lua = ui_with_input(|_| Err(STALE_RANGE_ERR.into()));
+        let (val, err) = eval(
+            &lua,
+            r#"return ui.input_edit({ start = 0, stop = 99, text = "x" })"#,
+        );
+        assert_eq!(val, serde_json::Value::Null);
+        assert_eq!(err.as_deref(), Some(STALE_RANGE_ERR));
     }
 }

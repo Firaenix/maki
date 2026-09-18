@@ -150,8 +150,10 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
 /// `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 /// `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"TaskStatusChanged"`,
-/// `"TaskFocusChanged"`, and `"ModelChanged"`. Plugins can also fire their
-/// own events with `exec_autocmds`.
+/// `"TaskFocusChanged"`, `"ModelChanged"`, `"ToolReviewed"`, and
+/// `"InputChanged"`.
+///
+/// Plugins can also fire their own events with `exec_autocmds`.
 ///
 /// Every host event carries `data.session_id`. For `"SessionReset"` and
 /// `"SessionEnd"` that is the session being left behind, the other events
@@ -170,7 +172,9 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// - `"CompactionDone"`: `data.context_size_before`,
 ///   `data.context_size_after`, and `data.context_window`.
 /// - `"PlanReady"`: `data.path`, the absolute path of the plan file the
-///   agent just wrote. Fires once per draft.
+///   agent just wrote. Fires once per draft. Plan state is per session, so
+///   pass `data.session_id` to `maki.plan.read` rather than letting it
+///   default to the focused tab.
 /// - `"SessionFocusChanged"`: `data.previous_session_id`, absent on the
 ///   first focus at startup.
 /// - `"SessionStatusChanged"`: `data.status` (`"working"`, `"needs_input"`,
@@ -186,6 +190,25 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// - `"ModelChanged"`: `data.model` in the shape `maki.model.get` returns,
 ///   plus `data.previous_spec`. Picking the model already in use stays
 ///   quiet, and so does startup.
+/// - `"ToolReviewed"`: one per reviewer that answered, with `data.tool`,
+///   `data.tool_use_id`, `data.reviewer`, `data.verdict` (`"ALLOW"`,
+///   `"DENY"`, `"ASK"`), `data.reason`, `data.scopes` (the permission scopes
+///   maki derived), and `data.resolution`, which is what the chain did with
+///   the answer: `"allowed"`, `"denied"`, `"escalated"` to the next
+///   reviewer, `"prompted"` because the chain ran out, `"redirected"` under
+///   yolo, or `"terminated"` because the turn's review budget ran out and
+///   maki ended the turn. `data.reviewer` is empty for the synthetic
+///   `"prompted"`, `"redirected"` and `"terminated"` events, which no
+///   reviewer answered. Tokens a reviewer spent are reported by
+///   `maki.model.complete`, not here.
+/// - `"InputChanged"`: `data.text`, `data.cursor` and `data.version`, the
+///   chat input as `maki.ui.input` reports it, so a handler can edit it
+///   back without reading it again. Plus `data.source`, the name of the
+///   plugin whose `maki.ui.input_edit` moved the value, or nil when the
+///   user typed or pasted it, so a plugin can ignore its own writes
+///   without a loop guard and still act on another plugin's. Coalesced to
+///   one event per frame, and quiet when the text did not move, so moving
+///   the cursor alone fires nothing.
 ///
 /// `"TurnEnd"` fires once per turn and only for the main session, so
 /// subagent turns never show up. A manual `/compact` ends its run without

@@ -15,6 +15,10 @@ use crate::api::util::pair::{Pair, try_pair};
 pub(crate) const NO_UI_ERR: &str = "no interactive UI attached";
 pub(crate) const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
 
+const ROW_REFINE: &str = "refine";
+const ROW_CLEAR_AND_IMPLEMENT: &str = "clear_and_implement";
+const ROW_IMPLEMENT: &str = "implement";
+
 #[derive(Clone)]
 pub struct LuaCommandInfo {
     pub name: Arc<str>,
@@ -172,6 +176,9 @@ pub enum Anchor {
     NE,
     SW,
     SE,
+    /// The cell the chat input cursor is drawn in. The host does the
+    /// placement, so a plugin never has to hold a terminal coordinate.
+    Caret,
 }
 
 impl Anchor {
@@ -180,6 +187,7 @@ impl Anchor {
             "NE" => Self::NE,
             "SW" => Self::SW,
             "SE" => Self::SE,
+            "caret" => Self::Caret,
             _ => Self::NW,
         }
     }
@@ -420,6 +428,13 @@ pub enum SessionRequest {
     Read {
         id: Option<String>,
     },
+    /// UI-mode fallback for `maki.session.messages`, the same way `Read`
+    /// falls back: headless drivers install a `SessionMessagesSlot` instead.
+    Messages {
+        id: Option<String>,
+        limit: Option<usize>,
+        role: Option<String>,
+    },
     New {
         prompt: Option<String>,
         focus: bool,
@@ -453,8 +468,93 @@ pub enum ModelRequest {
         thinking: Option<String>,
         fast: Option<bool>,
     },
+    /// Re-run model discovery; `live` skips the on-disk cache (picker `R`).
+    Refresh {
+        live: bool,
+    },
 }
 
+/// Offsets are flat byte counts into the whole input, newlines counted as one
+/// byte each, because Lua indexes strings by byte.
+#[derive(Default)]
+pub struct InputEdit {
+    pub start: usize,
+    pub stop: usize,
+    pub text: String,
+    /// Where to leave the cursor, the end of {text} when absent.
+    pub cursor: Option<usize>,
+    /// The value counter the reader was handed, when the caller wants an edit
+    /// planned against older text refused.
+    pub version: Option<u64>,
+    /// The tab the offsets were read from, refused once another is focused.
+    pub session_id: Option<String>,
+    /// Rides along on the `InputChanged` this edit fires, so one input plugin
+    /// can tell another's writes from its own.
+    pub plugin: Arc<str>,
+}
+
+pub enum InputRequest {
+    Read,
+    Edit(InputEdit),
+}
+
+/// The plan surface `maki.plan` drives. Plan state is per session, so every
+/// request names one; `None` means the focused session.
+pub enum PlanRequest {
+    /// Snapshot of the current plan: `{ mode, path, content, ready }`.
+    Read { session: Option<String> },
+}
+
+impl PlanRequest {
+    pub fn session(&self) -> Option<&str> {
+        match self {
+            Self::Read { session } => session.as_deref(),
+        }
+    }
+}
+
+/// What picking a plan form row does. The built-ins name a host outcome;
+/// `Plugin` means the row came out of the `ui.plan_form.actions` chain and
+/// its handler is waiting on the Lua side, found by the row's position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanRowAction {
+    Refine,
+    ClearAndImplement,
+    Implement,
+    Plugin,
+}
+
+impl PlanRowAction {
+    /// The `action` tag a row carries in Lua. `None` for a plugin row, which
+    /// the chain identifies by its `handler` instead.
+    pub fn tag(self) -> Option<&'static str> {
+        match self {
+            Self::Refine => Some(ROW_REFINE),
+            Self::ClearAndImplement => Some(ROW_CLEAR_AND_IMPLEMENT),
+            Self::Implement => Some(ROW_IMPLEMENT),
+            Self::Plugin => None,
+        }
+    }
+
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            ROW_REFINE => Some(Self::Refine),
+            ROW_CLEAR_AND_IMPLEMENT => Some(Self::ClearAndImplement),
+            ROW_IMPLEMENT => Some(Self::Implement),
+            _ => None,
+        }
+    }
+}
+
+/// One row of the plan form menu. The host proposes its built-in rows, the
+/// `ui.plan_form.actions` chain hands back the list the form draws, and a
+/// row's index in that list is how a pick finds its Lua handler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanFormRow {
+    pub label: String,
+    pub desc: String,
+    pub action: PlanRowAction,
+}
 pub type UiReply = Result<serde_json::Value, String>;
 
 /// Viewport of the focused chat transcript, zero-based like the rest of the
@@ -504,6 +604,18 @@ pub enum UiAction {
     },
     Model {
         req: ModelRequest,
+        reply_tx: flume::Sender<UiReply>,
+    },
+    Input {
+        req: InputRequest,
+        reply_tx: flume::Sender<UiReply>,
+    },
+    /// What a `maki.model.complete` call spent, for the session that is
+    /// paying for it. No reply: the caller already has its answer, this is
+    /// only the bill catching up.
+    ModelSpend(Box<crate::api::model::ModelSpend>),
+    Plan {
+        req: PlanRequest,
         reply_tx: flume::Sender<UiReply>,
     },
     Task {
@@ -723,6 +835,7 @@ mod tests {
     #[test_case("NE" => Anchor::NE ; "ne")]
     #[test_case("SW" => Anchor::SW ; "sw")]
     #[test_case("SE" => Anchor::SE ; "se")]
+    #[test_case("caret" => Anchor::Caret ; "caret")]
     #[test_case("garbage" => Anchor::NW ; "unknown_defaults_nw")]
     fn anchor_parse(s: &str) -> Anchor {
         Anchor::parse(s)

@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 use maki_agent::cancel::CancelToken;
 use maki_agent::tools::hook::{self, Authority, HookCall, HookStage, Verdict};
 use maki_agent::tools::{CallOrigin, ToolRegistry};
-use maki_lua::{Permission, PluginHost, PluginPermissions, SessionEndReason};
+use maki_lua::{
+    Permission, PlanFormRow, PlanRowAction, PluginHost, PluginPermissions, SessionEndReason,
+};
 use maki_storage::id::MakiId;
 use test_case::test_case;
 
@@ -807,16 +809,257 @@ fn a_parked_layer_ends_at_the_window_it_was_given() {
     );
 }
 
-#[test]
-fn host_slot_names_are_reserved() {
+#[test_case("tool.bash.input" ; "tool_stage")]
+#[test_case("ui.plan_form" ; "ui_surface")]
+#[test_case("ui.plan_form.actions" ; "ui_menu")]
+fn host_slot_names_are_reserved(name: &str) {
     let (_reg, host) = host();
     let err = host
         .load_source(
             "squatter",
-            r#"maki.api.declare_slot("tool.bash.input", function(i) return i end)"#,
+            &format!(r#"maki.api.declare_slot("{name}", function(i) return i end)"#),
         )
         .expect_err("declaring a host slot must fail");
     assert!(format!("{err}").contains("host owned"), "{err}");
+}
+
+// ------------------------------------------------------ ui.plan_form slots
+
+const PLAN_PATH: &str = "/tmp/plan.md";
+const PLAN_SESSION: &str = "s1";
+const PLANNER: &str = "planner";
+const BUILTIN_LABEL: &str = "Implement plan";
+const PLUGIN_LABEL: &str = "Commit and implement";
+
+/// Stands in for what the UI proposes: one row it knows how to run itself.
+fn builtin_rows() -> Vec<PlanFormRow> {
+    vec![PlanFormRow {
+        label: BUILTIN_LABEL.to_owned(),
+        desc: String::new(),
+        action: PlanRowAction::Implement,
+    }]
+}
+
+fn plan_slot_layer(host: &PluginHost, plugin: &str, slot: &str, body: &str) {
+    load(
+        host,
+        plugin,
+        &format!(r#"maki.api.set_slot("{slot}", function(prev, ev) {body} end)"#),
+    );
+}
+
+fn plan_form_layer(host: &PluginHost, plugin: &str, body: &str) {
+    plan_slot_layer(host, plugin, "ui.plan_form", body);
+}
+
+fn actions_layer(host: &PluginHost, plugin: &str, body: &str) {
+    plan_slot_layer(host, plugin, "ui.plan_form.actions", body);
+}
+
+fn ask_plan_form(host: &PluginHost) -> Option<Vec<PlanFormRow>> {
+    host.event_handle()
+        .open_plan_form(
+            PLAN_PATH.to_owned(),
+            PLAN_SESSION.to_owned(),
+            builtin_rows(),
+        )
+        .recv_timeout(DISPATCH_TIMEOUT)
+        .expect("the plan form chains must answer")
+}
+
+fn menu_labels(host: &PluginHost) -> Vec<String> {
+    ask_plan_form(host)
+        .expect("the built-in form must open")
+        .into_iter()
+        .map(|row| row.label)
+        .collect()
+}
+
+/// The chain decides whether the built-in form opens. Deferring to `prev`
+/// reaches the host default, which is the built-in; answering without it takes
+/// the surface over. A broken layer leaves the built-in, so a plugin that
+/// throws never costs the user the form.
+#[test_case("return false", false ; "layer_owns_the_surface")]
+#[test_case("return", false ; "layer_answers_with_nothing")]
+#[test_case("return prev(ev)", true ; "layer_defers_to_the_builtin")]
+#[test_case("error('boom')", true ; "broken_layer_leaves_the_builtin")]
+fn the_plan_form_slot_decides_whether_the_builtin_opens(body: &str, opens: bool) {
+    let (_reg, host) = host();
+    plan_form_layer(&host, PLANNER, body);
+    assert_eq!(ask_plan_form(&host).is_some(), opens);
+}
+
+/// Plan state is per session, so the layer is told which one it is answering
+/// for rather than left to ask for the focused tab.
+#[test]
+fn the_plan_form_slot_carries_the_path_and_session() {
+    let (_reg, host) = host();
+    plan_form_layer(
+        &host,
+        PLANNER,
+        &format!(r#"return ev.path == "{PLAN_PATH}" and ev.session == "{PLAN_SESSION}""#),
+    );
+    assert!(
+        ask_plan_form(&host).is_some(),
+        "the layer saw the wrong event"
+    );
+}
+
+/// Nothing layered means nothing to ask, and the default answer is the
+/// built-in form with the rows the host proposed.
+#[test]
+fn an_unlayered_plan_form_opens_the_builtin() {
+    let (_reg, host) = host();
+    assert_eq!(menu_labels(&host), [BUILTIN_LABEL]);
+}
+
+/// The form suppression is a slot rather than a per-plugin flag in the UI:
+/// unload a plugin that took the form over and the built-in comes back,
+/// because the layer is torn down with everything else the plugin owned.
+#[test]
+fn unloading_the_plan_form_owner_hands_the_form_back() {
+    let (_reg, host) = host();
+    plan_form_layer(&host, PLANNER, "return false");
+    assert!(ask_plan_form(&host).is_none());
+
+    host.unload(PLANNER).unwrap();
+    assert_eq!(
+        menu_labels(&host),
+        [BUILTIN_LABEL],
+        "the built-in form has to come back with the layer gone"
+    );
+}
+
+/// The menu is a value the chain produces, so a layer that appends to what
+/// `prev` gave it lands its row next to the built-in ones.
+#[test]
+fn an_actions_layer_adds_its_row_to_the_menu() {
+    let (_reg, host) = host();
+    actions_layer(
+        &host,
+        PLANNER,
+        &format!(
+            r#"local rows = prev(ev)
+               table.insert(rows, {{ label = "{PLUGIN_LABEL}", handler = function() end }})
+               return rows"#
+        ),
+    );
+    assert_eq!(menu_labels(&host), [BUILTIN_LABEL, PLUGIN_LABEL]);
+}
+
+/// Strictly more than the registry it replaces: the rows `prev` hands back are
+/// the plugin's to reorder or drop, not just to append to.
+#[test]
+fn an_actions_layer_can_reorder_and_drop_builtin_rows() {
+    let (_reg, host) = host();
+    actions_layer(
+        &host,
+        PLANNER,
+        &format!(r#"return {{ {{ label = "{PLUGIN_LABEL}", handler = function() end }} }}"#),
+    );
+    assert_eq!(menu_labels(&host), [PLUGIN_LABEL]);
+}
+
+/// A reload clears the plugin's layers before its source runs again, so the
+/// same row registered twice is still one row.
+#[test]
+fn reloading_an_actions_layer_does_not_stack_duplicates() {
+    let (_reg, host) = host();
+    let source = format!(
+        r#"maki.api.set_slot("ui.plan_form.actions", function(prev, ev)
+               local rows = prev(ev)
+               table.insert(rows, {{ label = "{PLUGIN_LABEL}", handler = function() end }})
+               return rows
+           end)"#
+    );
+    load(&host, PLANNER, &source);
+    load(&host, PLANNER, &source);
+    assert_eq!(menu_labels(&host), [BUILTIN_LABEL, PLUGIN_LABEL]);
+}
+
+/// Teardown comes free with the slot: unload the plugin and the host's own
+/// rows are what is left.
+#[test]
+fn unloading_an_actions_layer_restores_the_builtin_rows() {
+    let (_reg, host) = host();
+    actions_layer(
+        &host,
+        PLANNER,
+        &format!(
+            r#"local rows = prev(ev)
+               table.insert(rows, {{ label = "{PLUGIN_LABEL}", handler = function() end }})
+               return rows"#
+        ),
+    );
+    assert_eq!(menu_labels(&host).len(), 2);
+
+    host.unload(PLANNER).unwrap();
+    assert_eq!(menu_labels(&host), [BUILTIN_LABEL]);
+}
+
+/// A menu short of a row nobody can explain is worse than the one the user
+/// knows, so an off-contract answer leaves the host's own rows.
+#[test_case("return prev(ev) and 42" ; "not_a_table")]
+#[test_case(r#"return { { label = "nope" } }"# ; "row_with_no_handler_or_action")]
+fn a_broken_actions_layer_leaves_the_builtin_menu(body: &str) {
+    let (_reg, host) = host();
+    actions_layer(&host, PLANNER, body);
+    assert_eq!(menu_labels(&host), [BUILTIN_LABEL]);
+}
+
+/// The handler runs on the Lua thread when the user picks the row, and is told
+/// which session's plan it is acting on so it can name it back to
+/// `maki.plan.read` and `maki.session.*`.
+#[test]
+fn a_picked_row_runs_its_handler_with_the_plan_context() {
+    let (reg, host) = host();
+    load(
+        &host,
+        PLANNER,
+        &format!(
+            r#"
+local seen = nil
+maki.api.set_slot("ui.plan_form.actions", function(prev, ev)
+    local rows = prev(ev)
+    table.insert(rows, {{
+        label = "{PLUGIN_LABEL}",
+        handler = function(opts) seen = opts end,
+    }})
+    return rows
+end)
+{}
+"#,
+            probe_tool(
+                "probe_plan_row",
+                r#"
+if not seen then return "none" end
+return table.concat({ seen.session, seen.path, tostring(seen.parallel) }, "|")
+"#
+            )
+        ),
+    );
+
+    let rows = ask_plan_form(&host).expect("the built-in form must open");
+    let row = rows
+        .iter()
+        .position(|r| r.action == PlanRowAction::Plugin)
+        .expect("the layer's row must carry a handler");
+    host.event_handle()
+        .run_plan_action(PLAN_SESSION.to_owned(), row, PLAN_PATH.to_owned(), true);
+
+    let expected = format!("{PLAN_SESSION}|{PLAN_PATH}|true");
+    let give_up = Instant::now() + DISPATCH_TIMEOUT;
+    loop {
+        let seen = exec_tool(&reg, "probe_plan_row");
+        if seen == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < give_up,
+            "plan row handler saw {seen}, expected {expected}"
+        );
+        std::thread::sleep(DISPATCH_POLL);
+    }
 }
 
 /// A layer answering off contract costs what no layer costs: dispatch keeps the

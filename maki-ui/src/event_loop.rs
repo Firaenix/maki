@@ -25,17 +25,19 @@ use maki_agent::{
 };
 use maki_config::project::TrustQuestion;
 use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
+use maki_lua::session_messages::{self, MessagesQuery};
 use maki_lua::session_snapshot::{
     MODE_BUILD, MODE_PLAN, STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING, SessionQueueSnapshot,
     SessionSnapshot,
 };
 use maki_lua::{
-    EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, PackCommand,
-    PackPreparation, SessionEndReason, SessionRequest, TaskRequest, UiAction, UiAttachment,
-    UiReply,
+    EventHandle, HintReader, InputRequest, KeymapReader, LuaCommandReader, ModelRequest,
+    PackCommand, PackPreparation, PlanRequest, SessionEndReason, SessionRequest, TaskRequest,
+    UiAction, UiAttachment, UiReply,
 };
 use maki_providers::Timeouts;
-use maki_providers::provider::{Provider, fetch_all_models, from_model};
+use maki_providers::models_cache::fetch_all_models_cached;
+use maki_providers::provider::{Provider, from_model};
 use maki_providers::{Message, Model};
 use maki_storage::StateDir;
 use maki_storage::StorageError;
@@ -518,19 +520,25 @@ fn merge_batch(
 /// thread, over a channel so the loop wakes on it instead of noticing at the
 /// next tick. The channel holds one slot, which collapses overlapping fetches
 /// into a single rebuild.
+/// `live` skips the on-disk replay (R in the picker, a provider
+/// re-authenticating). Without it the last discovery replays instantly and a
+/// real probe still corrects it in the background. The notifier fires after
+/// each, so a session built on replayed metadata is rebuilt on the real thing.
 fn fetch_models(
     available: Arc<ArcSwapOption<Vec<String>>>,
     policy: Arc<ModelPolicy>,
     warn_tx: flume::Sender<String>,
     models_tx: flume::Sender<()>,
+    live: bool,
 ) -> smol::Task<()> {
     smol::spawn(async move {
-        fetch_all_models(
+        fetch_all_models_cached(
             &policy,
             |batch| merge_batch(&available, batch, &warn_tx),
             Some(Box::new(move || {
                 let _ = models_tx.try_send(());
             })),
+            live,
         )
         .await;
     })
@@ -540,11 +548,14 @@ fn spawn_model_fetch(policy: Arc<ModelPolicy>) -> BackgroundModels {
     let available: Arc<ArcSwapOption<Vec<String>>> = Arc::new(ArcSwapOption::empty());
     let (warn_tx, warn_rx) = flume::unbounded::<String>();
     let (models_tx, models_rx) = flume::bounded::<()>(1);
+    // Startup replays the cache first so the picker is usable immediately;
+    // the live probe that follows corrects it.
     let task = fetch_models(
         Arc::clone(&available),
         policy,
         warn_tx.clone(),
         models_tx.clone(),
+        false,
     );
     BackgroundModels {
         available,
@@ -847,7 +858,9 @@ impl<'t> EventLoop<'t> {
     /// Only the focused session is drawn, so only it can owe a frame; focusing
     /// another is an event, and events always repaint. Background sessions
     /// still drain their floats, or a plugin writing to a window nobody is
-    /// looking at would lose the output.
+    /// looking at would lose the output, and their plan form, or a draft that
+    /// landed in a background tab would sit unanswered until the user focused
+    /// it.
     fn tick(&mut self) -> Dirty {
         let mut dirty = Dirty::NO;
         for (i, rt) in self.sessions.iter_mut().enumerate() {
@@ -855,6 +868,7 @@ impl<'t> EventLoop<'t> {
                 dirty |= rt.app.tick();
             } else {
                 let _ = rt.app.float_mgr.tick();
+                let _ = rt.app.tick_plan_form();
             }
         }
         dirty
@@ -961,8 +975,20 @@ impl<'t> EventLoop<'t> {
             UiAction::Model { req, reply_tx } => {
                 let _ = reply_tx.send(self.handle_model_request(req));
             }
+            UiAction::Input { req, reply_tx } => {
+                let _ = reply_tx.send(self.handle_input_request(req));
+            }
+            // The Lua thread made the call, so it has no turn to attribute
+            // to: the session the user is looking at is the one that asked
+            // for whatever the plugin was doing.
+            UiAction::ModelSpend(spend) => {
+                self.focused_app().handle_model_spend(&spend);
+            }
             UiAction::Task { req, reply_tx } => {
                 let _ = reply_tx.send(self.handle_task_request(req));
+            }
+            UiAction::Plan { req, reply_tx } => {
+                let _ = reply_tx.send(self.handle_plan_request(req));
             }
             UiAction::WinSaveView { reply_tx } => {
                 let _ = reply_tx.send(self.focused_app().win_view());
@@ -1195,6 +1221,13 @@ impl<'t> EventLoop<'t> {
                 };
                 let _ = reply_tx.send(reply);
             }
+            SessionRequest::Messages { id, limit, role } => {
+                let query = MessagesQuery { limit, role };
+                let reply = self
+                    .resolve_session_index(id.as_deref())
+                    .map(|idx| self.session_messages_json(idx, &query));
+                let _ = reply_tx.send(reply);
+            }
             SessionRequest::New { prompt, focus } => {
                 let session = self.focused_app().blank_session();
                 // A blank session inherits the focused tab's model, whose slot
@@ -1249,6 +1282,15 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    /// The input a plugin reads and writes is the focused session's, the one
+    /// the user is typing into.
+    fn handle_input_request(&mut self, req: InputRequest) -> UiReply {
+        match req {
+            InputRequest::Read => Ok(self.focused_app().input_snapshot()),
+            InputRequest::Edit(edit) => self.focused_app().apply_input_edit(edit),
+        }
+    }
+
     /// Lua acts on the focused session, the same target the model picker
     /// writes to.
     fn handle_model_request(&mut self, req: ModelRequest) -> UiReply {
@@ -1277,6 +1319,21 @@ impl<'t> EventLoop<'t> {
                 }
                 Ok(app.model_state())
             }
+            ModelRequest::Refresh { live } => {
+                self.refresh_models(live);
+                Ok(json!(true))
+            }
+        }
+    }
+
+    /// Route a plan-surface request to the session it names, or the focused
+    /// one when it names none. Plan state is per session, so a plugin woken
+    /// by a background tab's `PlanReady` would otherwise read whatever the
+    /// user happens to be looking at.
+    fn handle_plan_request(&mut self, req: PlanRequest) -> UiReply {
+        let idx = self.resolve_session_index(req.session())?;
+        match req {
+            PlanRequest::Read { .. } => Ok(self.sessions[idx].app.plan_snapshot()),
         }
     }
 
@@ -1314,6 +1371,17 @@ impl<'t> EventLoop<'t> {
         };
         let parsed = parse_session_id(id)?;
         self.position(parsed).ok_or_else(|| NOT_LIVE_ERR.into())
+    }
+
+    /// The live mirror is the agent's own copy, so a plugin reads the same
+    /// conversation the model is working from. A tab with no agent attached
+    /// (stored, rewound) still has its messages on the session.
+    fn session_messages_json(&self, idx: usize, query: &MessagesQuery) -> serde_json::Value {
+        let app = &self.sessions[idx].app;
+        match &app.shared_history {
+            Some(mirror) => session_messages::to_json(&mirror.load().messages, query),
+            None => session_messages::to_json(app.state.session.messages(), query),
+        }
     }
 
     /// The totals live on the session, so a plugin that reloads mid run keeps
@@ -1640,7 +1708,8 @@ impl<'t> EventLoop<'t> {
                 terminal::suspend(self.terminal);
                 self.focus.on_resume();
             }
-            Action::RefreshModels => self.refresh_models(),
+            Action::RefreshModels => self.refresh_models(false),
+            Action::RefreshModelsLive => self.refresh_models(true),
             Action::RefreshUsage => self.refresh_usage(),
             Action::ManualExit => self.sessions[idx].notifications.on_manual_exit(),
         }
@@ -1694,13 +1763,17 @@ impl<'t> EventLoop<'t> {
         self.dispatch(self.focused, actions);
     }
 
-    fn refresh_models(&self) {
+    /// `live` skips the on-disk discovery cache replay (R in the picker,
+    /// provider auth changes). Without it the last discovery replays
+    /// instantly and live re-discovery still refreshes in the background.
+    fn refresh_models(&self, live: bool) {
         self.ctx.available_models.store(None);
         fetch_models(
             Arc::clone(&self.ctx.available_models),
             Arc::clone(&self.ctx.model_policy),
             self.warn_tx.clone(),
             self.models_tx.clone(),
+            live,
         )
         .detach();
     }

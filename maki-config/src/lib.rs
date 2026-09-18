@@ -89,6 +89,7 @@ pub const DEFAULT_BUILTINS: &[&str] = &[
     "bash",
     "batch",
     "code_execution",
+    "completion",
     "edit",
     "glob",
     "grep",
@@ -127,6 +128,9 @@ pub enum Permission {
     Net,
     Run,
     Env,
+    /// An always-allow reviewer silently bypasses prompting, so registering
+    /// reviewers is an explicit grant.
+    Reviewers,
 }
 
 impl Permission {
@@ -159,6 +163,7 @@ impl Permission {
             Permission::Net => "net",
             Permission::Run => "run",
             Permission::Env => "env",
+            Permission::Reviewers => "reviewers",
         }
     }
 
@@ -172,6 +177,7 @@ impl Permission {
             Permission::Net => "outbound network requests",
             Permission::Run => "starting processes",
             Permission::Env => "reading the process environment, where secrets live",
+            Permission::Reviewers => "registering reviewers that intercept permission prompts",
         }
     }
 }

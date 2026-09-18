@@ -64,8 +64,10 @@ const OPUS_SPEC: &str = "anthropic/claude-opus-4-8";
 const PLAIN_MODEL_SPEC: &str = "ollama/qwen3";
 const THINKING_OPTIONS: &str = "thinking_options";
 const MODEL_CHANGED_EVENT: &str = "ModelChanged";
+const INPUT_CHANGED_EVENT: &str = "InputChanged";
 const PLAN_READY_EVENT: &str = "PlanReady";
 const PLAN_DRAFT_PATH: &str = "/tmp/plan.md";
+const PLUGIN_ROW_LABEL: &str = "Commit and implement";
 const WALK_TIMEOUT: Duration = Duration::from_secs(5);
 const CURSOR_STAYS_HIDDEN: &str = "the hardware cursor must never be shown";
 const CURSOR_ON_SCREEN: &str = "the reported cursor must be on screen";
@@ -84,6 +86,8 @@ const MULTIBYTE_ERROR_CHAR: &str = "é";
 const TRUST: &str = "/trust";
 const GATED_INIT_SOURCE: &str = "-- shipped by the project";
 const PREVIOUS_ANSWER: &str = "Previous answer to select";
+const OTHER_SESSION_ID: &str = "11111111-1111-1111-1111-111111111111";
+const EDIT_PLUGIN: &str = "completion";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -969,6 +973,94 @@ fn plan_ready_does_not_fire_outside_plan_mode() {
     assert!(probe.try_recv_autocmd().is_none());
 }
 
+/// With no Lua host there is nobody to ask, so the form opens in the same
+/// frame the plan lands and never pays for a roundtrip.
+#[test]
+fn a_plan_form_with_no_host_opens_without_asking() {
+    let mut app = test_app();
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH));
+    app.transition_plan(PlanTrigger::WriteDone);
+
+    assert!(app.plan_form.is_visible());
+    assert!(app.plan_form_answer.is_none(), "nothing to wait for");
+}
+
+/// With a host attached the form waits for the chains instead of flashing
+/// open in front of whatever a plugin is about to draw.
+#[test]
+fn a_plan_form_with_a_host_waits_for_the_slots() {
+    let mut app = test_app();
+    let (handle, _probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    app.state.mode = Mode::Plan;
+    app.state.plan = PlanState::Drafting(PathBuf::from(PLAN_DRAFT_PATH));
+    app.transition_plan(PlanTrigger::WriteDone);
+
+    assert!(!app.plan_form.is_visible(), "the chains answer first");
+    assert!(app.plan_form_answer.is_some());
+}
+
+/// Rows are the chain's answer: a list opens the form with it, and `None` is
+/// a layer having taken the surface over.
+#[test_case(Some(vec![]), true ; "an_empty_menu_falls_back_to_the_builtin")]
+#[test_case(Some(vec![PLUGIN_ROW_LABEL]), true ; "a_layer_shaped_the_menu")]
+#[test_case(None, false ; "a_layer_took_the_surface")]
+fn the_plan_form_slot_answer_drives_the_form(answer: Option<Vec<&str>>, visible: bool) {
+    let mut app = test_app();
+    let (tx, rx) = flume::bounded(1);
+    app.plan_form_answer = Some(rx);
+
+    let rows = answer.map(|labels| {
+        labels
+            .into_iter()
+            .map(|label| maki_lua::PlanFormRow {
+                label: label.to_owned(),
+                desc: String::new(),
+                action: maki_lua::PlanRowAction::Plugin,
+            })
+            .collect()
+    });
+    tx.send(rows).unwrap();
+    assert_eq!(app.tick_plan_form(), Dirty::from(visible));
+
+    assert_eq!(app.plan_form.is_visible(), visible);
+    assert!(
+        app.plan_form_answer.is_none(),
+        "the answer is consumed once"
+    );
+}
+
+/// A host that dropped the reply cannot be drawing the plan either, so the
+/// built-in form is what is left.
+#[test]
+fn a_dropped_plan_form_answer_opens_the_builtin() {
+    let mut app = test_app();
+    let (tx, rx) = flume::bounded::<Option<Vec<maki_lua::PlanFormRow>>>(1);
+    app.plan_form_answer = Some(rx);
+    drop(tx);
+
+    assert_eq!(app.tick_plan_form(), Dirty::YES);
+    assert!(app.plan_form.is_visible());
+    assert!(app.plan_form_answer.is_none());
+}
+
+/// An unanswered chain leaves the form closed rather than guessing: the plugin
+/// is presumably mid-render, and the plan-toggle key still reopens the
+/// built-in.
+#[test]
+fn a_silent_plan_form_slot_leaves_the_form_closed() {
+    let mut app = test_app();
+    let (_tx, rx) = flume::bounded::<Option<Vec<maki_lua::PlanFormRow>>>(1);
+    app.plan_form_answer = Some(rx);
+
+    assert_eq!(app.tick_plan_form(), Dirty::NO);
+
+    assert!(!app.plan_form.is_visible());
+    assert!(app.plan_form_answer.is_some(), "still waiting");
+}
+
 #[test]
 fn load_session_clears_plan() {
     let (_tmp, _dir, _writer, mut app) = tempdir_app();
@@ -1376,6 +1468,32 @@ fn turn_complete_accumulates_usage_by_model() {
     let sub = &by_model["sub-model"];
     assert_eq!(sub.input, 200);
     assert_eq!(sub.output, 75);
+}
+
+/// A plugin's one-shot model call is spend on this session, so it lands in
+/// the status line total, the session cost, and the per-model breakdown,
+/// exactly like a turn does. A reviewer asking a model on every tool call is
+/// the bill this must not hide.
+#[test]
+fn model_spend_from_a_plugin_is_billed_to_the_session() {
+    let mut app = test_app();
+    app.handle_model_spend(&maki_lua::ModelSpend {
+        model: "reviewer-model".into(),
+        usage: TokenUsage {
+            input: 120,
+            output: 8,
+            ..Default::default()
+        },
+        cost: Some(0.5),
+        list_cost: Some(0.9),
+    });
+
+    assert_eq!(app.state.token_usage.input, 120);
+    assert_eq!(app.state.token_usage.output, 8);
+    assert_eq!(app.state.cost, Some(0.5));
+    let by_model = app.state.session.usage_by_model();
+    assert_eq!(by_model["reviewer-model"].input, 120);
+    assert_eq!(by_model["reviewer-model"].cost, Some(0.5));
 }
 
 #[test]
@@ -1993,6 +2111,95 @@ fn view_reports_the_reversed_input_cell_and_hides_the_hardware_cursor() {
 
     app.update(Msg::Key(kb::HELP.to_key_event()));
     assert_eq!(draw(&mut app), None, "{OVERLAY_TAKES_THE_CURSOR}");
+}
+
+/// A plugin slices `text` with the Lua string library, which counts bytes, so
+/// every offset in the snapshot has to be a byte offset.
+#[test]
+fn input_snapshot_offsets_are_byte_offsets() {
+    let mut app = test_app();
+    app.input_box.set_input("日本".into());
+    app.input_box.buffer.move_to_end();
+
+    let st = app.input_snapshot();
+    let text = st["text"].as_str().unwrap();
+    let cursor = st["cursor"].as_u64().unwrap() as usize;
+    assert_eq!(cursor, 6);
+    assert_eq!(&text[..cursor], "日本", "the offset has to slice the value");
+    assert_eq!(st["line"], 0);
+    assert_eq!(st["col"], 6);
+}
+
+/// The range a plugin planned, before the guards a test wants to vary.
+fn planned_edit(start: usize, stop: usize, text: &str) -> InputEdit {
+    InputEdit {
+        start,
+        stop,
+        text: text.into(),
+        plugin: Arc::from(EDIT_PLUGIN),
+        ..InputEdit::default()
+    }
+}
+
+/// The bounds check alone passes an edit the user has typed in front of: a
+/// plugin reads "hello" and plans to replace 0..5, the user presses home and
+/// types "x", and 5 still fits "xhello". Only the version catches it.
+#[test]
+fn an_input_edit_planned_against_an_older_value_fails_on_the_version() {
+    let mut app = test_app();
+    app.input_box.set_input("hello".into());
+    let planned = app.input_snapshot()["version"].as_u64().unwrap();
+
+    app.input_box.buffer.set_cursor_byte(0).unwrap();
+    app.input_box.buffer.push_char('x');
+
+    let err = app
+        .apply_input_edit(InputEdit {
+            version: Some(planned),
+            ..planned_edit(0, 5, "bye")
+        })
+        .unwrap_err();
+    assert!(err.contains("version"), "the error has to name why: {err}");
+    assert_eq!(app.input_box.buffer.value(), "xhello");
+
+    let fresh = app.input_snapshot()["version"].as_u64().unwrap();
+    assert!(
+        app.apply_input_edit(InputEdit {
+            version: Some(fresh),
+            ..planned_edit(0, 6, "bye")
+        })
+        .is_ok()
+    );
+    assert_eq!(app.input_box.buffer.value(), "bye");
+}
+
+/// Focus can move between the read and the write, and the version cannot tell
+/// the tabs apart: both buffers count from zero, so a tab typed in about as
+/// much agrees on a version while holding someone else's text.
+#[test]
+fn an_input_edit_naming_another_session_is_refused() {
+    let mut app = test_app();
+    app.input_box.set_input("hello".into());
+    let st = app.input_snapshot();
+
+    let err = app
+        .apply_input_edit(InputEdit {
+            session_id: Some(OTHER_SESSION_ID.into()),
+            ..planned_edit(0, 5, "bye")
+        })
+        .unwrap_err();
+    assert!(err.contains(OTHER_SESSION_ID), "the error names it: {err}");
+    assert_eq!(app.input_box.buffer.value(), "hello");
+
+    let focused = st["session_id"].as_str().unwrap().to_string();
+    assert!(
+        app.apply_input_edit(InputEdit {
+            session_id: Some(focused),
+            ..planned_edit(0, 5, "bye")
+        })
+        .is_ok()
+    );
+    assert_eq!(app.input_box.buffer.value(), "bye");
 }
 
 /// When the picker gives up on a directory it cannot list, the flash is the
@@ -4592,6 +4799,115 @@ fn loading_a_session_on_another_model_announces_the_swap() {
     let (event, data) = probe.try_recv_autocmd().expect(MODEL_CHANGED_EVENT);
     assert_eq!(event, MODEL_CHANGED_EVENT);
     assert_eq!(data["model"]["spec"], serde_json::json!(OPUS_SPEC));
+}
+
+/// A fast typist must not wake a handler per keystroke, so the event is
+/// coalesced onto the frame: whatever happened since the last tick arrives as
+/// one event carrying the final text.
+#[test]
+fn input_change_fires_once_per_tick() {
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    for c in "hi".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    let _ = app.tick();
+
+    let (event, data) = probe.try_recv_autocmd().expect(INPUT_CHANGED_EVENT);
+    assert_eq!(event, INPUT_CHANGED_EVENT);
+    assert_eq!(data["text"], serde_json::json!("hi"));
+    assert_eq!(data["cursor"], serde_json::json!(2));
+    assert_eq!(
+        data["source"],
+        serde_json::Value::Null,
+        "the user has no plugin name"
+    );
+    assert_eq!(
+        data["session_id"],
+        serde_json::json!(app.state.session.id.to_string())
+    );
+    assert_eq!(probe.try_recv_autocmd(), None);
+}
+
+/// A flat `"plugin"` would put two input plugins right back where they
+/// started: neither can tell the other's writes from its own, which is the
+/// loop guard this field exists to remove.
+#[test]
+fn input_change_names_the_plugin_that_wrote_it() {
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    app.apply_input_edit(planned_edit(0, 0, "hi")).unwrap();
+    let _ = app.tick();
+
+    let (_, data) = probe.try_recv_autocmd().expect(INPUT_CHANGED_EVENT);
+    assert_eq!(data["text"], serde_json::json!("hi"));
+    assert_eq!(data["source"], serde_json::json!(EDIT_PLUGIN));
+}
+
+/// Clearing the input is a change like any other, and retyping what was just
+/// sent has to be reported. Gating on a flag that only the typing paths set
+/// loses the clear, and then the retyped value compares equal to what Lua was
+/// last told, so a completion plugin stays dead until the user types something
+/// it has not seen before.
+#[test]
+fn resending_the_same_text_still_fires() {
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    for c in "hi".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    let _ = app.tick();
+    assert!(
+        probe.try_recv_autocmd().is_some(),
+        "the typing itself fires"
+    );
+
+    // Submitting fires a turn's worth of events alongside this one.
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    let _ = app.tick();
+    let data = next_input_change(&probe).expect("submitting empties the input, which is a change");
+    assert_eq!(data["text"], serde_json::json!(""));
+
+    for c in "hi".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    let _ = app.tick();
+    let data =
+        next_input_change(&probe).expect("the same text typed again is still a change from empty");
+    assert_eq!(data["text"], serde_json::json!("hi"));
+}
+
+fn next_input_change(probe: &maki_lua::test_support::RequestProbe) -> Option<serde_json::Value> {
+    while let Some((event, data)) = probe.try_recv_autocmd() {
+        if event == INPUT_CHANGED_EVENT {
+            return Some(data);
+        }
+    }
+    None
+}
+
+/// Moving around in the input is not a change: a completion plugin narrowing
+/// its list on every arrow key would flicker for no reason.
+#[test]
+fn moving_the_cursor_fires_nothing() {
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    app.update(Msg::Key(key(KeyCode::Char('a'))));
+    let _ = app.tick();
+    assert!(probe.try_recv_autocmd().is_some());
+
+    app.update(Msg::Key(key(KeyCode::Left)));
+    app.update(Msg::Key(key(KeyCode::Right)));
+    let _ = app.tick();
+    assert_eq!(probe.try_recv_autocmd(), None);
 }
 
 /// What `model_state` reports has to parse back into the same state, or a
