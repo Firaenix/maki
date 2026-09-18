@@ -18,6 +18,7 @@ pub(crate) mod tests;
 pub(crate) mod view;
 
 use std::collections::HashMap;
+use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,16 +65,16 @@ use maki_agent::{
 use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::{
-    BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader,
-    PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, PackCommand, PackPreparation,
-    PlanActionOutcome, PlanMenu, PlanRowAction, WinView,
+    BuiltinAction, EventHandle, HintReader, HintSnapshot, InputEdit, KeymapReader,
+    LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, PackCommand,
+    PackPreparation, PlanActionOutcome, PlanMenu, PlanRowAction, WinView,
 };
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig, add_cost};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
 
 use crate::storage_writer::StorageWriter;
-use ratatui::layout::Position;
+use ratatui::layout::{Position, Rect};
 
 pub(crate) use crate::agent::QueuedMessage;
 pub(crate) use mode::{Mode, PlanState, PlanTrigger};
@@ -142,6 +143,55 @@ const ERROR_BUBBLE_MAX_CHARS: usize = 2_000;
 /// error instead of ping-ponging with the Lua thread forever.
 pub(crate) const MAX_COMMAND_DEPTH: u8 = 8;
 pub(crate) const COMMAND_DEPTH_MSG: &str = "slash command nested too deeply (alias cycle?)";
+
+pub(crate) const INPUT_NOT_LIVE_ERR: &str =
+    "the chat input is not on screen, so it cannot be edited";
+
+/// Who has moved the chat input since the last tick, and the buffer version
+/// that writer left behind.
+///
+/// `InputChanged` names a plugin only when that plugin was the frame's sole
+/// writer. Handlers ignore their own writes, so a frame that also carried a
+/// keystroke or another plugin's edit has to reach them unlabelled, or they
+/// drop a change they can never see again.
+///
+/// The version is what holds that rule up without every path to the value
+/// having to remember this type exists. Submit, history recall, `$EDITOR` and
+/// the rest write the whole value without passing through
+/// [`App::input_changed`], and each of them bumps the buffer's version, which
+/// strands the name on a value that is gone instead of pinning it on their
+/// write.
+#[derive(Default)]
+enum InputWriter {
+    #[default]
+    Untouched,
+    Plugin(Arc<str>, u64),
+    /// The user, or two writers in one frame: nobody may ignore this one.
+    Anyone,
+}
+
+impl InputWriter {
+    fn merge(self, next: Self) -> Self {
+        match (self, next) {
+            (Self::Untouched, next) => next,
+            (Self::Plugin(name, _), Self::Plugin(next_name, version)) if name == next_name => {
+                Self::Plugin(name, version)
+            }
+            _ => Self::Anyone,
+        }
+    }
+
+    fn take(&mut self) -> Self {
+        mem::take(self)
+    }
+
+    fn into_source(self, current_version: u64) -> Option<Arc<str>> {
+        match self {
+            Self::Plugin(name, version) if version == current_version => Some(name),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Notification {
@@ -337,6 +387,15 @@ pub struct App {
     /// than the session's stored one: a restored session may name another
     /// model, and the event loop swaps the live one in on the first tick.
     announced_model_spec: String,
+    /// The value Lua was last told about. A fast typist would otherwise wake
+    /// every handler once per keystroke.
+    announced_input: String,
+    input_writer: InputWriter,
+    /// Whether this frame's tick already fired `InputChanged`, so the focus
+    /// announcement drained below it does not repeat that value. A tab that
+    /// did not tick clears it too ([`Self::tick_background`]): whatever it
+    /// holds was last announced in an earlier frame.
+    input_fired_this_frame: bool,
     pub(super) keymap_reader: KeymapReader,
     pub(super) hint_reader: HintReader,
     hints: Watch<HintSnapshot>,
@@ -436,6 +495,9 @@ impl App {
             model_policy: Arc::clone(&model_policy),
             lua_event_handle,
             announced_model_spec: model.spec(),
+            announced_input: String::new(),
+            input_writer: InputWriter::Untouched,
+            input_fired_this_frame: false,
             hints: Watch::seeded(hint_reader.load_full()),
             keymap_reader,
             hint_reader,
@@ -525,6 +587,128 @@ impl App {
             "supports_thinking": model.supports_thinking(),
             "supports_fast": model.supports_fast(),
         })
+    }
+
+    /// What `maki.ui.input` hands to Lua: text and offsets only. The terminal
+    /// cell the caret sits in has no answer for half the modes the UI can be
+    /// in, and the line and column the cursor is on are a slice of the two
+    /// fields below, which Lua can take for itself.
+    pub(crate) fn input_snapshot(&self) -> serde_json::Value {
+        let buffer = &self.input_box.buffer;
+        serde_json::json!({
+            "session_id": self.state.session.id.to_string(),
+            "text": buffer.value(),
+            "cursor": buffer.cursor_byte(),
+            "version": buffer.version(),
+        })
+    }
+
+    /// Refuses an edit the input has moved on from: another tab now focused, a
+    /// version the buffer has left behind, or a range it has outgrown. See
+    /// [`InputBox::replace_range`].
+    ///
+    /// The version cannot stand in for the session check. The counter is per
+    /// buffer and every buffer starts at 0, so two tabs typed in about as much
+    /// collide.
+    ///
+    /// An input the user cannot see is refused too, or the text would be sent
+    /// later without ever having been seen. {area} is the terminal the answer
+    /// is worked out against; see [`App::input_live`] for what hides the box.
+    pub(crate) fn apply_input_edit(
+        &mut self,
+        edit: InputEdit,
+        area: Rect,
+    ) -> Result<serde_json::Value, String> {
+        let focused = self.state.session.id.to_string();
+        if edit.session_id != focused {
+            return Err(format!(
+                "input of session {} is not focused (session {focused} is)",
+                edit.session_id
+            ));
+        }
+        if !self.input_live(area) {
+            return Err(INPUT_NOT_LIVE_ERR.to_string());
+        }
+        let current = self.input_box.buffer.version();
+        if edit.version != current {
+            return Err(format!(
+                "input changed since version {} (it is now {current})",
+                edit.version
+            ));
+        }
+        self.input_box
+            .replace_range(edit.start, edit.stop, &edit.text, edit.cursor)?;
+        self.input_changed(InputWriter::Plugin(
+            edit.plugin,
+            self.input_box.buffer.version(),
+        ));
+        Ok(serde_json::json!(true))
+    }
+
+    /// The paths that keep the command palette in step with the input, and
+    /// the only ones that can name a writer. Submit, discard, history recall
+    /// and `$EDITOR` change the value without coming through here, and the
+    /// tick diff reports those unlabelled: the version stamped here no longer
+    /// matches what they left.
+    fn input_changed(&mut self, writer: InputWriter) {
+        self.command_palette.sync(&self.input_box.buffer.value());
+        self.input_writer = self.input_writer.take().merge(writer);
+    }
+
+    /// One event per frame at most, and only when the text really moved, so
+    /// holding a key down wakes a handler once and arrowing around leaves it
+    /// asleep.
+    fn tick_input_changed(&mut self) -> Dirty {
+        let value = self.input_box.buffer.value();
+        self.input_fired_this_frame = value != self.announced_input;
+        if !self.input_fired_this_frame {
+            self.input_writer = InputWriter::Untouched;
+            return Dirty::NO;
+        }
+        // The value is the trigger and the writer only a label: submit,
+        // discard, history recall, a draft restored on a session switch and
+        // $EDITOR all change the value without passing a path that could set a
+        // writer flag.
+        let source = self
+            .input_writer
+            .take()
+            .into_source(self.input_box.buffer.version());
+        self.announced_input = value;
+        self.fire_input_changed(source);
+        Dirty::NO
+    }
+
+    /// Focus moving to another tab changes what `maki.ui.input` answers
+    /// without anyone editing anything, so the tab taking focus republishes
+    /// what it holds.
+    ///
+    /// It stays quiet only when this frame's own tick already said it: the
+    /// switch is drained below the tick that opened the frame, so a tab whose
+    /// draft that tick restored has already fired the value. Comparing
+    /// against what was last announced cannot stand in for the latch. Every
+    /// tab keeps its own record, so two tabs holding the same text - an empty
+    /// one is the common case - would announce nothing, and handlers would go
+    /// on acting on the text of the tab they came from while `maki.ui.input`
+    /// already answers with this one's.
+    pub(crate) fn announce_input(&mut self) {
+        self.input_writer = InputWriter::Untouched;
+        if mem::take(&mut self.input_fired_this_frame) {
+            return;
+        }
+        self.announced_input = self.input_box.buffer.value();
+        self.fire_input_changed(None);
+    }
+
+    fn fire_input_changed(&mut self, source: Option<Arc<str>>) {
+        self.fire_session_autocmd(
+            "InputChanged",
+            serde_json::json!({
+                "text": self.announced_input,
+                "cursor": self.input_box.buffer.cursor_byte(),
+                "version": self.input_box.buffer.version(),
+                "source": source,
+            }),
+        );
     }
 
     pub(crate) fn record_recent_model(&mut self, spec: &str) {
@@ -788,10 +972,8 @@ impl App {
                 FilePickerModalAction::Consumed => vec![],
                 FilePickerModalAction::Select(path) => {
                     self.file_picker.close();
-                    if let InputAction::PaletteSync(val) =
-                        self.input_box.handle_paste_with_spaces(&path)
-                    {
-                        self.command_palette.sync(&val);
+                    if let InputAction::Changed = self.input_box.handle_paste_with_spaces(&path) {
+                        self.input_changed(InputWriter::Anyone);
                     }
                     vec![]
                 }
@@ -1015,8 +1197,8 @@ impl App {
                 return self.run_builtin(BuiltinAction::FilePicker);
             } else if key.code == KeyCode::Char('v') && self.image_paste_rx.is_empty() {
                 self.start_image_paste();
-            } else if let InputAction::PaletteSync(val) = self.input_box.handle_key(key) {
-                self.command_palette.sync(&val);
+            } else if let InputAction::Changed = self.input_box.handle_key(key) {
+                self.input_changed(InputWriter::Anyone);
             }
             return vec![];
         }
@@ -1031,9 +1213,9 @@ impl App {
                 return self.execute_command(cmd, 0);
             }
             CommandAction::Complete(text) => {
-                self.command_palette.sync(&text);
                 self.input_box.set_input(text);
                 self.input_box.buffer.move_to_end();
+                self.input_changed(InputWriter::Anyone);
                 return vec![];
             }
             CommandAction::Passthrough => {}
@@ -1042,8 +1224,8 @@ impl App {
         let streaming = self.status == Status::Streaming;
         match self.input_box.handle_key(key) {
             InputAction::Submit(sub) => self.handle_submit(sub),
-            InputAction::PaletteSync(val) => {
-                self.command_palette.sync(&val);
+            InputAction::Changed => {
+                self.input_changed(InputWriter::Anyone);
                 vec![]
             }
             InputAction::Passthrough(key) => {
@@ -1845,6 +2027,7 @@ impl App {
             | self.hints.poll(self.hint_reader.load_full())
             | self.tick_plan()
             | self.tick_file_picker()
+            | self.tick_input_changed()
             | Dirty::any(self.chats.iter_mut().map(Chat::tick))
     }
 
@@ -1973,6 +2156,18 @@ impl App {
         self.plan_answers.form = Some((Instant::now() + PLAN_FORM_ANSWER_WAIT, answer));
     }
 
+    /// What a tab nobody is looking at still owes the frame. Its floats have
+    /// to drain, or a plugin writing to a window off screen would lose the
+    /// output, and its plan form too, or a draft in a background tab would
+    /// sit unanswered until the user focused it. Nothing it holds was
+    /// announced this frame, because it never diffed its input, so the
+    /// announcement has to speak when this tab takes focus.
+    pub fn tick_background(&mut self) {
+        self.input_fired_this_frame = false;
+        let _ = self.float_mgr.tick();
+        let _ = self.tick_plan();
+    }
+
     fn tick_file_picker(&mut self) -> Dirty {
         let (dirty, flash) = self.file_picker.tick();
         if let Some(flash) = flash {
@@ -2066,8 +2261,8 @@ impl App {
         if !self.is_main_chat() {
             return;
         }
-        if let InputAction::PaletteSync(val) = self.input_box.handle_paste(text) {
-            self.command_palette.sync(&val);
+        if let InputAction::Changed = self.input_box.handle_paste(text) {
+            self.input_changed(InputWriter::Anyone);
         }
     }
 

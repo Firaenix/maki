@@ -772,8 +772,8 @@ Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
 `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"TaskStatusChanged"`,
-`"TaskFocusChanged"`, and `"ModelChanged"`. Plugins can also fire their
-own events with `exec_autocmds`.
+`"TaskFocusChanged"`, `"ModelChanged"`, and `"InputChanged"`. Plugins can
+also fire their own events with `exec_autocmds`.
 
 Every host event carries `data.session_id`. For `"SessionReset"` and
 `"SessionEnd"` that is the session being left behind, the other events
@@ -809,6 +809,13 @@ name the session now running or focused. What each event adds:
 - `"ModelChanged"`: `data.model` in the shape `maki.model.get` returns,
   plus `data.previous_spec`. Picking the model already in use stays
   quiet, and so does startup.
+- `"InputChanged"`: `data.text`, `data.cursor` and `data.version`, the
+  chat input as `maki.ui.input` reports it. `data.source` is the plugin
+  name when that plugin's `maki.ui.input_edit` was the frame's sole
+  writer, and nil otherwise, so ignoring your own name never drops a
+  change. At most one event per frame and only when the text moved, so
+  moving the cursor alone fires nothing. Focusing another session
+  republishes the input that tab holds.
 
 `"TurnEnd"` fires once per turn and only for the main session, so
 subagent turns never show up. A manual `/compact` ends its run without
@@ -5410,7 +5417,7 @@ and close the window when you are done.
   - `height` (`integer|string`) window height. Integer for absolute rows; "N%" for percent of terminal height. Default "70%".
   - `row` (`integer?`) row offset from the anchor corner. Negative values move up.
   - `col` (`integer?`) column offset from the anchor corner.
-  - `anchor` (`string`) corner the (row, col) offset is relative to. One of "NW" (default), "NE", "SW", "SE".
+  - `anchor` (`string`) corner the (row, col) offset is relative to. One of "NW" (default), "NE", "SW", "SE". Or "input_caret", which sits the window beside the chat input caret: the host takes the roomier side of the caret, trims the height to what fits there, keeps the whole width on screen, and re-places it every frame, so it follows wraps, resizes and any modal taking focus. `row` and `col` shift the window off that spot, and `stack` grows the next one away from the caret. With no caret on screen, because a form, a permission prompt or a `below` split has taken the input box, it falls back to the centred default, `row` and `col` still applying.
   - `border` (`string`) border style. One of "rounded" (default), "single", "double", "none".
   - `title` (`string`) text shown in the top border. Default "".
   - `title_pos` (`string`) title alignment. One of "left" (default), "center", "right".
@@ -5492,6 +5499,104 @@ maki.ui.set_window_title("maki: " .. session_name)
 maki.ui.set_window_title("")
 ```
 
+---
+
+### `maki.ui.input()` {#maki-ui-input}
+
+```lua
+maki.ui.input()
+```
+
+Reads the chat input text and the cursor position.
+
+Offsets are byte offsets into `text`, the unit the Lua string library
+indexes by, so `text:sub(1, cursor)` is everything before the cursor. A
+newline counts as one byte.
+
+The returned table has:
+
+- `session_id` (string) the tab the value was read from. Pass it to
+  `input_edit`, which refuses once another tab is focused.
+- `text` (string) the whole value, newlines included.
+- `cursor` (integer) byte offset of the cursor into `text`.
+- `version` (integer) counter of changes to the value. Pass it to
+  `input_edit`, which refuses once the value has moved on.
+
+The cursor line and column are a slice of those two, so the table leaves
+them out: with `local before = st.text:sub(1, st.cursor)`,
+`select(2, before:gsub("\n", ""))` is the 0-based line and
+`#before:match("[^\n]*$")` the byte column inside it.
+
+To put a window on the caret, open it with `anchor = "input_caret"`. The
+host re-places it every frame, so it follows wraps and resizes.
+
+**Returns:** (`table|nil`, `string|nil`) The input state, or nil and an error.
+
+**Example:**
+
+```lua
+local st = maki.ui.input()
+local before = st.text:sub(1, st.cursor)
+```
+
+---
+
+### `maki.ui.input_edit()` {#maki-ui-input_edit}
+
+```lua
+maki.ui.input_edit({opts})
+```
+
+Replaces a byte range of the chat input, as if the user had selected it
+and typed {text}. The cursor lands after the inserted text unless you
+say otherwise.
+
+A handler runs after the key that woke it, so the user may have typed on
+or switched tab in between. Five checks refuse the edit:
+
+- `stop` past the end of the value.
+- An offset inside a multi-byte character.
+- `version` no longer current.
+- `session_id` naming a tab that is not focused. Both guards are
+  required and neither substitutes for the other: every tab counts
+  versions from zero.
+- A chat input the user cannot see, since text written there would be
+  sent later without ever being read. A permission prompt, the plan form,
+  a pack review, a `below` split, a focused subagent chat and a terminal
+  too short to give the box a text row all take it off screen, and a
+  picker, a modal or a focused plugin window covers it.
+
+Read again and retry on any of them.
+
+Tabs and carriage returns in {text} become spaces and newlines, and the
+other control characters are dropped, the way a paste is rewritten.
+
+**Parameters:**
+
+- `{opts}` (`table`) Options:
+  - `start` (`integer`) byte offset the replaced range starts at.
+  - `stop` (`integer`) byte offset it ends at. `start == stop` inserts.
+  - `text` (`string`) what to put there, `""` to delete the range. Required, so a misspelled key cannot empty it by accident.
+  - `version` (`integer`) the version `maki.ui.input` returned, which the offsets were planned against.
+  - `session_id` (`string`) the session `maki.ui.input` read the offsets from.
+  - `cursor` (`integer|nil`) byte offset to leave the cursor at, default is the end of the inserted text.
+
+**Returns:** (`boolean|nil`, `string|nil`) `true` on success, or nil and an error.
+
+**Example:**
+
+```lua
+local st = maki.ui.input()
+-- Replace the "@src/ma" before the cursor with a full path:
+maki.ui.input_edit({
+  start = 8,
+  stop = st.cursor,
+  text = "src/main.rs",
+  version = st.version,
+  session_id = st.session_id,
+})
+```
+
 
 ## maki.ui.Win {#maki-ui-Win}
 
@@ -5565,7 +5670,7 @@ Updates the window layout on the fly. Only the fields you include in
   - `title_pos` (`string`) title alignment, "left", "center", or "right".
   - `footer` (`table`) key-hint pairs `{{key, label}, ...}` shown in the bottom border.
   - `border` (`string`) "rounded", "single", "double", or "none".
-  - `anchor` (`string`) corner origin, "NW", "NE", "SW", or "SE".
+  - `anchor` (`string`) corner origin, "NW", "NE", "SW", "SE", or "input_caret".
   - `width` (`integer|string`) new width; integer or "N%".
   - `height` (`integer|string`) new height; integer or "N%".
   - `zindex` (`integer`) stacking order.

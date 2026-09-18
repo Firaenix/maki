@@ -25,6 +25,9 @@ use crate::selection::LineBreaks;
 const CHEVRON: &str = super::CHEVRON;
 const NEWLINE_PAD: &str = "  ";
 const PREFIX_WIDTH: u16 = 2;
+/// The box's top and bottom border. A box shorter than this plus one row
+/// shows the user none of what it holds.
+pub(crate) const BORDER_ROWS: u16 = 2;
 const PLACEHOLDER_SUGGESTIONS: &[&str] = &[
     "research how something works",
     "fix a bug",
@@ -55,7 +58,7 @@ pub enum Placeholder {
 pub enum InputAction {
     Submit(Submission),
     ContinueLine,
-    PaletteSync(String),
+    Changed,
     Passthrough(KeyEvent),
     None,
 }
@@ -124,7 +127,7 @@ impl InputBox {
         }
 
         match self.buffer.handle_key(key) {
-            EditResult::Changed => InputAction::PaletteSync(self.buffer.value()),
+            EditResult::Changed => InputAction::Changed,
             EditResult::Moved | EditResult::Ignored => InputAction::None,
         }
     }
@@ -132,7 +135,7 @@ impl InputBox {
     pub fn handle_paste(&mut self, text: &str) -> InputAction {
         self.follow_cursor = true;
         self.buffer.insert_text(text);
-        InputAction::PaletteSync(self.buffer.value())
+        InputAction::Changed
     }
 
     /// Inserting a file path mid-word looks broken ("read/tmp/x" instead of
@@ -217,12 +220,12 @@ impl InputBox {
 
     pub fn height(&self, width: u16) -> u16 {
         let ew = effective_width(width as usize);
-        let mut visual_lines = total_visual_lines(&self.buffer, ew, true);
+        let mut visual_lines = total_visual_lines(&self.buffer, ew);
         if !self.pending_images.is_empty() {
             visual_lines += 1;
         }
         let capped = visual_lines.min(self.max_input_lines as usize);
-        (capped + 2) as u16
+        (capped as u16).saturating_add(BORDER_ROWS)
     }
 
     pub fn is_at_first_line(&self) -> bool {
@@ -275,8 +278,32 @@ impl InputBox {
         self.pending_images.push(source);
     }
 
+    /// The way a plugin writes to the input. It carries the box's own state
+    /// the way the paste path does: the view follows the cursor again, and the
+    /// value stops counting as a recalled history entry, so the next history
+    /// key does not throw the edit away.
+    ///
+    /// See [`TextBuffer::replace_byte_range`] for what the offsets refuse.
+    pub fn replace_range(
+        &mut self,
+        start: usize,
+        stop: usize,
+        text: &str,
+        cursor: Option<usize>,
+    ) -> Result<(), String> {
+        self.buffer.replace_byte_range(start, stop, text, cursor)?;
+        self.follow_cursor = true;
+        self.history_index = None;
+        self.draft.clear();
+        Ok(())
+    }
+
+    /// Whole-value writes that are not plugin writes: a history entry, a
+    /// restored draft, a rewind prompt, what came back from `$EDITOR`. The
+    /// text lands verbatim, because the user composed it elsewhere and a
+    /// rewrite here is what the model would be sent.
     pub fn set_input(&mut self, s: String) {
-        self.buffer = TextBuffer::new(s);
+        self.buffer.set_value(s);
     }
 
     pub fn history_up(&mut self) {
@@ -325,17 +352,22 @@ impl InputBox {
         u16::try_from(row).unwrap_or(u16::MAX)
     }
 
-    /// Returns the screen cell it reversed for the cursor, if any.
+    /// Returns the screen cell the caret was drawn in, reversed or not.
+    ///
+    /// {show_cursor} only decides whether that cell is painted as a block
+    /// cursor, which an overlay owning the keyboard turns off. The cell is
+    /// reported either way, so a caret-anchored window stays on it while a
+    /// float holds focus to read keys.
     pub fn view(
         &mut self,
         frame: &mut Frame,
         area: Rect,
         placeholder: Placeholder,
         border_style: Style,
-        focused: bool,
+        show_cursor: bool,
         top_right_hint: Option<Line<'_>>,
     ) -> Option<Position> {
-        let content_height = area.height.saturating_sub(2);
+        let content_height = area.height.saturating_sub(BORDER_ROWS);
         let ew = effective_width(area.width as usize);
 
         if self.follow_cursor {
@@ -347,7 +379,7 @@ impl InputBox {
             }
         }
 
-        let mut total_vl = total_visual_lines(&self.buffer, ew, focused) as u16;
+        let mut total_vl = total_visual_lines(&self.buffer, ew) as u16;
         if !self.pending_images.is_empty() {
             total_vl += 1;
         }
@@ -373,13 +405,9 @@ impl InputBox {
             };
             let mut spans = vec![super::chevron_span()];
             let head = Span::styled(head, base);
-            if focused {
-                let (with_cursor, col) = overlay_cursor(vec![head], 0);
-                cursor_cell = Some(Position::new(display_width(&spans) + col, 0));
-                spans.extend(with_cursor);
-            } else {
-                spans.push(head);
-            }
+            let (with_cursor, col) = overlay_cursor(vec![head], 0, show_cursor);
+            cursor_cell = Some(Position::new(display_width(&spans) + col, 0));
+            spans.extend(with_cursor);
             spans.extend(tail);
             vec![Line::from(spans)]
         } else {
@@ -387,7 +415,7 @@ impl InputBox {
             let cursor_x = self.buffer.x();
             let mut lines: Vec<Line> = Vec::new();
             for (i, line) in self.buffer.lines().iter().enumerate() {
-                let is_cursor_line = i == cursor_y && focused;
+                let is_cursor_line = i == cursor_y;
                 let shell_spans = if i == 0 {
                     shell_highlight_spans(line)
                 } else {
@@ -400,6 +428,7 @@ impl InputBox {
                     cursor_x,
                     i == 0,
                     shell_spans.as_deref(),
+                    show_cursor,
                 );
                 if let Some(cell) = cursor
                     && let Ok(row) = u16::try_from(lines.len() + usize::from(cell.y))
@@ -468,8 +497,8 @@ impl InputBox {
 
     /// Move the text cursor to the position corresponding to a mouse click at
     /// the terminal coordinates (row, col) within the input content area.
-    pub fn handle_click(&mut self, area: Rect, row: u16, col: u16, focused: bool) {
-        let Some((y, x)) = self.click_position(area, row, col, focused) else {
+    pub fn handle_click(&mut self, area: Rect, row: u16, col: u16) {
+        let Some((y, x)) = self.click_position(area, row, col) else {
             return;
         };
         self.buffer.set_cursor(y, x);
@@ -479,13 +508,7 @@ impl InputBox {
     /// Convert a mouse click at terminal (row, col) within the input content
     /// area into a (line_index, char_index) in the text buffer, accounting
     /// for scroll offset, word-wrap, and the chevron/padding prefix.
-    fn click_position(
-        &self,
-        area: Rect,
-        row: u16,
-        col: u16,
-        focused: bool,
-    ) -> Option<(usize, usize)> {
+    fn click_position(&self, area: Rect, row: u16, col: u16) -> Option<(usize, usize)> {
         let content_y = row.checked_sub(area.y)?;
         let content_x = col.checked_sub(area.x)?;
 
@@ -499,8 +522,7 @@ impl InputBox {
             let chars: Vec<char> = line.chars().collect();
             let widths: Vec<usize> = chars.iter().copied().map(char_width).collect();
 
-            let is_cursor_line = buf_line_idx == cursor_line && focused;
-            let ranges = wrap_ranges(&widths, ew, is_cursor_line);
+            let ranges = wrap_ranges(&widths, ew, buf_line_idx == cursor_line);
 
             let n_visual_rows = ranges.len();
 
@@ -552,9 +574,11 @@ const fn effective_width(content_width: usize) -> usize {
 }
 
 /// Wraps one buffer line into rendered rows. When the line holds the cursor it
-/// also reports the cell it reversed, `y` rows down from the start of the line
-/// and `x` columns into that row. Only this function knows where the cursor was
-/// drawn, so a terminal cursor placed from it can never drift off that cell.
+/// also reports the cell the caret sits in, `y` rows down from the start of the
+/// line and `x` columns into that row. Only this function knows where the
+/// cursor was drawn, so a terminal cursor placed from it can never drift off
+/// that cell. {reversed} paints it as a block cursor, and it is reported
+/// either way.
 fn wrap_line(
     line: &str,
     ew: usize,
@@ -562,6 +586,7 @@ fn wrap_line(
     cursor_x: usize,
     is_first_line: bool,
     shell_spans: Option<&[Span<'static>]>,
+    reversed: bool,
 ) -> (Vec<Line<'static>>, Option<Position>) {
     let chars: Vec<char> = line.chars().collect();
     let widths: Vec<usize> = chars.iter().copied().map(char_width).collect();
@@ -595,7 +620,7 @@ fn wrap_line(
             let owns_cursor =
                 is_cursor_line && cursor_x >= start && (cursor_x < end || row + 1 == row_count);
             if owns_cursor {
-                let (with_cursor, col) = overlay_cursor(chunk_spans, cursor_x - start);
+                let (with_cursor, col) = overlay_cursor(chunk_spans, cursor_x - start, reversed);
                 cursor_cell = Some(Position::new(prefix_width + col, row as u16));
                 spans.extend(with_cursor);
             } else {
@@ -723,9 +748,16 @@ fn display_width(spans: &[Span<'_>]) -> u16 {
     spans.iter().map(Span::width).sum::<usize>() as u16
 }
 
-/// Reverses the cell under the cursor and reports its display column, measured
-/// from the spans actually emitted before it so wide chars cannot throw it off.
-fn overlay_cursor(spans: Vec<Span<'static>>, cursor_char_pos: usize) -> (Vec<Span<'static>>, u16) {
+/// Reports the display column of the cell under the cursor, measured from the
+/// spans actually emitted before it so wide chars cannot throw it off, and
+/// reverses that cell when {reversed}. The spans are split around it either
+/// way, so the geometry is the same whoever owns the keyboard.
+fn overlay_cursor(
+    spans: Vec<Span<'static>>,
+    cursor_char_pos: usize,
+    reversed: bool,
+) -> (Vec<Span<'static>>, u16) {
+    let cursor_style = |style: Style| if reversed { style.reversed() } else { style };
     let mut result = Vec::new();
     let mut pos = 0;
     let mut cursor_col = None;
@@ -743,7 +775,10 @@ fn overlay_cursor(spans: Vec<Span<'static>>, cursor_char_pos: usize) -> (Vec<Spa
                 break;
             };
             cursor_col = Some(display_width(&result));
-            result.push(Span::styled(cursor_char.to_string(), span.style.reversed()));
+            result.push(Span::styled(
+                cursor_char.to_string(),
+                cursor_style(span.style),
+            ));
             let rest: String = cs.collect();
             if !rest.is_empty() {
                 result.push(Span::styled(rest.to_string(), span.style));
@@ -757,17 +792,17 @@ fn overlay_cursor(spans: Vec<Span<'static>>, cursor_char_pos: usize) -> (Vec<Spa
         return (result, col);
     }
     let col = display_width(&result);
-    result.push(Span::styled(" ", Style::new().reversed()));
+    result.push(Span::styled(" ", cursor_style(Style::new())));
     (result, col)
 }
 
-fn total_visual_lines(buffer: &TextBuffer, ew: usize, cursor_visible: bool) -> usize {
+fn total_visual_lines(buffer: &TextBuffer, ew: usize) -> usize {
     let cursor_y = buffer.y();
     buffer
         .lines()
         .iter()
         .enumerate()
-        .map(|(i, line)| wrapped_row_count(line, ew, cursor_visible && i == cursor_y))
+        .map(|(i, line)| wrapped_row_count(line, ew, i == cursor_y))
         .sum()
 }
 
@@ -948,7 +983,7 @@ mod tests {
         width: u16,
         height: u16,
         placeholder: Placeholder,
-        focused: bool,
+        show_cursor: bool,
     ) -> Rendered {
         let border_style = Style::new().fg(theme::current().mode_build);
         let backend = ratatui::backend::TestBackend::new(width, height);
@@ -957,7 +992,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = Rect::new(0, 0, width, height);
-                cursor = input.view(frame, area, placeholder, border_style, focused, None);
+                cursor = input.view(frame, area, placeholder, border_style, show_cursor, None);
             })
             .unwrap();
         Rendered { terminal, cursor }
@@ -1296,7 +1331,7 @@ mod tests {
         text: &str,
         (row, col): (u16, u16),
     ) -> Option<(usize, usize)> {
-        single_line(text).click_position(area(10), row, col, true)
+        single_line(text).click_position(area(10), row, col)
     }
 
     #[test_case((1, 0) => Some((1, 0)); "second line col 0 is its start")]
@@ -1308,28 +1343,28 @@ mod tests {
         type_text(&mut input, "abc");
         input.buffer.add_line();
         type_text(&mut input, "def");
-        input.click_position(area(10), row, col, true)
+        input.click_position(area(10), row, col)
     }
 
     #[test_case((1, 0) => Some((0, 8)); "continuation row first col maps to wrapped chunk start")]
     #[test_case((1, 1) => Some((0, 9)); "continuation row has no prefix offset")]
     fn click_position_wrapped_line_has_no_prefix((row, col): (u16, u16)) -> Option<(usize, usize)> {
         // width 10 -> ew 8 -> "abcdefghij" wraps as [0,8) then [8,10).
-        single_line("abcdefghij").click_position(area(10), row, col, true)
+        single_line("abcdefghij").click_position(area(10), row, col)
     }
 
-    #[test_case(true, (1, 2) => Some((0, 8)); "focused full cursor line gets an extra row")]
-    #[test_case(false, (1, 2) => Some((1, 0)); "unfocused full cursor line has no extra row")]
-    fn click_position_cursor_extra_row(
-        focused: bool,
-        (row, col): (u16, u16),
-    ) -> Option<(usize, usize)> {
+    /// The cursor sitting just past a full row is drawn on a row of its own,
+    /// whoever owns the keyboard, so a click has to count that row too or
+    /// every line below it maps one row out.
+    #[test_case((1, 2) => Some((0, 8)); "the extra cursor row is its own row")]
+    #[test_case((2, 2) => Some((1, 0)); "the next buffer line comes after it")]
+    fn click_position_cursor_extra_row((row, col): (u16, u16)) -> Option<(usize, usize)> {
         let mut input = InputBox::new(InputHistory::default(), 20);
         type_text(&mut input, "abcdefgh");
         input.buffer.add_line();
         type_text(&mut input, "xy");
         input.buffer.set_cursor(0, 8);
-        input.click_position(area(10), row, col, focused)
+        input.click_position(area(10), row, col)
     }
 
     // Width 12 leaves 10 text columns after the 2 cell prefix, height 6 leaves
@@ -1337,6 +1372,9 @@ mod tests {
     const CURSOR_WIDTH: u16 = 12;
     const CURSOR_HEIGHT: u16 = 6;
     const CURSOR_EW: usize = effective_width(CURSOR_WIDTH as usize);
+    const CURSOR_STAYS_HIDDEN: &str = "the hardware cursor must never be shown";
+    const NO_BLOCK_CURSOR_UNFOCUSED: &str =
+        "an overlay owns the keyboard, so nothing may be reversed";
 
     fn reversed_cells(
         terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
@@ -1438,6 +1476,7 @@ mod tests {
     // leaving a hole behind. With only one content row the viewport has to
     // scroll down to that second row, or the reversed cell and the IME with it
     // end up off screen.
+    const CURSOR_ON_THE_EDIT: &str = "the cursor the edit moved has to be on screen";
     const WIDE_WRAP_LINE: &str = "a漢漢漢漢漢";
     const WIDE_WRAP_HEIGHT: u16 = 3;
     const WIDE_WRAP_SCROLL: u16 = 1;
@@ -1459,16 +1498,71 @@ mod tests {
         assert_cursor_at(&rendered, Some(expected));
     }
 
+    /// An overlay owning the keyboard takes the block cursor away, but not the
+    /// caret: a caret-anchored window is placed from the cell reported here,
+    /// and reporting None teleports it to the middle of the screen.
     #[test]
-    fn unfocused_input_leaves_the_terminal_cursor_alone() {
+    fn an_unfocused_input_reports_its_caret_without_reversing_it() {
         let mut input = single_line("hello");
-        let rendered = draw_input(
+        let focused = render_cursor(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
+        let unfocused = draw_input(
             &mut input,
             CURSOR_WIDTH,
             CURSOR_HEIGHT,
             Placeholder::Suggestion,
             false,
         );
-        assert_cursor_at(&rendered, None);
+        assert_eq!(
+            unfocused.cursor, focused.cursor,
+            "the caret cell does not move when the keyboard goes elsewhere"
+        );
+        assert!(
+            !unfocused.terminal.backend().cursor_visible(),
+            "{CURSOR_STAYS_HIDDEN}"
+        );
+        assert_eq!(
+            reversed_cells(&unfocused.terminal),
+            Vec::new(),
+            "{NO_BLOCK_CURSOR_UNFOCUSED}"
+        );
+    }
+
+    /// A plugin edit lands on a recalled history entry, so the value is the
+    /// user's own text again. Left in the browse state, the next history key
+    /// would put the entry back over the edit.
+    #[test]
+    fn a_plugin_edit_leaves_history_browsing() {
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        submit_text(&mut input, "recalled");
+        input.history_up();
+        assert_eq!(input.buffer.value(), "recalled");
+
+        input
+            .replace_range(0, "recalled".len(), "written", None)
+            .unwrap();
+        input.history_down();
+        assert_eq!(input.buffer.value(), "written");
+    }
+
+    /// A wheel scroll pins the view, so an edit has to bring the cursor back
+    /// into it the way typing does.
+    #[test]
+    fn a_plugin_edit_brings_the_view_back_to_the_cursor() {
+        const LINES: usize = 10;
+        let mut input = InputBox::new(InputHistory::default(), 20);
+        input.handle_paste(&["a"; LINES].join("\n"));
+        let _ = render_cursor(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
+
+        input.scroll(LINES as i32);
+        assert_eq!(input.scroll_y(), 0, "the wheel scrolled back to the top");
+
+        let end = input.buffer.byte_len();
+        input.replace_range(end - 1, end, "b", None).unwrap();
+        let rendered = render_cursor(&mut input, CURSOR_WIDTH, CURSOR_HEIGHT);
+        assert!(
+            input.scroll_y() > 0,
+            "the edit put the cursor on the last row, so the view has to follow"
+        );
+        assert!(rendered.cursor.is_some(), "{}", CURSOR_ON_THE_EDIT);
     }
 }

@@ -30,9 +30,9 @@ use maki_lua::session_snapshot::{
     SessionSnapshot,
 };
 use maki_lua::{
-    EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, PackCommand,
-    PackPreparation, PlanRequest, SessionEndReason, SessionRequest, TaskRequest, UiAction,
-    UiAttachment, UiReply,
+    EventHandle, HintReader, InputRequest, KeymapReader, LuaCommandReader, ModelRequest,
+    PackCommand, PackPreparation, PlanRequest, SessionEndReason, SessionRequest, TaskRequest,
+    UiAction, UiAttachment, UiReply,
 };
 use maki_providers::Timeouts;
 use maki_providers::provider::{Provider, fetch_all_models, from_model};
@@ -43,6 +43,7 @@ use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
 use maki_storage::model::persist_model;
 use maki_storage::sessions::{SessionError, normalize_title};
 use ratatui::backend::Backend;
+use ratatui::layout::Rect;
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -855,18 +856,15 @@ impl<'t> EventLoop<'t> {
     }
 
     /// Only the focused session is drawn, so only it can owe a frame; focusing
-    /// another is an event, and events always repaint. Background sessions
-    /// still drain their floats, or a plugin writing to a window nobody is
-    /// looking at would lose the output, and their plan form, or a draft in a
-    /// background tab would sit unanswered until the user focused it.
+    /// another is an event, and events always repaint. The rest get
+    /// [`App::tick_background`].
     fn tick(&mut self) -> Dirty {
         let mut dirty = Dirty::NO;
         for (i, rt) in self.sessions.iter_mut().enumerate() {
             if i == self.focused {
                 dirty |= rt.app.tick();
             } else {
-                let _ = rt.app.float_mgr.tick();
-                let _ = rt.app.tick_plan();
+                rt.app.tick_background();
             }
         }
         // A plan form row outlives the key press that picked it: its handler
@@ -979,6 +977,9 @@ impl<'t> EventLoop<'t> {
             }
             UiAction::Model { req, reply_tx } => {
                 let _ = reply_tx.send(self.handle_model_request(req));
+            }
+            UiAction::Input { req, reply_tx } => {
+                let _ = reply_tx.send(self.handle_input_request(req));
             }
             UiAction::Task { req, reply_tx } => {
                 let _ = reply_tx.send(self.handle_task_request(req));
@@ -1098,6 +1099,11 @@ impl<'t> EventLoop<'t> {
     /// and `maki.task.focus`, so none of them has to remember to fire an
     /// event. A session switch is a task switch too, so `TaskFocusChanged`
     /// always follows `SessionFocusChanged`.
+    ///
+    /// A switch also republishes the input the newly focused tab holds. Only
+    /// the focused session ticks, so a background tab never diffs its own
+    /// input, and without the announcement a handler keeps acting on the text
+    /// of the tab it came from.
     fn emit_focus_changes(&mut self) {
         let rt = &self.sessions[self.focused];
         let current = (rt.id(), rt.app.active_task_id());
@@ -1106,6 +1112,7 @@ impl<'t> EventLoop<'t> {
         }
         let previous_session = self.last_focus.replace(current.clone()).map(|(id, _)| id);
         let (session_id, task_id) = current;
+        let switched = previous_session.is_some() && previous_session != Some(session_id);
         let eh = &self.ctx.lua_event_handle;
         if previous_session != Some(session_id) {
             let mut data = json!({ "session_id": session_id });
@@ -1118,6 +1125,9 @@ impl<'t> EventLoop<'t> {
             "TaskFocusChanged",
             json!({ "session_id": session_id, "id": task_id }),
         );
+        if switched {
+            self.focused_app().announce_input();
+        }
     }
 
     fn start_mailbox_runs(&mut self) -> Dirty {
@@ -1278,6 +1288,21 @@ impl<'t> EventLoop<'t> {
                     Ok(json!(true))
                 })();
                 let _ = reply_tx.send(reply);
+            }
+        }
+    }
+
+    /// The input a plugin reads and writes is the focused session's.
+    ///
+    /// An edit is answered against the terminal as it is now, not as the last
+    /// frame found it: a batch of wakes runs between two paints, so the size
+    /// the box would be drawn at has to be asked for here.
+    fn handle_input_request(&mut self, req: InputRequest) -> UiReply {
+        match req {
+            InputRequest::Read => Ok(self.focused_app().input_snapshot()),
+            InputRequest::Edit(edit) => {
+                let area = self.terminal.size().map(Rect::from).unwrap_or_default();
+                self.focused_app().apply_input_edit(edit, area)
             }
         }
     }

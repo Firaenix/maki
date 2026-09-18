@@ -150,8 +150,8 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
 /// `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 /// `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"TaskStatusChanged"`,
-/// `"TaskFocusChanged"`, and `"ModelChanged"`. Plugins can also fire their
-/// own events with `exec_autocmds`.
+/// `"TaskFocusChanged"`, `"ModelChanged"`, and `"InputChanged"`. Plugins can
+/// also fire their own events with `exec_autocmds`.
 ///
 /// Every host event carries `data.session_id`. For `"SessionReset"` and
 /// `"SessionEnd"` that is the session being left behind, the other events
@@ -187,6 +187,13 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// - `"ModelChanged"`: `data.model` in the shape `maki.model.get` returns,
 ///   plus `data.previous_spec`. Picking the model already in use stays
 ///   quiet, and so does startup.
+/// - `"InputChanged"`: `data.text`, `data.cursor` and `data.version`, the
+///   chat input as `maki.ui.input` reports it. `data.source` is the plugin
+///   name when that plugin's `maki.ui.input_edit` was the frame's sole
+///   writer, and nil otherwise, so ignoring your own name never drops a
+///   change. At most one event per frame and only when the text moved, so
+///   moving the cursor alone fires nothing. Focusing another session
+///   republishes the input that tab holds.
 ///
 /// `"TurnEnd"` fires once per turn and only for the main session, so
 /// subagent turns never show up. A manual `/compact` ends its run without

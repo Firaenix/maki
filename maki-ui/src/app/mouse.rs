@@ -25,9 +25,8 @@ impl App {
                     }
                     // Move the cursor to the click position in the input area.
                     if zone.zone == SelectionZone::Input {
-                        let focused = !self.any_overlay_open();
                         self.input_box
-                            .handle_click(zone.area, event.row, event.column, focused);
+                            .handle_click(zone.area, event.row, event.column);
                     }
                     let pos = self.doc_pos(zone.zone, zone.area, event.row, event.column);
                     self.selection_state = Some(SelectionState::Dragging {

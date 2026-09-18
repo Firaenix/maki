@@ -172,7 +172,7 @@ fn win_extra<M: mlua::UserDataMethods<WinHandle>>(methods: &mut M) {
 ///   - title_pos (string): title alignment, "left", "center", or "right".
 ///   - footer (table): key-hint pairs `{{key, label}, ...}` shown in the bottom border.
 ///   - border (string): "rounded", "single", "double", or "none".
-///   - anchor (string): corner origin, "NW", "NE", "SW", or "SE".
+///   - anchor (string): corner origin, "NW", "NE", "SW", "SE", or "input_caret".
 ///   - width (integer|string): new width; integer or "N%".
 ///   - height (integer|string): new height; integer or "N%".
 ///   - zindex (integer): stacking order.

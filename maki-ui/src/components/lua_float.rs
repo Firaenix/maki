@@ -4,7 +4,7 @@ use crossterm::event::KeyEvent;
 use maki_agent::{SharedBuf, SnapshotLine, SpanStyle};
 use maki_lua::{Anchor, Axis, Border, FloatConfig, Split, TitlePos, WinCommand, WinEvent};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
@@ -304,12 +304,17 @@ impl FloatManager {
         true
     }
 
-    /// A stacked window sits below (or above, for the south anchors) every
-    /// stacked window opened before it in the same corner, so its offset can
-    /// only be known here, where the whole list is in scope. Recomputing it
-    /// each frame is what makes survivors close the hole left by a window
-    /// that went away, with nothing to keep in sync.
-    fn stack_offset(&self, idx: usize, area: Rect) -> u16 {
+    /// A stacked window sits below (or above, for the south anchors and a
+    /// caret the host placed above) every stacked window opened before it in
+    /// the same corner, so its offset can only be known here, where the whole
+    /// list is in scope. Recomputing it each frame is what makes survivors
+    /// close the hole left by a window that went away, with nothing to keep
+    /// in sync.
+    ///
+    /// The rows summed are the ones each earlier window really takes: a caret
+    /// anchor trims its height to the side it landed on, and summing the
+    /// request would leave a gap as tall as the rows that were cut.
+    fn stack_offset(&self, idx: usize, area: Rect, caret: Option<Position>) -> u16 {
         let win = &self.windows[idx];
         if !Self::stacks(win) {
             return 0;
@@ -318,7 +323,7 @@ impl FloatManager {
             .iter()
             .filter(|w| Self::stacks(w) && w.config.anchor == win.config.anchor && w.id < win.id)
             .fold(0, |acc, w| {
-                acc.saturating_add(w.config.height.resolve(area.height).min(area.height))
+                acc.saturating_add(effective_height(&w.config, area, caret))
                     .saturating_add(STACK_GAP)
             })
     }
@@ -330,7 +335,10 @@ impl FloatManager {
         win.config.stack && win.config.split == Split::None
     }
 
-    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+    /// {caret} is the cell the frame being painted put the chat input caret
+    /// on, so an [`Anchor::InputCaret`] window follows it through wraps and
+    /// resizes with nobody re-placing it.
+    pub fn view(&mut self, frame: &mut Frame, area: Rect, caret: Option<Position>) -> Rect {
         let mut union = Rect::default();
 
         for idx in 0..self.windows.len() {
@@ -340,7 +348,8 @@ impl FloatManager {
             let popup = resolve_rect(
                 &self.windows[idx].config,
                 area,
-                self.stack_offset(idx, area),
+                self.stack_offset(idx, area, caret),
+                caret,
             );
             if popup.width == 0 || popup.height == 0 {
                 continue;
@@ -575,53 +584,127 @@ fn hint_footer<K: AsRef<str>, V: AsRef<str>>(pairs: &[(K, V)]) -> Line<'static> 
     Line::from(spans)
 }
 
+/// Sits a window of {w} by {h} on the caret cell, and reports whether it
+/// landed above the caret.
+///
+/// The roomier side of the caret wins: a caret near the top of the screen has
+/// two rows above it and the whole transcript below. The height is trimmed to
+/// that side, and the column pulled left far enough that the whole width lands
+/// on screen.
+///
+/// A stack of these windows grows along the side reported, away from the
+/// caret, so the second window clears the first instead of landing back on the
+/// input box both were placed off.
+fn caret_rect(caret: Position, w: u16, h: u16, area: Rect) -> (Rect, bool) {
+    let above = caret.y.saturating_sub(area.y);
+    let below = (area.y + area.height).saturating_sub(caret.y + 1);
+    let height = h.min(above.max(below));
+    let sits_above = above >= below;
+    let y = if sits_above {
+        caret.y - height
+    } else {
+        caret.y + 1
+    };
+    let x = caret.x.clamp(area.x, area.x + area.width - w);
+    (Rect::new(x, y, w, height), sits_above)
+}
+
+/// The rows {config} really takes on this frame, which is its request for
+/// every anchor but [`Anchor::InputCaret`]: that one is trimmed to the side
+/// of the caret it sits on.
+fn effective_height(config: &FloatConfig, area: Rect, caret: Option<Position>) -> u16 {
+    let h = config.height.resolve(area.height).min(area.height);
+    match caret {
+        Some(caret) if config.anchor == Anchor::InputCaret => {
+            let w = config.width.resolve(area.width).min(area.width);
+            caret_rect(caret, w, h, area).0.height
+        }
+        _ => h,
+    }
+}
+
+/// Widened to `i32` before the shift: a column near `u16::MAX` plus a
+/// positive {delta} overflows an `i16` and panics in debug, and the clamp
+/// that follows brings the result back into `u16` anyway.
+fn shift(coord: u16, delta: i16, lo: u16, hi: u16) -> u16 {
+    (i32::from(coord) + i32::from(delta)).clamp(i32::from(lo), i32::from(hi)) as u16
+}
+
 /// `stack_offset` slides the window along the anchor's vertical direction
 /// after `config.row` has been applied, so `row` stays the point the stack
-/// grows from.
-fn resolve_rect(config: &FloatConfig, area: Rect, stack_offset: u16) -> Rect {
+/// grows from. Stacks grow downwards except from the southern anchors and from
+/// an [`Anchor::InputCaret`] the host put above the caret: stacking downwards
+/// from there would walk the next window back over the caret and into the
+/// input box.
+///
+/// {caret} is where this frame put the chat input caret. Without one,
+/// [`Anchor::InputCaret`] falls back to the centred default, because a form, a
+/// prompt or a `below` split takes the input box away often enough that
+/// erroring would make the anchor unusable.
+///
+/// `row` and `col` shift the window off whatever origin its anchor picked. For
+/// the caret that origin is the corner beside it, or the centre of the screen
+/// when there is no caret.
+fn resolve_rect(
+    config: &FloatConfig,
+    area: Rect,
+    stack_offset: u16,
+    caret: Option<Position>,
+) -> Rect {
     let w = config.width.resolve(area.width).min(area.width);
     let h = config.height.resolve(area.height).min(area.height);
-
-    let (x, y) = match (config.col, config.row) {
-        (None, None) => {
-            let cx = area.x + (area.width.saturating_sub(w)) / 2;
-            let cy = area.y + (area.height.saturating_sub(h)) / 2;
-            (cx, cy)
-        }
-        (col, row) => {
-            let c = col.unwrap_or(0);
-            let r = row.unwrap_or(0);
-
-            let x = match config.anchor {
-                Anchor::NW | Anchor::SW => {
-                    (area.x as i16 + c).clamp(area.x as i16, (area.x + area.width) as i16) as u16
-                }
-                Anchor::NE | Anchor::SE => ((area.x + area.width) as i16 - w as i16 + c)
-                    .clamp(area.x as i16, (area.x + area.width) as i16)
-                    as u16,
-            };
-            let y = match config.anchor {
-                Anchor::NW | Anchor::NE => {
-                    (area.y as i16 + r).clamp(area.y as i16, (area.y + area.height) as i16) as u16
-                }
-                Anchor::SW | Anchor::SE => ((area.y + area.height) as i16 - h as i16 + r)
-                    .clamp(area.y as i16, (area.y + area.height) as i16)
-                    as u16,
-            };
-            (x, y)
-        }
+    let (left, top) = (area.x, area.y);
+    let (right, bottom) = (area.x + area.width, area.y + area.height);
+    let centred = || {
+        (
+            left + area.width.saturating_sub(w) / 2,
+            top + area.height.saturating_sub(h) / 2,
+        )
     };
 
-    let y = match config.anchor {
-        Anchor::NW | Anchor::NE => y.saturating_add(stack_offset),
-        Anchor::SW | Anchor::SE => y.saturating_sub(stack_offset),
+    let placed = match caret {
+        Some(caret) if config.anchor == Anchor::InputCaret => Some(caret_rect(caret, w, h, area)),
+        _ => None,
+    };
+    let stacks_up = match placed {
+        Some((_, sits_above)) => sits_above,
+        None => matches!(config.anchor, Anchor::SW | Anchor::SE),
+    };
+
+    let (x, y, h) = if config.anchor == Anchor::InputCaret {
+        let (origin, h) = match placed {
+            Some((rect, _)) => ((rect.x, rect.y), rect.height),
+            None => (centred(), h),
+        };
+        (
+            shift(origin.0, config.col.unwrap_or(0), left, right),
+            shift(origin.1, config.row.unwrap_or(0), top, bottom),
+            h,
+        )
+    } else if config.col.is_none() && config.row.is_none() {
+        let (x, y) = centred();
+        (x, y, h)
+    } else {
+        let (c, r) = (config.col.unwrap_or(0), config.row.unwrap_or(0));
+        let x = match config.anchor {
+            Anchor::NE | Anchor::SE => shift(right - w, c, left, right),
+            _ => shift(left, c, left, right),
+        };
+        let y = match config.anchor {
+            Anchor::SW | Anchor::SE => shift(bottom - h, r, top, bottom),
+            _ => shift(top, r, top, bottom),
+        };
+        (x, y, h)
+    };
+
+    let y = if stacks_up {
+        y.saturating_sub(stack_offset)
+    } else {
+        y.saturating_add(stack_offset)
     }
-    .clamp(area.y, area.y + area.height);
+    .clamp(top, bottom);
 
-    let clamped_w = w.min(area.x + area.width - x);
-    let clamped_h = h.min(area.y + area.height - y);
-
-    Rect::new(x, y, clamped_w, clamped_h)
+    Rect::new(x, y, w.min(right - x), h.min(bottom - y))
 }
 
 fn adjust_scroll(
@@ -725,6 +808,7 @@ mod tests {
     const EXPECT_MODAL: &str = "expected a focused float to be modal";
     const EXPECT_NOT_MODAL: &str = "expected a focused split to not be modal";
     const NO_STACK_OFFSET: u16 = 0;
+    const NO_CARET: Option<Position> = None;
 
     fn make_line(text: &str) -> SnapshotLine {
         SnapshotLine {
@@ -808,7 +892,7 @@ mod tests {
             height: Dimension::Percent(40),
             ..FloatConfig::default()
         };
-        let r = resolve_rect(&config, area, NO_STACK_OFFSET);
+        let r = resolve_rect(&config, area, NO_STACK_OFFSET, NO_CARET);
         assert_eq!(r.width, 100);
         assert_eq!(r.height, 40);
         assert_eq!(r.x, 50);
@@ -826,7 +910,7 @@ mod tests {
             anchor: Anchor::NW,
             ..FloatConfig::default()
         };
-        let r = resolve_rect(&config, area, NO_STACK_OFFSET);
+        let r = resolve_rect(&config, area, NO_STACK_OFFSET, NO_CARET);
         assert_eq!(r.x, 10);
         assert_eq!(r.y, 5);
         assert_eq!(r.width, 20);
@@ -844,7 +928,7 @@ mod tests {
             anchor: Anchor::SE,
             ..FloatConfig::default()
         };
-        let r = resolve_rect(&config, area, NO_STACK_OFFSET);
+        let r = resolve_rect(&config, area, NO_STACK_OFFSET, NO_CARET);
         assert_eq!(r.x, 80);
         assert_eq!(r.y, 40);
     }
@@ -857,7 +941,7 @@ mod tests {
             height: Dimension::Abs(50),
             ..FloatConfig::default()
         };
-        let r = resolve_rect(&config, area, NO_STACK_OFFSET);
+        let r = resolve_rect(&config, area, NO_STACK_OFFSET, NO_CARET);
         assert_eq!(r.width, 30);
         assert_eq!(r.height, 20);
     }
@@ -873,7 +957,7 @@ mod tests {
             anchor: Anchor::NE,
             ..FloatConfig::default()
         };
-        let r = resolve_rect(&config, area, NO_STACK_OFFSET);
+        let r = resolve_rect(&config, area, NO_STACK_OFFSET, NO_CARET);
         assert_eq!(r.x, 80);
         assert_eq!(r.y, 5);
     }
@@ -889,7 +973,7 @@ mod tests {
             anchor: Anchor::SW,
             ..FloatConfig::default()
         };
-        let r = resolve_rect(&config, area, NO_STACK_OFFSET);
+        let r = resolve_rect(&config, area, NO_STACK_OFFSET, NO_CARET);
         assert_eq!(r.x, 5);
         assert_eq!(r.y, 40);
     }
@@ -905,7 +989,7 @@ mod tests {
             anchor: Anchor::SE,
             ..FloatConfig::default()
         };
-        let r = resolve_rect(&config, area, NO_STACK_OFFSET);
+        let r = resolve_rect(&config, area, NO_STACK_OFFSET, NO_CARET);
         assert_eq!(r.x, 70);
         assert_eq!(r.y, 35);
     }
@@ -918,7 +1002,7 @@ mod tests {
             height: Dimension::Abs(10),
             ..FloatConfig::default()
         };
-        let r = resolve_rect(&config, area, NO_STACK_OFFSET);
+        let r = resolve_rect(&config, area, NO_STACK_OFFSET, NO_CARET);
         assert_eq!(r.x, 40);
         assert_eq!(r.y, 20);
         assert!(r.x >= area.x && r.x + r.width <= area.x + area.width);
@@ -933,7 +1017,7 @@ mod tests {
             height: Dimension::Abs(10),
             ..FloatConfig::default()
         };
-        let r = resolve_rect(&config, area, NO_STACK_OFFSET);
+        let r = resolve_rect(&config, area, NO_STACK_OFFSET, NO_CARET);
         assert_eq!(r.width, 0);
         assert_eq!(r.height, 0);
     }
@@ -949,9 +1033,169 @@ mod tests {
             anchor: Anchor::NW,
             ..FloatConfig::default()
         };
-        let r = resolve_rect(&config, area, NO_STACK_OFFSET);
+        let r = resolve_rect(&config, area, NO_STACK_OFFSET, NO_CARET);
         assert_eq!(r.x, 10);
         assert_eq!(r.y, 0, "only col is set, so row falls back to 0");
+    }
+
+    const CARET_AREA: Rect = Rect::new(0, 0, 80, 24);
+    const CARET_WIDTH: u16 = 30;
+    const CARET_HEIGHT: u16 = 7;
+    const EXPECT_ON_SCREEN: &str = "the whole window has to land on screen";
+
+    /// {caret_y}, {caret_x}, then the row, column and height the window lands
+    /// at. The area is 24 rows, so a caret on row 20 has 20 above it and 3
+    /// below, and one on row 2 has 2 above and 21 below.
+    #[test_case(20, 5 => (13, 5, CARET_HEIGHT) ; "above_when_the_caret_is_near_the_bottom")]
+    #[test_case(2, 5 => (3, 5, CARET_HEIGHT) ; "below_when_the_caret_is_near_the_top")]
+    #[test_case(0, 0 => (1, 0, CARET_HEIGHT) ; "below_with_nothing_above")]
+    #[test_case(23, 0 => (16, 0, CARET_HEIGHT) ; "above_with_nothing_below")]
+    #[test_case(12, 0 => (5, 0, CARET_HEIGHT) ; "above_by_one_row_wins")]
+    #[test_case(11, 0 => (12, 0, CARET_HEIGHT) ; "below_by_one_row_wins")]
+    #[test_case(5, 60 => (6, 50, CARET_HEIGHT) ; "column_pulled_left_to_fit_the_width")]
+    #[test_case(5, 79 => (6, 50, CARET_HEIGHT) ; "column_on_the_last_cell")]
+    fn caret_rect_picks_the_roomier_side_and_keeps_the_width_on_screen(
+        caret_y: u16,
+        caret_x: u16,
+    ) -> (u16, u16, u16) {
+        let (r, sits_above) = caret_rect(
+            Position::new(caret_x, caret_y),
+            CARET_WIDTH,
+            CARET_HEIGHT,
+            CARET_AREA,
+        );
+        assert!(r.x + r.width <= CARET_AREA.width, "{EXPECT_ON_SCREEN}");
+        assert!(r.y + r.height <= CARET_AREA.height, "{EXPECT_ON_SCREEN}");
+        assert_eq!(
+            sits_above,
+            r.y < caret_y,
+            "the side reported is the side the window landed on, and a stack grows along it"
+        );
+        (r.y, r.x, r.height)
+    }
+
+    /// Asking for more rows than the side has leaves a window that would run
+    /// off the screen, so the height is trimmed to what is there. A caret with
+    /// nowhere to go at all resolves to zero rows, which `view` skips.
+    #[test_case(2, 40 => (3, 21) ; "trimmed_to_the_room_below")]
+    #[test_case(21, 20 => (1, 20) ; "trimmed_to_the_room_above")]
+    #[test_case(0, 40 => (1, 23) ; "trimmed_to_the_whole_screen")]
+    fn caret_rect_trims_the_height_to_the_side_it_picked(caret_y: u16, h: u16) -> (u16, u16) {
+        let (r, _) = caret_rect(Position::new(0, caret_y), CARET_WIDTH, h, CARET_AREA);
+        (r.y, r.height)
+    }
+
+    /// One row of terminal: neither side of the caret holds anything, and a
+    /// zero-height rect is what `view` already drops.
+    #[test]
+    fn caret_rect_gives_up_when_neither_side_has_a_row() {
+        let area = Rect::new(0, 0, 80, 1);
+        let (r, _) = caret_rect(Position::new(0, 0), CARET_WIDTH, CARET_HEIGHT, area);
+        assert_eq!(r.height, 0);
+    }
+
+    fn caret_config() -> FloatConfig {
+        FloatConfig {
+            width: Dimension::Abs(CARET_WIDTH),
+            height: Dimension::Abs(CARET_HEIGHT),
+            anchor: Anchor::InputCaret,
+            ..FloatConfig::default()
+        }
+    }
+
+    /// A caret anchor is unusable if it errors the moment a form, a prompt or
+    /// a `below` split takes the input box, which is often.
+    #[test]
+    fn caret_anchor_without_a_caret_falls_back_to_the_default_placement() {
+        let config = caret_config();
+        let centered = resolve_rect(&config, CARET_AREA, NO_STACK_OFFSET, NO_CARET);
+        assert_eq!(
+            (centered.x, centered.y),
+            (25, 8),
+            "no caret means the centred default"
+        );
+
+        let anchored = resolve_rect(
+            &config,
+            CARET_AREA,
+            NO_STACK_OFFSET,
+            Some(Position::new(5, 2)),
+        );
+        assert_eq!((anchored.x, anchored.y), (5, 3));
+    }
+
+    /// Returning before the stack offset left `stack = true` a no-op on this
+    /// anchor, so a second caret window drew exactly on top of the first.
+    #[test_case(2, 3, 11 ; "grows_downwards_from_a_window_below_the_caret")]
+    #[test_case(21, 14, 6 ; "grows_upwards_from_a_window_above_the_caret")]
+    fn caret_anchored_windows_stack_away_from_the_caret(caret_y: u16, first_y: u16, second_y: u16) {
+        const OFFSET: u16 = CARET_HEIGHT + STACK_GAP;
+        let config = caret_config();
+        let caret = Some(Position::new(5, caret_y));
+
+        let first = resolve_rect(&config, CARET_AREA, NO_STACK_OFFSET, caret);
+        let second = resolve_rect(&config, CARET_AREA, OFFSET, caret);
+
+        assert_eq!((first.y, second.y), (first_y, second_y));
+        assert_eq!(second.x, first.x);
+        assert_eq!(
+            second.height, CARET_HEIGHT,
+            "a stacked window keeps its rows instead of being clipped to a sliver"
+        );
+        assert!(
+            second.y + second.height <= CARET_AREA.height,
+            "{EXPECT_ON_SCREEN}"
+        );
+        assert_eq!(
+            first.y.abs_diff(second.y) - CARET_HEIGHT,
+            STACK_GAP,
+            "{EXPECT_STACK_STEPS}"
+        );
+        assert!(
+            !(second.y..second.y + second.height).contains(&caret_y),
+            "a stacked window must leave the caret row, and the input box it is in, alone"
+        );
+    }
+
+    /// The gap is the rows the earlier window really took. Summing what it
+    /// asked for pushes the next one down by every row the caret trim cut.
+    #[test]
+    fn a_caret_stack_steps_over_the_trimmed_height() {
+        const ROOM_ABOVE: u16 = 12;
+        const TALLER_THAN_THE_SIDE: u16 = 40;
+        let caret = Some(Position::new(0, ROOM_ABOVE));
+        let tall = || FloatConfig {
+            height: Dimension::Abs(TALLER_THAN_THE_SIDE),
+            stack: true,
+            ..caret_config()
+        };
+
+        let mut mgr = FloatManager::new();
+        open_float(&mut mgr, tall());
+        let second = open_float(&mut mgr, tall());
+        let idx = mgr.windows.iter().position(|w| w.id == second).unwrap();
+
+        assert_eq!(
+            mgr.stack_offset(idx, CARET_AREA, caret),
+            ROOM_ABOVE + STACK_GAP,
+            "{EXPECT_STACK_STEPS}"
+        );
+    }
+
+    /// The offsets used to apply only when the caret happened to be missing,
+    /// so the same config placed the window in two different ways.
+    #[test_case(Some(Position::new(5, 2)), 3, 5 ; "from_the_corner_next_to_the_caret")]
+    #[test_case(NO_CARET, 8, 25 ; "from_the_centred_fallback")]
+    fn caret_anchor_honours_row_and_col(caret: Option<Position>, base_y: u16, base_x: u16) {
+        const ROW: i16 = 2;
+        const COL: i16 = 1;
+        let shifted = FloatConfig {
+            row: Some(ROW),
+            col: Some(COL),
+            ..caret_config()
+        };
+        let r = resolve_rect(&shifted, CARET_AREA, NO_STACK_OFFSET, caret);
+        assert_eq!((r.y, r.x), (base_y + ROW as u16, base_x + COL as u16));
     }
 
     const STACK_AREA: Rect = Rect::new(0, 0, 100, 50);
@@ -987,8 +1231,11 @@ mod tests {
         let mut rows: Vec<(u32, u16)> = (0..mgr.windows.len())
             .map(|idx| {
                 let win = &mgr.windows[idx];
-                let offset = mgr.stack_offset(idx, STACK_AREA);
-                (win.id, resolve_rect(&win.config, STACK_AREA, offset).y)
+                let offset = mgr.stack_offset(idx, STACK_AREA, NO_CARET);
+                (
+                    win.id,
+                    resolve_rect(&win.config, STACK_AREA, offset, NO_CARET).y,
+                )
             })
             .collect();
         rows.sort_by_key(|(id, _)| *id);
@@ -1974,7 +2221,7 @@ mod tests {
         let (event_rx, _ctx) = open_split(&mut mgr, Split::Below, 10, true);
         let area = Rect::new(0, 0, 80, 40);
         render_into(&mut mgr, area, |m, f| {
-            let u = m.view(f, area);
+            let u = m.view(f, area, NO_CARET);
             assert_eq!(u, Rect::default(), "overlay pass must not draw the split");
         });
         assert!(
@@ -2116,7 +2363,7 @@ mod tests {
 
         let area = Rect::new(0, 0, 80, 40);
         render_into(&mut mgr, area, |m, f| {
-            let u = m.view(f, area);
+            let u = m.view(f, area, NO_CARET);
             assert_ne!(u, Rect::default(), "overlay pass must draw the float");
         });
 

@@ -176,6 +176,9 @@ pub enum Anchor {
     NE,
     SW,
     SE,
+    /// The cell the chat input caret is drawn in. Named after the widget,
+    /// because a window can hold a caret of its own.
+    InputCaret,
 }
 
 impl Anchor {
@@ -184,6 +187,7 @@ impl Anchor {
             "NE" => Self::NE,
             "SW" => Self::SW,
             "SE" => Self::SE,
+            "input_caret" => Self::InputCaret,
             _ => Self::NW,
         }
     }
@@ -553,6 +557,31 @@ pub struct PlanMenu {
     pub rows: Vec<PlanFormRow>,
 }
 
+/// Offsets are flat byte counts into the whole input, newlines counted as one
+/// byte each, because Lua indexes strings by byte.
+#[derive(Default)]
+pub struct InputEdit {
+    pub start: usize,
+    pub stop: usize,
+    pub text: String,
+    /// Where to leave the cursor, the end of {text} when absent.
+    pub cursor: Option<usize>,
+    /// The value counter the reader was handed. Required, because an optional
+    /// guard makes the shortest call the unguarded one.
+    pub version: u64,
+    /// The tab the offsets were read from, refused once another is focused.
+    /// Required for the same reason as {version}.
+    pub session_id: String,
+    /// Rides along on the `InputChanged` this edit fires, so one input plugin
+    /// can tell another's writes from its own.
+    pub plugin: Arc<str>,
+}
+
+pub enum InputRequest {
+    Read,
+    Edit(InputEdit),
+}
+
 pub type UiReply = Result<serde_json::Value, String>;
 
 /// Viewport of the focused chat transcript, zero-based like the rest of the
@@ -606,6 +635,10 @@ pub enum UiAction {
     },
     Plan {
         req: PlanRequest,
+        reply_tx: flume::Sender<UiReply>,
+    },
+    Input {
+        req: InputRequest,
         reply_tx: flume::Sender<UiReply>,
     },
     Task {
@@ -825,6 +858,7 @@ mod tests {
     #[test_case("NE" => Anchor::NE ; "ne")]
     #[test_case("SW" => Anchor::SW ; "sw")]
     #[test_case("SE" => Anchor::SE ; "se")]
+    #[test_case("input_caret" => Anchor::InputCaret ; "input_caret")]
     #[test_case("garbage" => Anchor::NW ; "unknown_defaults_nw")]
     fn anchor_parse(s: &str) -> Anchor {
         Anchor::parse(s)

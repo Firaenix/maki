@@ -7,6 +7,7 @@ use crate::components::file_picker::UNREADABLE_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
 use crate::components::messages::ScrollPos;
 use crate::components::rewind_picker::RewindEntry;
+use crate::components::split_layout::MIN_CHAT_ROWS;
 use crate::components::{ExitRequest, buffer_text, key, test_model};
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{RowPos, SelectableZone, SelectionState, SelectionZone};
@@ -33,7 +34,7 @@ use maki_storage::sessions::{SessionMeta, StoredMode, StoredThinking};
 use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::Modifier;
 use std::env;
 use std::fs;
@@ -65,6 +66,7 @@ const OPUS_SPEC: &str = "anthropic/claude-opus-4-8";
 const PLAIN_MODEL_SPEC: &str = "ollama/qwen3";
 const THINKING_OPTIONS: &str = "thinking_options";
 const MODEL_CHANGED_EVENT: &str = "ModelChanged";
+const INPUT_CHANGED_EVENT: &str = "InputChanged";
 const PLAN_READY_EVENT: &str = "PlanReady";
 const PLAN_DRAFT_PATH: &str = "/tmp/plan.md";
 /// The draft of the session a tab switch loads, which is not the one the
@@ -98,6 +100,8 @@ const GATED_INIT_SOURCE: &str = "-- shipped by the project";
 const PREVIOUS_ANSWER: &str = "Previous answer to select";
 const FIRST_ASK: &str = "ask-a";
 const SECOND_ASK: &str = "ask-b";
+const OTHER_SESSION_ID: &str = "11111111-1111-1111-1111-111111111111";
+const EDIT_PLUGIN: &str = "completion";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -2533,6 +2537,299 @@ fn view_reports_the_reversed_input_cell_and_hides_the_hardware_cursor() {
 
     app.update(Msg::Key(kb::HELP.to_key_event()));
     assert_eq!(draw(&mut app), None, "{OVERLAY_TAKES_THE_CURSOR}");
+}
+
+const CARET_FLOAT_MARK: &str = "xqcaret";
+const CARET_FLOAT_HEIGHT: u16 = 3;
+const CARET_FLOAT_WIDTH: u16 = 12;
+const CARET_FLOAT_DRAWN: &str = "the caret anchored float has to be on screen";
+const CARET_EXPECTED: &str = "the input box draws a caret with nothing in its way";
+
+/// A borderless float for the input caret, holding one line nothing else on
+/// screen says, so a test can find the row it was placed on.
+fn open_caret_float(app: &mut App) {
+    let buf = Arc::new(SharedBuf::new());
+    buf.append(maki_agent::SnapshotLine {
+        spans: vec![maki_agent::SnapshotSpan {
+            text: CARET_FLOAT_MARK.into(),
+            style: maki_agent::SpanStyle::Default,
+        }],
+    });
+    let config = FloatConfig {
+        width: Dimension::Abs(CARET_FLOAT_WIDTH),
+        height: Dimension::Abs(CARET_FLOAT_HEIGHT),
+        anchor: maki_lua::Anchor::InputCaret,
+        border: maki_lua::Border::None,
+        ..FloatConfig::default()
+    };
+    let (event_tx, _event_rx) = flume::bounded::<WinEvent>(8);
+    let (_cmd_tx, cmd_rx) = flume::bounded::<WinCommand>(8);
+    app.float_mgr.open(buf, config, true, event_tx, cmd_rx);
+}
+
+fn draw_sized(
+    app: &mut App,
+    width: u16,
+    height: u16,
+) -> (Option<Position>, ratatui::buffer::Buffer) {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut cursor = None;
+    terminal.draw(|frame| cursor = app.view(frame)).unwrap();
+    (cursor, terminal.backend().buffer().clone())
+}
+
+fn draw_to_buffer(app: &mut App) -> (Option<Position>, ratatui::buffer::Buffer) {
+    draw_sized(app, TEST_AREA.width, TEST_AREA.height)
+}
+
+/// Paints a frame and reports the terminal cursor plus the row the
+/// caret-anchored float landed on.
+fn draw_caret_float(app: &mut App) -> (Option<Position>, u16) {
+    let (cursor, buffer) = draw_to_buffer(app);
+    let row = (0..buffer.area.height)
+        .find(|&y| {
+            (0..buffer.area.width)
+                .filter_map(|x| buffer.cell(Position::new(x, y)))
+                .map(ratatui::buffer::Cell::symbol)
+                .collect::<String>()
+                .contains(CARET_FLOAT_MARK)
+        })
+        .expect(CARET_FLOAT_DRAWN);
+    (cursor, row)
+}
+
+/// A focused float reads keys, and the help modal is the other overlay that
+/// takes the keyboard. Neither owns the caret: reporting none drops the window
+/// in the middle of the screen.
+#[test]
+fn a_caret_anchored_float_stays_on_the_caret_when_an_overlay_takes_the_keyboard() {
+    let mut app = test_app();
+    let caret = draw_to_buffer(&mut app).0.expect(CARET_EXPECTED);
+
+    open_caret_float(&mut app);
+    let (cursor, row) = draw_caret_float(&mut app);
+    assert_eq!(cursor, None, "{OVERLAY_TAKES_THE_CURSOR}");
+    assert_eq!(
+        row,
+        caret.y - CARET_FLOAT_HEIGHT,
+        "the float sits on the roomier side of the caret, not in the centre"
+    );
+
+    app.update(Msg::Key(kb::HELP.to_key_event()));
+    assert_eq!(
+        draw_caret_float(&mut app).1,
+        row,
+        "a modal opening must not move it either"
+    );
+}
+
+/// The one case with no caret at all: the input box is not drawn, so the
+/// centred default is what is left.
+#[test]
+fn a_caret_anchored_float_falls_back_when_the_input_box_is_off_screen() {
+    let mut app = test_app();
+    open_caret_float(&mut app);
+    open_split_window(&mut app, Split::Below);
+
+    let (cursor, row) = draw_caret_float(&mut app);
+    assert_eq!(cursor, None, "{OVERLAY_TAKES_THE_CURSOR}");
+    assert_eq!(row, (TEST_AREA.height - CARET_FLOAT_HEIGHT) / 2);
+}
+
+/// A plugin slices `text` with the Lua string library, which counts bytes, so
+/// every offset in the snapshot has to be a byte offset.
+#[test]
+fn input_snapshot_offsets_are_byte_offsets() {
+    let mut app = test_app();
+    app.input_box.set_input("日本".into());
+    app.input_box.buffer.move_to_end();
+
+    let st = app.input_snapshot();
+    let text = st["text"].as_str().unwrap();
+    let cursor = st["cursor"].as_u64().unwrap() as usize;
+    assert_eq!(cursor, 6);
+    assert_eq!(&text[..cursor], "日本", "the offset has to slice the value");
+}
+
+/// The line and column the cursor sits on are a slice of `text` and `cursor`,
+/// so Lua takes them for itself. A field is forever once it ships, and these
+/// two would have to be kept in step with a buffer that already answers.
+#[test]
+fn input_snapshot_carries_nothing_a_slice_would_give() {
+    const DRAFT: &str = "first\nsecond";
+    let mut app = test_app();
+    app.input_box.set_input(DRAFT.into());
+    app.input_box.buffer.move_to_end();
+
+    assert_eq!(
+        app.input_snapshot(),
+        serde_json::json!({
+            "session_id": app.state.session.id.to_string(),
+            "text": DRAFT,
+            "cursor": DRAFT.len(),
+            "version": app.input_box.buffer.version(),
+        })
+    );
+}
+
+/// The edit a plugin plans right after reading, both guards naming the value
+/// it read. Tests spoil one guard at a time from here.
+fn planned_edit(app: &App, start: usize, stop: usize, text: &str) -> InputEdit {
+    let st = app.input_snapshot();
+    InputEdit {
+        start,
+        stop,
+        text: text.into(),
+        version: st["version"].as_u64().unwrap(),
+        session_id: st["session_id"].as_str().unwrap().into(),
+        plugin: Arc::from(EDIT_PLUGIN),
+        ..InputEdit::default()
+    }
+}
+
+/// Every plugin write is answered against the terminal the box would be
+/// drawn in, so a test that does not care about the size passes the one the
+/// rest of the file paints with.
+fn apply_edit(app: &mut App, edit: InputEdit) -> Result<serde_json::Value, String> {
+    app.apply_input_edit(edit, TEST_AREA)
+}
+
+/// The bounds check alone passes an edit the user has typed in front of: a
+/// plugin reads "hello" and plans to replace 0..5, the user presses home and
+/// types "x", and 5 still fits "xhello". Only the version catches it.
+#[test]
+fn an_input_edit_planned_against_an_older_value_fails_on_the_version() {
+    let mut app = test_app();
+    app.input_box.set_input("hello".into());
+    let planned = planned_edit(&app, 0, 5, "bye");
+
+    app.input_box.buffer.set_cursor_byte(0).unwrap();
+    app.input_box.buffer.push_char('x');
+
+    let err = apply_edit(&mut app, planned).unwrap_err();
+    assert!(err.contains("version"), "the error has to name why: {err}");
+    assert_eq!(app.input_box.buffer.value(), "xhello");
+
+    let fresh = planned_edit(&app, 0, 6, "bye");
+    assert!(apply_edit(&mut app, fresh).is_ok());
+    assert_eq!(app.input_box.buffer.value(), "bye");
+}
+
+/// Focus can move between the read and the write, and the version cannot tell
+/// the tabs apart: both buffers count from zero, so a tab typed in about as
+/// much agrees on a version while holding someone else's text.
+#[test]
+fn an_input_edit_naming_another_session_is_refused() {
+    let mut app = test_app();
+    app.input_box.set_input("hello".into());
+
+    let stale = InputEdit {
+        session_id: OTHER_SESSION_ID.into(),
+        ..planned_edit(&app, 0, 5, "bye")
+    };
+    let err = apply_edit(&mut app, stale).unwrap_err();
+    assert!(err.contains(OTHER_SESSION_ID), "the error names it: {err}");
+    assert_eq!(app.input_box.buffer.value(), "hello");
+
+    let planned = planned_edit(&app, 0, 5, "bye");
+    assert!(apply_edit(&mut app, planned).is_ok());
+    assert_eq!(app.input_box.buffer.value(), "bye");
+}
+
+/// A prompt, a form or a `below` split takes the input box off screen, and a
+/// write there is sent once the panel gives the input back.
+#[test]
+fn an_input_edit_is_refused_while_the_input_is_off_screen() {
+    let mut app = test_app();
+    app.input_box.set_input("hello".into());
+    open_split_window(&mut app, Split::Below);
+
+    let planned = planned_edit(&app, 0, 5, "bye");
+    let err = apply_edit(&mut app, planned).unwrap_err();
+    assert_eq!(err, INPUT_NOT_LIVE_ERR);
+    assert_eq!(app.input_box.buffer.value(), "hello");
+
+    app.float_mgr.close_all();
+    let planned = planned_edit(&app, 0, 5, "bye");
+    assert!(apply_edit(&mut app, planned).is_ok());
+    assert_eq!(app.input_box.buffer.value(), "bye");
+}
+
+/// A batch of wakes is handled between two frames, so a prompt and a plugin's
+/// edit can arrive in the same one. Asking the frame that was painted before
+/// either of them would let the write land in a box the user has already lost
+/// sight of.
+#[test]
+fn an_input_edit_meets_a_prompt_opened_since_the_last_frame() {
+    let mut app = test_app();
+    app.input_box.set_input("hello".into());
+    draw_to_buffer(&mut app);
+
+    app.permission_prompt.push(
+        "perm-1".into(),
+        maki_config::ToolKey::native("bash"),
+        vec!["execute".into()],
+        None,
+        true,
+    );
+
+    let planned = planned_edit(&app, 0, 5, "bye");
+    let err = apply_edit(&mut app, planned).unwrap_err();
+    assert_eq!(err, INPUT_NOT_LIVE_ERR);
+    assert_eq!(app.input_box.buffer.value(), "hello");
+}
+
+/// An overlay leaves the box on screen under it and still takes the user's
+/// eyes and keys, so a draft written while one is up is read by nobody.
+#[test]
+fn an_input_edit_is_refused_while_an_overlay_is_up() {
+    let mut app = test_app();
+    app.input_box.set_input("hello".into());
+
+    let tmp = TempDir::new().unwrap();
+    app.file_picker.open(&tmp.path().to_string_lossy());
+    let planned = planned_edit(&app, 0, 5, "bye");
+    let err = apply_edit(&mut app, planned).unwrap_err();
+    assert_eq!(err, INPUT_NOT_LIVE_ERR);
+    assert_eq!(app.input_box.buffer.value(), "hello");
+
+    app.file_picker.close();
+    let planned = planned_edit(&app, 0, 5, "bye");
+    assert!(apply_edit(&mut app, planned).is_ok());
+    assert_eq!(app.input_box.buffer.value(), "bye");
+}
+
+/// The transcript keeps `MIN_CHAT_ROWS` whatever else is on screen, so a
+/// short enough terminal leaves the input box no rows and it is never drawn.
+#[test]
+fn an_input_edit_is_refused_when_the_terminal_cannot_fit_the_input_box() {
+    const TOO_SHORT: u16 = MIN_CHAT_ROWS + 1;
+    let mut app = test_app();
+    app.input_box.set_input("hello".into());
+    let cramped = Rect::new(0, 0, TEST_AREA.width, TOO_SHORT);
+
+    let planned = planned_edit(&app, 0, 5, "bye");
+    let err = app.apply_input_edit(planned, cramped).unwrap_err();
+    assert_eq!(err, INPUT_NOT_LIVE_ERR);
+    assert_eq!(app.input_box.buffer.value(), "hello");
+
+    let planned = planned_edit(&app, 0, 5, "bye");
+    assert!(apply_edit(&mut app, planned).is_ok());
+    assert_eq!(app.input_box.buffer.value(), "bye");
+}
+
+/// `$EDITOR`, a restored draft and a rewind prompt all come back through
+/// `set_input`, and none of them is a plugin write: a tab-indented prompt has
+/// to reach the model as the user wrote it.
+#[test]
+fn editor_text_keeps_its_tabs() {
+    const EDITED: &str = "fn main() {
+	println!();
+}";
+    let mut app = test_app();
+    app.input_box.set_input(EDITED.into());
+    assert_eq!(app.input_snapshot()["text"], serde_json::json!(EDITED));
 }
 
 /// When the picker gives up on a directory it cannot list, the flash is the
@@ -5170,6 +5467,279 @@ fn loading_a_session_on_another_model_announces_the_swap() {
     let (event, data) = probe.try_recv_autocmd().expect(MODEL_CHANGED_EVENT);
     assert_eq!(event, MODEL_CHANGED_EVENT);
     assert_eq!(data["model"]["spec"], serde_json::json!(OPUS_SPEC));
+}
+
+/// A fast typist must not wake a handler per keystroke, so the event is
+/// coalesced onto the frame: whatever happened since the last tick arrives as
+/// one event carrying the final text.
+#[test]
+fn input_change_fires_once_per_tick() {
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    for c in "hi".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    let _ = app.tick();
+
+    let (event, data) = probe.try_recv_autocmd().expect(INPUT_CHANGED_EVENT);
+    assert_eq!(event, INPUT_CHANGED_EVENT);
+    assert_eq!(data["text"], serde_json::json!("hi"));
+    assert_eq!(data["cursor"], serde_json::json!(2));
+    assert_eq!(
+        data["source"],
+        serde_json::Value::Null,
+        "the user has no plugin name"
+    );
+    assert_eq!(
+        data["session_id"],
+        serde_json::json!(app.state.session.id.to_string())
+    );
+    assert_eq!(probe.try_recv_autocmd(), None);
+}
+
+/// Without a name, two input plugins cannot tell the other's writes from their
+/// own, which is the loop guard this field removes.
+#[test]
+fn input_change_names_the_plugin_that_wrote_it() {
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    let planned = planned_edit(&app, 0, 0, "hi");
+    apply_edit(&mut app, planned).unwrap();
+    let _ = app.tick();
+
+    let (_, data) = probe.try_recv_autocmd().expect(INPUT_CHANGED_EVENT);
+    assert_eq!(data["text"], serde_json::json!("hi"));
+    assert_eq!(data["source"], serde_json::json!(EDIT_PLUGIN));
+}
+
+/// The docs tell a plugin it can ignore its own writes, so a frame the user
+/// also typed into must never carry its name, or the plugin drops a change it
+/// can never see again.
+#[test]
+fn a_frame_the_user_also_typed_into_names_nobody() {
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    app.update(Msg::Key(key(KeyCode::Char('a'))));
+    let planned = planned_edit(&app, 1, 1, "b");
+    apply_edit(&mut app, planned).unwrap();
+    let _ = app.tick();
+
+    let data = next_input_change(&probe).expect(INPUT_CHANGED_EVENT);
+    assert_eq!(data["text"], serde_json::json!("ab"));
+    assert_eq!(
+        data["source"],
+        serde_json::Value::Null,
+        "the keystroke in the frame outranks the plugin's label"
+    );
+}
+
+/// Two plugins in one frame collapse the same way: neither wrote the whole
+/// frame, so attributing it to whoever wrote last lets the other one ignore a
+/// change that was not its own.
+#[test]
+fn a_frame_two_plugins_wrote_names_nobody() {
+    const OTHER_PLUGIN: &str = "snippets";
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    let first = planned_edit(&app, 0, 0, "a");
+    apply_edit(&mut app, first).unwrap();
+    let second = InputEdit {
+        plugin: Arc::from(OTHER_PLUGIN),
+        ..planned_edit(&app, 1, 1, "b")
+    };
+    apply_edit(&mut app, second).unwrap();
+    let _ = app.tick();
+
+    let data = next_input_change(&probe).expect(INPUT_CHANGED_EVENT);
+    assert_eq!(data["text"], serde_json::json!("ab"));
+    assert_eq!(data["source"], serde_json::Value::Null);
+}
+
+/// Only the focused session ticks, so a background tab never diffs its own
+/// input. Focusing it has to republish what it holds, or a handler keeps
+/// acting on the text of the tab it came from while `maki.ui.input` already
+/// answers with this one's.
+#[test]
+fn focusing_a_tab_announces_the_input_it_holds() {
+    const FOCUSED_DRAFT: &str = "the other tab's draft";
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    app.input_box.set_input(FOCUSED_DRAFT.into());
+    app.announce_input();
+
+    let data = next_input_change(&probe).expect(INPUT_CHANGED_EVENT);
+    assert_eq!(data["text"], serde_json::json!(FOCUSED_DRAFT));
+    assert_eq!(data["source"], serde_json::Value::Null);
+    assert_eq!(
+        data["version"],
+        serde_json::json!(app.input_snapshot()["version"]),
+        "the event has to carry a version an edit can be planned against"
+    );
+
+    let _ = app.tick();
+    assert_eq!(
+        next_input_change(&probe),
+        None,
+        "the announcement is what the tick would have said"
+    );
+}
+
+/// The order an in-tab restore really takes: the event loop ticks the tab at
+/// the top of the iteration and drains the switch below it, so a restored
+/// draft has already been diffed and fired by the time the announcement runs.
+/// Firing again would send the same event twice.
+#[test]
+fn a_focus_switch_fires_one_input_change() {
+    const RESTORED_DRAFT: &str = "the draft the switch restored";
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    app.input_box.set_input(RESTORED_DRAFT.into());
+    let _ = app.tick();
+    app.announce_input();
+
+    let data = next_input_change(&probe).expect(INPUT_CHANGED_EVENT);
+    assert_eq!(data["text"], serde_json::json!(RESTORED_DRAFT));
+    assert_eq!(
+        next_input_change(&probe),
+        None,
+        "the tick already said it, so the announcement owes nothing"
+    );
+}
+
+/// Clearing the input is a change like any other. Gating on a flag only the
+/// typing paths set loses the clear, and the retyped value then compares equal
+/// to what Lua was last told.
+#[test]
+fn resending_the_same_text_still_fires() {
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    for c in "hi".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    let _ = app.tick();
+    assert!(
+        probe.try_recv_autocmd().is_some(),
+        "the typing itself fires"
+    );
+
+    // Submitting fires a turn's worth of events alongside this one.
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    let _ = app.tick();
+    let data = next_input_change(&probe).expect("submitting empties the input, which is a change");
+    assert_eq!(data["text"], serde_json::json!(""));
+
+    for c in "hi".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    let _ = app.tick();
+    let data =
+        next_input_change(&probe).expect("the same text typed again is still a change from empty");
+    assert_eq!(data["text"], serde_json::json!("hi"));
+}
+
+/// The tab taking focus holds the text it announced the last time it was
+/// focused, which is what every tab holding an empty input does. Its own
+/// record reads the same, but Lua was last told about the tab focus came
+/// from, so the switch still has to speak.
+#[test]
+fn focusing_a_tab_holding_what_it_announced_fires_one_input_change() {
+    const HELD_DRAFT: &str = "what this tab held while another was focused";
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    app.input_box.set_input(HELD_DRAFT.into());
+    let _ = app.tick();
+    next_input_change(&probe).expect("the tab announced the draft while it was focused");
+
+    // The frames another tab was focused for: this one never diffs its input.
+    app.tick_background();
+    app.announce_input();
+
+    let data = next_input_change(&probe).expect(INPUT_CHANGED_EVENT);
+    assert_eq!(data["text"], serde_json::json!(HELD_DRAFT));
+    assert_eq!(
+        data["session_id"],
+        app.input_snapshot()["session_id"],
+        "a handler has to know which tab the text it now sees belongs to"
+    );
+    assert_eq!(
+        next_input_change(&probe),
+        None,
+        "the announcement is the frame's only event"
+    );
+}
+
+/// A whole-value path in the frame a plugin also wrote in. The plugin ignores
+/// its own name, so labelling the recalled entry with it drops a change the
+/// plugin can never see again: the value it wrote is gone.
+#[test]
+fn a_history_recall_after_a_plugin_edit_names_nobody() {
+    const SENT: &str = "sent a moment ago";
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    for c in SENT.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    let _ = app.tick();
+    while next_input_change(&probe).is_some() {}
+
+    let planned = planned_edit(&app, 0, 0, "a draft the plugin wrote");
+    apply_edit(&mut app, planned).unwrap();
+    app.update(Msg::Key(key(KeyCode::Up)));
+    let _ = app.tick();
+
+    let data = next_input_change(&probe).expect(INPUT_CHANGED_EVENT);
+    assert_eq!(data["text"], serde_json::json!(SENT));
+    assert_eq!(
+        data["source"],
+        serde_json::Value::Null,
+        "the recall wrote the value, not the plugin the last label named"
+    );
+}
+
+fn next_input_change(probe: &maki_lua::test_support::RequestProbe) -> Option<serde_json::Value> {
+    while let Some((event, data)) = probe.try_recv_autocmd() {
+        if event == INPUT_CHANGED_EVENT {
+            return Some(data);
+        }
+    }
+    None
+}
+
+/// Moving around in the input is not a change: a completion plugin narrowing
+/// its list on every arrow key would flicker for no reason.
+#[test]
+fn moving_the_cursor_fires_nothing() {
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    app.update(Msg::Key(key(KeyCode::Char('a'))));
+    let _ = app.tick();
+    assert!(probe.try_recv_autocmd().is_some());
+
+    app.update(Msg::Key(key(KeyCode::Left)));
+    app.update(Msg::Key(key(KeyCode::Right)));
+    let _ = app.tick();
+    assert_eq!(probe.try_recv_autocmd(), None);
 }
 
 /// What `model_state` reports has to parse back into the same state, or a
