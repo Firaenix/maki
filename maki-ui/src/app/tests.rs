@@ -6157,6 +6157,57 @@ fn agent_error_creates_synthetic_tool_done_with_message() {
     );
 }
 
+/// The float paints over the prompt, so it takes the key: otherwise `q`
+/// bounces off a prompt the user cannot even see, and the window never
+/// closes.
+#[test]
+fn focused_float_takes_keys_ahead_of_permission_prompt() {
+    let mut app = test_app();
+    app.permission_prompt.push(
+        "id".into(),
+        maki_config::ToolKey::native("bash"),
+        vec!["execute".into()],
+        None,
+        true,
+    );
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    let (event_tx, event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
+    let (cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
+    app.float_mgr.open(
+        buf,
+        maki_lua::FloatConfig::default(),
+        true,
+        event_tx,
+        cmd_rx,
+    );
+
+    let q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+    let actions = app.update(Msg::Key(q));
+    assert!(actions.is_empty());
+    assert!(
+        event_rx
+            .drain()
+            .any(|e| matches!(e, maki_lua::WinEvent::Key { key } if key.notation() == "q")),
+        "the focused float gets the key, not the prompt under it"
+    );
+    assert!(app.permission_prompt.is_open(), "the prompt is untouched");
+
+    // Hidden, the float is out of the way and the prompt answers again.
+    cmd_tx
+        .send(maki_lua::WinCommand::SetVisible(false))
+        .unwrap();
+    let _ = app.float_mgr.tick();
+    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(actions.is_empty());
+    assert!(!app.permission_prompt.is_open());
+    assert!(
+        !event_rx
+            .drain()
+            .any(|e| matches!(e, maki_lua::WinEvent::Key { .. })),
+        "a hidden float takes nothing"
+    );
+}
+
 #[test]
 fn ctrl_c_denies_permission_prompt() {
     let mut app = test_app();
