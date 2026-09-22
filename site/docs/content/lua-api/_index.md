@@ -4109,7 +4109,7 @@ current mode.
 
 1. `<C-c>` and `<C-z>`, which no binding can take. `<C-z>` suspends
    here, and `<C-c>` still goes to step 2 first.
-2. Maki's modals and prompts, then the focused window, then Maki's
+2. The focused window, then Maki's modals and prompts, then Maki's
    pickers. They take every key, except the plan form and the `/`
    command list, which pass on the keys they do not use. The focused
    window runs its buffer's bindings, then its `win:recv`.

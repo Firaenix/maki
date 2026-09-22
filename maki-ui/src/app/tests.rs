@@ -10546,6 +10546,58 @@ fn agent_error_creates_synthetic_tool_done_with_message() {
     );
 }
 
+/// The float paints over the prompt, so it takes the key: otherwise `q`
+/// bounces off a prompt the user cannot even see, and the window never
+/// closes.
+#[test]
+fn focused_float_takes_keys_ahead_of_permission_prompt() {
+    let mut app = test_app();
+    app.permission_prompt.push(
+        "id".into(),
+        maki_config::ToolKey::native("bash"),
+        vec!["execute".into()],
+        None,
+        ProjectAnswers::Saved,
+        None,
+    );
+    let buf = Arc::new(maki_agent::SharedBuf::new());
+    let (event_tx, mut event_rx) = unbounded_channel::<maki_lua::WinEvent>();
+    let (cmd_tx, cmd_rx) = unbounded_channel::<maki_lua::WinCommand>();
+    app.float_mgr.open(
+        buf,
+        maki_lua::FloatConfig::default(),
+        true,
+        event_tx,
+        cmd_rx,
+    );
+
+    let q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+    let actions = app.update(Msg::Key(q));
+    assert!(actions.is_empty());
+    assert!(
+        iter::from_fn(|| event_rx.try_recv().ok())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .any(|e| matches!(e, maki_lua::WinEvent::Key { key } if key.notation() == "q")),
+        "the focused float gets the key, not the prompt under it"
+    );
+    assert!(app.permission_prompt.is_open(), "the prompt is untouched");
+
+    // Hidden, the float is out of the way and the prompt answers again.
+    cmd_tx
+        .send(maki_lua::WinCommand::SetVisible(false))
+        .unwrap();
+    let _ = app.float_mgr.tick();
+    let actions = app.update(Msg::Key(kb::QUIT.to_key_event()));
+    assert!(actions.is_empty());
+    assert!(!app.permission_prompt.is_open());
+    assert!(
+        !iter::from_fn(|| event_rx.try_recv().ok())
+            .any(|e| matches!(e, maki_lua::WinEvent::Key { .. })),
+        "a hidden float takes nothing"
+    );
+}
+
 #[test]
 fn ctrl_c_denies_permission_prompt() {
     let mut app = test_app();
@@ -13413,14 +13465,14 @@ fn each_owner_alone_holds_the_keyboard(owner: KeyboardOwner) {
     assert!(!app.any_overlay_open(), "{OWNER_NOT_CLOSED}: {owner:?}");
 }
 
-#[test_case(KeyboardOwner::Alert, KeyboardOwner::Permission ; "alert_over_permission")]
+#[test_case(KeyboardOwner::Alert, KeyboardOwner::FocusedWindow ; "alert_over_focused_window")]
+#[test_case(KeyboardOwner::FocusedWindow, KeyboardOwner::Permission ; "focused_window_over_permission")]
 #[test_case(KeyboardOwner::Permission, KeyboardOwner::PackReview ; "permission_over_pack_review")]
 #[test_case(KeyboardOwner::PackReview, KeyboardOwner::PlanForm ; "pack_review_over_plan_form")]
 #[test_case(KeyboardOwner::PlanForm, KeyboardOwner::Help ; "plan_form_over_help")]
 #[test_case(KeyboardOwner::Help, KeyboardOwner::Usage ; "help_over_usage")]
 #[test_case(KeyboardOwner::Usage, KeyboardOwner::Btw ; "usage_over_btw")]
-#[test_case(KeyboardOwner::Btw, KeyboardOwner::FocusedWindow ; "btw_over_focused_window")]
-#[test_case(KeyboardOwner::FocusedWindow, KeyboardOwner::Search ; "focused_window_over_search")]
+#[test_case(KeyboardOwner::Btw, KeyboardOwner::Search ; "btw_over_search")]
 #[test_case(KeyboardOwner::Search, KeyboardOwner::FilePicker ; "search_over_file_picker")]
 #[test_case(KeyboardOwner::FilePicker, KeyboardOwner::Queue ; "file_picker_over_queue")]
 #[test_case(KeyboardOwner::Queue, KeyboardOwner::RewindPicker ; "queue_over_rewind_picker")]
