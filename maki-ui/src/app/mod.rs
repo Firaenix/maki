@@ -214,11 +214,16 @@ pub(crate) const UNKNOWN_WRITER: &str = "a plugin";
 /// compiler points at every `match` that has to place it.
 ///
 /// This is not the paint order: the permission prompt is drawn under every
-/// picker and float, yet answers first.
+/// picker, yet answers before them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
 enum KeyboardOwner {
     /// Drawn above everything else, so it answers keys before anything else.
     Alert,
+    /// The focused Lua window takes every key, ahead of maki's own modals and
+    /// the permission prompt: it paints over them, and a window the user
+    /// cannot close is worse than a prompt that waits one `q` longer. An
+    /// unfocused or hidden popup never holds the keyboard.
+    FocusedWindow,
     /// A tool is blocked on it and it owns the bottom panel, so with the pack
     /// review also up it goes first. The pack review waits on nothing.
     Permission,
@@ -228,9 +233,6 @@ enum KeyboardOwner {
     Help,
     Usage,
     Btw,
-    /// The focused Lua window takes every key. An unfocused popup never holds
-    /// the keyboard.
-    FocusedWindow,
     Search,
     FilePicker,
     Queue,
@@ -1832,17 +1834,19 @@ impl App {
     ///    skips the global bindings for it, but the modals and a focused
     ///    window still see it.
     /// 2. [`Self::dispatch_overlay`]: the holder of the keyboard, in
-    ///    [`KeyboardOwner`] order, which includes the focused window,
-    ///    [`Self::dispatch_focused_window`], and for the chat the `/` command
-    ///    list and `<C-t>` on a ready plan.
+    ///    [`KeyboardOwner`] order: the alert, then the focused window,
+    ///    [`Self::dispatch_focused_window`], then maki's other modals, prompts
+    ///    and pickers, and for the chat the `/` command list and `<C-t>` on a
+    ///    ready plan.
     /// 3. Windows on screen, front first, [`Self::dispatch_on_screen_windows`].
     /// 4. `<Esc>` while the agent runs, which [`Self::reserved_by_host`] keeps
     ///    from the global bindings, so it reaches the cancel in step 6.
     /// 5. Global bindings, [`Self::dispatch_binding`] without a buffer.
     /// 6. maki's built-in keys and the chat input, [`Self::handle_builtin_key`].
     ///
-    /// A focused window is above the overlays opened under it because it is
-    /// the window the user is in. An unfocused one is below them because it
+    /// A focused window is above maki's modals and prompts, the permission
+    /// prompt included, because it is the window the user is in and it paints
+    /// over them. An unfocused one is below them because it
     /// is not: the popup is up while the user works underneath, so a modal
     /// opened over it outranks it, and its keys come back the moment the
     /// modal closes. The command palette is one of those overlays, so a
