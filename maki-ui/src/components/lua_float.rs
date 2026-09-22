@@ -345,7 +345,8 @@ impl FloatManager {
     }
 
     /// The focused window is handed every key, ahead of every overlay the host
-    /// owns: it is the thing the user is looking at and typing into.
+    /// owns: it is the thing the user is looking at and typing into. A hidden
+    /// one is not being looked at, so it takes nothing.
     ///
     /// A press no notation names, like `Super+Enter`, is still spent here with
     /// nothing sent. Letting it through would run a built-in binding on the
@@ -353,7 +354,7 @@ impl FloatManager {
     pub fn handle_focused_key(&self, key: KeyEvent) -> bool {
         let Some(win) = self
             .focused_id
-            .and_then(|fid| self.windows.iter().find(|w| w.id == fid))
+            .and_then(|fid| self.windows.iter().find(|w| w.id == fid && w.visible))
         else {
             return false;
         };
