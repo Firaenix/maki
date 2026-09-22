@@ -963,7 +963,16 @@ impl App {
             self.alert_modal.handle_key(key);
             return Some(vec![]);
         }
-
+        // A focused plugin window is the thing the user is typing into, so it
+        // goes ahead of the rest, the permission prompt included: floats paint
+        // over the prompt, and a window the user cannot close is worse than a
+        // prompt that waits one `q` longer. The keys an *unfocused* window
+        // claimed are settled far below, after every modal here: a claim is
+        // up while the user works under it, and a popup that holds `<CR>`
+        // must not answer the Enter meant for the file picker opened over it.
+        if self.float_mgr.handle_focused_key(key) {
+            return Some(vec![]);
+        }
         // With both up the permission prompt goes first: a tool is blocked on
         // it and it owns the bottom panel. The pack review waits on nothing.
         if self.permission_prompt.is_open() {
@@ -1008,15 +1017,6 @@ impl App {
 
         if self.btw_modal.is_open() {
             self.btw_modal.handle_key(key);
-            return Some(vec![]);
-        }
-
-        // A focused plugin window is the thing the user is typing into, so it
-        // goes ahead of the rest. The keys an *unfocused* window claimed are
-        // settled far below, after every modal here: a claim is up while the
-        // user works under it, and a popup that holds `<CR>` must not answer
-        // the Enter meant for the file picker opened over it.
-        if self.float_mgr.handle_focused_key(key) {
             return Some(vec![]);
         }
 
