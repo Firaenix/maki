@@ -368,7 +368,8 @@ impl FloatManager {
     }
 
     /// The focused window is handed every key, ahead of every overlay the host
-    /// owns: it is the thing the user is looking at and typing into.
+    /// owns: it is the thing the user is looking at and typing into. A hidden
+    /// one is not being looked at, so it takes nothing.
     ///
     /// A press no notation names, like `Super+Enter`, is still spent here with
     /// nothing sent. Letting it through would run a built-in binding on the
@@ -383,9 +384,10 @@ impl FloatManager {
         true
     }
 
+    /// A hidden window is not being looked at, so it takes no keys.
     fn focused(&self) -> Option<&FloatWindow> {
         let fid = self.focused_id?;
-        self.windows.iter().find(|w| w.id == fid)
+        self.windows.iter().find(|w| w.id == fid && w.visible)
     }
 
     pub fn focused_buf(&self) -> Option<Arc<SharedBuf>> {

@@ -1486,7 +1486,12 @@ impl App {
             self.alert_modal.handle_key(key);
             return Some(vec![]);
         }
-
+        // Step 2 of `handle_key`, ahead of maki's own modals, the permission
+        // prompt included: floats paint over the prompt, and a window the user
+        // cannot close is worse than a prompt that waits one `q` longer.
+        if self.dispatch_focused_window(&Pressed::Key(key, sight), turn) {
+            return Some(vec![]);
+        }
         // With both up the permission prompt goes first: a tool is blocked on
         // it and it owns the bottom panel. The pack review waits on nothing.
         // Ctrl+B passes it by, so the user hears why the parked call stays.
@@ -1535,11 +1540,6 @@ impl App {
 
         if self.btw_modal.is_open() {
             self.btw_modal.handle_key(key);
-            return Some(vec![]);
-        }
-
-        // Step 2 of `handle_key`, among the overlays, see there for why.
-        if self.dispatch_focused_window(&Pressed::Key(key, sight), turn) {
             return Some(vec![]);
         }
 
@@ -1872,18 +1872,19 @@ impl App {
     ///    answered here: no binding can take it and [`Self::reserved_by_host`]
     ///    skips the global bindings for it, but the modals and a focused
     ///    window still see it.
-    /// 2. [`Self::dispatch_overlay`]: maki's modals and prompts, then the
-    ///    focused window, [`Self::dispatch_focused_window`], then maki's
-    ///    pickers, the search, the focused queue, the `/` command list and
-    ///    `<C-t>` on a ready plan.
+    /// 2. [`Self::dispatch_overlay`]: the alert, then the focused window,
+    ///    [`Self::dispatch_focused_window`], then maki's other modals and
+    ///    prompts, its pickers, the search, the focused queue, the `/` command
+    ///    list and `<C-t>` on a ready plan.
     /// 3. Windows on screen, front first, [`Self::dispatch_on_screen_windows`].
     /// 4. `<Esc>` while the agent runs, which [`Self::reserved_by_host`] keeps
     ///    from the global bindings, so it reaches the cancel in step 6.
     /// 5. Global bindings, [`Self::dispatch_binding`] without a buffer.
     /// 6. maki's built-in keys and the chat input, [`Self::handle_builtin_key`].
     ///
-    /// A focused window is above the overlays opened under it because it is
-    /// the window the user is in. An unfocused one is below them because it
+    /// A focused window is above maki's modals and prompts, the permission
+    /// prompt included, because it is the window the user is in and it paints
+    /// over them. An unfocused one is below them because it
     /// is not: the popup is up while the user works underneath, so a modal
     /// opened over it outranks it, and its keys come back the moment the
     /// modal closes. The command palette is one of those overlays, so a
@@ -3596,7 +3597,12 @@ impl App {
     /// modal get none of its keys, so they get none of its pastes either.
     fn route_text_paste(&mut self, text: &str, turn: &Turn) {
         let text = &normalize_line_endings(text);
-        if self.alert_modal.is_open() || self.permission_prompt.handle_paste(text) {
+        if self.alert_modal.is_open() {
+            return;
+        }
+        let pressed = Pressed::Paste(text.to_owned());
+        if self.dispatch_focused_window(&pressed, turn) || self.permission_prompt.handle_paste(text)
+        {
             return;
         }
         if self.pack_review.is_open()
@@ -3605,10 +3611,6 @@ impl App {
             || self.usage_modal.is_open()
             || self.btw_modal.is_open()
         {
-            return;
-        }
-        let pressed = Pressed::Paste(text.to_owned());
-        if self.dispatch_focused_window(&pressed, turn) {
             return;
         }
         if self.search_modal.is_open() {
