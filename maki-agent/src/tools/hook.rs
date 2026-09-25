@@ -10,8 +10,9 @@ use std::time::Instant;
 use serde_json::Value;
 
 use super::registry::BoxFuture;
-use super::{CallOrigin, ToolOutputMode};
+use super::{CallOrigin, ToolContext, ToolOutputMode};
 use crate::cancel::CancelToken;
+use crate::permissions::LayerAnswer;
 use maki_config::Permission;
 
 /// Fields of the value a [`HookStage::Output`] hook sees and returns.
@@ -112,4 +113,15 @@ pub trait ToolHook: Send + Sync + 'static {
         value: Value,
         call: &'a HookCall<'a>,
     ) -> BoxFuture<'a, Verdict>;
+
+    /// Asked where the permission prompt would show, with the scopes it would
+    /// ask about. `None` is nobody answering, which leaves the call to the
+    /// prompt.
+    fn prompt<'a>(
+        &'a self,
+        input: &'a Value,
+        scopes: &'a [String],
+        call: &'a HookCall<'a>,
+        ctx: &'a ToolContext,
+    ) -> BoxFuture<'a, Option<LayerAnswer>>;
 }
