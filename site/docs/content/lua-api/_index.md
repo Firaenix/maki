@@ -955,7 +955,8 @@ tool declaring no capability charges. You can only name permissions your
 own plugin holds.
 
 Throws if another plugin already owns a slot with the same {name}, or
-if {name} starts with `"tool."` or `"ui."`, which the host fires itself.
+if {name} starts with `"tool."`, `"ui."` or `"permission."`, which the host
+fires itself.
 The name stays yours across an unload: nobody else can take it over, or
 re-declare it cheaper, while maki runs.
 
@@ -1019,6 +1020,12 @@ table to replace the value, nothing to leave it alone, or
 `nil, reason` to stop the call. Wrapping one costs the capability the
 tool declares, and a tool declaring none costs every permission. See
 [Hooks](/docs/hooks/).
+
+`permission.prompt` fires where the permission prompt would show, with
+the prompt as its default. A layer takes `function(prev, req, ctx)` and
+answers with one of the prompt's options, like
+`{ decision = "allow_session" }`, or passes the call on with
+`prev(req, ctx)`. See [Hooks](/docs/hooks/#permission-prompt).
 
 Wrapping a slot another plugin declared steers a chain that plugin's
 callers trust, so it costs whatever the owner priced it at in
@@ -3574,6 +3581,46 @@ local specs = maki.model.available()
 
 ---
 
+### `maki.model.disabled()` {#maki-model-disabled}
+
+```lua
+maki.model.disabled()
+```
+
+Lists the specs this session is not suggesting: what
+`provider.disabled_models` switched off, plus whatever `enable` moved
+since. Always a subset of `available()`.
+
+**Returns:** (`table|nil`, `string|nil`) Array of `"provider/id"` specs, or nil and an error.
+
+**Example:**
+
+```lua
+local off = maki.model.disabled()
+```
+
+---
+
+### `maki.model.disabled_providers()` {#maki-model-disabled_providers}
+
+```lua
+maki.model.disabled_providers()
+```
+
+Lists the provider slugs this session is not suggesting: what
+`provider.disabled_providers` switched off, plus whatever
+`enable_provider` moved since.
+
+**Returns:** (`table|nil`, `string|nil`) Array of provider slugs, or nil and an error.
+
+**Example:**
+
+```lua
+local off = maki.model.disabled_providers()
+```
+
+---
+
 ### `maki.model.set()` {#maki-model-set}
 
 ```lua
@@ -3602,6 +3649,73 @@ Answers with the new state, in the same shape `get` returns.
 maki.model.set("anthropic/claude-opus-4-6")
 maki.model.set({ spec = "zai/glm-5", thinking = "high" })
 maki.keymap.set("n", "<M-t>", function() maki.model.set({ thinking = "" }) end)
+```
+
+---
+
+### `maki.model.enable()` {#maki-model-enable}
+
+```lua
+maki.model.enable({spec}, {on?})
+```
+
+Switches a model off for this session, or back on. A model switched off
+drops out of the shortlist the picker opens on and stops being suggested;
+`set` still takes it by name, because naming one is you asking for it.
+Nothing here is written to disk: `provider.disabled_models` in the config
+is what survives a restart, and this moves a session away from it.
+
+**Parameters:**
+
+- `{spec}` (`string`) `"provider/id"`, as listed by `available()`. A bare
+
+  slug is an error; `enable_provider` is the one that takes those.
+
+- `{on?}` (`boolean|nil`) `false` to switch it off; omit or pass `true` for on.
+
+**Returns:** (`boolean|nil`, `string|nil`) Whether the model is now on, which is
+  `false` whatever you asked for while its provider is switched off, or nil
+  and an error.
+
+**Example:**
+
+```lua
+-- an all-local afternoon, without touching the config file
+for _, spec in ipairs(maki.model.available()) do
+  if not spec:match("^lmstudio/") then maki.model.enable(spec, false) end
+end
+```
+
+---
+
+### `maki.model.enable_provider()` {#maki-model-enable_provider}
+
+```lua
+maki.model.enable_provider({slug}, {on?})
+```
+
+Switches a whole provider off for this session, or back on. The picker
+keeps the provider listed and collapses its models away. The per-model
+switches underneath are left where they were, so a provider coming back
+brings each model back to what it was. As with `enable`, nothing is written
+to disk: `provider.disabled_providers` in the config is what survives a
+restart.
+
+**Parameters:**
+
+- `{slug}` (`string`) Provider slug, the part of a spec before the `/`. A
+
+  qualified spec is an error; `enable` is the one that takes those.
+
+- `{on?}` (`boolean|nil`) `false` to switch it off; omit or pass `true` for on.
+
+**Returns:** (`boolean|nil`, `string|nil`) Whether the provider is now on, or nil and an error.
+
+**Example:**
+
+```lua
+-- an all-local afternoon, one call per provider instead of per model
+maki.model.enable_provider("anthropic", false)
 ```
 
 ---
