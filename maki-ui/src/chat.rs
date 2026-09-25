@@ -14,6 +14,7 @@ use crate::markdown::truncate_output;
 
 use crate::selection::{DocPos, RowPos, Selection};
 use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
+use maki_agent::types::ALLOWED_BY;
 use maki_agent::{
     AgentEvent, BufferSnapshot, SteerKind, SubagentInbox, ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
@@ -227,6 +228,9 @@ impl Chat {
                     format!("{prefix}\n\n{text}"),
                 ));
             }
+            AgentEvent::AllowedByPlugin { id, plugin } => self
+                .messages_panel
+                .annotate_tool(&id, &format!("{ALLOWED_BY} {plugin}")),
             AgentEvent::AuthRequired => {
                 return ChatEventResult::AuthRequired;
             }
@@ -451,7 +455,7 @@ impl Chat {
     }
 
     pub fn update_tool_model(&mut self, tool_id: &str, model: &str) {
-        self.messages_panel.update_tool_model(tool_id, model);
+        self.messages_panel.annotate_tool(tool_id, model);
     }
 
     pub fn set_tool_turn_usage(&mut self, tool_id: &str, usage: String) {
@@ -1006,6 +1010,30 @@ mod tests {
             None,
         );
         assert_eq!(chat.in_progress_count(), 0);
+    }
+
+    /// The call never opened a prompt, so the row is the only place the user
+    /// learns something let it through. A code_execution run marks its row
+    /// once per inner call, and the row needs to say it only once.
+    #[test]
+    fn a_call_a_plugin_allowed_is_marked_on_its_row_once() {
+        const PLUGIN: &str = "automode";
+        let mut chat = chat();
+        chat.handle_event(tool_start("t1", "code_execution"), None);
+        for _ in 0..2 {
+            chat.handle_event(
+                AgentEvent::AllowedByPlugin {
+                    id: "t1".into(),
+                    plugin: PLUGIN.into(),
+                },
+                None,
+            );
+        }
+        let row = chat.message_at(0).expect("the tool row");
+        assert_eq!(
+            row.annotation.as_deref(),
+            Some(format!("{ALLOWED_BY} {PLUGIN}").as_str())
+        );
     }
 
     #[test]

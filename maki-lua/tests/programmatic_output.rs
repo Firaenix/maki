@@ -11,12 +11,12 @@ use std::sync::Arc;
 
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 
-use maki_agent::AgentMode;
 use maki_agent::agent::tool_dispatch;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::tools::interpreter_bridge;
 use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{CallOrigin, ToolContext, ToolRegistry};
+use maki_agent::{AgentEvent, AgentMode, EventSender};
 use maki_config::{
     DEFAULT_BUILTINS, Effect, PermissionRule, PermissionsConfig, PluginFileConfig, PluginsConfig,
     ProjectConfig, ToolKey,
@@ -40,6 +40,10 @@ const MODEL_LINES: usize = 8;
 const COMPACT_GLOB_LIMIT: usize = 100;
 const TEST_TIMEOUT_SECS: u64 = 60;
 const LAST_ITEM: &str = "final-item";
+const CALL_ID: &str = "output-test";
+const PROMPT_PLUGIN: &str = "guard";
+const ALLOW_EVERY_PROMPT: &str =
+    r#"maki.api.set_slot("permission.prompt", function() return { decision = "allow" } end)"#;
 #[cfg(unix)]
 const RTK_FIXTURE_DIR: &str = "MAKI_TEST_RTK_DIR";
 #[cfg(unix)]
@@ -101,7 +105,7 @@ fn setup() -> (Arc<ToolRegistry>, PluginHost, ToolContext) {
 
 fn run(ctx: &ToolContext, name: &str, input: Value) -> Result<String, String> {
     let done = smol::block_on(tool_dispatch::run(
-        "output-test".into(),
+        CALL_ID.into(),
         name,
         &input,
         ctx,
@@ -406,6 +410,46 @@ fn programmatic_mode_keeps_permission_denials() {
     assert!(!error.contains(LAST_ITEM));
     assert!(error.contains("denied"), "{error}");
     assert_eq!(fs::read_to_string(&path).unwrap(), LAST_ITEM);
+}
+
+/// Nobody saw a prompt for the write inside the script, so the code_execution
+/// row is where the user learns a plugin let it through.
+#[test]
+fn a_write_a_plugin_allowed_inside_python_marks_the_code_execution_row() {
+    let (_registry, host, mut ctx) = setup();
+    host.load_source(PROMPT_PLUGIN, ALLOW_EVERY_PROMPT).unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    // A write outside the project prompts, and nobody is here to answer it.
+    ctx.permissions = Arc::new(PermissionManager::new(
+        PermissionsConfig::default(),
+        project.path().to_owned(),
+        ProjectConfig::discover(project.path()),
+        Arc::default(),
+    ));
+    let (event_tx, events) = flume::unbounded();
+    ctx.event_tx = EventSender::new(event_tx, 0);
+    ctx.tool_use_id = Some(CALL_ID.to_owned());
+    let path = outside.path().join("allowed.txt");
+
+    python(
+        &ctx,
+        &format!(
+            "await write(path={:?}, content={LAST_ITEM:?})",
+            path.to_str().unwrap()
+        ),
+    )
+    .expect("the plugin allowed the write");
+
+    assert_eq!(fs::read_to_string(&path).unwrap(), LAST_ITEM);
+    let marked: Vec<(String, String)> = events
+        .try_iter()
+        .filter_map(|envelope| match envelope.event {
+            AgentEvent::AllowedByPlugin { id, plugin } => Some((id, plugin)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(marked, [(CALL_ID.to_owned(), PROMPT_PLUGIN.to_owned())]);
 }
 
 #[test]

@@ -11,12 +11,13 @@ use tracing::{debug, error, warn};
 
 use crate::agent::CallInstructions;
 use crate::mcp::{McpSession, TOOL_SEARCH_TOOL_NAME, ToolDeferral, UNKNOWN_MCP, is_wire_name};
+use crate::permissions::{LayerAnswer, PromptLayers};
 use crate::task_set::TaskSet;
 use crate::tools::hook::{Authority, HookCall, HookStage, OUTPUT_IS_ERROR, OUTPUT_TEXT, Verdict};
-use crate::tools::registry::{InstalledHook, RegisteredTool, Tool, ToolInvocation};
+use crate::tools::registry::{BoxFuture, InstalledHook, RegisteredTool, Tool, ToolInvocation};
 use crate::tools::{
     CallOrigin, FileKey, LocalTool, LocalToolFn, PermissionScopes, ToolAudience, ToolContext,
-    truncate_bytes,
+    ToolLive, truncate_bytes,
 };
 use crate::{
     AgentError, AgentEvent, AgentSeed, CallRecord, TextOutput, ToolDoneEvent, ToolOutput,
@@ -161,7 +162,16 @@ pub async fn run(
 
     let source = maki_otel::enabled().then(|| resolved.route.source());
     let started = Instant::now();
-    let mut done = run_inner(resolved, id, &input, ctx, origin, ask.as_deref()).await;
+    let mut done = run_inner(
+        resolved,
+        id,
+        &input,
+        ctx,
+        origin,
+        ask.as_deref(),
+        hook.as_ref(),
+    )
+    .await;
     let took = started.elapsed();
     if let Some(hook) = &hook {
         hook.filter_output(&mut done, &input).await;
@@ -316,7 +326,16 @@ impl<'a> Hook<'a> {
         input: Option<&Value>,
         on_cancel: Verdict,
     ) -> Verdict {
-        let call = HookCall {
+        let call = self.call(tool_id, input);
+        self.ctx
+            .cancel
+            .race(self.installed.run(stage, value, &call))
+            .await
+            .unwrap_or(on_cancel)
+    }
+
+    fn call<'b>(&'b self, tool_id: &'b str, input: Option<&'b Value>) -> HookCall<'b> {
+        HookCall {
             tool: self.tool,
             tool_id,
             tool_kind: self.native.as_deref().and_then(Tool::tool_kind),
@@ -327,12 +346,7 @@ impl<'a> Hook<'a> {
             authority: self.authority,
             cancel: &self.ctx.cancel,
             deadline: self.window(),
-        };
-        self.ctx
-            .cancel
-            .race(self.installed.run(stage, value, &call))
-            .await
-            .unwrap_or(on_cancel)
+        }
     }
 
     /// Read when a stage fires, not once per call: the input chain and the tool
@@ -341,6 +355,25 @@ impl<'a> Hook<'a> {
     fn window(&self) -> Instant {
         let cap = Instant::now() + HOOK_CHAIN_MAX;
         self.ctx.deadline.at().map_or(cap, |at| at.min(cap))
+    }
+}
+
+/// The hook, bound to the call whose permission prompt it may answer.
+struct PromptAsk<'a> {
+    hook: &'a Hook<'a>,
+    tool_id: &'a str,
+    input: &'a Value,
+}
+
+impl PromptLayers for PromptAsk<'_> {
+    fn answer<'a>(&'a self, scopes: &'a [String]) -> BoxFuture<'a, Option<LayerAnswer>> {
+        Box::pin(async move {
+            let call = self.hook.call(self.tool_id, Some(self.input));
+            self.hook
+                .installed
+                .prompt(self.input, scopes, &call, self.hook.ctx)
+                .await
+        })
     }
 }
 
@@ -554,10 +587,11 @@ async fn run_inner(
     ctx: &ToolContext,
     origin: CallOrigin,
     ask: Option<&str>,
+    hook: Option<&Hook<'_>>,
 ) -> ToolDoneEvent {
     let name = resolved.name;
     if let (Some(_), Route::Local(_) | Route::ToolSearch(_)) = (ask, &resolved.route)
-        && let Err(e) = gate_on_input(ctx, &ToolKey::native(name), &id, input, ask).await
+        && let Err(e) = gate_on_input(ctx, &ToolKey::native(name), &id, input, ask, None).await
     {
         return ToolDoneEvent {
             tool: Arc::from(name),
@@ -566,10 +600,12 @@ async fn run_inner(
     }
     match resolved.route {
         Route::Local(local) => run_local_tool(&local.handler, id, name, input, ctx, origin).await,
-        Route::Native(entry) => run_native_tool(entry, id, name, input, ctx, origin, ask).await,
+        Route::Native(entry) => {
+            run_native_tool(entry, id, name, input, ctx, origin, ask, hook).await
+        }
         Route::ToolSearch(mcp) => run_tool_search(mcp, id, input, ctx, origin),
         Route::Mcp(mcp, qualified) => {
-            execute_mcp_tool(ctx, mcp, &id, qualified, input, origin, ask).await
+            execute_mcp_tool(ctx, mcp, &id, qualified, input, origin, ask, hook).await
         }
         Route::Unknown => {
             warn!(tool = %name, "unknown tool");
@@ -591,6 +627,7 @@ async fn run_inner(
 }
 
 /// Parse errors skip the start event so the UI never shows a phantom spinner.
+#[allow(clippy::too_many_arguments)]
 async fn run_native_tool(
     entry: RegisteredTool,
     id: String,
@@ -599,6 +636,7 @@ async fn run_native_tool(
     ctx: &ToolContext,
     origin: CallOrigin,
     ask: Option<&str>,
+    hook: Option<&Hook<'_>>,
 ) -> ToolDoneEvent {
     let tool_id: Arc<str> = Arc::from(entry.tool.name());
     let started = Instant::now();
@@ -682,7 +720,8 @@ async fn run_native_tool(
 
     invocation.start(ctx).await;
 
-    if let Err(e) = enforce_permission(invocation.as_ref(), name, input, ctx, &id, ask).await {
+    if let Err(e) = enforce_permission(invocation.as_ref(), name, input, ctx, &id, ask, hook).await
+    {
         return done_error(e);
     }
 
@@ -847,6 +886,7 @@ async fn enforce_permission(
     ctx: &ToolContext,
     id: &str,
     ask: Option<&str>,
+    hook: Option<&Hook<'_>>,
 ) -> Result<(), String> {
     if name.contains('.') {
         return Err(format!(
@@ -854,8 +894,10 @@ async fn enforce_permission(
         ));
     }
     match (inv.permission_scopes().await, ask) {
-        (Some(scopes), ask) => gate(ctx, &ToolKey::native(name), &scopes, id, ask).await,
-        (None, Some(_)) => gate_on_input(ctx, &ToolKey::native(name), id, input, ask).await,
+        (Some(scopes), ask) => {
+            gate(ctx, &ToolKey::native(name), &scopes, id, input, ask, hook).await
+        }
+        (None, Some(_)) => gate_on_input(ctx, &ToolKey::native(name), id, input, ask, hook).await,
         (None, None) => Ok(()),
     }
 }
@@ -868,8 +910,15 @@ async fn gate(
     tool: &ToolKey,
     scopes: &PermissionScopes,
     id: &str,
+    input: &Value,
     ask: Option<&str>,
+    hook: Option<&Hook<'_>>,
 ) -> Result<(), String> {
+    let layers = hook.map(|hook| PromptAsk {
+        hook,
+        tool_id: id,
+        input,
+    });
     let decision = ctx.permissions.enforce(
         tool,
         scopes,
@@ -880,11 +929,32 @@ async fn gate(
         &ctx.cancel,
         ctx.mode.plan_path(),
         ask,
+        layers.as_ref().map(|layers| layers as &dyn PromptLayers),
     );
-    ctx.deadline
+    let allowed_by = ctx
+        .deadline
         .paused_while(decision)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if let Some(plugin) = allowed_by {
+        mark_allowed_by(ctx, plugin);
+    }
+    Ok(())
+}
+
+/// The user never saw a prompt for this call, so its row says who let it
+/// through. A call inside `batch` or `code_execution` has no row of its own,
+/// so the mark goes up its caller's live stream, and `maki.agent.call_tool`
+/// puts it on the closest row that can show it.
+pub fn mark_allowed_by(ctx: &ToolContext, plugin: Arc<str>) {
+    if let Some(id) = &ctx.tool_use_id {
+        let _ = ctx.event_tx.send(AgentEvent::AllowedByPlugin {
+            id: id.clone(),
+            plugin: plugin.to_string(),
+        });
+    } else if let Some(sink) = &ctx.live_sink {
+        let _ = sink.send(ToolLive::AllowedBy(plugin));
+    }
 }
 
 /// For a call with no scopes of its own, like an MCP call or an escalated tool
@@ -896,11 +966,22 @@ async fn gate_on_input(
     id: &str,
     input: &Value,
     ask: Option<&str>,
+    hook: Option<&Hook<'_>>,
 ) -> Result<(), String> {
     let scope = truncate_bytes(&input.to_string(), MCP_PERM_SCOPE_MAX_BYTES);
-    gate(ctx, tool, &PermissionScopes::single(scope), id, ask).await
+    gate(
+        ctx,
+        tool,
+        &PermissionScopes::single(scope),
+        id,
+        input,
+        ask,
+        hook,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_mcp_tool(
     ctx: &ToolContext,
     mcp: &McpSession,
@@ -909,6 +990,7 @@ async fn execute_mcp_tool(
     input: &Value,
     origin: CallOrigin,
     ask: Option<&str>,
+    hook: Option<&Hook<'_>>,
 ) -> ToolDoneEvent {
     emit_raw_start(ctx, origin, id, &tool, format!("mcp: {tool}"), input);
     let done = |output: TextOutput, is_error: bool| ToolDoneEvent {
@@ -927,7 +1009,7 @@ async fn execute_mcp_tool(
             return done(format!("invalid MCP tool key '{tool}': {e}").into(), true);
         }
     };
-    if let Err(e) = gate_on_input(ctx, &perm_tool, id, input, ask).await {
+    if let Err(e) = gate_on_input(ctx, &perm_tool, id, input, ask, hook).await {
         return done(e.into(), true);
     }
 
@@ -1512,6 +1594,16 @@ mod tests {
                 Reply::Answers(answer) => Box::pin(std::future::ready(answer(stage, &value))),
                 Reply::Pending => Box::pin(std::future::pending()),
             }
+        }
+
+        fn prompt<'a>(
+            &'a self,
+            _input: &'a Value,
+            _scopes: &'a [String],
+            _call: &'a HookCall<'a>,
+            _ctx: &'a ToolContext,
+        ) -> BoxFuture<'a, Option<LayerAnswer>> {
+            Box::pin(std::future::ready(None))
         }
     }
 
@@ -2815,5 +2907,51 @@ mod telemetry_tests {
     fn diffs_count_added_and_removed_lines() {
         assert_eq!(changed_lines(BEFORE, AFTER), (2, 1));
         assert_eq!(changed_lines(BEFORE, BEFORE), (0, 0));
+    }
+}
+
+#[cfg(test)]
+mod layer_mark_tests {
+    use test_case::test_case;
+
+    use super::*;
+    use crate::tools::test_support::stub_ctx_with;
+    use crate::{AgentMode, EventSender};
+
+    const PLUGIN: &str = "guard";
+    const ROW_ID: &str = "t1";
+
+    /// A nested call has no row, so its mark must go up the caller's stream
+    /// and never to a row by id.
+    #[test_case(Some(ROW_ID), &[ROW_ID], &[] ; "own_row")]
+    #[test_case(None, &[], &[PLUGIN] ; "callers_stream")]
+    fn a_plugin_allowed_call_is_marked_on_the_closest_row(
+        row: Option<&str>,
+        marked_rows: &[&str],
+        streamed: &[&str],
+    ) {
+        let (event_tx, events) = flume::unbounded();
+        let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&EventSender::new(event_tx, 0)), row);
+        let (sink, live) = flume::unbounded();
+        ctx.live_sink = Some(sink);
+
+        mark_allowed_by(&ctx, Arc::from(PLUGIN));
+
+        let rows: Vec<String> = events
+            .try_iter()
+            .filter_map(|envelope| match envelope.event {
+                AgentEvent::AllowedByPlugin { id, plugin } if plugin == PLUGIN => Some(id),
+                _ => None,
+            })
+            .collect();
+        let sent: Vec<String> = live
+            .try_iter()
+            .filter_map(|ev| match ev {
+                ToolLive::AllowedBy(plugin) => Some(plugin.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows, marked_rows);
+        assert_eq!(sent, streamed);
     }
 }

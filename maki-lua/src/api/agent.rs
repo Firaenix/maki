@@ -16,6 +16,7 @@ use maki_agent::tools::{
     CallOrigin, Deadline, DescriptionContext, LocalTool, LocalTools, RequestTools, ToolAudience,
     ToolContext, ToolFilter, ToolLive, ToolOutputMode,
 };
+use maki_agent::types::ALLOWED_BY;
 use maki_agent::{
     Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams, AgentSeed, DoneReason,
     EMPTY_RESPONSE_MARKER, EventSender, EventStreamGuard, History, InputSource, McpSession,
@@ -496,7 +497,9 @@ async fn callable_tools(lua: Lua, ctx: mlua::UserDataRef<LuaCtx>) -> LuaResult<P
 ///   `on_live_buf` (function?) - called with a `BufHandle` for each live buffer
 ///     the tool publishes. Must not yield.
 ///   `on_annotation` (function?) - called with an annotation string for each
-///     annotation event. Must not yield.
+///     annotation event. Must not yield. A call a `permission.prompt` layer
+///     allowed arrives as `"allowed by <plugin>"`. Without this callback that
+///     mark goes on your own tool's row instead.
 ///   `on_usage` (function?) - called with a formatted cumulative token usage
 ///     string. Must not yield.
 /// @return (string?, string?) Tool output text, or `(nil, err)` on failure.
@@ -521,7 +524,11 @@ async fn call_tool(
     let agent = try_pair!(dispatch_ctx(&ctx, "call_tool"));
     let mut tctx = agent.to_tool_context();
     tctx.output_mode = ToolOutputMode::Full;
-    let (mut on_buf, mut on_ann, mut on_usage, mut rx) = (None, None, None, None);
+    // Open even without callbacks: when a plugin answers the child's
+    // permission prompt, the user still has to see it somewhere.
+    let (live_tx, live_rx) = flume::unbounded();
+    tctx.live_sink = Some(live_tx);
+    let (mut on_buf, mut on_ann, mut on_usage) = (None, None, None);
     if let Some(o) = opts {
         if let Some(mode) = o.get::<Option<String>>("output_mode")? {
             let Some(mode) = ToolOutputMode::parse(&mode) else {
@@ -535,23 +542,19 @@ async fn call_tool(
         on_buf = o.get::<Option<Function>>("on_live_buf")?;
         on_ann = o.get::<Option<Function>>("on_annotation")?;
         on_usage = o.get::<Option<Function>>("on_usage")?;
-        if on_buf.is_some() || on_ann.is_some() || on_usage.is_some() {
-            let (tx, r) = flume::unbounded();
-            tctx.live_sink = Some(tx);
-            rx = Some(r);
-        }
-    }
-    drop(ctx);
-    if let Err(e) = tctx.deadline.check() {
-        return Ok(err_pair(e));
     }
     let cbs = LiveCallbacks {
         tool: &name,
+        caller: ToolContext::clone(agent),
         on_buf,
         on_ann,
         on_usage,
     };
-    let done = dispatch_racing_live(&tctx, &name, &input_json, rx, &cbs).await;
+    drop(ctx);
+    if let Err(e) = tctx.deadline.check() {
+        return Ok(err_pair(e));
+    }
+    let done = dispatch_racing_live(&tctx, &name, &input_json, live_rx, &cbs).await;
     // Same fallback the UI applies on tool completion, so a batch child's
     // header carries the annotation its standalone run would get.
     let annotation = done
@@ -1063,6 +1066,9 @@ lua_table! {
 /// markdown) hit the C-call boundary otherwise.
 struct LiveCallbacks<'a> {
     tool: &'a str,
+    /// The tool that called `call_tool`. A child's "allowed by" mark goes on
+    /// its row when there is no `on_annotation` to show it.
+    caller: ToolContext,
     on_buf: Option<Function>,
     on_ann: Option<Function>,
     on_usage: Option<Function>,
@@ -1074,6 +1080,13 @@ impl LiveCallbacks<'_> {
             ToolLive::Buf(buf) => call_opt(&self.on_buf, BufHandle::foreign(buf)).await,
             ToolLive::Annotation(ann) => call_opt(&self.on_ann, ann).await,
             ToolLive::Usage(usage) => call_opt(&self.on_usage, usage).await,
+            ToolLive::AllowedBy(plugin) if self.on_ann.is_some() => {
+                call_opt(&self.on_ann, format!("{ALLOWED_BY} {plugin}")).await
+            }
+            ToolLive::AllowedBy(plugin) => {
+                tool_dispatch::mark_allowed_by(&self.caller, plugin);
+                None
+            }
         };
         if let Some(Err(e)) = res {
             tracing::warn!(tool = self.tool, error = %e, "call_tool callback failed");
@@ -1095,14 +1108,16 @@ async fn dispatch_racing_live(
     tctx: &ToolContext,
     name: &str,
     input: &JsonValue,
-    rx: Option<flume::Receiver<ToolLive>>,
+    rx: flume::Receiver<ToolLive>,
     cbs: &LiveCallbacks<'_>,
 ) -> ToolDoneEvent {
-    let run = tool_dispatch::run(String::new(), name, input, tctx, CallOrigin::Nested);
-    let Some(rx) = rx else {
-        return run.await;
-    };
-    let mut run = pin!(run);
+    let mut run = pin!(tool_dispatch::run(
+        String::new(),
+        name,
+        input,
+        tctx,
+        CallOrigin::Nested
+    ));
     loop {
         match select(run.as_mut(), pin!(rx.recv_async())).await {
             Either::Left((done, _)) => {

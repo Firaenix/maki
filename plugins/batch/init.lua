@@ -430,9 +430,15 @@ end
 
 -- Live annotations (say, a task child's model) arrive before the done
 -- annotation ("12 lines"), so append rather than replace, with the same
--- separator the standalone header uses.
+-- separator the standalone header uses. A note already shown is skipped, the
+-- same as the standalone header does: a code_execution child sends one
+-- "allowed by" mark for every call a plugin let through.
 function Batch:annotate(c, ann)
-  c.annotation = c.annotation and (c.annotation .. ANNOTATION_SEP .. ann) or ann
+  local sep = ANNOTATION_SEP
+  if c.annotation and (sep .. c.annotation .. sep):find(sep .. ann .. sep, 1, true) then
+    return
+  end
+  c.annotation = c.annotation and (c.annotation .. sep .. ann) or ann
   self:rerender()
 end
 

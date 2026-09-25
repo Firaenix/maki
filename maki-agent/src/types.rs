@@ -633,6 +633,10 @@ pub enum SessionEndReason {
     Completed,
 }
 
+/// One spelling for the mark, whether the UI draws it on a row or
+/// `maki.agent.call_tool` hands it to a caller's `on_annotation`.
+pub const ALLOWED_BY: &str = "allowed by";
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -705,6 +709,14 @@ pub enum AgentEvent {
         /// Why a plugin escalated this call to the user, if one did.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+    },
+    /// A `permission.prompt` layer allowed a call that would have prompted.
+    /// The prompt is where the user learns what the agent is about to do, so
+    /// a frontend marks the row instead. `id` is the closest row the user can
+    /// see: for a call inside `code_execution` that is the script's row.
+    AllowedByPlugin {
+        id: String,
+        plugin: String,
     },
     AuthRequired,
     Nudge,

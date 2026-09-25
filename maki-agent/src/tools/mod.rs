@@ -365,10 +365,9 @@ pub struct ToolContext {
     pub workflow: bool,
     pub audience: ToolAudience,
     pub local_tools: LocalTools,
-    /// Streams a dispatched child's live bufs and annotations back to the
-    /// caller (`maki.agent.call_tool` with `on_live_buf`/`on_annotation`).
-    /// Never inherited: `to_tool_context` clears it, and each caller sets
-    /// it for its own call only.
+    /// Streams a dispatched child's live bufs and annotations back to its
+    /// caller (`maki.agent.call_tool`). Never inherited: `to_tool_context`
+    /// clears it, and each caller sets it for its own call only.
     pub live_sink: Option<flume::Sender<ToolLive>>,
     pub model_policy: Arc<ModelPolicy>,
 }
@@ -378,6 +377,8 @@ pub enum ToolLive {
     Buf(Arc<SharedBuf>),
     Annotation(String),
     Usage(String),
+    /// The plugin that answered the child's permission prompt.
+    AllowedBy(Arc<str>),
 }
 
 pub(crate) fn resolve_path(path: &str) -> Result<String, String> {
