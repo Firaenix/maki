@@ -129,6 +129,8 @@ const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
 pub(crate) const NOTHING_TO_TRUST_MSG: &str = "nothing to trust in this folder";
 const TRUSTED_PREFIX: &str = "Trusted this folder: ";
+const PROVIDER_FOLDED_SUFFIX: &str = ": folded away";
+const PROVIDER_UNFOLDED_SUFFIX: &str = ": unfolded";
 const PACK_CHANGES_DECLINED: &str = "Package changes declined";
 const PACK_USER_ONLY_SUFFIX: &str = " can only be run by you";
 const IMPLEMENT_MSG_PREFIX: &str = "Implement the plan";
@@ -531,6 +533,8 @@ impl App {
                 .filter(|spec| model_policy.allows(spec))
                 .collect(),
         );
+        app.model_picker
+            .set_collapsed(maki_storage::model::read_collapsed_providers(&app.storage));
         // The manager arrives forked from the prototype the process was
         // started with, so a tab that resumes or spawns blank runs on
         // `--yolo` until its own meta is read back here.
@@ -962,7 +966,16 @@ impl App {
             self.alert_modal.handle_key(key);
             return Some(vec![]);
         }
-
+        // A focused plugin window is the thing the user is typing into, so it
+        // goes ahead of the rest, the permission prompt included: floats paint
+        // over the prompt, and a window the user cannot close is worse than a
+        // prompt that waits one `q` longer. The keys an *unfocused* window
+        // claimed are settled far below, after every modal here: a claim is
+        // up while the user works under it, and a popup that holds `<CR>`
+        // must not answer the Enter meant for the file picker opened over it.
+        if self.float_mgr.handle_focused_key(key) {
+            return Some(vec![]);
+        }
         // With both up the permission prompt goes first: a tool is blocked on
         // it and it owns the bottom panel. The pack review waits on nothing.
         if self.permission_prompt.is_open() {
@@ -1007,15 +1020,6 @@ impl App {
 
         if self.btw_modal.is_open() {
             self.btw_modal.handle_key(key);
-            return Some(vec![]);
-        }
-
-        // A focused plugin window is the thing the user is typing into, so it
-        // goes ahead of the rest. The keys an *unfocused* window claimed are
-        // settled far below, after every modal here: a claim is up while the
-        // user works under it, and a popup that holds `<CR>` must not answer
-        // the Enter meant for the file picker opened over it.
-        if self.float_mgr.handle_focused_key(key) {
             return Some(vec![]);
         }
 
@@ -1105,6 +1109,22 @@ impl App {
                 }
                 ModelPickerAction::UnassignTier(spec, tier) => {
                     vec![Action::UnassignTier(spec, tier)]
+                }
+                // Written here rather than raised as an `Action`: a fold is the
+                // picker's own view of the list, and this is where the state
+                // dir already is.
+                ModelPickerAction::Collapse(slug, folded) => {
+                    maki_storage::model::persist_collapsed_providers(
+                        &self.storage,
+                        self.model_picker.collapsed_providers(),
+                    );
+                    let suffix = if folded {
+                        PROVIDER_FOLDED_SUFFIX
+                    } else {
+                        PROVIDER_UNFOLDED_SUFFIX
+                    };
+                    self.flash(format!("{slug}{suffix}"));
+                    vec![]
                 }
                 ModelPickerAction::Close => vec![],
             });
