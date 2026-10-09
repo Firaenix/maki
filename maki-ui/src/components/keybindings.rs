@@ -164,6 +164,11 @@ pub mod key {
         modifiers: KeyModifiers::ALT,
         label: "Alt+O",
     };
+    pub const UNDO: Bind = Bind {
+        code: KeyCode::Char('z'),
+        modifiers: KeyModifiers::ALT,
+        label: "Alt+Z",
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
@@ -465,6 +470,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(key::EDIT_INPUT.label),
         description: "Edit input in external editor",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::UNDO.label),
+        description: "Undo typing / paste",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },
