@@ -29,9 +29,11 @@ use maki_lua::{
     WinCommand, WinEvent,
 };
 use maki_providers::{
-    ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, TokenUsage,
+    ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, ThinkingSupport,
+    TokenUsage,
 };
 use maki_storage::id::MakiId;
+use maki_storage::model::read_thinking;
 use maki_storage::sessions::{SessionClaim, SessionMeta, StoredMode, StoredThinking};
 use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
 use ratatui::Terminal;
@@ -5778,11 +5780,58 @@ fn model_state_carries_the_thinking_ladder() {
 #[test]
 fn set_thinking_clamps_to_what_the_model_will_run() {
     let mut app = test_app();
-    app.state.model.thinking_override = Some(maki_providers::ThinkingSupport::Required);
+    app.state.model.thinking_override = Some(ThinkingSupport::Required);
 
     let lifted = ThinkingConfig::Effort(Effort::Minimal);
     assert_eq!(app.set_thinking("off").unwrap(), lifted);
     assert_eq!(app.state.thinking, lifted);
+}
+
+#[test_case("off", ThinkingConfig::Off)]
+#[test_case("low", ThinkingConfig::Effort(Effort::Low))]
+fn explicit_thinking_choice_replaces_pending_level(input: &str, expected: ThinkingConfig) {
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    app.set_thinking("high").unwrap();
+    let mut model = app.state.model.clone();
+    model.thinking_override = Some(ThinkingSupport::No);
+    app.state.update_model(&model);
+    assert_eq!(app.state.thinking, ThinkingConfig::Off);
+
+    model.thinking_override = Some(ThinkingSupport::Yes);
+    app.state.model = model.clone();
+    assert_eq!(app.set_thinking(input).unwrap(), expected);
+    app.state.update_model(&model);
+    app.checkpoint();
+
+    assert_eq!(app.state.thinking, expected);
+    assert_eq!(app.state.session.meta.thinking, Some(expected.into()));
+    assert_eq!(read_thinking(&app.storage), Some(expected.into()));
+}
+
+#[test_case(StoredThinking::Adaptive)]
+#[test_case(StoredThinking::Effort { level: Effort::High })]
+#[test_case(StoredThinking::Budget { tokens: 8192 })]
+fn checkpoint_preserves_thinking_until_discovery_finishes(stored: StoredThinking) {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    let mut model = test_model();
+    model.thinking_override = Some(ThinkingSupport::No);
+    let mut session = AppSession::new(TEST_MODEL_SPEC, TEST_CWD);
+    session.meta.thinking = Some(stored);
+    session.push_message(Message::user(RESUMED_PROMPT.into()));
+    app.apply_loaded_session(OpenSession::claimed(session, &dir), &model);
+    assert_eq!(app.state.thinking, ThinkingConfig::Off);
+
+    app.checkpoint();
+    assert_eq!(app.state.session.meta.thinking, Some(stored));
+    assert_eq!(app.blank_session().session.meta.thinking, Some(stored));
+    let id = app.state.session.id;
+    drain_writer(app, writer);
+
+    let session = AppSession::load(id, &dir).unwrap();
+    assert_eq!(session.meta.thinking, Some(stored));
+    model.thinking_override = Some(ThinkingSupport::Yes);
+    let state = SessionState::from_session(OpenSession::claimed(session, &dir), &model, &dir);
+    assert_eq!(state.thinking, ThinkingConfig::from(stored));
 }
 
 /// A plugin redraws its badge from the payload alone, and only when the model
@@ -6181,7 +6230,7 @@ fn set_thinking_keeps_state_on_rejected_input(supported: bool, input: &str, expe
     let mut app = test_app();
     app.set_thinking("high").unwrap();
     if !supported {
-        app.state.model.thinking_override = Some(maki_providers::ThinkingSupport::No);
+        app.state.model.thinking_override = Some(ThinkingSupport::No);
     }
 
     assert_eq!(app.set_thinking(input).unwrap_err(), expected);

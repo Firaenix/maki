@@ -2922,6 +2922,7 @@ impl LuaRuntime {
         let meta = self.lua.create_table()?;
         meta.set("__index", self.lua.globals())?;
         env.set_metatable(Some(meta))?;
+        env.set_safeenv(true);
         Ok(env)
     }
 

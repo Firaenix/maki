@@ -622,6 +622,7 @@ impl App {
         self.state.thinking = ThinkingConfig::parse(input.trim(), self.state.thinking)
             .map_err(str::to_owned)?
             .clamped(&self.state.model);
+        self.state.pending_thinking = None;
         persist_thinking(&self.storage, self.state.thinking.into());
         Ok(self.state.thinking)
     }

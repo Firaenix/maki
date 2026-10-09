@@ -133,7 +133,7 @@ impl App {
             } else {
                 self.recoverable_queue.clone()
             },
-            thinking: Some(state.thinking.into()),
+            thinking: Some(state.thinking_intent().into()),
             fast: state.fast_intent(),
             workflow: state.workflow,
             yolo: self.permissions.persisted_yolo(),
@@ -321,7 +321,7 @@ impl App {
         );
         open.session.meta = SessionMeta {
             mode: Some(self.state.mode.into()),
-            thinking: Some(self.state.thinking.into()),
+            thinking: Some(self.state.thinking_intent().into()),
             fast: self.state.fast_intent(),
             workflow: self.state.workflow,
             plan_path: None,
