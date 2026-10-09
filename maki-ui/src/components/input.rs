@@ -4,7 +4,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::app::shell::parse_shell_prefix;
 use crate::highlight;
-use crate::text_buffer::{EditResult, TextBuffer, is_newline_key};
+use crate::text_buffer::{EditKind, EditResult, TextBuffer, is_newline_key};
 use crate::theme;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -106,7 +106,7 @@ impl InputBox {
             }
             KeyCode::Tab | KeyCode::Esc => return InputAction::Passthrough(key),
             _ if is_newline_key(&key) => {
-                self.buffer.add_line();
+                self.buffer.edit(EditKind::Other, TextBuffer::add_line);
                 return InputAction::ContinueLine;
             }
             KeyCode::Enter if self.char_before_cursor_is_backslash() => {
@@ -130,7 +130,8 @@ impl InputBox {
 
     pub fn handle_paste(&mut self, text: &str) -> InputAction {
         self.follow_cursor = true;
-        self.buffer.insert_text(text);
+        self.buffer
+            .edit(EditKind::Other, |buf| buf.insert_text(text));
         InputAction::Changed
     }
 
@@ -166,6 +167,19 @@ impl InputBox {
         }
 
         self.handle_paste(&spaced)
+    }
+
+    /// Rewinds one editing step. The paste a mistimed `Cmd+V` drops in the
+    /// middle of a sentence is one step back; a run of typing rewinds word
+    /// by word. Cmd+Z is also answered inside the buffer itself, for the
+    /// terminals that deliver it; Alt+Z is the portable spelling.
+    pub fn undo(&mut self) -> InputAction {
+        self.follow_cursor = true;
+        if self.buffer.undo() {
+            InputAction::Changed
+        } else {
+            InputAction::None
+        }
     }
 
     pub fn new(history: InputHistory, max_input_lines: u32) -> Self {
@@ -243,8 +257,10 @@ impl InputBox {
     }
 
     pub fn continue_line(&mut self) {
-        self.buffer.remove_char();
-        self.buffer.add_line();
+        self.buffer.edit(EditKind::Other, |buf| {
+            buf.remove_char();
+            buf.add_line();
+        });
     }
 
     pub fn submit(&mut self) -> Option<Submission> {
@@ -312,7 +328,9 @@ impl InputBox {
         text: &str,
         cursor: Option<usize>,
     ) -> Result<(), String> {
-        self.buffer.replace_byte_range(start, stop, text, cursor)?;
+        self.buffer.edit(EditKind::Other, |buf| {
+            buf.replace_byte_range(start, stop, text, cursor)
+        })?;
         self.follow_cursor = true;
         self.history_index = None;
         self.draft.clear();
