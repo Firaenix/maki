@@ -8,7 +8,7 @@ use maki_agent::cancel::CancelToken;
 use maki_agent::permissions::{LayerAnswer, LayerVerdict};
 use maki_agent::tools::hook::{self, Authority, HookCall, HookStage, Verdict};
 use maki_agent::tools::test_support::stub_ctx;
-use maki_agent::tools::{CallOrigin, ToolRegistry};
+use maki_agent::tools::{CallOrigin, ToolOutputMode, ToolRegistry};
 use maki_lua::{
     Permission, PlanActionOutcome, PlanFormRow, PlanMenu, PlanRowAction, PluginHost,
     PluginPermissions, SessionEndReason,
@@ -387,6 +387,7 @@ fn call_of<'a>(
         input: None,
         session_id: None,
         origin,
+        output_mode: ToolOutputMode::Compact,
         authority,
         cancel,
         deadline: Instant::now() + DISPATCH_TIMEOUT,

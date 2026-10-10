@@ -35,11 +35,13 @@ smol = { workspace = true }
 tempfile = { workspace = true }
 isahc = { workspace = true }
 thiserror = { workspace = true }
-libc = { workspace = true }
 uuid = { workspace = true }
 flume = { workspace = true }
 open = { workspace = true }
 unicode-width = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
 
 [dev-dependencies]
 maki-config = { workspace = true, features = ["test-util"] }
@@ -66,7 +68,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 authors = ["Tony Solomonik <tony.solomonik@gmail.com>"]
 license = "MIT"
@@ -129,7 +131,7 @@ arboard = { version = "3", default-features = false, features = ["image-data"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 flume = { version = "0.12", default-features = false, features = ["async", "select"] }
 pin-project-lite = "0.2"
-rustix = { version = "1", default-features = false, features = ["process"] }
+rustix = { version = "1", features = ["event", "fs", "process"] }
 humantime = "2"
 semver = "1"
 toml = "1.1"
@@ -190,6 +192,7 @@ tree-sitter-make = "1.1"
 monty = { git = "https://github.com/pydantic/monty.git", tag = "v0.0.23", package = "monty" }
 monty-types = { git = "https://github.com/pydantic/monty.git", tag = "v0.0.23", package = "monty-types" }
 notify = { version = "9.0.0-rc.5", default-features = false, features = ["flume", "macos_fsevent"] }
+notify-rust = "4.18.1"
 serde_yaml = "0.9"
 shell-words = "1"
 agent-client-protocol-schema = "1.10"

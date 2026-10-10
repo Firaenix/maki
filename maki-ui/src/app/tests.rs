@@ -560,7 +560,7 @@ fn undo_key_rewinds_the_last_paste_in_the_chat_input() {
     let mut app = test_app();
     app.update(Msg::Key(key(KeyCode::Char('h'))));
     app.update(Msg::Key(key(KeyCode::Char('i'))));
-    app.update(Msg::Paste("pasted".into()));
+    app.update(Msg::Paste("pasted\nacross\nlines".into()));
     let alt_z = KeyEvent {
         code: KeyCode::Char('z'),
         modifiers: KeyModifiers::ALT,

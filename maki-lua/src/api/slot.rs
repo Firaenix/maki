@@ -647,9 +647,10 @@ fn parse_slot_capability(
 ///
 /// `permission.prompt` fires where the permission prompt would show, with
 /// the prompt as its default. A layer takes `function(prev, req, ctx)` and
-/// answers with one of the prompt's options, like
-/// `{ decision = "allow_session" }`, or passes the call on with
-/// `prev(req, ctx)`. See [Hooks](/docs/hooks/#permission-prompt).
+/// answers `{ decision = "allow" }` or `{ decision = "deny", guidance = … }`,
+/// or passes the call on with `prev(req, ctx)`. A verdict decides that one call
+/// and records no rule, and an escalated call (`ask`) is never offered to a
+/// layer. See [Hooks](/docs/hooks/#permission-prompt).
 ///
 /// Wrapping a slot another plugin declared steers a chain that plugin's
 /// callers trust, so it costs whatever the owner priced it at in

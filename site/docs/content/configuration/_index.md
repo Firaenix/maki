@@ -75,7 +75,7 @@ All fields are optional. Typos in field names cause an error right away.
 | `splash_animation` | bool | `true` | - | Show splash animation on startup |
 | `scrollbar` | bool | `true` | - | Show vertical scrollbar in scrollable areas |
 | `inline_images` | bool | `true` | - | Render inline images in terminals with graphics support, falling back to an [image] line where nothing else names the image |
-| `notifications` | string | `auto` | - | Terminal notification method: auto, osc9, bell, or off |
+| `notifications` | string | `auto` | - | Terminal notification method: auto, osc9, bell, notify, or off |
 | `flash_duration_ms` | u64 | `1500` | - | Duration of flash messages (ms) |
 | `typewriter_ms_per_char` | u64 | `4` | - | Typewriter effect speed (ms/char) |
 | `mouse_scroll_lines` | u32 | `3` | 1 | Lines per mouse wheel scroll |
@@ -249,8 +249,8 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
-| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool's model output. |
+| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool's model output. |
 | `timeout_secs` | integer | `120` | 5 | Kill the command after this many seconds. A call's `timeout` param overrides it. |
 
 ### `plugins.code_execution`
@@ -258,8 +258,8 @@ maki.setup({
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
 | `max_memory_mb` | integer | `50` | 10 | Memory limit for the Python sandbox (MB). |
-| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
-| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool's model output. |
+| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool's model output. |
 | `timeout_secs` | integer | `30` | 5 | Script execution time budget in seconds; waiting on tool calls does not count. A call's `timeout` param overrides it. |
 
 ### `plugins.completion`
@@ -280,17 +280,17 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
-| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
-| `search_result_limit` | integer | `100` | 10 | Max files returned per search. |
+| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool's model output. |
+| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool's model output. |
+| `search_result_limit` | integer | `100` | 10 | Max files returned per search in compact mode. |
 
 ### `plugins.grep`
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `max_line_bytes` | integer | `500` | 80 | Skip lines longer than this many bytes. |
-| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
-| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `max_line_bytes` | integer | `500` | 80 | Truncate model output lines longer than this many bytes. |
+| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool's model output. |
+| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool's model output. |
 | `search_result_limit` | integer | `100` | 10 | Max match groups per search. A call's `limit` param overrides it. |
 
 ### `plugins.index`
@@ -303,8 +303,8 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `max_line_bytes` | integer | `500` | 80 | Truncate lines longer than this many bytes. |
-| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `max_line_bytes` | integer | `500` | 80 | Truncate model output lines longer than this many bytes. |
+| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool's model output. |
 
 ### `plugins.skill`
 
@@ -323,16 +323,16 @@ maki.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
-| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool's model output. |
+| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool's model output. |
 | `max_response_bytes` | integer | `5242880` | 1024 | Stop reading a response after this many bytes. |
 
 ### `plugins.websearch`
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
-| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
+| `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool's model output. |
+| `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool's model output. |
 | `max_response_bytes` | integer | `5242880` | 1024 | Stop reading a response after this many bytes. |
 | `provider` | string | `"exa"` | - | Search backend: "exa" (default) or "youcom" (You.com MCP). |
 

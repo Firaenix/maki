@@ -72,6 +72,31 @@ impl CallOrigin {
     }
 }
 
+/// Result presentation, independent of tool visibility and history ownership.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolOutputMode {
+    #[default]
+    Full,
+    Compact,
+}
+
+impl ToolOutputMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Compact => "compact",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "full" => Some(Self::Full),
+            "compact" => Some(Self::Compact),
+            _ => None,
+        }
+    }
+}
+
 pub struct DescriptionContext<'a> {
     pub filter: &'a ToolFilter,
     pub audience: ToolAudience,
@@ -357,6 +382,7 @@ pub struct ToolContext {
     pub config: AgentConfig,
     pub tool_filter: Arc<ToolFilter>,
     pub tool_output_lines: ToolOutputLines,
+    pub output_mode: ToolOutputMode,
     pub permissions: Arc<PermissionManager>,
     pub timeouts: maki_providers::Timeouts,
     pub file_access: Arc<FileAccess>,
@@ -593,6 +619,7 @@ pub fn interpreter_ctx(
         config: AgentConfig::default(),
         tool_filter: Arc::default(),
         tool_output_lines: ToolOutputLines::default(),
+        output_mode: ToolOutputMode::Full,
         permissions,
         timeouts: maki_providers::Timeouts::default(),
         file_access,
@@ -778,6 +805,7 @@ pub mod test_support {
             Arc::new(ToolRegistry::new()),
         );
         ctx.tool_use_id = tool_use_id.map(String::from);
+        ctx.output_mode = ToolOutputMode::Compact;
         ctx
     }
 
@@ -802,6 +830,7 @@ pub mod test_support {
             Arc::new(ToolRegistry::new()),
         );
         ctx.tool_use_id = None;
+        ctx.output_mode = ToolOutputMode::Compact;
         ctx
     }
 }
