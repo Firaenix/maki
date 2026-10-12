@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -120,7 +121,13 @@ pub(crate) enum PromptState {
     DenyEditing,
 }
 
+/// Hands every queued ask a handle unique across the process. The agent's id
+/// cannot name an ask on its own: it is empty for calls nested in batch or
+/// code_execution, and each session queues its asks separately.
+static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
+
 struct Request {
+    handle: u64,
     id: String,
     tool: ToolKey,
     scopes: Vec<String>,
@@ -136,6 +143,7 @@ struct Request {
 /// request it is parked on, and the ask on screen is not always the last one in.
 #[derive(Debug)]
 pub struct AnsweredRequest {
+    pub handle: u64,
     pub id: String,
     pub subagent_id: Option<String>,
     pub answer: PermissionAnswer,
@@ -185,7 +193,8 @@ impl PermissionPrompt {
         subagent_id: Option<String>,
         project_trusted: bool,
         reason: Option<String>,
-    ) {
+    ) -> u64 {
+        let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
         let allow_scopes = generalized_scopes(&tool, &scopes);
         let allow_scopes = if allow_scopes == scopes {
             vec![]
@@ -193,6 +202,7 @@ impl PermissionPrompt {
             allow_scopes
         };
         self.queue.push_back(Request {
+            handle,
             id,
             tool,
             scopes,
@@ -201,6 +211,7 @@ impl PermissionPrompt {
             project_trusted,
             reason,
         });
+        handle
     }
 
     fn reset_entry(&mut self) {
@@ -210,12 +221,44 @@ impl PermissionPrompt {
 
     /// A cancelled subagent has nothing left to answer with, so its asks leave
     /// with it instead of parking the panel on a dead tool call.
-    pub fn drop_subagent(&mut self, subagent_id: &str) {
+    pub fn drop_subagent(&mut self, subagent_id: &str) -> Vec<u64> {
         let owns = |request: &Request| request.subagent_id.as_deref() == Some(subagent_id);
         if self.queue.front().is_some_and(owns) {
             self.reset_entry();
         }
+        let dropped = self
+            .queue
+            .iter()
+            .filter(|request| owns(request))
+            .map(|request| request.handle)
+            .collect();
         self.queue.retain(|request| !owns(request));
+        dropped
+    }
+
+    pub fn handles(&self) -> Vec<u64> {
+        self.queue.iter().map(|request| request.handle).collect()
+    }
+
+    /// Settles the ask {handle} names, wherever it sits in the queue, the way
+    /// a key settles the one on screen. `None` when it is already gone: the
+    /// user or another plugin answered first, or the run ended.
+    pub fn answer_by_handle(
+        &mut self,
+        handle: u64,
+        answer: PermissionAnswer,
+    ) -> Option<AnsweredRequest> {
+        let pos = self.queue.iter().position(|r| r.handle == handle)?;
+        if pos == 0 {
+            self.reset_entry();
+        }
+        let request = self.queue.remove(pos)?;
+        Some(AnsweredRequest {
+            handle,
+            id: request.id,
+            subagent_id: request.subagent_id,
+            answer,
+        })
     }
 
     pub(crate) fn tool(&self) -> Option<&ToolKey> {
@@ -227,6 +270,7 @@ impl PermissionPrompt {
         let request = self.queue.pop_front()?;
         self.reset_entry();
         Some(AnsweredRequest {
+            handle: request.handle,
             id: request.id,
             subagent_id: request.subagent_id,
             answer,
@@ -731,5 +775,77 @@ mod tests {
                 .then(|| text.trim_start()[WHY_LABEL.len()..].trim().to_owned())
         });
         assert_eq!(why_row.as_deref(), reason);
+    }
+
+    fn queue_main_and_subagent() -> (PermissionPrompt, u64, u64) {
+        let mut prompt = PermissionPrompt::new();
+        let main = prompt.push(
+            MAIN_ID.into(),
+            ToolKey::native("bash"),
+            vec!["execute".into()],
+            None,
+            true,
+            None,
+        );
+        let sub = prompt.push(
+            SUB_ID.into(),
+            ToolKey::native("read"),
+            vec!["/tmp/x".into()],
+            Some(SUB_AGENT.into()),
+            true,
+            None,
+        );
+        (prompt, main, sub)
+    }
+
+    #[test]
+    fn answer_by_handle_settles_a_queued_ask_and_leaves_the_front() {
+        let (mut prompt, _, sub) = queue_main_and_subagent();
+        let answered = prompt
+            .answer_by_handle(sub, PermissionAnswer::AllowOnce)
+            .unwrap();
+        assert_eq!(
+            (answered.id.as_str(), answered.subagent_id.as_deref()),
+            (SUB_ID, Some(SUB_AGENT))
+        );
+        let front = prompt.handle_key(key(KeyCode::Char('y'))).unwrap();
+        assert_eq!(front.id, MAIN_ID, "the ask on screen is still the user's");
+    }
+
+    #[test]
+    fn answer_by_handle_on_the_front_resets_what_the_user_was_typing() {
+        let (mut prompt, main, sub) = queue_main_and_subagent();
+        prompt.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(prompt.state, PromptState::DenyEditing);
+        prompt
+            .answer_by_handle(main, PermissionAnswer::Deny)
+            .unwrap();
+        assert_eq!(prompt.state, PromptState::Normal);
+        assert_eq!(prompt.handles(), vec![sub]);
+    }
+
+    #[test]
+    fn the_second_answer_to_one_ask_loses() {
+        let (mut prompt, main, _) = queue_main_and_subagent();
+        prompt.handle_key(key(KeyCode::Char('y'))).unwrap();
+        assert!(
+            prompt
+                .answer_by_handle(main, PermissionAnswer::Deny)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn handles_are_unique_across_prompts() {
+        let (_, first, _) = queue_main_and_subagent();
+        let (_, second, _) = queue_main_and_subagent();
+        assert_ne!(first, second, "two sessions must never share a handle");
+    }
+
+    #[test]
+    fn drop_subagent_reports_the_asks_it_dropped() {
+        let (mut prompt, main, sub) = queue_main_and_subagent();
+        assert_eq!(prompt.drop_subagent(SUB_AGENT), vec![sub]);
+        assert_eq!(prompt.handles(), vec![main]);
     }
 }

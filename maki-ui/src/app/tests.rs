@@ -4523,6 +4523,106 @@ fn allow_once(ask_id: &str) -> String {
     TaggedAnswer::new(ask_id, PermissionAnswer::AllowOnce).encode()
 }
 
+const REMOTE_PLUGIN: &str = "remote";
+
+fn main_app_with_probe() -> (
+    App,
+    flume::Receiver<String>,
+    maki_lua::test_support::RequestProbe,
+) {
+    let (main_tx, main_rx) = flume::unbounded();
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.answer_tx = Some(main_tx);
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+    (app, main_rx, probe)
+}
+
+fn ask_main(app: &mut App, ask: &str) {
+    app.update(Msg::Agent(Box::new(Envelope {
+        event: AgentEvent::PermissionRequest {
+            id: ask.into(),
+            tool: ToolKey::native("bash"),
+            scopes: vec!["ls".into()],
+            reason: None,
+        },
+        subagent: None,
+        run_id: 1,
+    })));
+}
+
+/// The next permission event, past whatever else the update fired.
+fn next_permission_event(
+    probe: &maki_lua::test_support::RequestProbe,
+) -> (String, serde_json::Value) {
+    std::iter::from_fn(|| probe.try_recv_autocmd())
+        .find(|(event, _)| {
+            event == PERMISSION_REQUESTED_EVENT || event == PERMISSION_RESOLVED_EVENT
+        })
+        .expect("a permission event fired")
+}
+
+/// The prompt stays the user's while a plugin races them: whichever answer
+/// lands first settles the ask, and both the agent and every plugin hear it.
+#[test]
+fn a_plugin_answer_settles_an_open_prompt() {
+    let (mut app, main_rx, probe) = main_app_with_probe();
+    ask_main(&mut app, FIRST_ASK);
+    let (event, asked) = next_permission_event(&probe);
+    assert_eq!(event, PERMISSION_REQUESTED_EVENT);
+    assert_eq!(asked["tool_id"], serde_json::json!(FIRST_ASK));
+    assert_eq!(asked["tool"], serde_json::json!("bash"));
+    assert_eq!(asked["scopes"], serde_json::json!(["ls"]));
+    let handle = asked["request_id"].as_u64().unwrap();
+
+    assert!(app.answer_permission(handle, PermissionAnswer::AllowOnce, REMOTE_PLUGIN));
+    assert_eq!(main_rx.try_recv().unwrap(), allow_once(FIRST_ASK));
+    assert!(!app.permission_prompt.is_open());
+    let (event, resolved) = next_permission_event(&probe);
+    assert_eq!(event, PERMISSION_RESOLVED_EVENT);
+    assert_eq!(resolved["request_id"], serde_json::json!(handle));
+    assert_eq!(resolved["decision"], serde_json::json!("allow"));
+    assert_eq!(
+        resolved["by"],
+        serde_json::json!(format!("plugin:{REMOTE_PLUGIN}"))
+    );
+}
+
+#[test]
+fn a_plugin_answering_after_the_user_loses() {
+    let (mut app, main_rx, probe) = main_app_with_probe();
+    ask_main(&mut app, FIRST_ASK);
+    let handle = next_permission_event(&probe).1["request_id"]
+        .as_u64()
+        .unwrap();
+    app.update(Msg::Key(key(KeyCode::Char('y'))));
+    assert_eq!(
+        next_permission_event(&probe).1["by"],
+        serde_json::json!(RESOLVED_BY_USER)
+    );
+
+    assert!(!app.answer_permission(handle, PermissionAnswer::Deny, REMOTE_PLUGIN));
+    assert_eq!(main_rx.try_recv().unwrap(), allow_once(FIRST_ASK));
+    assert!(
+        main_rx.is_empty(),
+        "the losing answer never reaches the agent"
+    );
+}
+
+#[test]
+fn closing_the_prompt_reports_its_asks_cancelled() {
+    let (mut app, _main_rx, probe) = main_app_with_probe();
+    ask_main(&mut app, FIRST_ASK);
+    let handle = next_permission_event(&probe).1["request_id"].clone();
+    app.close_all_overlays();
+    let (event, resolved) = next_permission_event(&probe);
+    assert_eq!(event, PERMISSION_RESOLVED_EVENT);
+    assert_eq!(resolved["request_id"], handle);
+    assert_eq!(resolved["by"], serde_json::json!(RESOLVED_BY_CANCEL));
+}
+
 /// Subagents run in parallel and each parks its own tool call on its own ask.
 /// Every answer has to reach the subagent that asked, tagged with its own ask,
 /// or that tool call waits forever.

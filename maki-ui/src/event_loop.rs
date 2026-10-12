@@ -1346,6 +1346,19 @@ impl<'t> EventLoop<'t> {
                 })();
                 let _ = reply_tx.send(reply);
             }
+            SessionRequest::AnswerPermission {
+                handle,
+                answer,
+                plugin,
+            } => {
+                // Handles are unique across sessions, so at most one holds the
+                // ask; finding none means the user or another plugin won.
+                let won = self
+                    .sessions
+                    .iter_mut()
+                    .any(|rt| rt.app.answer_permission(handle, answer.clone(), &plugin));
+                let _ = reply_tx.send(Ok(json!(won)));
+            }
         }
     }
 
