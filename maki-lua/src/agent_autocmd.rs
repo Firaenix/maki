@@ -119,6 +119,20 @@ pub enum HostEvent<'a> {
         crashed: bool,
         truncated: bool,
     },
+    PermissionRequested {
+        request_id: u64,
+        tool_id: &'a str,
+        tool: String,
+        scopes: &'a [String],
+        reason: Option<&'a str>,
+        subagent_id: Option<&'a str>,
+    },
+    PermissionResolved {
+        request_id: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        decision: Option<&'static str>,
+        by: &'a str,
+    },
 }
 
 impl HostEvent<'_> {
@@ -200,6 +214,12 @@ impl HostEventKind {
             Self::ModelChanged => (&[], &["model", "previous_spec"]),
             Self::InputChanged => (&["text"], &["cursor", "version", "source", "cursor_only"]),
             Self::FileIndexReady => (&[], &["root", "files", "crashed", "truncated"]),
+            // Scopes name the paths or commands a tool wants, which is conversation content.
+            Self::PermissionRequested => (
+                &["scopes", "reason"],
+                &["request_id", "tool_id", "tool", "subagent_id"],
+            ),
+            Self::PermissionResolved => (&[], &["request_id", "decision", "by"]),
         };
         EventFields { content, metadata }
     }
@@ -515,6 +535,19 @@ mod tests {
                 files: 0,
                 crashed: false,
                 truncated: false,
+            },
+            HostEventKind::PermissionRequested => HostEvent::PermissionRequested {
+                request_id: 0,
+                tool_id: SAMPLE_TEXT,
+                tool: SAMPLE_TEXT.into(),
+                scopes: Box::leak(Box::new([SAMPLE_TEXT.to_owned()])),
+                reason: Some(SAMPLE_TEXT),
+                subagent_id: Some(SAMPLE_TEXT),
+            },
+            HostEventKind::PermissionResolved => HostEvent::PermissionResolved {
+                request_id: 0,
+                decision: Some(SAMPLE_TEXT),
+                by: SAMPLE_TEXT,
             },
         }
     }

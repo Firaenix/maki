@@ -155,7 +155,9 @@ impl App {
         chat.cancel_in_progress();
         chat.mark_finished(TaskOutcome::Error, CANCELLED_TEXT);
         self.subagent_answers.remove(id);
-        self.permission_prompt.drop_subagent(id);
+        for handle in self.permission_prompt.drop_subagent(id) {
+            self.fire_permission_cancelled(handle);
+        }
         Ok(action)
     }
 

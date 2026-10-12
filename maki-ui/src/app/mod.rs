@@ -42,7 +42,7 @@ use crate::components::lua_float::FloatManager;
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::pack_review::{PackReview, PackReviewAction};
-use crate::components::permission_prompt::PermissionPrompt;
+use crate::components::permission_prompt::{AnsweredRequest, PermissionPrompt};
 use crate::components::plan_form::{PlanForm, PlanFormAction, builtin_menu, builtin_rows};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
@@ -58,7 +58,7 @@ use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::ArcSwapOption;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
-use maki_agent::permissions::{PermissionManager, TaggedAnswer};
+use maki_agent::permissions::{PermissionAnswer, PermissionManager, TaggedAnswer};
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
     SharedMessages, SubagentInfo,
@@ -132,6 +132,8 @@ const FAST_OFF_MSG: &str = "Fast mode: off";
 const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
 pub(crate) const NOTHING_TO_TRUST_MSG: &str = "nothing to trust in this folder";
+pub(crate) const RESOLVED_BY_USER: &str = "user";
+pub(crate) const RESOLVED_BY_CANCEL: &str = "cancelled";
 const TRUSTED_PREFIX: &str = "Trusted this folder: ";
 const PROVIDER_FOLDED_SUFFIX: &str = ": folded away";
 const PROVIDER_UNFOLDED_SUFFIX: &str = ": unfolded";
@@ -979,8 +981,7 @@ impl App {
         // it and it owns the bottom panel. The pack review waits on nothing.
         if self.permission_prompt.is_open() {
             if let Some(answered) = self.permission_prompt.handle_key(key) {
-                let encoded = TaggedAnswer::new(&answered.id, answered.answer).encode();
-                self.send_to_agent(answered.subagent_id.as_deref(), encoded);
+                self.settle_permission(answered, RESOLVED_BY_USER);
             }
             return Some(vec![]);
         }
@@ -1756,14 +1757,23 @@ impl App {
         } = result
         {
             let project_trusted = self.permissions.project_is_trusted();
-            self.permission_prompt.push(
-                id,
+            let tool_name = tool.to_string();
+            let handle = self.permission_prompt.push(
+                id.clone(),
                 tool,
-                scopes,
+                scopes.clone(),
                 subagent_id.clone(),
                 project_trusted,
-                reason,
+                reason.clone(),
             );
+            self.fire_session_event(HostEvent::PermissionRequested {
+                request_id: handle,
+                tool_id: &id,
+                tool: tool_name,
+                scopes: &scopes,
+                reason: reason.as_deref(),
+                subagent_id: subagent_id.as_deref(),
+            });
             return vec![];
         }
 
@@ -2299,7 +2309,47 @@ impl App {
     }
 
     pub fn close_all_overlays(&mut self) {
+        for handle in self.permission_prompt.handles() {
+            self.fire_permission_cancelled(handle);
+        }
         self.overlays_mut().iter_mut().for_each(|o| o.close());
+    }
+
+    /// A plugin answering the ask {handle} names, racing the user at the
+    /// prompt. `false` when the ask is already settled, so the loser knows.
+    pub(crate) fn answer_permission(
+        &mut self,
+        handle: u64,
+        answer: PermissionAnswer,
+        plugin: &str,
+    ) -> bool {
+        let Some(answered) = self.permission_prompt.answer_by_handle(handle, answer) else {
+            return false;
+        };
+        self.settle_permission(answered, &format!("plugin:{plugin}"));
+        true
+    }
+
+    fn settle_permission(&mut self, answered: AnsweredRequest, by: &str) {
+        self.fire_session_event(HostEvent::PermissionResolved {
+            request_id: answered.handle,
+            decision: Some(if answered.answer.is_allow() {
+                "allow"
+            } else {
+                "deny"
+            }),
+            by,
+        });
+        let encoded = TaggedAnswer::new(&answered.id, answered.answer).encode();
+        self.send_to_agent(answered.subagent_id.as_deref(), encoded);
+    }
+
+    fn fire_permission_cancelled(&self, handle: u64) {
+        self.fire_session_event(HostEvent::PermissionResolved {
+            request_id: handle,
+            decision: None,
+            by: RESOLVED_BY_CANCEL,
+        });
     }
 
     /// Every poller that feeds the screen, in one place and never in `view`;
