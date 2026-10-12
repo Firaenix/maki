@@ -169,6 +169,7 @@ declare maki: {
     request_compact: @checked (opts: any) -> (boolean?, string?),
     set_title: @checked (opts: any) -> (boolean?, string?),
     data_dir: @checked (opts: any) -> (string?, string?),
+    answer_permission: @checked (request_id: number, answer: any) -> (boolean?, string?),
   },
   task: {
     list: @checked () -> (any, string?),

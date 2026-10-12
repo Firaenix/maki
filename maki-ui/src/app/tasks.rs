@@ -756,6 +756,7 @@ impl App {
     /// honours the stop.
     pub(crate) fn end_task(&mut self, id: &str, outcome: BackgroundOutcome) {
         let (ending, text) = tab_ending(outcome);
+        let mut dropped = Vec::new();
         for chat in &mut self.chats {
             let Some(task) = chat.task_id() else {
                 continue;
@@ -763,9 +764,12 @@ impl App {
             let started_by_it =
                 matches!(&chat.parent, Some(TaskParent::Started(call)) if **call == *id);
             if (**task == *id || started_by_it) && !chat.is_finished() {
-                self.permission_prompt.drop_subagent(task);
+                dropped.extend(self.permission_prompt.drop_subagent(task));
                 chat.end_early(ending, text);
             }
+        }
+        for handle in dropped {
+            self.fire_permission_cancelled(handle);
         }
         self.set_badge_outcome(id, outcome);
     }
