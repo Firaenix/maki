@@ -1327,6 +1327,19 @@ impl<'t> EventLoop<'t> {
                 })();
                 let _ = reply_tx.send(reply);
             }
+            SessionRequest::AnswerPermission {
+                handle,
+                answer,
+                plugin,
+            } => {
+                // Handles are unique across sessions, so at most one holds the
+                // ask; finding none means the user or another plugin won.
+                let won = self
+                    .sessions
+                    .iter_mut()
+                    .any(|rt| rt.app.answer_permission(handle, answer.clone(), &plugin));
+                let _ = reply_tx.send(Ok(json!(won)));
+            }
         }
     }
 
@@ -1393,6 +1406,7 @@ impl<'t> EventLoop<'t> {
         match req {
             TaskRequest::List => Ok(json!(self.focused_app().tasks())),
             TaskRequest::Focus { id } => self.focused_app().focus_task(&id).map(|()| json!(true)),
+            TaskRequest::Remove { id } => self.focused_app().remove_task(&id).map(|()| json!(true)),
         }
     }
 

@@ -111,7 +111,12 @@ pub(crate) fn create_maki_global(
     maki.set("text", text::create_text_table(lua)?)?;
     maki.set(
         "session",
-        session::create_session_table(lua, ui_action_tx.clone())?,
+        session::create_session_table(
+            lua,
+            ui_action_tx.clone(),
+            Arc::clone(&plugin),
+            permissions.holds_all(),
+        )?,
     )?;
     maki.set(
         "model",

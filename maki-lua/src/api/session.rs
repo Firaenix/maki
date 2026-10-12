@@ -2,8 +2,11 @@
 //! the UI event loop, which owns live runtimes and storage. `notify` posts
 //! directly to the agent mailbox so synchronous callbacks can use it.
 
+use std::sync::Arc;
+
 use maki_agent::SessionMailbox;
 use maki_agent::agent::live_history;
+use maki_agent::permissions::PermissionAnswer;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::{ContentBlock, Message, Role};
 use maki_storage::id::MakiId;
@@ -13,6 +16,7 @@ use serde_json::json;
 use crate::api::util::command::{SessionRequest, UiAction, ui_json_roundtrip, ui_roundtrip};
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
+use crate::plugin_permissions::MANIFEST_FILE;
 
 /// Answers `maki.session.read` for a driver that has no UI to ask. Takes the
 /// optional session id from Lua and returns a serialized
@@ -26,6 +30,7 @@ const BLANK_NOTIFY_ERR: &str = "text must not be blank";
 const SESSION_REQUIRED_ERR: &str = "session is required";
 const NOT_LIVE_ERR: &str = "session not live";
 const NO_FOCUSED_ERR: &str = "no focused session";
+const ANSWER_DECISION_ERR: &str = "decision must be \"allow\" or \"deny\"";
 
 async fn roundtrip(
     lua: Lua,
@@ -416,6 +421,56 @@ async fn set_title(
     roundtrip(lua, tx, req).await
 }
 
+/// Answers an open permission prompt, racing the user at it. The prompt stays
+/// on screen until someone answers, and whichever answer lands first settles
+/// the call. A plugin may only allow or deny that one call, so nothing it
+/// answers records a rule. Answering for the user takes every permission in
+/// the plugin's `plugin.toml`.
+///
+/// @param request_id integer The `request_id` of a `PermissionRequested` event.
+/// @param answer table Required field: decision ("allow" or "deny").
+///   Optional: guidance (string) the agent reads with a deny.
+/// @return (boolean|nil, string|nil) true if this answer settled the prompt,
+///   false if the user or another plugin answered first, or nil and an error.
+/// @example
+/// maki.api.create_autocmd("PermissionRequested", {
+///   callback = function(ev)
+///     maki.session.answer_permission(ev.data.request_id, { decision = "deny" })
+///   end,
+/// })
+#[lua_fn]
+async fn answer_permission(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] plugin: Arc<str>,
+    #[ctx] full_trust: bool,
+    request_id: u64,
+    answer: Table,
+) -> LuaResult<Pair<Value>> {
+    if !full_trust {
+        return Err(mlua::Error::runtime(format!(
+            "permission denied: answering a permission prompt answers for the user, so it \
+             needs every permission granted in {MANIFEST_FILE}"
+        )));
+    }
+    let decision: String = answer.get("decision")?;
+    let guidance: Option<String> = answer.get("guidance")?;
+    let answer = match decision.as_str() {
+        "allow" => PermissionAnswer::AllowOnce,
+        "deny" => match guidance.filter(|g| !g.trim().is_empty()) {
+            Some(g) => PermissionAnswer::DenyWithGuidance(g),
+            None => PermissionAnswer::Deny,
+        },
+        _ => return Ok(err_pair(ANSWER_DECISION_ERR)),
+    };
+    let req = SessionRequest::AnswerPermission {
+        handle: request_id,
+        answer,
+        plugin,
+    };
+    roundtrip(lua, tx, req).await
+}
+
 lua_table! {
     /// Host session primitives. The interactive UI can run several sessions
     /// at once. These functions list, create, focus, rename, and delete them.
@@ -423,8 +478,12 @@ lua_table! {
     /// Without a UI, most functions return `nil, "no interactive UI attached"`.
     /// `current` and `read` still work under `maki -p` and the sdk.
     /// `messages` and `notify` work everywhere, ACP included.
-    "maki.session" => pub(crate) fn create_session_table(tx: Option<flume::Sender<UiAction>>),
-    DOCS [list(tx), live(tx), current(tx), read(tx), messages(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), set_mode(tx), set_title(tx)]
+    "maki.session" => pub(crate) fn create_session_table(
+        tx: Option<flume::Sender<UiAction>>,
+        plugin: Arc<str>,
+        full_trust: bool
+    ),
+    DOCS [list(tx), live(tx), current(tx), read(tx), messages(tx), focus(tx), delete(tx), new(tx), prompt(tx), notify(), set_mode(tx), set_title(tx), answer_permission(tx, plugin, full_trust)]
 }
 
 #[cfg(test)]
@@ -450,10 +509,12 @@ mod tests {
     const THOUGHT: &str = "let me check";
     const IMAGE_DATA: &str = "iVBORw0KGgo=";
     const TEXT: &str = "hello";
+    const TEST_PLUGIN: &str = "remote";
+    const ASK_HANDLE: u64 = 7;
 
     fn lua_with_session(tx: Option<flume::Sender<UiAction>>) -> Lua {
         let lua = Lua::new();
-        let t = create_session_table(&lua, tx).unwrap();
+        let t = create_session_table(&lua, tx, Arc::from(TEST_PLUGIN), true).unwrap();
         lua.globals().set("session", t).unwrap();
         lua
     }
@@ -485,6 +546,62 @@ mod tests {
             smol::block_on(lua.load("return session.focus('abc')").eval_async()).unwrap();
         assert_eq!(err, None);
         assert_eq!(val.get::<String>("focused").unwrap(), "abc");
+    }
+
+    #[test_case("{ decision = 'allow' }", PermissionAnswer::AllowOnce ; "allow")]
+    #[test_case("{ decision = 'deny' }", PermissionAnswer::Deny ; "deny")]
+    #[test_case("{ decision = 'deny', guidance = '  ' }", PermissionAnswer::Deny ; "blank_guidance_is_a_plain_deny")]
+    #[test_case(
+        "{ decision = 'deny', guidance = 'use trash' }",
+        PermissionAnswer::DenyWithGuidance("use trash".into())
+        ; "deny_with_guidance"
+    )]
+    fn answer_permission_forwards_the_verdict(answer: &str, expected: PermissionAnswer) {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_session(Some(tx));
+        let checker = std::thread::spawn(move || {
+            let Ok(UiAction::Session {
+                req:
+                    SessionRequest::AnswerPermission {
+                        handle,
+                        answer,
+                        plugin,
+                    },
+                reply_tx,
+            }) = rx.recv()
+            else {
+                panic!("expected an answer_permission request");
+            };
+            assert_eq!((handle, &*plugin), (ASK_HANDLE, TEST_PLUGIN));
+            assert_eq!(answer, expected);
+            reply_tx.send(Ok(json!(true))).unwrap();
+        });
+        let code = format!("return session.answer_permission({ASK_HANDLE}, {answer})");
+        let (won, err): (bool, Option<String>) =
+            smol::block_on(lua.load(code).eval_async()).unwrap();
+        checker.join().unwrap();
+        assert_eq!(err, None);
+        assert!(won);
+    }
+
+    #[test]
+    fn answer_permission_takes_only_allow_or_deny() {
+        let lua = lua_with_session(None);
+        let code = "return session.answer_permission(1, { decision = 'allow_session' })";
+        let (val, err): (Value, Option<String>) =
+            smol::block_on(lua.load(code).eval_async()).unwrap();
+        assert!(val.is_nil());
+        assert_eq!(err.as_deref(), Some(ANSWER_DECISION_ERR));
+    }
+
+    #[test]
+    fn answer_permission_needs_every_permission() {
+        let lua = Lua::new();
+        let t = create_session_table(&lua, None, Arc::from(TEST_PLUGIN), false).unwrap();
+        lua.globals().set("session", t).unwrap();
+        let code = "return session.answer_permission(1, { decision = 'allow' })";
+        let err = smol::block_on(lua.load(code).eval_async::<Value>()).unwrap_err();
+        assert!(err.to_string().contains(MANIFEST_FILE), "{err}");
     }
 
     #[test_case("return session.prompt('hi', { session = 'abc' })", Some("abc") ; "explicit_session_id")]

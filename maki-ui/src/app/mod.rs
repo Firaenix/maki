@@ -17,7 +17,7 @@ pub(crate) mod tasks;
 pub(crate) mod tests;
 pub(crate) mod view;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::mem;
 use std::path::PathBuf;
@@ -42,7 +42,7 @@ use crate::components::lua_float::FloatManager;
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
 use crate::components::model_picker::{ModelPicker, ModelPickerAction};
 use crate::components::pack_review::{PackReview, PackReviewAction};
-use crate::components::permission_prompt::PermissionPrompt;
+use crate::components::permission_prompt::{AnsweredRequest, PermissionPrompt};
 use crate::components::plan_form::{PlanForm, PlanFormAction, builtin_menu, builtin_rows};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
 use crate::components::scrollbar;
@@ -58,7 +58,7 @@ use crate::repaint::{Cadence, Dirty, Watch};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use arc_swap::ArcSwapOption;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
-use maki_agent::permissions::{PermissionManager, TaggedAnswer};
+use maki_agent::permissions::{PermissionAnswer, PermissionManager, TaggedAnswer};
 use maki_agent::{
     AgentEvent, Envelope, ImageSource, McpConfigErrors, McpPromptInfo, McpSnapshotReader,
     SharedMessages, SubagentInfo,
@@ -128,6 +128,10 @@ const FAST_OFF_MSG: &str = "Fast mode: off";
 const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
 pub(crate) const NOTHING_TO_TRUST_MSG: &str = "nothing to trust in this folder";
+pub(crate) const PERMISSION_REQUESTED_EVENT: &str = "PermissionRequested";
+pub(crate) const PERMISSION_RESOLVED_EVENT: &str = "PermissionResolved";
+pub(crate) const RESOLVED_BY_USER: &str = "user";
+pub(crate) const RESOLVED_BY_CANCEL: &str = "cancelled";
 const TRUSTED_PREFIX: &str = "Trusted this folder: ";
 const PROVIDER_FOLDED_SUFFIX: &str = ": folded away";
 const PROVIDER_UNFOLDED_SUFFIX: &str = ": unfolded";
@@ -355,6 +359,10 @@ pub struct App {
     pub(super) chats: Vec<Chat>,
     pub(super) active_chat: usize,
     pub(super) chat_index: HashMap<String, usize>,
+    /// Cancel marks a task finished while its agent is still shutting down,
+    /// so the user can delete it before its last events arrive. Those events
+    /// would bring it back, so we drop them.
+    pub(super) deleted_tasks: HashSet<String>,
     pub(crate) input_box: InputBox,
     pub(super) command_palette: CommandPalette,
     pub(super) theme_picker: ThemePicker,
@@ -476,6 +484,7 @@ impl App {
             )],
             active_chat: 0,
             chat_index: HashMap::new(),
+            deleted_tasks: HashSet::new(),
             input_box,
             command_palette: CommandPalette::new(
                 custom_commands,
@@ -490,7 +499,7 @@ impl App {
             alert_modal: AlertModal::new(),
             help_modal: HelpModal::new(),
             usage_modal: UsageModal::new(),
-            btw_modal: BtwModal::new(typewriter, ui_config.show_thinking),
+            btw_modal: BtwModal::new(typewriter, ui_config.thinking_lines),
             float_mgr: FloatManager::new(),
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),
@@ -993,8 +1002,7 @@ impl App {
         // it and it owns the bottom panel. The pack review waits on nothing.
         if self.permission_prompt.is_open() {
             if let Some(answered) = self.permission_prompt.handle_key(key) {
-                let encoded = TaggedAnswer::new(&answered.id, answered.answer).encode();
-                self.send_to_agent(answered.subagent_id.as_deref(), encoded);
+                self.settle_permission(answered, RESOLVED_BY_USER);
             }
             return Some(vec![]);
         }
@@ -1546,7 +1554,9 @@ impl App {
         self.chats[self.active_chat].cancel_in_progress();
         self.chats[self.active_chat].mark_finished(TaskOutcome::Error, CANCELLED_TEXT);
         self.subagent_answers.remove(&tool_use_id);
-        self.permission_prompt.drop_subagent(&tool_use_id);
+        for handle in self.permission_prompt.drop_subagent(&tool_use_id) {
+            self.fire_permission_cancelled(handle);
+        }
 
         vec![Action::CancelSubagent { tool_use_id }]
     }
@@ -1588,6 +1598,14 @@ impl App {
                     "tool render event dropped: stale run_id"
                 );
             }
+            return vec![];
+        }
+
+        let task_id = match &envelope.event {
+            AgentEvent::SubagentHistory { tool_use_id, .. } => Some(tool_use_id),
+            _ => envelope.subagent.as_ref().map(|s| &s.parent_tool_use_id),
+        };
+        if task_id.is_some_and(|id| self.deleted_tasks.contains(id)) {
             return vec![];
         }
 
@@ -1722,7 +1740,14 @@ impl App {
         } = result
         {
             let project_trusted = self.permissions.project_is_trusted();
-            self.permission_prompt.push(
+            let mut data = serde_json::json!({
+                "tool_id": id,
+                "tool": tool.to_string(),
+                "scopes": scopes,
+                "reason": reason,
+                "subagent_id": subagent_id,
+            });
+            let handle = self.permission_prompt.push(
                 id,
                 tool,
                 scopes,
@@ -1730,6 +1755,8 @@ impl App {
                 project_trusted,
                 reason,
             );
+            data["request_id"] = handle.into();
+            self.fire_session_autocmd(PERMISSION_REQUESTED_EVENT, data);
             return vec![];
         }
 
@@ -2205,7 +2232,45 @@ impl App {
     }
 
     pub fn close_all_overlays(&mut self) {
+        for handle in self.permission_prompt.handles() {
+            self.fire_permission_cancelled(handle);
+        }
         self.overlays_mut().iter_mut().for_each(|o| o.close());
+    }
+
+    /// A plugin answering the ask {handle} names, racing the user at the
+    /// prompt. `false` when the ask is already settled, so the loser knows.
+    pub(crate) fn answer_permission(
+        &mut self,
+        handle: u64,
+        answer: PermissionAnswer,
+        plugin: &str,
+    ) -> bool {
+        let Some(answered) = self.permission_prompt.answer_by_handle(handle, answer) else {
+            return false;
+        };
+        self.settle_permission(answered, &format!("plugin:{plugin}"));
+        true
+    }
+
+    fn settle_permission(&mut self, answered: AnsweredRequest, by: &str) {
+        self.fire_session_autocmd(
+            PERMISSION_RESOLVED_EVENT,
+            serde_json::json!({
+                "request_id": answered.handle,
+                "decision": if answered.answer.is_allow() { "allow" } else { "deny" },
+                "by": by,
+            }),
+        );
+        let encoded = TaggedAnswer::new(&answered.id, answered.answer).encode();
+        self.send_to_agent(answered.subagent_id.as_deref(), encoded);
+    }
+
+    fn fire_permission_cancelled(&self, handle: u64) {
+        self.fire_session_autocmd(
+            PERMISSION_RESOLVED_EVENT,
+            serde_json::json!({ "request_id": handle, "by": RESOLVED_BY_CANCEL }),
+        );
     }
 
     /// Every poller that feeds the screen, in one place and never in `view`;
