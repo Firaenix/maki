@@ -187,6 +187,13 @@ rules, but nobody can answer their prompts, so a call that would prompt is
 denied. Give them allow rules for what they run. In plan mode their file writes
 are denied too.
 
+A plugin can answer an open prompt too, for example to relay it to your phone.
+It hears `PermissionRequested` when the prompt opens and answers with
+`maki.session.answer_permission`. The prompt stays on screen while the plugin
+waits, and whichever answer lands first settles the call. A plugin may only
+allow or deny that one call, so its answer never writes a rule. Answering for
+you takes every permission in the plugin's `plugin.toml`.
+
 ### Scope Generalization
 
 When you pick "always allow" (or always deny for MCP), the saved scope is generalized so it stays useful beyond that one call:
