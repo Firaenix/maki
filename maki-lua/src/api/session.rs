@@ -10,7 +10,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use maki_agent::agent::{SessionExport, live_header, live_history, live_snapshot};
+use maki_agent::permissions::PermissionAnswer;
 use maki_agent::session::{StoredSession, store_new};
+use maki_agent::tools::Authority;
 use maki_agent::{SessionMailbox, Transcript};
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::{ContentBlock, Message, Role};
@@ -29,7 +31,7 @@ use crate::api::util::command::{
 };
 use crate::api::util::convert::{TableExt, json_to_lua, json_to_lua_exact, lua_to_json};
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
-use crate::plugin_permissions::{Permission, PluginPermissions, require};
+use crate::plugin_permissions::{MANIFEST_FILE, Permission, PluginPermissions, require};
 use crate::runtime::Lineage;
 use crate::session_snapshot::SessionSnapshot;
 
@@ -82,6 +84,7 @@ const DOCUMENT_KEYS: [&str; 8] = [
     "facts",
     MESSAGES_KEY,
 ];
+const ANSWER_DECISION_ERR: &str = "decision must be \"allow\" or \"deny\"";
 
 /// Rewind and fork put a user turn back in the chat input, and Enter runs it
 /// as if a plugin that could send prompts wrote it. So a turn that runs
@@ -1262,6 +1265,65 @@ async fn set_title(
     roundtrip(lua, tx, req).await
 }
 
+/// Answering a prompt answers for the user, so it costs everything an
+/// undeclared tool could reach, plus `agent`, since the answer steers a turn.
+pub(crate) fn may_answer_for_user(perms: &PluginPermissions) -> bool {
+    perms.is_allowed(Permission::Agent)
+        && !perms
+            .lacking()
+            .any(|perm| Authority::Unbounded.requires(perm))
+}
+
+/// Answers an open permission prompt, racing the user at it. The prompt stays
+/// on screen until someone answers, and whichever answer lands first settles
+/// the call. A plugin may only allow or deny that one call, so nothing it
+/// answers records a rule. Answering for the user takes every permission in
+/// the plugin's `plugin.toml`.
+///
+/// @param request_id integer The `request_id` of a `PermissionRequested` event.
+/// @param answer table Required field: decision ("allow" or "deny").
+///   Optional: guidance (string) the agent reads with a deny.
+/// @return (boolean|nil, string|nil) true if this answer settled the prompt,
+///   false if the user or another plugin answered first, or nil and an error.
+/// @example
+/// maki.api.create_autocmd("PermissionRequested", {
+///   callback = function(ev)
+///     maki.session.answer_permission(ev.data.request_id, { decision = "deny" })
+///   end,
+/// })
+#[lua_fn]
+async fn answer_permission(
+    lua: Lua,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
+    #[ctx] plugin: Arc<str>,
+    #[ctx] full_trust: bool,
+    request_id: u64,
+    answer: Table,
+) -> LuaResult<Pair<Value>> {
+    if !full_trust {
+        return Err(mlua::Error::runtime(format!(
+            "permission denied: answering a permission prompt answers for the user, so it \
+             needs every permission granted in {MANIFEST_FILE}"
+        )));
+    }
+    let decision: String = answer.get("decision")?;
+    let guidance: Option<String> = answer.opt("guidance")?;
+    let answer = match decision.as_str() {
+        "allow" => PermissionAnswer::AllowOnce,
+        "deny" => match guidance.filter(|g| !g.trim().is_empty()) {
+            Some(g) => PermissionAnswer::DenyWithGuidance(g),
+            None => PermissionAnswer::Deny,
+        },
+        _ => return Ok(err_pair(ANSWER_DECISION_ERR)),
+    };
+    let req = SessionRequest::AnswerPermission {
+        handle: request_id,
+        answer,
+        plugin,
+    };
+    roundtrip(lua, tx, req).await
+}
+
 lua_table! {
     /// Host session primitives. The interactive UI can run several sessions
     /// at once. These functions list, create, focus, rename, and delete them.
@@ -1276,12 +1338,14 @@ lua_table! {
         perms: &PluginPermissions,
         grants: PluginPermissions,
         plugin: Arc<str>,
+        full_trust: bool,
     ),
     DOCS [
         list(tx), live(tx), current(tx), read(tx), export(perms, tx), messages(perms, tx),
         windows(perms, tx), subagents(perms, tx), focus(tx), delete(perms, tx),
         new(perms, tx, grants), prompt(perms, tx), notify(perms, grants), set_mode(perms, tx),
         set_title(perms, tx), data_dir(plugin, tx),
+        answer_permission(tx, plugin, full_trust),
     ]
 }
 
@@ -1333,6 +1397,7 @@ mod tests {
     const PLUGIN: &str = "test";
     const FACTS_CWD: &str = "/origin";
     const ONE_MESSAGE: &str = "{ { role = 'user', content = { { type = 'text', text = 'hi' } } } }";
+    const ASK_HANDLE: u64 = 7;
 
     fn lua_with_session(tx: Option<UnboundedSender<UiAction>>) -> Lua {
         lua_granted(tx, PluginPermissions::trusted())
@@ -1340,7 +1405,9 @@ mod tests {
 
     fn lua_granted(tx: Option<UnboundedSender<UiAction>>, grants: PluginPermissions) -> Lua {
         let lua = Lua::new();
-        let t = create_session_table(&lua, tx, &grants, grants.clone(), PLUGIN.into()).unwrap();
+        let full_trust = may_answer_for_user(&grants);
+        let t = create_session_table(&lua, tx, &grants, grants.clone(), PLUGIN.into(), full_trust)
+            .unwrap();
         lua.globals().set("session", t).unwrap();
         lua
     }
@@ -1432,6 +1499,69 @@ mod tests {
             .unwrap();
         assert_eq!(err, None);
         assert_eq!(val.get::<String>("focused").unwrap(), "abc");
+    }
+
+    #[test_case("{ decision = 'allow' }", PermissionAnswer::AllowOnce ; "allow")]
+    #[test_case("{ decision = 'deny' }", PermissionAnswer::Deny ; "deny")]
+    #[test_case("{ decision = 'deny', guidance = '  ' }", PermissionAnswer::Deny ; "blank_guidance_is_a_plain_deny")]
+    #[test_case(
+        "{ decision = 'deny', guidance = 'use trash' }",
+        PermissionAnswer::DenyWithGuidance("use trash".into())
+        ; "deny_with_guidance"
+    )]
+    #[tokio::test]
+    async fn answer_permission_forwards_the_verdict(answer: &str, expected: PermissionAnswer) {
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
+        let lua = lua_with_session(Some(tx));
+        let checker = std::thread::spawn(move || {
+            let Some(UiAction::Session {
+                req:
+                    SessionRequest::AnswerPermission {
+                        handle,
+                        answer,
+                        plugin,
+                    },
+                reply_tx,
+            }) = rx.blocking_recv()
+            else {
+                panic!("expected an answer_permission request");
+            };
+            assert_eq!((handle, &*plugin), (ASK_HANDLE, PLUGIN));
+            assert_eq!(answer, expected);
+            reply_tx.send(Ok(json!(true))).unwrap();
+        });
+        let code = format!("return session.answer_permission({ASK_HANDLE}, {answer})");
+        let (won, err): (bool, Option<String>) = lua.load(code).eval_async().await.unwrap();
+        checker.join().unwrap();
+        assert_eq!(err, None);
+        assert!(won);
+    }
+
+    #[tokio::test]
+    async fn answer_permission_takes_only_allow_or_deny() {
+        let lua = lua_with_session(None);
+        let code = "return session.answer_permission(1, { decision = 'allow_session' })";
+        let (val, err): (Value, Option<String>) = lua.load(code).eval_async().await.unwrap();
+        assert!(val.is_nil());
+        assert_eq!(err.as_deref(), Some(ANSWER_DECISION_ERR));
+    }
+
+    #[tokio::test]
+    async fn answer_permission_needs_every_permission() {
+        let lua = Lua::new();
+        let t = create_session_table(
+            &lua,
+            None,
+            &PluginPermissions::trusted(),
+            PluginPermissions::trusted(),
+            PLUGIN.into(),
+            false,
+        )
+        .unwrap();
+        lua.globals().set("session", t).unwrap();
+        let code = "return session.answer_permission(1, { decision = 'allow' })";
+        let err = lua.load(code).eval_async::<Value>().await.unwrap_err();
+        assert!(err.to_string().contains(MANIFEST_FILE), "{err}");
     }
 
     #[test_case("return session.prompt('hi', { session = 'abc' })", Some("abc") ; "explicit_session_id")]

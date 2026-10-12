@@ -231,8 +231,9 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 /// `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"SessionTitleChanged"`,
 /// `"SessionCwdChanged"`, `"TaskStatusChanged"`, `"TaskStopped"`, `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
-/// `"ModeChanged"` and `"FileIndexReady"`. Plugins can also fire their own
-/// events with `exec_autocmds`.
+/// `"ModeChanged"`, `"PermissionRequested"`, `"PermissionResolved"` and
+/// `"FileIndexReady"`. Plugins can also fire their own events with
+/// `exec_autocmds`.
 ///
 /// Every host event carries `data.session_id` except `"FileIndexReady"`,
 /// which is about a directory rather than a session, and `"ModeChanged"`,
@@ -307,6 +308,15 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 ///   and when the chat input gains or loses the keyboard, as when a picker
 ///   opens. Use it to draw a mode indicator. Like `"InputChanged"`, it fires
 ///   only with a UI.
+/// - `"PermissionRequested"`: `data.request_id`, the handle
+///   `maki.session.answer_permission` takes, unique across the process, plus
+///   `data.tool`, `data.scopes`, `data.tool_id` (empty for a call nested in
+///   batch or code_execution), `data.subagent_id` and `data.reason` (why a
+///   plugin escalated the call, if one did). Fires when the prompt opens,
+///   so the prompt is already on screen while a plugin decides.
+/// - `"PermissionResolved"`: `data.request_id` and `data.by`: `"user"`,
+///   `"plugin:<name>"`, or `"cancelled"` when the run that asked is gone.
+///   `data.decision` (`"allow"` or `"deny"`) comes with every answer.
 /// - `"FileIndexReady"`: `data.root`, the absolute directory that was
 ///   walked, `data.files`, how many paths the walk left, and `data.crashed`
 ///   and `data.truncated`, the two ways that list is not the whole tree.
@@ -329,8 +339,9 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// subagent turns never show up. A manual `/compact` ends its run without
 /// ending a turn, so it stays quiet too.
 ///
-/// Drivers are not all caught up. `"TurnStart"` and `"PlanReady"` come from
-/// `maki-ui` only. `maki-acp` runs the agent on its own loop and does not
+/// Drivers are not all caught up. `"TurnStart"`, `"PlanReady"`,
+/// `"PermissionRequested"` and `"PermissionResolved"` come from `maki-ui`
+/// only. `maki-acp` runs the agent on its own loop and does not
 /// call the dispatcher yet, so plugins loaded under ACP receive no turn
 /// events. Everything else fires under `maki -p` and sdk mode as well.
 ///

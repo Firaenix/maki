@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use maki_agent::agent::SessionExport;
+use maki_agent::permissions::PermissionAnswer;
 use maki_agent::{Envelope, SharedBuf, SubagentInfo, TaskEnd, Transcript};
 use maki_storage::id::MakiId;
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
@@ -514,6 +515,13 @@ pub enum SessionRequest {
     SetTitle {
         id: String,
         title: String,
+    },
+    /// A plugin's answer to an open permission ask, racing the user at the
+    /// prompt. The UI replies whether this answer was the one that settled it.
+    AnswerPermission {
+        handle: u64,
+        answer: PermissionAnswer,
+        plugin: Arc<str>,
     },
 }
 
