@@ -121,6 +121,7 @@ pub(crate) fn create_maki_global(
             permissions,
             permissions.clone(),
             Arc::clone(&plugin),
+            session::may_answer_for_user(permissions),
         )?,
     )?;
     maki.set(

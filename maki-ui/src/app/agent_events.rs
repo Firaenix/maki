@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use maki_agent::{AgentEvent, Envelope, SubagentInfo, ToolDoneEvent};
+use maki_lua::agent_autocmd::HostEvent;
 use maki_providers::{TokenUsage, add_cost};
 use maki_storage::sessions::StoredTokenUsage;
 
@@ -403,15 +404,25 @@ impl App {
             } => {
                 let project_answers =
                     ProjectAnswers::new(self.permissions.project_is_trusted(), &self.trust);
+                let tool_name = tool.to_string();
+                let mut handle = 0;
                 self.open_prompt(|app| {
-                    app.permission_prompt.push(
-                        id,
+                    handle = app.permission_prompt.push(
+                        id.clone(),
                         tool,
-                        scopes,
-                        subagent_id,
+                        scopes.clone(),
+                        subagent_id.clone(),
                         project_answers,
-                        reason,
+                        reason.clone(),
                     );
+                });
+                self.fire_session_event(HostEvent::PermissionRequested {
+                    request_id: handle,
+                    tool_id: &id,
+                    tool: tool_name,
+                    scopes: &scopes,
+                    reason: reason.as_deref(),
+                    subagent_id: subagent_id.as_deref(),
                 });
             }
             AgentEvent::AuthRequired => self.park_for_auth(chat_idx),
