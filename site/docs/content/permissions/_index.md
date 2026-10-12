@@ -182,6 +182,13 @@ ACP clients offer the four options the protocol defines. "Allow always" lasts
 for the session, and "Reject always" is a project answer that follows folder
 trust like the TUI, reading "Reject for this session" in an untrusted folder.
 
+A plugin can answer an open prompt too, for example to relay it to your phone.
+It hears `PermissionRequested` when the prompt opens and answers with
+`maki.session.answer_permission`. The prompt stays on screen while the plugin
+waits, and whichever answer lands first settles the call. A plugin may only
+allow or deny that one call, so its answer never writes a rule. Answering for
+you takes every permission in the plugin's `plugin.toml`.
+
 ### Scope Generalization
 
 When you pick "always allow" (or always deny for MCP), the saved scope is generalized so it stays useful beyond that one call:
