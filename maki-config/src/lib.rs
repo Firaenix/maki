@@ -141,9 +141,7 @@ pub const PROVIDER_BUILTINS: &[&str] = &[
 /// costs at scale is not yet known.
 pub const OPTIONAL_BUILTINS: &[&str] = &["completion"];
 
-/// These used to be their own `tools.<name>` tables and are now edit plugin
-/// options; the config layer uses this list to reject the old form with a
-/// pointer to the new one.
+/// Tools the edit plugin provides alongside `edit`, toggled through its options.
 pub const EDIT_SUB_TOOLS: &[&str] = &["edit_lines", "insert_lines", "multiedit"];
 
 pub const FILE_WRITE_TOOLS: &[&str] = &["write", "edit", "multiedit", "edit_lines", "insert_lines"];
@@ -416,24 +414,10 @@ pub enum ConfigError {
     #[error("invalid config: always_thinking: {0}")]
     Thinking(#[from] ThinkingParseError),
     #[error(
-        "invalid config: plugins.{tool} was removed; {tool} is provided by the edit plugin, \
-         set plugins.edit = {{ {tool} = true|false }} instead"
-    )]
-    RemovedEditSubTool { tool: &'static str },
-    #[error(
         "invalid config: plugins.{plugin}: no bundled plugin or installed \
          package is named \"{plugin}\" (available: {valid})"
     )]
     UnknownPlugin { plugin: String, valid: String },
-    #[error(
-        "invalid config: the `tools` table in maki.setup was renamed to `plugins` \
-         (plugins can provide more than tools).\n\n\
-         Fix your config with:\n\n    \
-         sed -i.bak 's/^\\( *\\)tools *=/\\1plugins =/' ~/.config/maki/init.lua\n\n\
-         Run it on .maki/init.lua too if you keep a project config. \
-         A .bak backup is left next to the file."
-    )]
-    RenamedToolsTable,
     #[error(
         "invalid config: ui.show_thinking was replaced by ui.thinking_lines. \
          Use thinking_lines = -1 for show_thinking = true, or 0 for show_thinking = false"
@@ -542,9 +526,6 @@ pub struct RawConfig {
     pub trust: TrustFileConfig,
     pub telemetry: TelemetryConfig,
     pub plugins: HashMap<String, PluginFileConfig>,
-    /// Renamed to `plugins`; kept so old configs fail with a pointer to the
-    /// new name instead of a generic unknown-field error.
-    tools: HashMap<String, PluginFileConfig>,
 }
 
 impl RawConfig {
@@ -571,7 +552,6 @@ impl RawConfig {
             }
             entry.opts.extend(plugin.opts);
         }
-        self.tools.extend(overlay.tools);
     }
 
     /// `packages` are the external package names discovery found. They are
@@ -608,14 +588,6 @@ impl RawConfig {
     /// A `plugins.<name>` key that matches no bundled plugin is a typo or an
     /// old config, so fail loudly instead of letting it silently drift.
     fn validate_plugin_tables(&self, packages: &[String]) -> Result<(), ConfigError> {
-        if !self.tools.is_empty() {
-            return Err(ConfigError::RenamedToolsTable);
-        }
-        for &name in EDIT_SUB_TOOLS {
-            if self.plugins.contains_key(name) {
-                return Err(ConfigError::RemovedEditSubTool { tool: name });
-            }
-        }
         let mut unknown: Vec<&String> = self
             .plugins
             .keys()
@@ -2273,16 +2245,6 @@ fn parse_mcp_server_table(
                                 push_mcp_tool_rule(rules, server_name, tool_name, effect);
                             }
                         }
-                    }
-                    toml::Value::Boolean(true) => {
-                        tracing::warn!(
-                            server = server_name,
-                            key = key.as_str(),
-                            "{key} = true is deprecated — use default = \"{key}\" instead; ignoring"
-                        );
-                    }
-                    toml::Value::Boolean(false) => {
-                        // No-op: explicitly disabled.
                     }
                     toml::Value::String(s) => {
                         let tool_name = s.as_str();
@@ -4253,22 +4215,6 @@ mod tests {
         assert!(on.plugins.names.iter().any(|n| n == name));
     }
 
-    #[test]
-    fn removed_sub_tool_tables_error() {
-        for &tool in EDIT_SUB_TOOLS {
-            let raw: RawConfig = toml::from_str(&format!("[plugins.{tool}]\n")).unwrap();
-            let Err(err) = raw.into_config(&[]) else {
-                panic!("plugins.{tool} should be rejected");
-            };
-            let msg = err.to_string();
-            assert!(
-                msg.contains(&format!("plugins.{tool} was removed"))
-                    && msg.contains("plugins.edit = {"),
-                "error should point at plugins.edit, got: {msg}"
-            );
-        }
-    }
-
     #[test_case("enabled = false" ; "enabled_false")]
     #[test_case("search_result_limit = 50" ; "opts_only")]
     fn unknown_plugin_name_errors(body: &str) {
@@ -4355,18 +4301,6 @@ mod tests {
     }
 
     #[test]
-    fn renamed_tools_table_errors() {
-        let raw: RawConfig = toml::from_str("[tools.bash]\nenabled = true\n").unwrap();
-        let Err(err) = raw.into_config(&[]) else {
-            panic!("old tools table should be rejected");
-        };
-        assert!(
-            err.to_string().contains("renamed to `plugins`"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
     fn edit_sub_tool_toggles_flow_as_edit_opts() {
         let raw: RawConfig =
             toml::from_str("[plugins.edit]\nmultiedit = false\nedit_lines = true\n").unwrap();
@@ -4407,62 +4341,6 @@ mod tests {
                 tool: "fetch".into()
             }
             && r.effect == Effect::Allow));
-    }
-
-    #[test]
-    fn permissions_mcp_server_wide_allow_true_ignored() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        write_global_permissions(dir.path(), "[mcp.deepwiki]\nallow = true\n");
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
-        assert_eq!(perms.rules.len(), 0, "no rules generated");
-        assert!(
-            !perms.tool_defaults.contains_key(&ToolKey::McpServer {
-                server: "deepwiki".into()
-            }),
-            "allow = true is deprecated and ignored — no default injected"
-        );
-    }
-
-    #[test]
-    fn permissions_mcp_deny_true_ignored() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        write_global_permissions(dir.path(), "[mcp.server]\ndeny = true\n");
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
-        assert!(
-            !perms.tool_defaults.contains_key(&ToolKey::McpServer {
-                server: "server".into()
-            }),
-            "deny = true is deprecated and ignored — no default injected"
-        );
-    }
-
-    #[test]
-    fn explicit_default_preserved_with_deprecated_deny_true() {
-        let dir = TempDir::new().unwrap();
-        let global = global_config_dir(dir.path());
-        write_global_permissions(
-            dir.path(),
-            "[mcp.server]\ndefault = \"allow\"\ndeny = true\n",
-        );
-        let perms = load_permissions_inner(
-            std::slice::from_ref(&global),
-            &ProjectConfig::for_project(dir.path()),
-        );
-        assert_eq!(
-            perms.tool_defaults.get(&ToolKey::McpServer {
-                server: "server".into()
-            }),
-            Some(&DefaultEffect::Allow),
-            "explicit default still works; deprecated deny = true is ignored"
-        );
     }
 
     #[test]

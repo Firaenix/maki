@@ -772,6 +772,9 @@ impl<'t> EventLoop<'t> {
                 Err(e) => break Err(e),
             }
             self.checkpoint_all();
+            for rt in &self.sessions {
+                rt.handles.publish_chat_settings(&rt.app);
+            }
             if dirty.take()
                 && let Err(e) = self.paint()
             {
@@ -1029,6 +1032,15 @@ impl<'t> EventLoop<'t> {
                     Err(e) => {
                         let _ = reply_tx.send(Err(e));
                     }
+                }
+            }
+            UiAction::BackgroundUsage {
+                session,
+                model,
+                usage,
+            } => {
+                for rt in &mut self.sessions {
+                    rt.app.add_background_usage(session, &model, usage);
                 }
             }
         }

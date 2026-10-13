@@ -23,8 +23,6 @@ use crate::resume::{self, Resolved};
 use crate::setup;
 
 const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
-const STALE_PROJECT_CONFIG: &str = ".maki/config.toml";
-const STALE_GLOBAL_CONFIG: &str = "config.toml";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
 const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous model";
 const POLICY_GRANT_NOTICE: &str = "folder trusted by trust.paths pattern";
@@ -312,7 +310,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
     };
     let mut trust = project::resolve(&storage, &cwd, mode);
     load_env_files(&trust.project_config);
-    warn_stale_config_toml(&trust.project_config);
     let mut teardown = Teardown::default();
     let launch = Launch {
         cli: &cli,
@@ -568,24 +565,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     "reload: rebuilt plugins and config"
                 );
             }
-        }
-    }
-}
-
-/// Trust has nothing to say about this file, because Maki no longer reads it.
-/// Someone who declined trust deserves to hear that the file is inert just as
-/// much as someone who accepted.
-fn warn_stale_config_toml(project_config: &ProjectConfig) {
-    let stale_paths = [
-        maki_config::global_config_dir().map(|dir| dir.join(STALE_GLOBAL_CONFIG)),
-        Some(project_config.config_root().join(STALE_PROJECT_CONFIG)),
-    ];
-    for path in stale_paths.into_iter().flatten() {
-        if path.is_file() {
-            tracing::warn!(
-                path = %path.display(),
-                "config.toml found but no longer used. Migrate to init.lua. See https://maki.sh/docs/configuration/"
-            );
         }
     }
 }

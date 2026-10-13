@@ -34,13 +34,9 @@ struct ModelsCache {
     /// [`fingerprint`]. One cache file serves every maki process on the
     /// machine, so without it a shell logged into account A replays its list
     /// into a shell logged into account B and the picker offers models that
-    /// account cannot touch. Files written before this field existed
-    /// deserialize to an empty string, which matches no live fingerprint and
-    /// so is discarded like any other mismatch.
-    #[serde(default)]
+    /// account cannot touch.
     fingerprint: String,
     /// Unix milliseconds, for [`MAX_AGE_MS`].
-    #[serde(default)]
     written_at: u64,
     specs: Vec<String>,
 }
@@ -353,15 +349,6 @@ mod tests {
             ["old/model"]
         );
         assert!(replay(&path, &policy, fingerprint, now_ms).is_empty());
-    }
-
-    #[test]
-    fn cache_without_fingerprint_is_a_miss() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(CACHE_FILE);
-        std::fs::write(&path, br#"{"specs":["old/model"],"known":{}}"#).unwrap();
-        assert!(load_from(&path).is_some(), "the old shape still parses");
-        assert!(replay(&path, &ModelPolicy::default(), FINGERPRINT, NOW).is_empty());
     }
 
     #[test]

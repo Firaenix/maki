@@ -1738,33 +1738,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_event_tool_snapshot_theme_gen_backwards_compat() {
-        const OMIT_MSG: &str = "theme_gen: None must not appear in serialized JSON";
-        const COMPAT_MSG: &str = "missing theme_gen must deserialize as None (backwards compat)";
-
-        let event = AgentEvent::ToolSnapshot {
-            id: "t1".into(),
-            snapshot: BufferSnapshot {
-                lines: Arc::new(vec![]),
-            },
-            theme_gen: None,
-        };
-        let json = serde_json::to_string(&event).unwrap();
-        assert!(!json.contains("theme_gen"), "{OMIT_MSG}");
-
-        #[derive(Deserialize)]
-        struct ToolSnapshotFields {
-            #[allow(dead_code)]
-            id: String,
-            #[serde(default)]
-            theme_gen: Option<u64>,
-        }
-        let json_without = r#"{"id":"t1"}"#;
-        let parsed: ToolSnapshotFields = serde_json::from_str(json_without).unwrap();
-        assert_eq!(parsed.theme_gen, None, "{COMPAT_MSG}");
-    }
-
-    #[test]
     fn text_output_serde_legacy_bare_string() {
         const MSG: &str = "old sessions store Plain as a bare string";
         let json = r#"{"Plain":"hello world"}"#;

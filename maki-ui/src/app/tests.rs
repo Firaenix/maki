@@ -34,7 +34,9 @@ use maki_providers::{
 };
 use maki_storage::id::MakiId;
 use maki_storage::model::read_thinking;
-use maki_storage::sessions::{SessionClaim, SessionMeta, StoredMode, StoredThinking};
+use maki_storage::sessions::{
+    SessionClaim, SessionMeta, StoredMode, StoredThinking, StoredTokenUsage,
+};
 use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -99,6 +101,8 @@ const PERMISSIONS_CWD: &str = "/tmp";
 /// doubles as the window the gauge is allowed to land in.
 const SMALL_HISTORY: u32 = 1_000;
 const AGENT_ERROR_MSG: &str = "boom";
+const HELP_COMMAND: &str = "/help";
+const MAIN_DRAFT: &str = "for main";
 const MULTIBYTE_ERROR_CHAR: &str = "é";
 const TRUST: &str = "/trust";
 const GATED_INIT_SOURCE: &str = "-- shipped by the project";
@@ -772,6 +776,10 @@ fn app_with_queued_message() -> App {
     app
 }
 
+fn palette_open(app: &mut App) -> bool {
+    app.command_palette.is_active(&app.input_box.buffer)
+}
+
 fn type_and_submit(app: &mut App, text: &str) -> Vec<Action> {
     for c in text.chars() {
         app.update(Msg::Key(key(KeyCode::Char(c))));
@@ -813,10 +821,10 @@ fn typing_filters_palette() {
     let mut app = test_app();
     type_slash(&mut app);
     app.update(Msg::Key(key(KeyCode::Char('n'))));
-    assert!(app.command_palette.is_active());
+    assert!(palette_open(&mut app));
 
     app.update(Msg::Key(key(KeyCode::Char('z'))));
-    assert!(!app.command_palette.is_active());
+    assert!(!palette_open(&mut app));
 }
 
 #[test]
@@ -826,17 +834,17 @@ fn enter_executes_new_command() {
     app.update(Msg::Key(key(KeyCode::Char('n'))));
     let actions = app.update(Msg::Key(key(KeyCode::Enter)));
     assert!(matches!(&actions[0], Action::RestartAgent(h) if h.is_empty()));
-    assert!(!app.command_palette.is_active());
+    assert!(!palette_open(&mut app));
 }
 
 #[test]
 fn ctrl_c_closes_palette() {
     let mut app = test_app();
     type_slash(&mut app);
-    assert!(app.command_palette.is_active());
+    assert!(palette_open(&mut app));
 
     app.update(Msg::Key(kb::QUIT.to_key_event()));
-    assert!(!app.command_palette.is_active());
+    assert!(!palette_open(&mut app));
 }
 
 /// Plugins that only watch read the prompt here, instead of wrapping
@@ -1641,7 +1649,7 @@ fn tool_lifecycle_events_name_the_session_and_tool() {
 fn tab_in_palette_completes_command() {
     let mut app = test_app();
     type_slash(&mut app);
-    assert!(app.command_palette.is_active());
+    assert!(palette_open(&mut app));
 
     app.update(Msg::Key(key(KeyCode::Tab)));
     let val = app.input_box.buffer.value();
@@ -1994,6 +2002,32 @@ fn turn_complete_accumulates_usage_by_model() {
     let sub = &by_model["sub-model"];
     assert_eq!(sub.input, 200);
     assert_eq!(sub.output, 75);
+}
+
+const BACKGROUND_MODEL: &str = "background-model";
+const BACKGROUND_USAGE: StoredTokenUsage = StoredTokenUsage {
+    input: 300,
+    output: 40,
+    cache_creation: 0,
+    cache_read: 0,
+    cost: Some(0.011),
+    subsidised_list_cost: None,
+};
+
+#[test]
+fn background_usage_bills_only_the_tab_showing_its_session() {
+    let mut app = test_app();
+
+    app.add_background_usage(MakiId::generate(), BACKGROUND_MODEL, BACKGROUND_USAGE);
+    app.add_background_usage(app.state.session.id, BACKGROUND_MODEL, BACKGROUND_USAGE);
+
+    assert_eq!(app.state.cost, BACKGROUND_USAGE.cost);
+    assert_eq!(app.chats[0].cost, BACKGROUND_USAGE.cost);
+    assert_eq!(app.state.token_usage, TokenUsage::from(BACKGROUND_USAGE));
+    assert_eq!(
+        app.state.session.usage_by_model().get(BACKGROUND_MODEL),
+        Some(&BACKGROUND_USAGE)
+    );
 }
 
 #[test]
@@ -5433,7 +5467,7 @@ fn the_command_palette_outranks_the_keys_a_popup_claimed() {
 
     type_slash(&mut app);
     app.update(Msg::Key(key(KeyCode::Char('n'))));
-    assert!(app.command_palette.is_active(), "the palette is up");
+    assert!(palette_open(&mut app), "the palette is up");
 
     app.update(Msg::Key(key(KeyCode::Tab)));
     assert!(
@@ -6849,6 +6883,45 @@ fn submit_in_subagent_chat_queues_for_that_subagent() {
     );
     assert_eq!(app.chats[0].message_count(), main_messages);
     assert!(app.input_box.is_empty());
+}
+
+#[test_case(HELP_COMMAND, |_, app| app.help_modal.is_open() ; "slash_command")]
+#[test_case("!ls", |actions, _| matches!(actions, [Action::ShellCommand { .. }]) ; "shell")]
+fn command_in_subagent_chat_runs_in_main_chat(input: &str, ran: fn(&[Action], &App) -> bool) {
+    let (mut app, inbox) = app_with_subagent_inbox();
+    app.chats[MAIN_CHAT].draft.text = MAIN_DRAFT.into();
+
+    let actions = type_and_submit(&mut app, input);
+
+    assert!(ran(&actions, &app));
+    assert_eq!(inbox.len(), 0);
+    assert_eq!(app.active_chat, MAIN_CHAT);
+    assert_eq!(app.input_box.buffer.value(), MAIN_DRAFT);
+    assert!(app.chats[1].draft.text.is_empty());
+}
+
+#[test]
+fn exit_in_subagent_chat_quits() {
+    let (mut app, inbox) = app_with_subagent_inbox();
+    let actions = type_and_submit(&mut app, EXIT_WORD);
+    assert!(matches!(actions.as_slice(), [Action::ManualExit]));
+    assert_eq!(inbox.len(), 0);
+}
+
+/// These change the text without a keypress, and `Enter` must still act on
+/// what the box shows.
+#[test_case(false, |app| app.input_box.set_input(HELP_COMMAND.into()), true ; "set_directly_opens_it")]
+#[test_case(true, |app| app.input_box.set_input(MAIN_DRAFT.into()), false ; "replaced_directly_closes_it")]
+#[test_case(true, |app| { app.run_builtin(BuiltinAction::PrevChat); }, false ; "chat_switch_closes_it")]
+fn enter_acts_on_what_the_box_shows(open_first: bool, change: fn(&mut App), runs_command: bool) {
+    let (mut app, _inbox) = app_with_subagent_inbox();
+    if open_first {
+        app.update(Msg::Paste(HELP_COMMAND.into()));
+        assert!(palette_open(&mut app));
+    }
+    change(&mut app);
+    app.update(Msg::Key(key(KeyCode::Enter)));
+    assert_eq!(app.help_modal.is_open(), runs_command);
 }
 
 /// The subagent's loop reports the pickup like the main one does, and the

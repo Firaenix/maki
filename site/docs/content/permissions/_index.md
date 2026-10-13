@@ -112,7 +112,7 @@ deny = ["admin_delete"]
 
 Each tool gets its own section with `allow` and `deny` arrays. Values are glob-like scope patterns.
 
-> **Note:** In MCP server sections (`[mcp.*]`), the boolean forms `allow = true` and `deny = true` are deprecated and ignored. Use `default = "allow"` or `default = "deny"` instead. For native tool sections (e.g. `[bash]`), `allow = true` still works.
+> **Note:** In MCP server sections (`[mcp.*]`), `allow` and `deny` take tool names only. Set a server-wide default with `default = "allow"` or `default = "deny"`. Native tool sections (e.g. `[bash]`) also accept `allow = true`.
 
 ### The `default` key
 
@@ -184,6 +184,11 @@ of reaching `.maki/permissions.toml`.
 ACP clients offer the four options the protocol defines. "Allow always" lasts
 for the session, and "Reject always" is a project answer that follows folder
 trust like the TUI, reading "Reject for this session" in an untrusted folder.
+
+Plugin [background subagents](/docs/lua-api/#maki-agent-session) follow these
+rules, but nobody can answer their prompts, so a call that would prompt is
+denied. Give them allow rules for what they run. In plan mode their file writes
+are denied too.
 
 A plugin can answer an open prompt too, for example to relay it to your phone.
 It hears `PermissionRequested` when the prompt opens and answers with

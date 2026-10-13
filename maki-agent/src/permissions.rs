@@ -7,11 +7,13 @@ use maki_config::{
     DefaultEffect, Effect, FILE_WRITE_TOOLS, PermissionRule, PermissionTarget, PermissionsConfig,
     ProjectConfig, ToolKey, append_permission_rule,
 };
+use maki_storage::id::SessionRef;
 use thiserror::Error;
 use tracing::{info, warn};
 
+use crate::tools::PermissionScopes;
 use crate::tools::registry::BoxFuture;
-use crate::{AgentEvent, EventSender};
+use crate::{AgentEvent, CancelToken, EventSender};
 
 pub const DEFAULT_DENY_GUIDANCE: &str =
     "Do not retry. Try a different approach or ask the user for guidance.";
@@ -140,6 +142,8 @@ const ORIGIN_PLUGIN: &str = "a Lua plugin";
 
 const USER_REJECTED_REASON: &str = "rejected by the user";
 const PROMPT_UNANSWERED_REASON: &str = "permission prompt cancelled, unanswered";
+const UNATTENDED_REASON: &str =
+    "no one can answer a permission prompt in this session, so this call needs an allow rule";
 const PLUGIN_DENIED_REASON: &str = "denied by a plugin answering the prompt";
 
 fn deny_rule_reason(origin: &str, rule: &PermissionRule) -> String {
@@ -748,15 +752,19 @@ impl PermissionManager {
     /// `ask` is a plugin's reason to show this call to the user whatever the
     /// rules say. See [`Self::check_escalated`]. `layers` is the chain that may
     /// answer the prompt in the user's place, and runs before it opens.
+    ///
+    /// No `user_response_rx` means nobody is there to answer, like in `maki -p`
+    /// or a background session, so a prompt is denied instead of waiting forever.
     #[allow(clippy::too_many_arguments)]
     pub async fn enforce(
         &self,
         tool: &ToolKey,
-        scopes: &crate::tools::PermissionScopes,
+        scopes: &PermissionScopes,
+        session: Option<&SessionRef>,
         event_tx: &EventSender,
         user_response_rx: Option<&smol::lock::Mutex<flume::Receiver<String>>>,
         request_id: &str,
-        cancel: &crate::CancelToken,
+        cancel: &CancelToken,
         plan_path: Option<&Path>,
         ask: Option<&str>,
         layers: Option<&dyn PromptLayers>,
@@ -839,10 +847,16 @@ impl PermissionManager {
         }
 
         let Some(rx) = user_response_rx else {
-            warn!(tool = %tool, scope = %scope_display(), "no permission response channel");
+            warn!(
+                tool = %tool,
+                scope = %scope_display(),
+                session = ?session,
+                request_id,
+                "denied a permission prompt nobody can answer"
+            );
             return Err(deny(
                 DECISION_SOURCE_USER_ABORT,
-                PROMPT_UNANSWERED_REASON.to_owned(),
+                UNATTENDED_REASON.to_owned(),
                 None,
                 None,
             ));
@@ -1184,6 +1198,27 @@ mod tests {
 
     fn default_mgr() -> PermissionManager {
         mgr_with(PermissionsConfig::default(), PathBuf::from("/tmp"))
+    }
+
+    #[test]
+    fn unattended_denies_prompt_without_parking() {
+        let (event_tx, events) = flume::unbounded();
+        let err = smol::block_on(default_mgr().enforce(
+            &ToolKey::native(BASH_TOOL),
+            &PermissionScopes::single("cargo test".to_owned()),
+            None,
+            &EventSender::new(event_tx, 0),
+            None,
+            TAGGED_REQUEST_ID,
+            &CancelToken::none(),
+            None,
+            None,
+            None,
+        ))
+        .unwrap_err();
+
+        assert_eq!(err.reason, UNATTENDED_REASON);
+        assert!(events.is_empty(), "no prompt may go out");
     }
 
     fn plugin_edit_rule(scope: &str, effect: Effect) -> PermissionRule {
@@ -2503,6 +2538,7 @@ mod tests {
         let result = smol::block_on(mgr.enforce(
             &ToolKey::native(BASH_TOOL),
             &crate::tools::PermissionScopes::single(LAYER_SCOPE.to_owned()),
+            None,
             &guard.sender(0),
             None,
             TAGGED_REQUEST_ID,

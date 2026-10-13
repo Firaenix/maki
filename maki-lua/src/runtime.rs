@@ -63,6 +63,7 @@ use crate::api::util::convert::{json_to_lua, lua_to_json_within};
 use crate::api::util::ctx::{LuaCtx, RestoreCtx};
 use crate::api::util::setup::ConfigStore;
 use crate::api::{Owner, create_maki_global};
+use crate::background::BackgroundSessions;
 use crate::docs_render;
 use crate::error::PluginError;
 use crate::key_lint::KeyLint;
@@ -1321,9 +1322,12 @@ pub(crate) struct PluginEnvs(HashMap<Arc<str>, usize>);
 struct HostUi(Option<flume::Sender<UiAction>>);
 
 fn host_flash(lua: &Lua, msg: String) {
-    if let Some(ui) = lua.app_data_ref::<HostUi>() {
-        let _ = ui_send(ui.0.as_ref(), UiAction::Flash(msg));
-    }
+    let _ = ui_send(host_ui(lua).as_ref(), UiAction::Flash(msg));
+}
+
+/// For host code that has the VM but no `#[ctx]` sender of its own.
+pub(crate) fn host_ui(lua: &Lua) -> Option<flume::Sender<UiAction>> {
+    lua.app_data_ref::<HostUi>()?.0.clone()
 }
 
 /// Who to name for the code a watchdog interrupt caught running.
@@ -1602,6 +1606,7 @@ async fn run_host_hook(lua: &Lua, hook: HostHook) {
             crate::api::autocmd::dispatch(lua.clone(), SESSION_END_EVENT.to_owned(), None, data)
                 .await;
             with_jobs(lua, |store| store.kill_session(lua, end.session));
+            BackgroundSessions::of(lua).end_session(end.session);
             // Nothing can pick from this session's plan form again.
             clear_session_rows(lua, &end.session.to_string());
             if let Some((_, reply)) = end.wait {
@@ -1650,6 +1655,7 @@ impl Drop for TaskScope {
                 );
             }
         });
+        BackgroundSessions::of(&self.lua).end_task(task_id);
     }
 }
 
@@ -1724,6 +1730,12 @@ pub(crate) fn with_jobs<R>(lua: &Lua, f: impl FnOnce(&mut JobStore) -> R) -> R {
 pub(crate) fn active_task_id(lua: &Lua) -> Option<u64> {
     let handle = lua.app_data_ref::<TaskHandle>()?;
     Some(lock_cell(&handle).id)
+}
+
+pub(crate) fn active_task_cancel(lua: &Lua) -> Option<(u64, CancelToken)> {
+    let handle = lua.app_data_ref::<TaskHandle>()?;
+    let cell = lock_cell(&handle);
+    Some((cell.id, cell.cancel.clone()))
 }
 
 /// Slash-command hops that led to the running task; 0 outside a command
@@ -2628,6 +2640,7 @@ impl LuaRuntime {
         lua.set_app_data(SpawnQueue::new());
         lua.set_app_data(DeferQueue::new());
         lua.set_app_data(SpawnedTasks::default());
+        lua.set_app_data(BackgroundSessions::default());
         lua.set_app_data(crate::api::top::NotifyHandler::default());
         lua.set_app_data(PluginEnvs::default());
         lua.set_app_data(HostUi(ui_action_tx.clone()));
