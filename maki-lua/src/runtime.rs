@@ -2739,6 +2739,7 @@ impl LuaRuntime {
             store.kill_owner(&self.lua, &JobOwner::Plugin(Arc::from(name)));
             store.detach_plugin_callbacks(&self.lua, name);
         });
+        BackgroundSessions::of(&self.lua).end_plugin(name);
         if let Some(mut store) = self.lua.app_data_mut::<PluginOptionSpecs>() {
             store.remove(name);
         }
@@ -3729,7 +3730,7 @@ fn layer_delegation<'a>(
             Authority::Capability(required) => granted.is_some_and(|p| p.is_allowed(required)),
             // Steering a call whose reach nobody declared takes every
             // capability: a meta-tool like `batch` names none and reaches all.
-            Authority::Unbounded => granted.is_some_and(PluginPermissions::holds_all),
+            Authority::Unbounded => granted.is_some_and(PluginPermissions::holds_all_reach),
         };
         if !held {
             // Every call of a layered tool re-decides this, so a warning here

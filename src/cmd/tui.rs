@@ -509,7 +509,11 @@ pub fn run(mut cli: Cli) -> Result<()> {
         match outcome {
             RunOutcome::Exit { session_id, code } => {
                 if let Some(session_id) = session_id {
-                    eprintln!("Resume session:\n\n  maki -r {session_id}");
+                    let argv0 = env::args_os().next().unwrap_or_default();
+                    eprintln!(
+                        "Resume session:\n\n  {} -r {session_id}",
+                        argv0.to_string_lossy()
+                    );
                 }
                 let started = Instant::now();
                 drop(stack);

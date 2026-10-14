@@ -256,7 +256,7 @@ end
 local description = [[Execute a bash command.
 Commands run in the session's working directory (see Environment) by default.
 
-- **DO NOT** use for file ops! Only git, builds, tests, and system commands.
+- Read, list, search, and edit files with dedicated tools, not cat/ls/find/grep/sed. Bash is for git, builds, tests, and file management (mv, cp, rm, mkdir).
 - Use `workdir` param instead of `cd <dir> && <cmd>` patterns.
 - Do NOT use to communicate text to the user.
 - Chain dependent commands with `&&`. Use batch for independent ones.
@@ -267,7 +267,7 @@ Commands run in the session's working directory (see Environment) by default.
 
 maki.api.register_prompt_hint({
   slot = "tool_usage",
-  content = "- Reserve bash for system commands (git, builds, tests). Do NOT use bash for file operations, including on files outside the working dir.",
+  content = "- Read, list, search, and edit files with dedicated tools, even outside cwd. Bash is for git, builds, tests, and file management (mv, cp, rm, mkdir).",
 })
 
 local opts = maki.api.register_options(output_limits.extend({
