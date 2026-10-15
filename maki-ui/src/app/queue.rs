@@ -35,7 +35,6 @@ impl MessageQueue {
         self.shared = Some(shared);
     }
 
-    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.shared.as_ref().is_none_or(|s| s.is_empty())
     }

@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::OpenSession;
+use crate::agent::detach::DETACHED_RUN_ID;
 use crate::app::tasks::TaskOutcome;
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
@@ -97,6 +98,7 @@ const EXIT_WORD: &str = "exit";
 /// don't belong to any real agent run.
 pub(crate) const RESTORE_RUN_ID: u64 = u64::MAX;
 const FLASH_CANCEL: &str = "Press esc again to stop...";
+const FLASH_DETACH: &str = "Sending now, the running turn goes on in the background";
 const FLASH_REWIND: &str = "Press esc again to rewind...";
 const AUTH_EXPIRED_MSG: &str =
     "Token expired. Run `maki auth login` in another terminal, then press Enter to retry.";
@@ -362,6 +364,10 @@ pub struct App {
     /// so the user can delete it before its last events arrive. Those events
     /// would bring it back, so we drop them.
     pub(super) deleted_tasks: HashSet<String>,
+    /// Chats of runs sent to the background, and of the subagents those runs
+    /// started. They outlive the turn that started them, so a turn ending
+    /// must not close them or forget how to reach them.
+    pub(super) background_tasks: HashSet<String>,
     pub(crate) input_box: InputBox,
     pub(super) command_palette: CommandPalette,
     pub(super) theme_picker: ThemePicker,
@@ -484,6 +490,7 @@ impl App {
             active_chat: 0,
             chat_index: HashMap::new(),
             deleted_tasks: HashSet::new(),
+            background_tasks: HashSet::new(),
             input_box,
             command_palette: CommandPalette::new(
                 custom_commands,
@@ -1369,6 +1376,9 @@ impl App {
             }
             return vec![];
         }
+        if key::DETACH_RUN.matches(key) && self.can_detach() {
+            return self.detach_run();
+        }
         if is_ctrl(&key) {
             if key::POP_QUEUE.matches(key) {
                 return self.run_builtin(BuiltinAction::PopQueue);
@@ -1413,6 +1423,42 @@ impl App {
             }
             InputAction::ContinueLine | InputAction::None => vec![],
         }
+    }
+
+    /// Anywhere else `Ctrl+Enter` stays a newline: a subagent's chat has no
+    /// queue of its own to force, and an idle chat sends on `Enter` anyway.
+    fn can_detach(&self) -> bool {
+        self.status == Status::Streaming
+            && self.is_main_chat()
+            && (!self.queue.is_empty() || !self.input_box.is_empty())
+    }
+
+    /// Forces the queue through by moving the running turn to a background
+    /// task. What is still in the input box joins the queue first, so the key
+    /// reads as "send this now" whether or not it was queued already.
+    fn detach_run(&mut self) -> Vec<Action> {
+        let mut actions = self
+            .input_box
+            .submit()
+            .map(|sub| self.handle_submit(sub))
+            .unwrap_or_default();
+        if self.status != Status::Streaming || self.queue.is_empty() {
+            return actions;
+        }
+        // Every subagent still running belongs to the turn that is leaving,
+        // and keeps reporting from the background.
+        let running = self
+            .chat_index
+            .iter()
+            .filter(|&(_, &idx)| !self.chats[idx].is_finished())
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        self.background_tasks.extend(running);
+        self.status_bar.flash(FLASH_DETACH.into());
+        actions.push(Action::DetachAgent {
+            run_id: self.run_id,
+        });
+        actions
     }
 
     fn handle_esc(&mut self, streaming: bool) -> Vec<Action> {
@@ -1517,11 +1563,17 @@ impl App {
         self.close_all_overlays();
         self.pending_input = PendingInput::None;
         self.finish_subagents(TaskOutcome::Error, CANCELLED_TEXT);
-        self.subagent_answers.clear();
         self.shell.cancel_all();
-        for chat in self.chats.iter_mut().filter(|c| c.plugin.is_none()) {
+        for (idx, chat) in self
+            .chats
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, c)| c.plugin.is_none())
+        {
             chat.flush();
-            chat.cancel_in_progress();
+            if !self.chat_index.values().any(|&bg| bg == idx) {
+                chat.cancel_in_progress();
+            }
         }
         self.main_chat()
             .push(DisplayMessage::new(DisplayRole::Error, CANCEL_MSG.into()));
@@ -1584,7 +1636,12 @@ impl App {
             }
             return vec![];
         }
-        if envelope.run_id != self.run_id {
+        if envelope.run_id == DETACHED_RUN_ID {
+            if let Some(subagent) = &envelope.subagent {
+                self.background_tasks
+                    .insert(subagent.parent_tool_use_id.clone());
+            }
+        } else if envelope.run_id != self.run_id {
             // A snapshot dropped here degrades the tool body to llm_output.
             if let AgentEvent::ToolSnapshot { id, .. }
             | AgentEvent::ToolHeaderSnapshot { id, .. }
@@ -1672,7 +1729,13 @@ impl App {
             self.state
                 .session_mut()
                 .insert_tool_output(e.id.clone(), e.output.clone());
-            if let Some(&sub_idx) = self.chat_index.get(&e.id) {
+            // The main chat closes a call the background took over, and that
+            // must not finish the subagent still running behind it.
+            let handed_off =
+                envelope.run_id != DETACHED_RUN_ID && self.background_tasks.contains(&e.id);
+            if let Some(&sub_idx) = self.chat_index.get(&e.id)
+                && !handed_off
+            {
                 let (outcome, text) = if e.is_error {
                     (TaskOutcome::Error, ERROR_TEXT)
                 } else {
@@ -1818,8 +1881,7 @@ impl App {
                 ChatEventResult::Done => {
                     self.status_bar.clear_flash();
                     self.terminalize_turn(MISSING_TOOL_COMPLETION);
-                    self.chat_index.clear();
-                    self.subagent_answers.clear();
+                    self.forget_turn_routing();
                     self.status = Status::Idle;
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Success;
@@ -1832,11 +1894,10 @@ impl App {
                         DisplayRole::Error,
                         cap_error_text(&message),
                     ));
-                    self.subagent_answers.clear();
                     self.terminalize_turn(&message);
                     self.recoverable_queue = self.queue.text_messages();
                     self.queue.clear();
-                    self.chat_index.clear();
+                    self.forget_turn_routing();
                     if self.exit_on_done {
                         self.exit_request = ExitRequest::Error;
                     }
@@ -2489,24 +2550,45 @@ impl App {
 
     fn finish_subagents(&mut self, outcome: TaskOutcome, text: &str) {
         self.retain_resolved_subagents(outcome, text);
-        self.chat_index.clear();
+        self.forget_turn_routing();
+    }
+
+    /// What a turn ending wipes. Only background work still running keeps its
+    /// routes, since it goes on reporting into its chat after the turn.
+    fn forget_turn_routing(&mut self) {
+        let background = &self.background_tasks;
+        let chats = &self.chats;
+        self.chat_index
+            .retain(|id, &mut idx| background.contains(id) && !chats[idx].is_finished());
+        let routed = &self.chat_index;
+        self.subagent_answers
+            .retain(|id, _| routed.contains_key(id));
     }
 
     /// Terminalizes every tool left in progress when a turn ends, sparing
-    /// shell commands that outlive the agent.
+    /// shell commands that outlive the agent and background work.
     fn terminalize_turn(&mut self, message: &str) {
         self.retain_resolved_subagents(TaskOutcome::Error, ERROR_TEXT);
         self.chats[MAIN_CHAT].fail_in_progress_except(message.into(), self.shell.active_ids());
-        for chat in self.chats.iter_mut().skip(1).filter(|c| c.plugin.is_none()) {
-            chat.fail_in_progress_with_message(message.into());
+        let background: HashSet<usize> = self
+            .chat_index
+            .iter()
+            .filter(|(id, _)| self.background_tasks.contains(*id))
+            .map(|(_, &idx)| idx)
+            .collect();
+        for (idx, chat) in self.chats.iter_mut().enumerate().skip(1) {
+            if chat.plugin.is_none() && !background.contains(&idx) {
+                chat.fail_in_progress_with_message(message.into());
+            }
         }
     }
 
     /// Marks unfinished subagent chats as ended and drops them from
-    /// `chat_index`, then mirrors the tabs into the session meta.
+    /// `chat_index`, then mirrors the tabs into the session meta. Background
+    /// work is still running, so it stays.
     fn retain_resolved_subagents(&mut self, outcome: TaskOutcome, text: &str) {
-        self.chat_index.retain(|_, &mut sub_idx| {
-            if self.chats[sub_idx].is_finished() {
+        self.chat_index.retain(|id, &mut sub_idx| {
+            if self.chats[sub_idx].is_finished() || self.background_tasks.contains(id) {
                 true
             } else {
                 self.chats[sub_idx].mark_finished(outcome, text);

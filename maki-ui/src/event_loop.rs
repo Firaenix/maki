@@ -1829,6 +1829,9 @@ impl<'t> EventLoop<'t> {
                 rt.notifications.reset();
                 rt.handles.cancel_run(run_id);
             }
+            Action::DetachAgent { run_id } => {
+                self.sessions[idx].handles.detach_run(run_id);
+            }
             Action::CancelSubagent { tool_use_id } => {
                 self.sessions[idx]
                     .handles

@@ -211,6 +211,10 @@ pub enum Action {
     CancelAgent {
         run_id: u64,
     },
+    /// Lets {run_id} go on as a background task, so the queue goes next.
+    DetachAgent {
+        run_id: u64,
+    },
     CancelSubagent {
         tool_use_id: String,
     },

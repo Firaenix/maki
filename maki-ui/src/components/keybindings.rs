@@ -174,6 +174,11 @@ pub mod key {
         modifiers: KeyModifiers::ALT,
         label: "Alt+Z",
     };
+    pub const DETACH_RUN: Bind = Bind {
+        code: KeyCode::Enter,
+        modifiers: KeyModifiers::CONTROL,
+        label: "Ctrl+Enter",
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
@@ -493,6 +498,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single("Esc Esc"),
         description: "Cancel agent",
+        context: KeybindContext::Streaming,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::DETACH_RUN.label),
+        description: "Send now, running turn goes to background",
         context: KeybindContext::Streaming,
         platform: Platform::All,
     },

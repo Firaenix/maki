@@ -1,4 +1,5 @@
 mod agent_loop;
+pub(crate) mod detach;
 mod model_slots;
 mod run_cancels;
 pub(crate) mod shared_queue;
@@ -18,6 +19,7 @@ use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
 use maki_storage::id::SessionRef;
 
+use self::detach::DetachedRuns;
 use self::run_cancels::RunCancels;
 use maki_providers::Message;
 use tracing::{info, warn};
@@ -44,7 +46,8 @@ pub(crate) struct AgentHandles {
     pub(crate) queue: QueueSender,
     pub(crate) timeouts: maki_providers::Timeouts,
     cancels: Arc<RunCancels>,
-    subagent_cancels: Arc<CancelMap<String>>,
+    subagent_cancels: Arc<ArcSwap<CancelMap<String>>>,
+    detached: Arc<DetachedRuns>,
     model_policy: Arc<ModelPolicy>,
     mailbox: SessionMailbox,
     task: smol::Task<()>,
@@ -116,14 +119,23 @@ impl AgentHandles {
         self.cancels.cancel(run_id);
     }
 
+    /// Ctrl+Enter: {run_id} goes on as a background task so the chat can take
+    /// the next message.
+    pub(crate) fn detach_run(&self, run_id: u64) {
+        self.cancels.detach(run_id);
+    }
+
     pub(crate) fn cancel_subagent(&self, tool_use_id: String) {
-        self.subagent_cancels.cancel(tool_use_id);
+        self.detached.cancel(&tool_use_id);
+        self.subagent_cancels.load().cancel(tool_use_id);
     }
 
     /// Respawn or shutdown: this loop is done, whatever it was in the middle of.
+    /// Background tasks go with it, since they write into its session.
     pub(crate) fn cancel_all(&self) {
         self.cancels.cancel_all();
-        self.subagent_cancels.cancel_all();
+        self.subagent_cancels.load().cancel_all();
+        self.detached.cancel_all();
     }
 
     pub(crate) fn send_mcp(&self, cmd: McpCommand) {
@@ -246,7 +258,9 @@ fn spawn_agent_internal(
         Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
     maki_agent::agent::publish_live_history(resumed.id.id(), &shared_history);
     let cancels = RunCancels::new();
-    let subagent_cancels: Arc<CancelMap<String>> = Arc::new(CancelMap::new());
+    let subagent_cancels: Arc<ArcSwap<CancelMap<String>>> =
+        Arc::new(ArcSwap::from_pointee(CancelMap::new()));
+    let detached = Arc::new(DetachedRuns::default());
     let mailbox = SessionMailbox::register(resumed.id.id());
 
     let agent_loop = AgentLoop::new(
@@ -265,6 +279,7 @@ fn spawn_agent_internal(
         timeouts,
         lua_handle,
         Arc::clone(&subagent_cancels),
+        Arc::clone(&detached),
         Arc::clone(&model_policy),
     );
 
@@ -281,6 +296,7 @@ fn spawn_agent_internal(
         timeouts,
         cancels,
         subagent_cancels,
+        detached,
         model_policy,
         mailbox,
         task,
