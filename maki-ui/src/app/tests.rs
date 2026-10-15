@@ -3321,6 +3321,73 @@ fn ctrl_q_pops_front() {
     );
 }
 
+fn detaches(actions: &[Action]) -> bool {
+    actions
+        .iter()
+        .any(|a| matches!(a, Action::DetachAgent { run_id: 1 }))
+}
+
+#[test]
+fn ctrl_enter_with_a_queued_message_detaches_the_run() {
+    let mut app = app_with_queued_message();
+    let actions = app.update(Msg::Key(kb::DETACH_RUN.to_key_event()));
+    assert!(detaches(&actions));
+    assert_eq!(
+        app.queue.len(),
+        1,
+        "the agent drains the queue, not the key"
+    );
+}
+
+#[test]
+fn ctrl_enter_queues_the_input_before_detaching() {
+    let mut app = streaming_app();
+    for c in "now".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    let actions = app.update(Msg::Key(kb::DETACH_RUN.to_key_event()));
+    assert!(detaches(&actions));
+    assert_eq!(app.queue.panel_entries()[0].text, "now");
+    assert!(app.input_box.is_empty());
+}
+
+#[test_case(test_app       as fn() -> App ; "idle")]
+#[test_case(streaming_app  as fn() -> App ; "nothing_queued")]
+#[test_case(app_with_active_subagent as fn() -> App ; "subagent_chat")]
+fn ctrl_enter_without_a_queue_to_force_does_not_detach(make: fn() -> App) {
+    let mut app = make();
+    let actions = app.update(Msg::Key(kb::DETACH_RUN.to_key_event()));
+    assert!(!detaches(&actions));
+    assert!(app.queue.is_empty());
+}
+
+#[test]
+fn detached_run_events_get_a_chat_that_outlives_the_turn() {
+    let mut app = streaming_app();
+    app.update(subagent_msg_with_run_id(
+        AgentEvent::TextDelta { text: "x".into() },
+        "background-1",
+        Some("background"),
+        DETACHED_RUN_ID,
+    ));
+    let idx = *app.chat_index.get("background-1").unwrap();
+    end_turn(&mut app);
+    assert_eq!(app.chat_index.get("background-1"), Some(&idx));
+    assert!(!app.chats[idx].is_finished());
+}
+
+#[test]
+fn subagents_of_a_detached_run_keep_their_chat_after_the_turn_ends() {
+    let mut app = app_with_subagent_id(TASK_ID);
+    app.queue_and_notify(queued_msg("queued"));
+    assert!(detaches(
+        &app.update(Msg::Key(kb::DETACH_RUN.to_key_event()))
+    ));
+    end_turn(&mut app);
+    let idx = *app.chat_index.get(TASK_ID).unwrap();
+    assert!(!app.chats[idx].is_finished());
+}
+
 #[test_case(cancel_app as fn(&mut App) ; "cancel")]
 #[test_case(error_app as fn(&mut App)  ; "error")]
 fn clears_queue_focus_on_terminate(terminate: fn(&mut App)) {
