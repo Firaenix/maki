@@ -15,6 +15,7 @@ use crate::components::Overlay;
 use crate::components::form::render_form;
 use crate::components::hint_line;
 use crate::components::is_ctrl;
+use crate::highlight;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
 
@@ -77,6 +78,46 @@ const CONFIRM_DENY_PROJECT_SESSION_HINTS: &[(&str, &str)] = &[
 
 const DENY_GUIDANCE_HINTS: &[(&str, &str)] = &[("Enter", "Deny"), ("Esc", "Cancel")];
 const QUEUED_NOTICE: &str = "more request(s) waiting";
+
+/// A bash scope is the command itself: each line of it gets its own row,
+/// highlighted as bash, with the label on the first.
+fn scope_lines(
+    label: &'static str,
+    scope: &str,
+    shell: bool,
+    label_style: Style,
+    value_style: Style,
+) -> Vec<Line<'static>> {
+    let mut hl =
+        (shell && highlight::is_ready()).then(|| maki_highlight::Highlighter::for_token("bash"));
+    let rows: Vec<&str> = if shell {
+        scope.split('\n').collect()
+    } else {
+        vec![scope]
+    };
+    rows.into_iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let mut spans = vec![
+                Span::raw("  "),
+                Span::styled(if i == 0 { label } else { "      " }, label_style),
+            ];
+            match hl.as_mut() {
+                Some(hl) => spans.extend(
+                    highlight::highlight_line(hl, &format!("{text}\n"))
+                        .into_iter()
+                        .map(|span| {
+                            let content = span.content.trim_end_matches('\n').to_owned();
+                            Span::styled(content, span.style)
+                        })
+                        .filter(|span| !span.content.is_empty()),
+                ),
+                None => spans.push(Span::styled(text.to_owned(), value_style)),
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
 
 fn aligned_hint_rows(rows: &[&[(&str, &str)]]) -> Vec<Line<'static>> {
     let t = theme::current();
@@ -407,13 +448,10 @@ impl PermissionPrompt {
                 Span::styled(format!("{waiting} {QUEUED_NOTICE}"), t.item_desc),
             ]));
         }
+        let shell = matches!(tool, ToolKey::Native(name) if &**name == "bash");
         for (i, s) in scopes.iter().enumerate() {
             let label = if i == 0 { "scope " } else { "    + " };
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(label, label_style),
-                Span::styled(s.clone(), value_style),
-            ]));
+            lines.extend(scope_lines(label, s, shell, label_style, value_style));
         }
 
         if !allow_scopes.is_empty() {
@@ -577,6 +615,48 @@ mod tests {
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    fn row_texts(prompt: &PermissionPrompt) -> Vec<String> {
+        prompt
+            .build_lines()
+            .iter()
+            .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn bash_scope_gets_a_row_per_line_under_one_label() {
+        crate::highlight::warmup();
+        let mut prompt = PermissionPrompt::new();
+        let script = "for f in *.rs; do\n  echo \"$f\"\ndone";
+        prompt.push(
+            MAIN_ID.into(),
+            ToolKey::native("bash"),
+            vec![script.into()],
+            None,
+            true,
+            None,
+        );
+        let rows = row_texts(&prompt);
+        let at = rows.iter().position(|r| r.contains("scope ")).unwrap();
+        assert_eq!(rows[at], "  scope for f in *.rs; do");
+        assert_eq!(rows[at + 1], "          echo \"$f\"");
+        assert_eq!(rows[at + 2], "        done");
+    }
+
+    #[test]
+    fn non_bash_scope_stays_one_row() {
+        let mut prompt = PermissionPrompt::new();
+        prompt.push(
+            MAIN_ID.into(),
+            ToolKey::native("read"),
+            vec!["a\nb".into()],
+            None,
+            true,
+            None,
+        );
+        assert!(row_texts(&prompt).contains(&"  scope a\nb".to_owned()));
     }
 
     fn ctrl_c() -> KeyEvent {
