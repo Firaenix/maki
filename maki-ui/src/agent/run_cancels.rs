@@ -26,6 +26,9 @@ struct State {
     /// The run in flight, held by its [`LiveRun`]. The id tells a late esc for
     /// a run that already finished from one meant for this one.
     live: Option<(u64, CancelTrigger)>,
+    /// Fires when the user sends the run in flight to the background. Kept
+    /// apart from `live` because a detached run is not stopped, only let go.
+    detach: Option<(u64, CancelTrigger)>,
     /// Dropped by [`cancel_all`](RunCancels::cancel_all), which is what fires
     /// the token.
     teardown: Option<CancelTrigger>,
@@ -49,6 +52,7 @@ impl RunCancels {
             state: Mutex::new(State {
                 min_run_id: 0,
                 live: None,
+                detach: None,
                 teardown: Some(trigger),
             }),
             teardown,
@@ -72,6 +76,7 @@ impl RunCancels {
     /// and starting it.
     pub(super) fn start(self: &Arc<Self>, run_id: u64) -> LiveRun {
         let (trigger, token) = CancelToken::new();
+        let (detach_trigger, detach) = CancelToken::new();
         let mut state = self.lock();
         if run_id < state.min_run_id {
             // Dropped instead of stored, so the run is born cancelled.
@@ -79,11 +84,19 @@ impl RunCancels {
         } else {
             state.live = Some((run_id, trigger));
         }
+        state.detach = Some((run_id, detach_trigger));
         drop(state);
         LiveRun {
             cancels: Arc::clone(self),
             token,
+            detach,
         }
+    }
+
+    /// Lets {run_id} go on in the background. A run that already finished
+    /// has nothing left to let go, so a late press does nothing.
+    pub(super) fn detach(&self, run_id: u64) {
+        self.lock().detach.take_if(|&mut (id, _)| id == run_id);
     }
 
     /// Cancels {run_id} and everything older, in flight or still queued. The
@@ -111,11 +124,16 @@ impl RunCancels {
 pub(super) struct LiveRun {
     cancels: Arc<RunCancels>,
     token: CancelToken,
+    detach: CancelToken,
 }
 
 impl LiveRun {
     pub(super) fn token(&self) -> &CancelToken {
         &self.token
+    }
+
+    pub(super) fn detach_signal(&self) -> &CancelToken {
+        &self.detach
     }
 }
 
@@ -124,10 +142,13 @@ impl Drop for LiveRun {
         // By trigger identity, not by run id. A queued run carries the id it
         // was typed under, so ids repeat, and matching on one would let a
         // finished run retire the registration of the one running now.
-        self.cancels
-            .lock()
+        let mut state = self.cancels.lock();
+        state
             .live
             .take_if(|(_, trigger)| trigger.fires(&self.token));
+        state
+            .detach
+            .take_if(|(_, trigger)| trigger.fires(&self.detach));
     }
 }
 
@@ -201,6 +222,28 @@ mod tests {
             !cancels.start(FIRST_RUN).token().is_cancelled(),
             "the loop has to go on to take the next run"
         );
+    }
+
+    #[test]
+    fn detach_lets_the_run_go_without_cancelling_it() {
+        let cancels = RunCancels::new();
+        let run = cancels.start(FIRST_RUN);
+
+        cancels.detach(FIRST_RUN);
+
+        assert!(run.detach_signal().is_cancelled());
+        assert!(!run.token().is_cancelled(), "a detached run keeps going");
+    }
+
+    #[test]
+    fn detach_aimed_at_a_finished_run_leaves_the_next_one_alone() {
+        let cancels = RunCancels::new();
+        drop(cancels.start(FIRST_RUN));
+        let next = cancels.start(SECOND_RUN);
+
+        cancels.detach(FIRST_RUN);
+
+        assert!(!next.detach_signal().is_cancelled());
     }
 
     #[test]

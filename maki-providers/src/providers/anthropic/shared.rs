@@ -32,6 +32,8 @@ pub(crate) const LONG_CONTEXT_SUFFIX: &str = "-1m";
 pub(crate) const LONG_CONTEXT_BETA: &str = "context-1m-2025-08-07";
 pub(crate) const LONG_CONTEXT_WINDOW: u32 = 1_000_000;
 
+pub(crate) const DISPLACED_ERROR_PREFIX: &str = "Tool call failed: ";
+
 pub(crate) fn strip_long_context(model_id: &str) -> &str {
     model_id
         .strip_suffix(LONG_CONTEXT_SUFFIX)
@@ -214,7 +216,9 @@ fn deferred_tool_names(tools: &Value) -> HashSet<&str> {
 /// a reference to a name it was not handed, so a load recorded while a
 /// server was up degrades to text once that server is gone. And it refuses
 /// a `tool_result` mixing references with anything else, so the text is
-/// displaced to a sibling block.
+/// displaced to a sibling block. An errored result may hold only text, and
+/// the retry needs the definition more than the flag, so the error rides
+/// along as a prefix on the displaced text.
 ///
 /// Each name is referenced once per request, by the first result that loaded
 /// it. Every later call records the load again so compaction cannot drop the
@@ -223,7 +227,7 @@ fn deferred_tool_names(tools: &Value) -> HashSet<&str> {
 fn wire_block<'a>(
     block: &'a ContentBlock,
     unreferenced: &mut HashSet<&str>,
-) -> (WireBlock<'a>, Option<&'a str>) {
+) -> (WireBlock<'a>, Option<Value>) {
     let ContentBlock::ToolResult {
         tool_use_id,
         content,
@@ -236,7 +240,7 @@ fn wire_block<'a>(
     if loaded_tools.is_empty() {
         return (WireBlock::Verbatim(block), None);
     }
-    let text = if content.is_empty() {
+    let text = if content.trim().is_empty() {
         EMPTY_RESPONSE_MARKER
     } else {
         content
@@ -246,16 +250,21 @@ fn wire_block<'a>(
         .filter(|name| unreferenced.remove(name.as_str()))
         .map(|name| json!({"type": "tool_reference", "tool_name": name}))
         .collect();
-    let (parts, displaced) = if refs.is_empty() {
-        (vec![text_block(text)], None)
-    } else {
-        (refs, Some(text))
-    };
-    let mut result = json!({"type": "tool_result", "tool_use_id": tool_use_id, "content": parts});
-    if *is_error {
-        result["is_error"] = json!(true);
+    let mut result = json!({"type": "tool_result", "tool_use_id": tool_use_id});
+    if refs.is_empty() {
+        result["content"] = json!([text_block(text)]);
+        if *is_error {
+            result["is_error"] = json!(true);
+        }
+        return (WireBlock::Rebuilt(result), None);
     }
-    (WireBlock::Rebuilt(result), displaced)
+    result["content"] = Value::Array(refs);
+    let displaced = if *is_error {
+        text_block(&format!("{DISPLACED_ERROR_PREFIX}{text}"))
+    } else {
+        text_block(text)
+    };
+    (WireBlock::Rebuilt(result), Some(displaced))
 }
 
 fn text_block(text: &str) -> Value {
@@ -295,15 +304,15 @@ fn wire_content<'a>(
         .iter()
         .filter(|block| is_replayable(block))
         .map(|block| {
-            let (inner, text) = wire_block(block, unreferenced);
-            displaced.extend(text);
+            let (inner, sibling) = wire_block(block, unreferenced);
+            displaced.extend(sibling);
             plain(inner)
         })
         .collect();
     content.extend(
         displaced
             .into_iter()
-            .map(|text| plain(WireBlock::Rebuilt(text_block(text)))),
+            .map(|block| plain(WireBlock::Rebuilt(block))),
     );
 
     if content.is_empty() {

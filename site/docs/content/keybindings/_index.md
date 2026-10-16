@@ -56,6 +56,7 @@ On macOS, some bindings use Option or Fn keys instead (run `/help` for exact key
 |-----|--------|
 | `↑` / `↓` | Navigate input history |
 | `Esc Esc` | Cancel agent |
+| `Ctrl+Enter` | Send now, running turn goes to background |
 
 ## Form
 

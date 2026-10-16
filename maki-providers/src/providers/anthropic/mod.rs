@@ -702,7 +702,7 @@ mod tests {
         TokenUsage,
     };
     use serde_json::{Value, json};
-    use shared::build_wire_messages;
+    use shared::{DISPLACED_ERROR_PREFIX, build_wire_messages};
     use std::time::Duration;
     use test_case::test_case;
 
@@ -1338,10 +1338,9 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
 
     /// A deferred tool called straight from the catalog records its load
     /// even when the call failed.
-    #[test_case(&[DEFERRED_TOOL] ; "referenced")]
-    #[test_case(&["gone__tool"] ; "text_only")]
-    fn rebuilt_result_keeps_is_error(loaded: &[&str]) {
-        let mut messages = search_result(loaded);
+    #[test]
+    fn text_only_rebuilt_result_keeps_is_error() {
+        let mut messages = search_result(&["gone__tool"]);
         set_result(&mut messages, |_, is_error| *is_error = true);
         assert_eq!(
             wire_content(&messages, &deferred_tools())[0]["is_error"],
@@ -1349,12 +1348,31 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n";
         );
     }
 
-    /// The API rejects blank text blocks.
-    #[test_case(&[DEFERRED_TOOL], |content| &content[1]["text"] ; "displaced_text")]
-    #[test_case(&["gone__tool"], |content| &content[0]["content"][0]["text"] ; "in_place_text")]
-    fn empty_loading_result_replays_the_marker(loaded: &[&str], text_at: fn(&Value) -> &Value) {
+    /// Verified live: "all content must be type `text` if `is_error` is
+    /// true". The reference must stay for the retry, so the flag goes.
+    #[test]
+    fn referenced_error_moves_flag_into_displaced_text() {
+        let mut messages = search_result(&[DEFERRED_TOOL]);
+        set_result(&mut messages, |_, is_error| *is_error = true);
+        let content = wire_content(&messages, &deferred_tools());
+        assert_eq!(content[0].get("is_error"), None);
+        assert_eq!(
+            content[0]["content"],
+            json!([{"type": "tool_reference", "tool_name": DEFERRED_TOOL}])
+        );
+        assert_eq!(
+            content[1]["text"],
+            format!("{DISPLACED_ERROR_PREFIX}{SEARCH_TEXT}")
+        );
+    }
+
+    /// The API rejects blank text blocks, whitespace-only included. The
+    /// verbatim path is safe since it ships `content` as a string.
+    #[test_case(&[DEFERRED_TOOL], |content| &content[1]["text"] ; "displaced")]
+    #[test_case(&["gone__tool"], |content| &content[0]["content"][0]["text"] ; "in_place")]
+    fn blank_loading_result_replays_the_marker(loaded: &[&str], text_at: fn(&Value) -> &Value) {
         let mut messages = search_result(loaded);
-        set_result(&mut messages, |content, _| content.clear());
+        set_result(&mut messages, |content, _| *content = " \n".into());
         let content = wire_content(&messages, &deferred_tools());
         assert_eq!(text_at(&content), EMPTY_RESPONSE_MARKER);
     }
