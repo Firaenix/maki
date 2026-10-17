@@ -6,7 +6,8 @@
 //! document `maki session export` prints. The one difference is an image
 //! block's `source`, which is a `maki.image.Image` sharing the payload.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
 use maki_agent::agent::{SessionExport, live_header, live_history, live_snapshot};
 use maki_agent::session::{StoredSession, store_new};
@@ -15,16 +16,17 @@ use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::{ContentBlock, Message};
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
-use mlua::{IntoLua, Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
+use mlua::{AnyUserData, IntoLua, Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 use serde_json::{Map, Value as JsonValue};
 
 use crate::api::image::LuaImage;
+use crate::api::ui::win::{WinHandle, WinSender};
 use crate::api::util::command::{
-    NO_UI_ERR, SessionRequest, UiAction, ui_json_roundtrip, ui_reachable, ui_roundtrip,
+    NO_UI_ERR, SessionRequest, UiAction, WinCommand, ui_json_roundtrip, ui_reachable, ui_roundtrip,
 };
 use crate::api::util::convert::{TableExt, json_to_lua, json_to_lua_exact, lua_to_json};
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
-use crate::plugin_permissions::{Permission, PluginPermissions, denied_error};
+use crate::plugin_permissions::{MANIFEST_FILE, Permission, PluginPermissions, denied_error};
 use crate::session_snapshot::SessionSnapshot;
 
 /// Answers `maki.session.read` for a driver that has no UI to ask. Takes the
@@ -65,6 +67,35 @@ const DOCUMENT_KEYS: [&str; 8] = [
     "facts",
     MESSAGES_KEY,
 ];
+const QUESTION_REPLY_ERR: &str =
+    "reply must be { answers = { { label, ... }, ... } } or { dismiss = true }";
+const QUESTION_SUBMIT: &str = "submit";
+const QUESTION_DISMISS: &str = "dismiss";
+
+/// Question forms a plugin may answer, keyed by the `question` tool call id.
+/// Process-wide because the asking session and the answering plugin need not
+/// share anything else.
+static OPEN_QUESTIONS: LazyLock<Mutex<HashMap<String, OpenQuestion>>> =
+    LazyLock::new(Mutex::default);
+
+struct OpenQuestion {
+    plugin: Arc<str>,
+    session: Option<String>,
+    form: WinSender,
+    answer: Option<QuestionAnswer>,
+}
+
+#[derive(Debug, PartialEq)]
+enum QuestionAnswer {
+    Submit(Vec<Vec<String>>),
+    Dismiss,
+}
+
+fn open_questions() -> MutexGuard<'static, HashMap<String, OpenQuestion>> {
+    OPEN_QUESTIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
 
 pub(crate) fn not_live(session: MakiId) -> String {
     format!("{NOT_LIVE_ERR}: {session}")
@@ -780,6 +811,143 @@ async fn set_title(
     roundtrip(lua, tx, req).await
 }
 
+/// Opens the question form {win} shows for the `question` tool call
+/// {tool_id} to `maki.session.answer_question`. The bundled `question`
+/// plugin calls this. The form stays the user's: a plugin's answer closes
+/// {win}, and `settle_question` hands it back.
+///
+/// @param tool_id string The `question` tool call id, `ctx:tool_id()`.
+/// @param win maki.ui.Win The open form.
+/// @param opts table? Optional fields: session (string) id of the session
+///   that asked.
+/// @return
+/// @example
+/// maki.session.register_question(ctx:tool_id(), win, { session = ctx:session_id() })
+#[lua_fn]
+fn register_question(
+    _lua: &Lua,
+    #[ctx] plugin: Arc<str>,
+    tool_id: String,
+    win: AnyUserData,
+    opts: Option<Table>,
+) -> LuaResult<()> {
+    let session = match opts {
+        Some(opts) => opts.get("session")?,
+        None => None,
+    };
+    let form = win.borrow::<WinHandle>()?.sender();
+    let mut open = open_questions();
+    open.retain(|_, question| !question.form.is_disconnected());
+    open.insert(
+        tool_id,
+        OpenQuestion {
+            plugin,
+            session,
+            form,
+            answer: None,
+        },
+    );
+    Ok(())
+}
+
+/// Closes {tool_id} to plugin answers once its form returned.
+///
+/// @param tool_id string The id given to `register_question`.
+/// @return (table|nil) `{type = "submit", answers}` or `{type = "dismiss"}`
+///   if a plugin answered first, the way the form reports a result. nil when
+///   the user did.
+/// @example
+/// local remote = maki.session.settle_question(ctx:tool_id())
+#[lua_fn]
+fn settle_question(lua: &Lua, #[ctx] plugin: Arc<str>, tool_id: String) -> LuaResult<Value> {
+    let mut open = open_questions();
+    if open.get(&tool_id).is_none_or(|q| q.plugin != plugin) {
+        return Ok(Value::Nil);
+    }
+    let answer = open.remove(&tool_id).and_then(|q| q.answer);
+    drop(open);
+    let Some(answer) = answer else {
+        return Ok(Value::Nil);
+    };
+    let result = lua.create_table()?;
+    match answer {
+        QuestionAnswer::Submit(answers) => {
+            result.set("type", QUESTION_SUBMIT)?;
+            result.set("answers", answers)?;
+        }
+        QuestionAnswer::Dismiss => result.set("type", QUESTION_DISMISS)?,
+    }
+    Ok(Value::Table(result))
+}
+
+fn parse_question_reply(reply: &Table) -> LuaResult<Option<QuestionAnswer>> {
+    if matches!(reply.get("dismiss")?, Value::Boolean(true)) {
+        return Ok(Some(QuestionAnswer::Dismiss));
+    }
+    Ok(reply
+        .opt::<Vec<Vec<String>>>("answers")
+        .ok()
+        .flatten()
+        .map(QuestionAnswer::Submit))
+}
+
+/// Answers an open question form, racing the user at it, as if they had
+/// submitted or dismissed it. The form closes, and whichever answer lands
+/// first is the one the agent reads. Answering for the user takes every
+/// permission in the plugin's `plugin.toml`.
+///
+/// @param tool_id string The `tool_id` of a `QuestionAsked` event.
+/// @param reply table `{ answers = { { label, ... }, ... } }`, one list of
+///   picked labels per question, free text counting as a label, or
+///   `{ dismiss = true }`.
+/// @param opts table? Optional fields: session (string) id the question must
+///   belong to. Tool call ids are unique, so this only guards against a
+///   stale id.
+/// @return (boolean|nil, string|nil) true if this answer settled the form,
+///   false if it is no longer open or someone answered first, or nil and an
+///   error.
+/// @example
+/// maki.api.create_autocmd("QuestionAsked", {
+///   callback = function(ev)
+///     maki.session.answer_question(ev.data.tool_id, { answers = { { "Yes" } } })
+///   end,
+/// })
+#[lua_fn]
+fn answer_question(
+    _lua: &Lua,
+    #[ctx] full_trust: bool,
+    tool_id: String,
+    reply: Table,
+    opts: Option<Table>,
+) -> LuaResult<Pair<bool>> {
+    if !full_trust {
+        return Err(mlua::Error::runtime(format!(
+            "permission denied: answering a question answers for the user, so it needs every \
+             permission granted in {MANIFEST_FILE}"
+        )));
+    }
+    let Some(answer) = parse_question_reply(&reply)? else {
+        return Ok(err_pair(QUESTION_REPLY_ERR));
+    };
+    let session: Option<String> = match opts {
+        Some(opts) => opts.get("session")?,
+        None => None,
+    };
+    let mut open = open_questions();
+    let Some(question) = open.get_mut(&tool_id).filter(|q| {
+        q.answer.is_none()
+            && !q.form.is_disconnected()
+            && session
+                .as_ref()
+                .is_none_or(|s| q.session.as_ref() == Some(s))
+    }) else {
+        return Ok((Some(false), None));
+    };
+    question.answer = Some(answer);
+    question.form.send(WinCommand::Close);
+    Ok((Some(true), None))
+}
+
 lua_table! {
     /// Host session primitives. The interactive UI can run several sessions
     /// at once. These functions list, create, focus, rename, and delete them.
@@ -792,11 +960,14 @@ lua_table! {
         tx: Option<flume::Sender<UiAction>>,
         perms: &PluginPermissions,
         may_run_agents: bool,
+        plugin: Arc<str>,
+        full_trust: bool,
     ),
     DOCS [
         list(tx), live(tx), current(tx), read(tx), export(perms, tx), messages(perms, tx), focus(tx),
         delete(perms, tx), new(perms, tx, may_run_agents), prompt(perms, tx),
         notify(perms, may_run_agents), set_mode(perms, tx), set_title(perms, tx),
+        register_question(plugin), settle_question(plugin), answer_question(full_trust),
     ]
 }
 
@@ -843,14 +1014,149 @@ mod tests {
     const PLUGIN: &str = "test";
     const FACTS_CWD: &str = "/origin";
     const ONE_MESSAGE: &str = "{ { role = 'user', content = { { type = 'text', text = 'hi' } } } }";
+    const TEST_PLUGIN: &str = "remote";
+    const ASKING_SESSION: &str = "asking";
 
     fn lua_with_session(tx: Option<flume::Sender<UiAction>>) -> Lua {
         let lua = Lua::new();
-        let t = create_session_table(&lua, tx, &PluginPermissions::trusted(), true).unwrap();
+        let t = create_session_table(
+            &lua,
+            tx,
+            &PluginPermissions::trusted(),
+            true,
+            Arc::from(TEST_PLUGIN),
+            true,
+        )
+        .unwrap();
         lua.globals().set("session", t).unwrap();
         lua
     }
 
+    /// A form registered under {tool_id} as `form`, and the commands it gets.
+    fn lua_with_question(tool_id: &str) -> (Lua, flume::Receiver<WinCommand>) {
+        let lua = lua_with_session(None);
+        let (_event_tx, event_rx) = flume::unbounded();
+        let (cmd_tx, cmd_rx) = flume::unbounded();
+        let win = WinHandle::new(event_rx, WinSender::new(cmd_tx, None), 80, 10, true);
+        lua.globals().set("form", win).unwrap();
+        let code = format!(
+            "session.register_question('{tool_id}', form, {{ session = '{ASKING_SESSION}' }})"
+        );
+        lua.load(code).exec().unwrap();
+        (lua, cmd_rx)
+    }
+
+    #[test_case(
+        "{ answers = { { 'Yes' }, { 'a', 'my own' } } }",
+        QUESTION_SUBMIT,
+        Some(vec![vec!["Yes"], vec!["a", "my own"]])
+        ; "answers"
+    )]
+    #[test_case("{ dismiss = true }", QUESTION_DISMISS, None ; "dismiss")]
+    fn answer_question_closes_the_form_and_settles_it(
+        reply: &str,
+        expected_type: &str,
+        expected_answers: Option<Vec<Vec<&str>>>,
+    ) {
+        let tool_id = format!("toolu_answer_{expected_type}");
+        let (lua, cmd_rx) = lua_with_question(&tool_id);
+        let (won, err): (bool, Option<String>) = eval(
+            &lua,
+            &format!("return session.answer_question('{tool_id}', {reply})"),
+        );
+        assert_eq!(err, None);
+        assert!(won);
+        assert!(matches!(cmd_rx.try_recv(), Ok(WinCommand::Close)));
+
+        let settled: Table = eval(
+            &lua,
+            &format!("return session.settle_question('{tool_id}')"),
+        );
+        assert_eq!(settled.get::<String>("type").unwrap(), expected_type);
+        let answers: Option<Vec<Vec<String>>> = settled.get("answers").unwrap();
+        assert_eq!(
+            answers,
+            expected_answers.map(|qs| qs
+                .into_iter()
+                .map(|q| q.into_iter().map(str::to_owned).collect())
+                .collect())
+        );
+    }
+
+    #[test]
+    fn the_second_answer_to_one_question_loses() {
+        let tool_id = "toolu_second";
+        let (lua, _cmd_rx) = lua_with_question(tool_id);
+        let answer = format!("return session.answer_question('{tool_id}', {{ dismiss = true }})");
+        assert!(eval::<bool>(&lua, &answer));
+        assert!(!eval::<bool>(&lua, &answer));
+    }
+
+    /// The user's answer settles the form first: nothing comes back, and a
+    /// plugin answering afterwards loses.
+    #[test]
+    fn a_plugin_answering_after_the_user_loses() {
+        let tool_id = "toolu_user_first";
+        let (lua, cmd_rx) = lua_with_question(tool_id);
+        let settled: Value = eval(
+            &lua,
+            &format!("return session.settle_question('{tool_id}')"),
+        );
+        assert!(settled.is_nil());
+        let answer = format!("return session.answer_question('{tool_id}', {{ dismiss = true }})");
+        assert!(!eval::<bool>(&lua, &answer));
+        assert!(cmd_rx.is_empty(), "a settled form is never closed again");
+    }
+
+    #[test_case("{ session = 'other' }", false ; "another_session")]
+    #[test_case("{ session = 'asking' }", true ; "the_asking_session")]
+    fn answer_question_checks_the_session(opts: &str, expected: bool) {
+        let tool_id = format!("toolu_session_{expected}");
+        let (lua, _cmd_rx) = lua_with_question(&tool_id);
+        let code =
+            format!("return session.answer_question('{tool_id}', {{ dismiss = true }}, {opts})");
+        assert_eq!(eval::<bool>(&lua, &code), expected);
+    }
+
+    #[test]
+    fn a_closed_form_takes_no_answer() {
+        let tool_id = "toolu_closed";
+        let (lua, cmd_rx) = lua_with_question(tool_id);
+        drop(cmd_rx);
+        let answer = format!("return session.answer_question('{tool_id}', {{ dismiss = true }})");
+        assert!(!eval::<bool>(&lua, &answer));
+    }
+
+    #[test_case("{}" ; "empty")]
+    #[test_case("{ answers = 'Yes' }" ; "answers_not_a_list")]
+    #[test_case("{ dismiss = false }" ; "dismiss_false")]
+    fn answer_question_rejects_a_malformed_reply(reply: &str) {
+        let lua = lua_with_session(None);
+        let (val, err): (Value, Option<String>) = eval(
+            &lua,
+            &format!("return session.answer_question('toolu_malformed', {reply})"),
+        );
+        assert!(val.is_nil());
+        assert_eq!(err.as_deref(), Some(QUESTION_REPLY_ERR));
+    }
+
+    #[test]
+    fn answer_question_needs_every_permission() {
+        let lua = Lua::new();
+        let t = create_session_table(
+            &lua,
+            None,
+            &PluginPermissions::trusted(),
+            true,
+            Arc::from(TEST_PLUGIN),
+            false,
+        )
+        .unwrap();
+        lua.globals().set("session", t).unwrap();
+        let code = "return session.answer_question('toolu_untrusted', { dismiss = true })";
+        let err = lua.load(code).eval::<Value>().unwrap_err();
+        assert!(err.to_string().contains(MANIFEST_FILE), "{err}");
+    }
     #[test]
     fn live_without_ui_returns_error_pair() {
         let lua = lua_with_session(None);
