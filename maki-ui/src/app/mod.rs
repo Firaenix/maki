@@ -1533,6 +1533,11 @@ impl App {
         }]
     }
 
+    /// A plugin's interrupt, the one a double Esc fires. `None` when no turn
+    /// is running, so there is nothing to cancel.
+    pub(crate) fn cancel_turn(&mut self) -> Option<Vec<Action>> {
+        (self.status == Status::Streaming).then(|| self.handle_cancel())
+    }
     fn handle_subagent_cancel(&mut self) -> Vec<Action> {
         let id = self.active_task_id();
         self.stop_task(&id).into_iter().collect()
