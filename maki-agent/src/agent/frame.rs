@@ -20,14 +20,14 @@ use std::sync::Arc;
 
 use maki_providers::{Message, Model};
 use maki_storage::frame::{LiveFacts, PlanChange, PromptFacts, StoredFrame};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use strum::IntoEnumIterator;
 
 use super::history::History;
 use super::instructions::build_system_prompt;
 use crate::mcp::{McpSession, ToolDeferral};
-use crate::prompt::{PLAN_PROMPT, PromptId, ResolvedSlots, Slot};
+use crate::prompt::{PromptId, ResolvedPrompts, Slot, SlotKind};
 use crate::template::Vars;
 use crate::tools::RequestTools;
 
@@ -55,22 +55,28 @@ impl RunContext {
     pub fn render(
         vars: &Vars,
         instructions: &str,
-        slots: &ResolvedSlots,
+        slots: &ResolvedPrompts,
         model: &Model,
         tools: RequestTools,
     ) -> Self {
+        let system = build_system_prompt(vars, instructions, slots, model);
         Self {
-            system: build_system_prompt(vars, instructions, slots, model),
+            system,
             tools,
             facts: Some(PromptFacts {
                 date: vars.apply("{date}").into_owned(),
                 cwd: vars.apply("{cwd}").into_owned(),
                 model: model.spec(),
-                instructions: instructions.to_owned(),
+                instructions: if slots.renders_instructions(PromptId::System) {
+                    instructions.to_owned()
+                } else {
+                    String::new()
+                },
                 hints: hint_facts(slots),
             }),
             authored: String::new(),
         }
+        .with_prompt_policy(slots)
     }
 
     /// For a prompt the host wrote itself.
@@ -82,15 +88,30 @@ impl RunContext {
             facts: None,
         }
     }
+
+    pub fn with_prompt_policy(mut self, prompts: &ResolvedPrompts) -> Self {
+        let policy = prompts.policy_key();
+        if !policy.is_empty() {
+            self.authored = json!([self.authored, policy]).to_string();
+        }
+        self
+    }
 }
 
 /// Each frontend brings its own, because only it knows how its prompt and
 /// tools are put together.
 pub type RunContextBuilder = Arc<dyn Fn(&Model, bool) -> RunContext + Send + Sync>;
 
-fn hint_facts(slots: &ResolvedSlots) -> BTreeMap<String, String> {
+fn hint_facts(slots: &ResolvedPrompts) -> BTreeMap<String, String> {
     let mut hints: BTreeMap<String, String> = BTreeMap::new();
     for slot in Slot::iter() {
+        if slot.kind() == SlotKind::Singleton {
+            let content = slots.section(PromptId::System, slot);
+            if content != PromptId::System.default_section(slot) {
+                hints.insert(format!("prompt/{slot}"), content);
+            }
+            continue;
+        }
         for entry in slots.get(PromptId::System, slot) {
             hints
                 .entry(format!("{}/{slot}", entry.plugin))
@@ -217,19 +238,23 @@ fn wrap_update(parts: &[String]) -> String {
     format!("{UPDATE_OPEN}{}{UPDATE_CLOSE}", parts.join("\n\n"))
 }
 
-fn plan_text(plan_path: &Path) -> String {
+fn plan_text(plan_path: &Path, prompts: &ResolvedPrompts) -> String {
     let vars = Vars::new().set("{plan_path}", plan_path.display().to_string());
-    vars.apply(PLAN_PROMPT).trim().to_owned()
+    prompts.render(PromptId::Plan, &vars, "").trim().to_owned()
 }
 
 /// The update entering plan mode sends, exactly as the model reads it.
-pub fn plan_mode_update(plan_path: &Path) -> String {
-    wrap_update(&[plan_text(plan_path)])
+pub fn plan_mode_update(plan_path: &Path, prompts: &ResolvedPrompts) -> String {
+    wrap_update(&[plan_text(plan_path, prompts)])
 }
 
 /// The update that brings the model from `told` to `now`, if anything
 /// changed. It says only what changed, and stores only that.
-pub(crate) fn context_update(told: &LiveFacts, now: &LiveFacts) -> Option<Message> {
+pub(crate) fn context_update(
+    told: &LiveFacts,
+    now: &LiveFacts,
+    prompts: &ResolvedPrompts,
+) -> Option<Message> {
     let update = told.changes_to(now);
     if update.is_empty() {
         return None;
@@ -252,7 +277,7 @@ pub(crate) fn context_update(told: &LiveFacts, now: &LiveFacts) -> Option<Messag
         });
     }
     match &update.plan {
-        Some(PlanChange::Entered(path)) => parts.push(plan_text(path)),
+        Some(PlanChange::Entered(path)) => parts.push(plan_text(path, prompts)),
         Some(PlanChange::Ended) => parts.push(PLAN_ENDED.to_owned()),
         None => {}
     }
@@ -300,7 +325,7 @@ mod tests {
 
     #[test]
     fn unchanged_facts_tell_nothing() {
-        assert!(context_update(&facts(), &facts()).is_none());
+        assert!(context_update(&facts(), &facts(), &ResolvedPrompts::default()).is_none());
     }
 
     #[test_case(|f: &mut LiveFacts| prompt(f).date = NEXT_DATE.into(), NEXT_DATE ; "date")]
@@ -313,7 +338,7 @@ mod tests {
     fn changed_fact_is_told(change: fn(&mut LiveFacts), says: &str) {
         let mut now = facts();
         change(&mut now);
-        let update = context_update(&facts(), &now).unwrap();
+        let update = context_update(&facts(), &now, &ResolvedPrompts::default()).unwrap();
         let mut heard = facts();
         heard.apply(update.facts_update().unwrap());
         assert_eq!(heard, now);

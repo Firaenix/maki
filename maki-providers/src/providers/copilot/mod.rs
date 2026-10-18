@@ -99,6 +99,8 @@ const MODELS_PATH: &str = "/models";
 
 /// Scales `/models` AI-credit prices (1 credit = $0.01) to USD per 1M tokens.
 const AIC_TO_USD_PER_MILLION: f64 = 10_000.0;
+/// `copilot_usage.total_nano_aiu` is billed in nano AI credits.
+const NANO_AIU_PER_USD: f64 = 100_000_000_000.0;
 
 pub struct Copilot {
     client: HttpClient,
@@ -357,6 +359,19 @@ impl Copilot {
             interaction_type,
         ))
     }
+}
+
+/// Prices a turn from the `copilot_usage` bill Copilot attaches to every stream,
+/// next to the usage counts: on the final chat completions chunk, on
+/// `message_delta`, and on `response.completed`, always at the top level of the
+/// event rather than inside `usage`. It already reflects the context tier the
+/// request landed in, which raises every rate past a per-model prompt size, so
+/// it beats any table we could keep. Read loosely so an unexpected shape only
+/// leaves the turn unpriced instead of failing the whole event.
+pub(crate) fn copilot_usd(copilot_usage: &Value) -> Option<f64> {
+    copilot_usage["total_nano_aiu"]
+        .as_f64()
+        .map(|nano_aiu| nano_aiu / NANO_AIU_PER_USD)
 }
 
 #[derive(Clone)]
@@ -1031,6 +1046,22 @@ mod tests {
 
         let unmatched: CopilotModel = serde_json::from_value(billing("gpt-5")).unwrap();
         assert_eq!(unmatched.pricing().unwrap().cache_write, 0.0);
+    }
+
+    #[test_case(json!(7_576_685_000_u64), 0.07576685 ; "long_context_luna_turn")]
+    #[test_case(json!(0), 0.0 ; "free_turn")]
+    #[test_case(json!(375_000.5), 0.000003750005 ; "float_total")]
+    fn copilot_usd_converts_nano_credits_to_usd(nano_aiu: Value, expected_usd: f64) {
+        let usd = copilot_usd(&json!({"total_nano_aiu": nano_aiu})).unwrap();
+        assert!((usd - expected_usd).abs() < 1e-12);
+    }
+
+    #[test_case(Value::Null ; "no_billing_block")]
+    #[test_case(json!({"token_details": []}) ; "no_total")]
+    #[test_case(json!({"total_nano_aiu": "375000"}) ; "string_total")]
+    #[test_case(json!("billed") ; "not_an_object")]
+    fn copilot_usd_unusable_leaves_the_turn_unpriced(copilot_usage: Value) {
+        assert!(copilot_usd(&copilot_usage).is_none());
     }
 
     #[test_case(json!({"id": "gpt-5"}) ; "no billing")]

@@ -94,8 +94,8 @@ pub struct PermissionError {
     scope: String,
     reason: String,
     guidance: Option<String>,
-    /// Set when a plugin answered instead of the user. Its guidance is still
-    /// text the agent reads, so it must not arrive dressed as the user's.
+    /// Set when a plugin denied the call. Its guidance can echo the very input
+    /// it judged, so the agent must not take it for the user's words.
     plugin: Option<Arc<str>>,
 }
 
@@ -298,29 +298,24 @@ impl TaggedAnswer {
     }
 }
 
-/// What a layer may answer about one call: allow it, or deny it with optional
-/// guidance.
-///
-/// Deliberately narrower than [`PermissionAnswer`]. The prompt's own answers
-/// widen scopes and persist rules — allowing `git status` with `allow_session`
-/// leaves a `git *` rule behind — so a plugin answering in the user's place
-/// would quietly grant everything that rule covers, including calls the layer
-/// never saw. A verdict decides this call and records nothing.
+/// A plugin answering the prompt can only allow or deny this one call. The
+/// prompt's own answers save rules, and allowing `git status` for the session
+/// leaves a `git *` rule behind. A plugin giving that answer would let through
+/// a later `git push --force` it never got to see.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LayerVerdict {
     Allow,
     Deny { guidance: Option<String> },
 }
 
-/// A plugin's verdict on a call that would have prompted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LayerAnswer {
     pub plugin: Arc<str>,
     pub verdict: LayerVerdict,
 }
 
-/// Whatever sits in front of the permission prompt. `None` leaves the call to
-/// the prompt, exactly as if nothing were there.
+/// The plugins sitting in front of the permission prompt. `None` leaves the
+/// call to the prompt.
 pub trait PromptLayers: Sync {
     fn answer<'a>(&'a self, scopes: &'a [String]) -> BoxFuture<'a, Option<LayerAnswer>>;
 }
@@ -750,8 +745,9 @@ impl PermissionManager {
     }
 
     /// `ask` is a plugin's reason to show this call to the user whatever the
-    /// rules say. See [`Self::check_escalated`]. `layers` is the chain that may
-    /// answer the prompt in the user's place, and runs before it opens.
+    /// rules say. See [`Self::check_escalated`]. `layers` may answer in the
+    /// user's place before the prompt opens, and the plugin that allowed the
+    /// call comes back so the caller can mark it.
     ///
     /// No `user_response_rx` means nobody is there to answer, like in `maki -p`
     /// or a background session, so a prompt is denied instead of waiting forever.
@@ -809,41 +805,26 @@ impl PermissionManager {
             } => (tool, scopes, force_prompt),
         };
 
-        // Runs before the prompt's lock, so a slow layer never holds up a
-        // prompt the user could already be answering, and before the missing
-        // channel check, since a run nobody watches is where a layer earns
-        // its keep.
+        // Asked before the prompt lock, so a slow layer never holds up a prompt
+        // the user could already answer, and before the missing channel check,
+        // since a run nobody watches is where a layer helps the most.
         //
-        // Never on an escalated call. `ask` means another layer's
-        // `tool.*.input` sent this call to a human on purpose, and
-        // `check_escalated` only ever makes a call harder to run — so letting a
-        // `permission.prompt` layer allow it would undo the escalation. Under
-        // yolo the escalated calls are the *only* ones that reach here, which
-        // is exactly where a guard plugin's "show this to the user" must not be
-        // answered by another plugin.
+        // An escalated call skips the layers. Another plugin's `tool.*.input`
+        // sent it to a human on purpose, and under yolo these are the only
+        // calls that get this far. Nothing is recorded, see `LayerVerdict`.
         if ask.is_none()
             && let Some(layers) = layers
             && let Ok(Some(LayerAnswer { plugin, verdict })) = cancel.race(layers.answer(&ps)).await
         {
-            // No `apply_decision`: a verdict settles this call and leaves no
-            // rule behind, so nothing a layer allows widens into a scope the
-            // layer never judged.
-            if let LayerVerdict::Deny { guidance } = verdict {
-                return Err(deny(
+            return match verdict {
+                LayerVerdict::Allow => allowed(DECISION_SOURCE_PLUGIN).map(|_| Some(plugin)),
+                LayerVerdict::Deny { guidance } => Err(deny(
                     DECISION_SOURCE_PLUGIN,
                     PLUGIN_DENIED_REASON.to_owned(),
                     guidance,
                     Some(plugin),
-                ));
-            }
-            maki_otel::emit::tool_decision(
-                &tool_string,
-                maki_otel::emit::DECISION_ACCEPT,
-                DECISION_SOURCE_PLUGIN,
-            );
-            // The caller owns the mark: a nested call has no row of its own to
-            // annotate, and only the dispatcher knows which it is.
-            return Ok(Some(plugin));
+                )),
+            };
         }
 
         let Some(rx) = user_response_rx else {
@@ -2509,10 +2490,9 @@ mod tests {
     }
 
     const LAYER_PLUGIN: &str = "guard";
-
     const LAYER_SCOPE: &str = "rm -rf build";
-
     const LAYER_GUIDANCE: &str = "use trash instead";
+    const ESCALATION: &str = "look at this";
 
     struct Layer(Option<LayerVerdict>);
 
@@ -2526,16 +2506,15 @@ mod tests {
         }
     }
 
-    /// Runs one call that would prompt, with no answer channel behind the
-    /// layer, the way `maki -p` does. `ask` escalates the call, as another
-    /// layer's `tool.*.input` does.
+    /// No answer channel, like `maki -p`, so whatever the layer leaves to the
+    /// prompt gets denied.
     fn enforce_behind(
         mgr: &PermissionManager,
         layer: Layer,
         ask: Option<&str>,
     ) -> Result<Option<Arc<str>>, PermissionError> {
         let (guard, _events) = crate::event_stream();
-        let result = smol::block_on(mgr.enforce(
+        smol::block_on(mgr.enforce(
             &ToolKey::native(BASH_TOOL),
             &crate::tools::PermissionScopes::single(LAYER_SCOPE.to_owned()),
             None,
@@ -2546,13 +2525,11 @@ mod tests {
             None,
             ask,
             Some(&layer),
-        ));
-        drop(guard);
-        result
+        ))
     }
 
-    /// A verdict settles the call it was given and nothing else: the next call
-    /// on the same scope still prompts, because an allow records no rule.
+    /// The next call on the same scope still prompts, so an allow saved no
+    /// rule that could cover calls the layer never saw.
     #[test_case(Some(LayerVerdict::Allow), true ; "allow")]
     #[test_case(Some(LayerVerdict::Deny { guidance: None }), false ; "deny")]
     #[test_case(None, false ; "no_answer_falls_to_the_prompt")]
@@ -2567,28 +2544,24 @@ mod tests {
         );
         assert_eq!(
             outcome(mgr.check(&ToolKey::native(BASH_TOOL), LAYER_SCOPE, None)),
-            PROMPTS,
-            "a layer's verdict left a rule behind"
+            PROMPTS
         );
     }
 
-    /// An escalated call is one another layer sent to a human on purpose.
-    /// Escalation only ever makes a call harder to run, so no layer may answer
-    /// it — and under yolo these are the only calls that reach a layer at all.
+    /// Another plugin sent this call to a human on purpose, so no layer may
+    /// answer it, whichever way it would go.
     #[test_case(LayerVerdict::Allow ; "allow")]
     #[test_case(LayerVerdict::Deny { guidance: None } ; "deny")]
     fn an_escalated_call_never_reaches_a_layer(verdict: LayerVerdict) {
-        let result = enforce_behind(&default_mgr(), Layer(Some(verdict)), Some("look at this"));
-        let err = result.expect_err("no channel, so the prompt cannot answer");
-        let err = err.to_string();
-        assert!(
-            !err.contains(LAYER_PLUGIN),
-            "a layer answered an escalated call: {err}"
-        );
+        let result = enforce_behind(&default_mgr(), Layer(Some(verdict)), Some(ESCALATION));
+        let err = result
+            .expect_err("no channel, so the prompt cannot answer")
+            .to_string();
+        assert!(!err.contains(LAYER_PLUGIN), "a layer answered: {err}");
     }
 
-    /// A plugin's reason is shaped by the very call it judged, so the agent
-    /// has to be told whose voice it is reading.
+    /// The guidance can echo the input the plugin judged, so the agent has to
+    /// know it came from the plugin rather than the user.
     #[test_case(None, DEFAULT_DENY_GUIDANCE ; "bare")]
     #[test_case(Some(LAYER_GUIDANCE.to_owned()), LAYER_GUIDANCE ; "with_guidance")]
     fn a_layer_deny_is_labelled_by_plugin(guidance: Option<String>, expected: &str) {

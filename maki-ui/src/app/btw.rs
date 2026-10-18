@@ -114,8 +114,86 @@ async fn run_btw(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arc_swap::ArcSwap;
+    use maki_agent::HistorySnapshot;
+    use maki_agent::prompt::{PromptId, Slot};
+    use maki_agent::tools::ToolRegistry;
+    use maki_lua::PluginHost;
+    use maki_providers::provider::BoxFuture;
+    use maki_providers::{AgentError, ModelInfo, StreamResponse};
+    use maki_storage::frame::StoredFrame;
+    use std::future;
+    use test_case::test_case;
 
     const Q: &str = "why sqlite?";
+    const FRAME_POLICY: &str = "Use the active conversation policy.";
+
+    struct RecordingProvider(Sender<(String, Value)>);
+
+    impl Provider for RecordingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            system: &'a str,
+            tools: &'a Value,
+            _: &'a Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                self.0.send((system.to_owned(), tools.clone())).unwrap();
+                future::pending().await
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[test_case(false, BTW_FALLBACK_SYSTEM ; "native_fallback")]
+    #[test_case(true, FRAME_POLICY ; "stored_frame_precedence")]
+    fn side_question_uses_the_selected_policy(with_frame: bool, expected: &str) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "persona",
+            r#"
+            local calls = 0
+            maki.api.set_prompt({ slot = "identity", content = function()
+                calls += 1
+                return tostring(calls)
+            end })
+            "#,
+        )
+        .unwrap();
+        let mut app = crate::app::tests::test_app();
+        app.lua_event_handle = host.event_handle();
+        if with_frame {
+            let mut snapshot = HistorySnapshot::new(Vec::new());
+            snapshot.frame = Some(Arc::new(StoredFrame {
+                system: FRAME_POLICY.into(),
+                fingerprint: String::new(),
+                facts: None,
+                mcp_tools: Vec::new(),
+            }));
+            app.shared_history = Some(Arc::new(ArcSwap::from_pointee(snapshot)));
+        }
+        let (sent, requests) = flume::unbounded();
+        app.start_btw(
+            Q.into(),
+            Arc::new(RecordingProvider(sent)),
+            crate::components::test_model(),
+        );
+        let (system, tools) = smol::block_on(requests.recv_async()).unwrap();
+        assert_eq!(system, expected);
+        assert!(tools.as_array().unwrap().is_empty());
+        let prompts = host.event_handle().collect_prompt_slots();
+        assert_eq!(
+            prompts.get(PromptId::System, Slot::Identity)[0].content,
+            "1"
+        );
+    }
 
     fn user_text(msg: &Message) -> String {
         msg.content

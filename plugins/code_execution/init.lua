@@ -108,8 +108,10 @@ local function build_body(ctx, code)
   end
 
   view:set_header(header())
+  -- Flip the flag directly: `toggle` would flush the old header first, and
+  -- each flush walks every line of a script this long.
   buf:on("click", function()
-    view:toggle()
+    view.expanded = not view.expanded
     view:set_header(header())
   end)
 

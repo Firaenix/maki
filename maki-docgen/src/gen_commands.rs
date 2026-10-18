@@ -1,8 +1,13 @@
+use std::collections::BTreeMap;
 use std::fmt::Write;
+use std::sync::Arc;
 
-use maki_ui::BUILTIN_COMMANDS;
+use maki_agent::tools::ToolRegistry;
+use maki_config::Permission;
+use maki_lua::{LuaCommandInfo, PluginHost};
+use maki_ui::{BUILTIN_COMMANDS, PluginAccess, STARTS_TURNS};
 
-use crate::lua_util;
+use crate::lua_util::in_registration_window;
 
 const ALIASING: &str = r#"## Aliasing commands
 
@@ -29,7 +34,85 @@ for _, alias in ipairs(aliases) do
 end
 ```
 
-Both names stay in the palette: aliasing adds a name, it does not rename or hide the original. It works for any command listed above, plus plugin commands and MCP prompts. See [`maki.api.run_command`](/docs/lua-api/#maki-api-run_command) for matching and error handling, or [`maki.ui.action`](/docs/lua-api/#maki-ui-action) to bind a key instead of a name."#;
+Aliasing adds a name, so both stay in the palette. Any command works as a target, including MCP prompts and other plugins' commands. See [`maki.api.run_command`](/docs/lua-api/#maki-api-run_command) for matching and error handling, or [`maki.ui.action`](/docs/lua-api/#maki-ui-action) to bind a key instead of a name."#;
+
+const PLUGIN_ACCESS: &str = r#"### What a plugin may run {#plugin-access}
+
+`run_command` only runs what the calling plugin's grants cover. Your `init.lua` counts as a plugin, and its grants come from `~/.config/maki/plugin.toml` (see [plugin permissions](/docs/lua-api/#plugin-permissions)). Commands not listed here run for any plugin."#;
+
+const PLUGIN_COMMAND_ACCESS: &str = r#"A plugin command's handler runs with the grants of the plugin that registered it. The caller picks the arguments, so it must hold at least the same reach:
+
+- Every permission the owner holds.
+- Host access as wide as the owner's. A caller without `net_hosts` has it. A caller with a list needs the owner to have one too, and must contain each of its entries exactly as written, so `*.example.com` does not cover `api.example.com`.
+- Its own provider on the address of each provider the owner registered. That address may be on your LAN, which `net_hosts` cannot grant.
+
+A caller granted `run` skips both address checks, since a process it starts can reach any host."#;
+
+fn builtin_names(access: PluginAccess) -> Vec<String> {
+    BUILTIN_COMMANDS
+        .iter()
+        .filter(|cmd| cmd.plugin_access == access)
+        .map(|cmd| format!("`{}`", cmd.name))
+        .collect()
+}
+
+/// Read from booted plugins, so what is listed is the grant `run_command`
+/// actually compares against.
+fn bundled_commands() -> Vec<LuaCommandInfo> {
+    let host = in_registration_window(|| {
+        PluginHost::with_all_builtins(Arc::new(ToolRegistry::new())).expect("loading builtins")
+    });
+    let mut commands = host.command_reader().load().commands.clone();
+    commands.sort_by(|a, b| a.name.cmp(&b.name));
+    commands
+}
+
+fn write_plugin_access(out: &mut String, bundled: &[LuaCommandInfo]) {
+    writeln!(out, "{PLUGIN_ACCESS}").unwrap();
+    writeln!(out).unwrap();
+    let mut by_needs: BTreeMap<Vec<Permission>, Vec<String>> = BTreeMap::new();
+    for &perm in Permission::ALL {
+        let access = PluginAccess::Needs(perm);
+        let names = by_needs.entry(vec![perm]).or_default();
+        names.extend(builtin_names(access));
+        if access == STARTS_TURNS {
+            names.extend(["custom commands".into(), "MCP prompts".into()]);
+        }
+    }
+    for cmd in bundled {
+        let held: Vec<Permission> = Permission::ALL
+            .iter()
+            .copied()
+            .filter(|&perm| cmd.reach.is_allowed(perm))
+            .collect();
+        if !held.is_empty() {
+            by_needs
+                .entry(held)
+                .or_default()
+                .push(format!("`{}`", cmd.name));
+        }
+    }
+    for (perms, names) in by_needs.iter().filter(|(_, names)| !names.is_empty()) {
+        let keys: Vec<String> = perms
+            .iter()
+            .map(|perm| format!("`{}`", perm.manifest_key()))
+            .collect();
+        writeln!(out, "- Needs {}: {}.", keys.join(", "), names.join(", ")).unwrap();
+    }
+    writeln!(
+        out,
+        "- Needs what its owner holds: every other plugin command, as described below."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "- Only when you type it: {}. These change permissions, folder trust, or installed packages.",
+        builtin_names(PluginAccess::UserOnly).join(", ")
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "{PLUGIN_COMMAND_ACCESS}").unwrap();
+}
 
 fn write_row(out: &mut String, name: &str, description: &str) {
     writeln!(out, "| `{name}` | {} |", description.replace('|', "\\|")).unwrap();
@@ -60,7 +143,8 @@ pub fn generate() -> String {
     for cmd in BUILTIN_COMMANDS {
         write_row(&mut out, cmd.name, cmd.description);
     }
-    for cmd in &lua_util::load_builtin_plugin_commands() {
+    let bundled = bundled_commands();
+    for cmd in &bundled {
         write_row(&mut out, &cmd.name, &cmd.description);
     }
 
@@ -192,6 +276,8 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(out).unwrap();
     writeln!(out, "{ALIASING}").unwrap();
+    writeln!(out).unwrap();
+    write_plugin_access(&mut out, &bundled);
 
     writeln!(out).unwrap();
     writeln!(

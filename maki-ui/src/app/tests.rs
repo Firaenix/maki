@@ -1,9 +1,11 @@
+use super::session::{FORK_EMPTY_MSG, FORK_TITLE_PREFIX};
 use super::*;
 use crate::AppSession;
 use crate::agent::shared_queue;
+use crate::app::tasks::TaskStatus;
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT, INBOX_DROPPED_SUFFIX};
 use crate::components::btw_modal::BtwEvent;
-use crate::components::command::ParsedCommand;
+use crate::components::command::{ParsedCommand, USER_ONLY_SUFFIX, missing_refusal};
 use crate::components::file_picker::UNREADABLE_DIR_MSG;
 use crate::components::keybindings::{KeybindContext, key as kb};
 use crate::components::messages::ScrollPos;
@@ -15,6 +17,7 @@ use crate::selection::{RowPos, SelectableZone, SelectionState, SelectionZone};
 use crate::theme;
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+use maki_agent::command::{CommandScope, CustomCommand};
 use maki_agent::permissions::{PermissionAnswer, PermissionManager};
 use maki_agent::{
     AgentMode, DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus,
@@ -25,8 +28,8 @@ use maki_config::{Effect, PermissionRule, PermissionsConfig, ProjectConfig, Tool
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use maki_lua::{
     BuiltinAction, Dimension, FloatConfig, HintReader, KeymapReader, LuaCommandInfo,
-    LuaCommandReader, PackCommand, PackPlan, PackPreparation, PackReport, SessionEndReason, Split,
-    WinCommand, WinEvent,
+    LuaCommandReader, Missing, PackCommand, PackPlan, PackPreparation, PackReport, Permission,
+    PluginPermissions, SessionEndReason, Split, WinCommand, WinEvent,
 };
 use maki_providers::{
     ContentBlock, Effort, Message, Model, RequestOptions, Role, THINKING_USAGE, ThinkingSupport,
@@ -113,6 +116,10 @@ const OTHER_SESSION_ID: &str = "11111111-1111-1111-1111-111111111111";
 const EDIT_PLUGIN: &str = "completion";
 const CD_TARGET_DIR: &str = "other";
 const CD_TARGET_PROMPT: &str = "typed in the other project";
+const CUSTOM_COMMAND_NAME: &str = "fix";
+const CUSTOM_COMMAND_CONTENT: &str = "Fix $ARGUMENTS";
+const RUNNING_PLUGIN: &str = "runner";
+const RUNNING_PLUGIN_COMMAND: &str = "/runit";
 
 fn set_zone(app: &mut App, zone: SelectionZone, area: Rect) {
     app.zones.push(SelectableZone { area, zone });
@@ -273,7 +280,7 @@ fn agent_msg_with_run_id(event: AgentEvent, run_id: u64) -> Msg {
     }))
 }
 
-fn done() -> AgentEvent {
+pub(crate) fn done() -> AgentEvent {
     AgentEvent::Done {
         usage: TokenUsage::default(),
         cost: None,
@@ -2004,8 +2011,7 @@ fn turn_complete_accumulates_usage_by_model() {
     assert_eq!(sub.output, 75);
 }
 
-const BACKGROUND_MODEL: &str = "background-model";
-const BACKGROUND_USAGE: StoredTokenUsage = StoredTokenUsage {
+const MONITOR_TURN: StoredTokenUsage = StoredTokenUsage {
     input: 300,
     output: 40,
     cache_creation: 0,
@@ -2013,21 +2019,245 @@ const BACKGROUND_USAGE: StoredTokenUsage = StoredTokenUsage {
     cost: Some(0.011),
     subsidised_list_cost: None,
 };
+pub(crate) const MONITOR_PLUGIN: &str = "ci";
+pub(crate) const MONITOR_ID: &str = "session-01";
+const MONITOR_NAME: &str = "ci-monitor";
+const MONITOR_PROMPT: &str = "Check CI now.";
+const SECOND_PROMPT: &str = "Check again.";
 
-#[test]
-fn background_usage_bills_only_the_tab_showing_its_session() {
-    let mut app = test_app();
-
-    app.add_background_usage(MakiId::generate(), BACKGROUND_MODEL, BACKGROUND_USAGE);
-    app.add_background_usage(app.state.session.id, BACKGROUND_MODEL, BACKGROUND_USAGE);
-
-    assert_eq!(app.state.cost, BACKGROUND_USAGE.cost);
-    assert_eq!(app.chats[0].cost, BACKGROUND_USAGE.cost);
-    assert_eq!(app.state.token_usage, TokenUsage::from(BACKGROUND_USAGE));
-    assert_eq!(
-        app.state.session.usage_by_model().get(BACKGROUND_MODEL),
-        Some(&BACKGROUND_USAGE)
+/// What the relay of a plugin session sends: every event names the task and
+/// its first prompt, and none is bound to a run of the tab's agent.
+pub(crate) fn plugin_event(app: &mut App, event: AgentEvent) {
+    let mut info = subagent_info(MONITOR_ID, MONITOR_NAME);
+    info.prompt = Some(MONITOR_PROMPT.into());
+    app.deliver(
+        Envelope {
+            event,
+            subagent: Some(info),
+            run_id: 0,
+        },
+        Some(Arc::from(MONITOR_PLUGIN)),
     );
+}
+
+pub(crate) fn app_with_plugin_task() -> App {
+    let mut app = test_app();
+    plugin_event(&mut app, AgentEvent::TextDelta { text: "x".into() });
+    app
+}
+
+fn monitor_turn() -> AgentEvent {
+    turn_complete(
+        TokenUsage::from(MONITOR_TURN),
+        TEST_MODEL_SPEC,
+        MONITOR_TURN.cost,
+    )
+}
+
+fn monitor_history(messages: Vec<Message>) -> AgentEvent {
+    AgentEvent::SubagentHistory {
+        tool_use_id: MONITOR_ID.into(),
+        messages,
+    }
+}
+
+fn next_prompt() -> AgentEvent {
+    AgentEvent::QueueItemConsumed {
+        text: SECOND_PROMPT.into(),
+        images: vec![],
+    }
+}
+
+fn agent_error() -> AgentEvent {
+    AgentEvent::Error {
+        message: AGENT_ERROR_MSG.into(),
+        auth: false,
+    }
+}
+
+/// A plugin task is a chat like a tool task, but routed by id: `chat_index`
+/// is the running turn's map, and the main chat is idle here.
+#[test]
+fn plugin_task_opens_a_chat_by_id_with_its_first_prompt() {
+    let app = app_with_plugin_task();
+
+    assert_eq!(app.chats.len(), 2);
+    assert!(app.chat_index.is_empty());
+    let chat = &app.chats[1];
+    assert_eq!(chat.plugin.as_deref(), Some(MONITOR_PLUGIN));
+    assert_eq!(chat.task_status(), TaskStatus::Working);
+    assert_eq!(chat.message_count(), 1);
+    assert_eq!(chat.last_message_text(), MONITOR_PROMPT);
+    let tasks = serde_json::to_value(app.tasks()).unwrap();
+    assert_eq!(tasks[1]["plugin"], MONITOR_PLUGIN);
+    assert_eq!(tasks[0].get("plugin"), None);
+}
+
+/// A plugin session that never prompted has nothing to show, and must not
+/// land in the main chat the way a run-level event does.
+#[test]
+fn plugin_event_without_a_task_shows_nowhere() {
+    let mut app = test_app();
+    app.deliver(
+        Envelope {
+            event: AgentEvent::TextDelta { text: "x".into() },
+            subagent: None,
+            run_id: 0,
+        },
+        Some(Arc::from(MONITOR_PLUGIN)),
+    );
+    assert_eq!(app.chats.len(), 1);
+    assert_eq!(app.chats[0].message_count(), 0);
+}
+
+/// `Done` and `Error` end the prompt, not the session: the task goes idle
+/// with nothing said in the main chat, and the next prompt shows as a user
+/// bubble and brings the spinner back.
+#[test_case(done(),        DisplayRole::Assistant ; "done")]
+#[test_case(agent_error(), DisplayRole::Error     ; "error")]
+fn plugin_task_idles_between_prompts(ending: AgentEvent, shown_as: DisplayRole) {
+    let mut app = app_with_plugin_task();
+
+    plugin_event(&mut app, ending);
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Idle);
+    assert_eq!(app.chats[1].last_message_role(), Some(&shown_as));
+    assert_eq!(app.chats[0].last_message_role(), None);
+
+    plugin_event(&mut app, next_prompt());
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
+    assert_eq!(app.chats[1].last_message_text(), SECOND_PROMPT);
+}
+
+/// A plugin task's run can end mid-tool with no `ToolDone` to follow: its
+/// Lua task got cancelled, or the plugin closed the session. No turn-end
+/// sweep reaches a plugin chat, so the ending itself has to settle the tool,
+/// or it spins forever in an idle or done transcript.
+#[test_case(done()                   ; "run_end")]
+#[test_case(agent_error()            ; "run_error")]
+#[test_case(AgentEvent::StreamClosed ; "session_closed")]
+fn plugin_task_ending_settles_its_tools_in_progress(ending: AgentEvent) {
+    let mut app = app_with_plugin_task();
+    plugin_event(&mut app, tool_start("tool-1", "bash"));
+    assert_eq!(app.chats[1].in_progress_count(), 1);
+
+    plugin_event(&mut app, ending);
+
+    assert_eq!(app.chats[1].in_progress_count(), 0);
+}
+
+/// The main chat's turn end and Esc sweep the tool tasks of that turn, and
+/// leave a plugin task alone: it answers to its plugin, not to the turn.
+/// The cleared `chat_index` must not bring it back as a second chat either.
+#[test_case(end_turn   ; "turn_end")]
+#[test_case(cancel_app ; "main_esc")]
+fn plugin_task_outlives_the_main_chats_turn(sweep: fn(&mut App)) {
+    let mut app = app_with_subagent();
+    plugin_event(&mut app, AgentEvent::TextDelta { text: "x".into() });
+    assert_eq!(app.chats.len(), 3);
+
+    sweep(&mut app);
+
+    assert!(app.chats[1].is_finished());
+    assert_eq!(app.chats[2].task_status(), TaskStatus::Working);
+    plugin_event(&mut app, AgentEvent::TextDelta { text: "y".into() });
+    assert_eq!(app.chats.len(), 3);
+}
+
+/// Esc in the task's tab is the one way to stop it from the UI. It closes the
+/// session rather than a run, so it works while idle too, and the
+/// `StreamClosed` of the closing session cannot walk the cancel back.
+#[test]
+fn esc_in_a_plugin_task_tab_stops_its_session() {
+    let mut app = app_with_plugin_task();
+    plugin_event(&mut app, done());
+    app.run_builtin(BuiltinAction::NextChat);
+    app.last_esc = Some(Instant::now());
+
+    let actions = app.update(Msg::Key(key(KeyCode::Esc)));
+
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::CancelPluginTask { id }] if id == MONITOR_ID
+    ));
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Error);
+    assert_eq!(app.chats[1].last_message_text(), CANCELLED_TEXT);
+    assert_eq!(app.chats[0].last_message_role(), None);
+
+    plugin_event(&mut app, AgentEvent::StreamClosed);
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Error);
+}
+
+/// The transcript lands after every prompt, so a monitor that dies with the
+/// process leaves what it did, and the close is its own event.
+#[test]
+fn plugin_task_stores_its_transcript_per_prompt_and_finishes_on_close() {
+    let mut app = app_with_plugin_task();
+    plugin_event(&mut app, monitor_history(vec![Message::user("ok".into())]));
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
+    assert_eq!(app.state.session.subagent_messages()[MONITOR_ID].len(), 1);
+
+    plugin_event(&mut app, AgentEvent::StreamClosed);
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Done);
+    assert_eq!(app.chats[1].last_message_text(), DONE_TEXT);
+}
+
+/// What a finished plugin task shows after a reload: who spent it, and how
+/// much. Restored as finished, since no plugin session survives a restart.
+#[test]
+fn plugin_task_restores_with_its_owner_and_cost() {
+    let mut app = app_with_plugin_task();
+    plugin_event(&mut app, monitor_turn());
+    assert_eq!(app.chats[1].cost, MONITOR_TURN.cost);
+    assert_eq!(app.state.cost, MONITOR_TURN.cost);
+    plugin_event(&mut app, monitor_history(vec![]));
+    plugin_event(&mut app, AgentEvent::StreamClosed);
+
+    app.reset_ui_chrome();
+    app.restore_display();
+
+    let chat = &app.chats[1];
+    assert_eq!(chat.plugin.as_deref(), Some(MONITOR_PLUGIN));
+    assert_eq!(chat.cost, MONITOR_TURN.cost);
+    assert_eq!(chat.task_status(), TaskStatus::Done);
+    assert!(app.chat_index.is_empty());
+}
+
+/// A rewind rebuilds the main chat, not the monitor a plugin runs beside it.
+/// The live task keeps its tab, its cost and its status, and a transcript
+/// no tool use in the history anchors is not pruned as an orphan.
+#[test]
+fn rewind_leaves_a_live_plugin_task_alone() {
+    let mut app = build_rewind_app();
+    plugin_event(&mut app, monitor_turn());
+    plugin_event(&mut app, monitor_history(vec![]));
+    plugin_event(&mut app, done());
+
+    app.rewind_to(rewind_to_second_turn());
+
+    assert_eq!(app.chats.len(), 2);
+    let chat = &app.chats[1];
+    assert_eq!(chat.task_status(), TaskStatus::Idle);
+    assert_eq!(chat.cost, MONITOR_TURN.cost);
+    assert!(
+        app.state
+            .session
+            .subagent_messages()
+            .contains_key(MONITOR_ID)
+    );
+    assert_eq!(app.state.session.subagents()[0].cost, MONITOR_TURN.cost);
+    plugin_event(&mut app, next_prompt());
+    assert_eq!(app.chats.len(), 2);
+    assert_eq!(app.chats[1].task_status(), TaskStatus::Working);
+}
+
+/// `/new` swaps the session under the tab, and the Lua host ends every
+/// plugin session of the old one. A task still shown as live belongs to
+/// that old session and goes with it.
+#[test]
+fn new_session_drops_the_old_sessions_plugin_task() {
+    let mut app = app_with_plugin_task();
+    app.reset_session();
+    assert_eq!(app.chats.len(), 1);
 }
 
 #[test]
@@ -2468,6 +2698,23 @@ fn double_esc_cancels_flushes_and_fails_tools() {
     assert_eq!(app.chats[0].in_progress_count(), 0);
 }
 
+/// A plugin's cancel is the double Esc without the keys: it interrupts a
+/// running turn, and reports an idle session as nothing to cancel.
+#[test]
+fn cancel_turn_interrupts_only_a_running_turn() {
+    let mut app = test_app();
+    assert!(app.cancel_turn().is_none());
+
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    let actions = app.cancel_turn().expect("a running turn is cancelled");
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::CancelAgent { run_id: 1 }]
+    ));
+    assert_eq!(app.status, Status::Idle);
+    assert!(app.cancel_turn().is_none());
+}
 #[test]
 fn double_esc_idle_opens_rewind_picker() {
     let mut app = test_app();
@@ -3939,6 +4186,7 @@ fn typed_lua_command_with_args_executes() {
             name: "/rename".into(),
             description: "Rename the current session".into(),
             plugin: "sessions".into(),
+            reach: trusted(),
             max_args: usize::MAX,
         }]),
     );
@@ -3953,6 +4201,8 @@ fn typed_lua_command_with_args_executes() {
 
 const RUN_CMDLINE_REJECTED: &str = "a rejected cmdline must not run anything";
 
+/// The caller holds nothing at all, because a local command like `/new` runs
+/// for any plugin.
 #[test_case("/new" ; "plain")]
 #[test_case("/NEW" ; "uppercase")]
 #[test_case("  /new  " ; "surrounding_whitespace")]
@@ -3960,7 +4210,9 @@ const RUN_CMDLINE_REJECTED: &str = "a rejected cmdline must not run anything";
 fn run_cmdline_executes_builtin(cmdline: &str) {
     let mut app = test_app();
 
-    let actions = app.run_cmdline(cmdline, 0).unwrap();
+    let actions = app
+        .run_cmdline(cmdline, 0, &PluginReach::new(PluginPermissions::denied()))
+        .unwrap();
 
     assert!(matches!(&actions[..], [Action::RestartAgent(h)] if h.is_empty()));
 }
@@ -3969,7 +4221,9 @@ fn run_cmdline_executes_builtin(cmdline: &str) {
 fn run_cmdline_splits_args_off_the_name() {
     let mut app = test_app();
 
-    let actions = app.run_cmdline("/btw what is rust?", 0).unwrap();
+    let actions = app
+        .run_cmdline("/btw what is rust?", 0, &trusted())
+        .unwrap();
 
     assert!(matches!(&actions[..], [Action::Btw(q)] if q == "what is rust?"));
 }
@@ -3981,7 +4235,7 @@ fn run_cmdline_keeps_typed_input() {
     let mut app = test_app();
     app.input_box.set_input("half written".into());
 
-    app.run_cmdline("/usage", 0).unwrap();
+    app.run_cmdline("/usage", 0, &trusted()).unwrap();
 
     assert_eq!(app.input_box.buffer.value(), "half written");
 }
@@ -3992,7 +4246,7 @@ fn run_cmdline_unknown_name_errors_without_dispatching() {
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
 
-    let Err(err) = app.run_cmdline("/nope", 0) else {
+    let Err(err) = app.run_cmdline("/nope", 0, &trusted()) else {
         panic!("{RUN_CMDLINE_REJECTED}");
     };
 
@@ -4004,16 +4258,84 @@ fn run_cmdline_unknown_name_errors_without_dispatching() {
 fn run_cmdline_rejects_past_max_depth() {
     let mut app = test_app();
 
-    let Err(err) = app.run_cmdline("/new", crate::app::MAX_COMMAND_DEPTH + 1) else {
+    let Err(err) = app.run_cmdline("/new", crate::app::MAX_COMMAND_DEPTH + 1, &trusted()) else {
         panic!("{RUN_CMDLINE_REJECTED}");
     };
 
     assert_eq!(err, crate::app::COMMAND_DEPTH_MSG);
     assert!(
-        app.run_cmdline("/new", crate::app::MAX_COMMAND_DEPTH)
+        app.run_cmdline("/new", crate::app::MAX_COMMAND_DEPTH, &trusted())
             .is_ok(),
         "the cap itself must still run"
     );
+}
+
+fn trusted() -> PluginReach {
+    PluginReach::new(PluginPermissions::trusted())
+}
+
+fn without(permission: Permission) -> PluginReach {
+    let mut permissions = PluginPermissions::trusted();
+    permissions.set(permission, false);
+    PluginReach::new(permissions)
+}
+
+fn only(permission: Permission) -> PluginReach {
+    PluginReach::new(PluginPermissions::from_approved(
+        [permission.manifest_key()],
+    ))
+}
+
+/// A model turn needs `agent`, and another plugin's command needs whatever
+/// its handler runs with. Holding only that one permission is enough, and
+/// holding everything else is not.
+#[test_case("/btw what is rust?", Permission::Agent ; "btw")]
+#[test_case("/compact", Permission::Agent ; "compact")]
+#[test_case("/user:fix the tests", Permission::Agent ; "custom_command")]
+#[test_case(RUNNING_PLUGIN_COMMAND, Permission::Run ; "plugin_command")]
+fn run_cmdline_needs_what_the_command_reaches(cmdline: &str, needed: Permission) {
+    let mut app = test_app();
+    app.command_palette = CommandPalette::new(
+        Arc::from([CustomCommand {
+            name: CUSTOM_COMMAND_NAME.into(),
+            description: String::new(),
+            content: CUSTOM_COMMAND_CONTENT.into(),
+            scope: CommandScope::User,
+            accepts_args: true,
+        }]),
+        McpSnapshotReader::empty(),
+        LuaCommandReader::from_commands(vec![LuaCommandInfo {
+            name: RUNNING_PLUGIN_COMMAND.into(),
+            description: String::new().into(),
+            plugin: RUNNING_PLUGIN.into(),
+            reach: only(Permission::Run),
+            max_args: 0,
+        }]),
+    );
+
+    assert_eq!(
+        app.run_cmdline(cmdline, 1, &without(needed)).err(),
+        Some(missing_refusal(
+            cmdline.split_whitespace().next().unwrap(),
+            &Missing::Permission(needed)
+        ))
+    );
+    assert_eq!(app.run_cmdline(cmdline, 1, &only(needed)).err(), None);
+}
+
+#[test_case("/yolo" ; "yolo")]
+#[test_case("/trust" ; "trust")]
+#[test_case(PACKUPDATE ; "packupdate")]
+#[test_case("/packdel" ; "packdel")]
+fn run_cmdline_leaves_user_only_commands_to_the_user(cmdline: &str) {
+    let mut app = test_app();
+
+    assert_eq!(
+        app.run_cmdline(cmdline, 1, &trusted()).err(),
+        Some(format!("{cmdline}{USER_ONLY_SUFFIX}"))
+    );
+    assert!(!app.permissions.is_yolo());
+    assert_eq!(app.exit_request, ExitRequest::None);
 }
 
 /// A Lua command reached through an alias carries the hop count onward, or a
@@ -4029,13 +4351,14 @@ fn run_cmdline_forwards_depth_to_lua_command() {
             name: "/Sessions".into(),
             description: "Browse sessions".into(),
             plugin: "sessions".into(),
+            reach: trusted(),
             max_args: 0,
         }]),
     );
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
     app.lua_event_handle = handle;
 
-    app.run_cmdline("/sessions", 3).unwrap();
+    app.run_cmdline("/sessions", 3, &trusted()).unwrap();
 
     assert_eq!(
         probe.try_recv_command(),
@@ -4053,8 +4376,12 @@ fn slash_noncommand_sends_as_prompt() {
 
 fn build_rewind_app() -> App {
     let mut app = test_app();
+    seed_rewind_session(app.state.session_mut());
+    app
+}
 
-    app.state.session_mut().replace_messages(vec![
+fn seed_rewind_session(session: &mut AppSession) {
+    session.replace_messages(vec![
         Message::user("first prompt".into()),
         Message {
             role: Role::Assistant,
@@ -4076,11 +4403,10 @@ fn build_rewind_app() -> App {
         },
         Message::user("third prompt".into()),
     ]);
-    app.state.session_mut().insert_tool_output(
+    session.insert_tool_output(
         "tool-1".into(),
         Arc::new(ToolOutput::Plain("output".into())),
     );
-    app
 }
 
 const RESTART_EXPECTED: &str = "a rewind must respawn the agent on the truncated history";
@@ -4826,14 +5152,14 @@ fn parent_done_reconciles_unresolved_children_and_tools() {
             .contains(MISSING_TOOL_COMPLETION)
     );
     app.checkpoint();
-    assert!(app.state.session.subagents().is_empty());
+    assert_eq!(app.state.session.subagents().len(), 1);
     assert_eq!(app.state.session.messages().len(), 2);
     assert!(app.state.session.tool_outputs().is_empty());
     assert_eq!(app.cadence(), Cadence::IDLE);
 }
 
 #[test]
-fn parent_error_refreshes_picker_and_persists_only_completed_children() {
+fn parent_error_refreshes_picker_and_persists_every_child() {
     let mut app = streaming_app_with_history();
     app.update(subagent_msg_with_model(
         AgentEvent::TextDelta { text: "one".into() },
@@ -4881,6 +5207,7 @@ fn parent_error_refreshes_picker_and_persists_only_completed_children() {
         saved,
         vec![
             ("task1", "first", Some("model-a")),
+            ("task2", "second", Some("model-b")),
             ("task3", "third", Some("model-c")),
         ]
     );
@@ -5716,20 +6043,13 @@ fn bash_prefix_overrides_mode() {
 }
 
 #[test]
-fn package_commands_are_user_only_and_preserve_update_bang() {
+fn package_update_preserves_typed_bang() {
     let mut app = test_app();
     let typed = || ParsedCommand {
         name: PACKUPDATE.into(),
         args: PACK_NAME.into(),
         bang: true,
     };
-
-    app.execute_command(typed(), 1);
-    assert_eq!(app.exit_request, ExitRequest::None);
-    assert_eq!(
-        app.status_bar.flash_text().unwrap(),
-        format!("{PACKUPDATE}{PACK_USER_ONLY_SUFFIX}")
-    );
 
     let actions = app.execute_command(typed(), 0);
     assert_eq!(app.exit_request, ExitRequest::None);
@@ -7134,6 +7454,7 @@ const BUMP_TITLE: &str = "title bump ";
 const TOOL_IDS: [&str; 2] = ["tool-a", "tool-b"];
 const FINISHED_TASK_ID: &str = "task-finished";
 const UNFINISHED_TASK_ID: &str = "task-unfinished";
+const LATER_TASK_ID: &str = "task-later";
 
 #[test]
 fn turn_response_normalizes_text_and_truncates_unicode() {
@@ -7461,6 +7782,95 @@ fn reset_session_never_writes_the_old_conversation_under_the_new_id() {
     );
 }
 
+const ONE_FORK: &str = "a fork must hand the loop exactly one copy to open";
+const RECOVERED_PROMPT: &str = "prompt queued before the agent failed";
+
+fn opened_fork(actions: Vec<Action>) -> AppSession {
+    let Ok([Action::OpenFork(open)]) = <[Action; 1]>::try_from(actions) else {
+        panic!("{ONE_FORK}");
+    };
+    open.session
+}
+
+#[test]
+fn fork_opens_a_copy_and_leaves_the_original_alone() {
+    let mut app = test_app();
+    let _live = attach_live_history(&mut app, vec![Message::user(LIVE_AGENT_TEXT.into())]);
+    app.recoverable_queue = vec![RECOVERED_PROMPT.into()];
+    let original = app.state.session.id;
+
+    let fork = opened_fork(type_and_submit(&mut app, "/fork"));
+    assert_ne!(fork.id, original);
+    assert_eq!(fork.title, format!("{FORK_TITLE_PREFIX}{LIVE_AGENT_TEXT}"));
+    assert_eq!(
+        fork.messages().len(),
+        1,
+        "the copy carries what the agent wrote since the last frame",
+    );
+    assert_eq!(
+        fork.meta.input_draft, None,
+        "the submitted `/fork` must not linger as the copy's draft",
+    );
+    assert!(
+        fork.meta.queued_messages.is_empty(),
+        "the original runs its own queue, the copy must not run it again",
+    );
+    assert_eq!(app.state.session.id, original);
+    assert_eq!(
+        app.state.session.messages().len(),
+        1,
+        "the original keeps its transcript",
+    );
+}
+
+fn fork_to_first_prompt(app: &mut App) -> Vec<Action> {
+    seed_rewind_session(app.state.session_mut());
+    app.fork_to(RewindEntry {
+        turn_index: 0,
+        prompt_preview: "1: first".into(),
+        prompt_text: "first prompt".into(),
+    })
+}
+
+#[test_case(App::fork_session ; "blank_session")]
+#[test_case(fork_to_first_prompt ; "to_the_first_prompt")]
+fn fork_refuses_an_empty_copy(fork: fn(&mut App) -> Vec<Action>) {
+    let mut app = test_app();
+    assert!(fork(&mut app).is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some(FORK_EMPTY_MSG));
+}
+
+#[test]
+fn fork_to_prompt_opens_a_truncated_copy_and_leaves_the_original_alone() {
+    let mut app = test_app();
+    seed_rewind_session(app.state.session_mut());
+    app.state.context_size = MEASURED_CONTEXT;
+    let original = app.state.session.id;
+
+    let fork = opened_fork(app.fork_to(rewind_to_second_turn()));
+    assert_eq!(
+        fork.messages().len(),
+        2,
+        "the copy ends right before the selected prompt",
+    );
+    assert_eq!(
+        fork.meta.input_draft.as_deref(),
+        Some("second prompt"),
+        "the dropped prompt rides along as the copy's draft",
+    );
+    assert!(
+        fork.meta.context_size < MEASURED_CONTEXT,
+        "the copy's gauge must drop the turns it left behind",
+    );
+    assert_eq!(app.state.session.id, original);
+    assert_eq!(
+        app.state.session.messages().len(),
+        5,
+        "the original keeps its transcript",
+    );
+    assert_eq!(app.state.context_size, MEASURED_CONTEXT);
+}
+
 const ONE_RESTART: &str = "the gesture must hand the loop exactly one restart";
 const RESTART_MATCHES_SESSION: &str =
     "the respawned agent must run on the history the session now holds";
@@ -7761,11 +8171,12 @@ fn two_tool_results_checkpointed_separately_both_reach_disk() {
     }
 }
 
-/// The `Done` path clears `chat_index` right after pruning it, so nothing can
-/// rebuild the tabs later. Only the `sync_subagents` call inside
-/// `retain_resolved_subagents` carries the survivors over.
+/// The `Done` path clears `chat_index` right after pruning it, so the meta
+/// has to be rebuilt from the chats: the child the turn end terminalized is
+/// still a tab, and a child a later turn spawns must not push the earlier
+/// ones out.
 #[test]
-fn turn_end_keeps_only_the_subagents_that_finished() {
+fn turn_end_keeps_every_subagent_tab_in_the_meta() {
     let mut app = test_app();
     app.status = Status::Streaming;
     app.run_id = 1;
@@ -7784,6 +8195,7 @@ fn turn_end_keeps_only_the_subagents_that_finished() {
 
     app.update(done_event());
     assert!(app.chat_index.is_empty());
+    start_subagent(&mut app, LATER_TASK_ID, "later child");
     app.checkpoint();
 
     let ids: Vec<_> = app
@@ -7793,7 +8205,7 @@ fn turn_end_keeps_only_the_subagents_that_finished() {
         .iter()
         .map(|sa| sa.tool_use_id.as_str())
         .collect();
-    assert_eq!(ids, [FINISHED_TASK_ID]);
+    assert_eq!(ids, [FINISHED_TASK_ID, UNFINISHED_TASK_ID, LATER_TASK_ID]);
 }
 
 /// A folder that ships exactly one gated file, plus the question a start in it
@@ -7860,10 +8272,10 @@ fn run_builtin_model_picker_opens_and_refreshes() {
 }
 
 #[test]
-fn alt_m_opens_model_picker() {
+fn ctrl_l_opens_model_picker() {
     let mut app = test_app();
     let key = KeyEvent {
-        code: KeyCode::Char('m'),
+        code: KeyCode::Char('l'),
         modifiers: KeyModifiers::CONTROL,
         kind: crossterm::event::KeyEventKind::Press,
         state: crossterm::event::KeyEventState::NONE,

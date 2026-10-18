@@ -633,10 +633,8 @@ pub enum SessionEndReason {
     Completed,
 }
 
-/// How a call a `permission.prompt` layer allowed is marked, wherever it is
-/// marked: a top-level row from [`AgentEvent::AllowedByPlugin`], a nested call
-/// from an annotation on its parent's live stream. One spelling, so the two
-/// paths cannot drift.
+/// One spelling for the mark, whether the UI draws it on a row or
+/// `maki.agent.call_tool` hands it to a caller's `on_annotation`.
 pub const ALLOWED_BY: &str = "allowed by";
 
 #[derive(Debug, Serialize)]
@@ -714,9 +712,8 @@ pub enum AgentEvent {
     },
     /// A `permission.prompt` layer allowed a call that would have prompted.
     /// The prompt is where the user learns what the agent is about to do, so
-    /// a frontend marks the call instead. Only for a call with a row of its
-    /// own: a nested call is marked through its parent's live stream, which is
-    /// why the text lives in [`ALLOWED_BY`] rather than in the frontend.
+    /// a frontend marks the row instead. `id` is the closest row the user can
+    /// see: for a call inside `code_execution` that is the script's row.
     AllowedByPlugin {
         id: String,
         plugin: String,

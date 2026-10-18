@@ -5,10 +5,10 @@ use nucleo_matcher::{Config, Matcher};
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::Overlay;
-use crate::components::is_ctrl;
 use crate::components::keybindings::key;
-use crate::components::modal::Modal;
+use crate::components::modal::{BORDER, Modal};
 use crate::components::scrollbar::render_vertical_scrollbar;
+use crate::components::{hint_footer, is_ctrl};
 use crate::repaint::Cadence;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
@@ -29,6 +29,9 @@ const MAX_HEIGHT_PERCENT: u16 = 80;
 const SEARCH_ROW: u16 = 1;
 const DETAIL_RIGHT_PAD: u16 = 1;
 
+/// Key and action pairs for the bottom border, empty for none.
+type Hints = &'static [(&'static str, &'static str)];
+
 pub trait PickerItem {
     fn label(&self) -> &str;
     fn suffix(&self) -> Option<&str> {
@@ -46,8 +49,8 @@ pub trait PickerItem {
     fn is_highlighted(&self) -> bool {
         false
     }
-    /// Drawn where the synthesized header for its section would have gone,
-    /// which is what makes a section something the cursor can land on.
+    /// Drawn in place of its section header, so the cursor can land on the
+    /// section itself.
     fn is_section_row(&self) -> bool {
         false
     }
@@ -70,7 +73,7 @@ pub struct ListPicker<T> {
     state: Option<State<T>>,
     title: String,
     max_visible: Option<u16>,
-    footer: Option<fn() -> Line<'static>>,
+    footer: Hints,
     error_text: Option<String>,
 }
 
@@ -121,25 +124,11 @@ impl<T: PickerItem> State<T> {
                 Normalization::Smart,
                 AtomKind::Fuzzy,
             );
-            // A section row sits out the search while its section still has
-            // rows of its own: a query is after those, and letting the header
-            // match too would put it where the answer goes and hand `Enter` to
-            // it. A section collapsed down to its own row is all that is left
-            // to find, so that one answers.
-            let populated: HashSet<&str> = self
-                .items
-                .iter()
-                .filter(|item| !item.is_section_row())
-                .filter_map(PickerItem::section)
-                .collect();
+            // Create labels with their original indices
             let labeled: Vec<(usize, &str)> = self
                 .items
                 .iter()
                 .enumerate()
-                .filter(|(_, item)| {
-                    !item.is_section_row()
-                        || !item.section().is_some_and(|sec| populated.contains(sec))
-                })
                 .map(|(idx, item)| (idx, item.label()))
                 .collect();
             let matches: HashSet<&str> = pattern
@@ -254,7 +243,7 @@ impl<T: PickerItem> ListPicker<T> {
             state: None,
             title: String::new(),
             max_visible: None,
-            footer: None,
+            footer: &[],
             error_text: None,
         }
     }
@@ -264,8 +253,8 @@ impl<T: PickerItem> ListPicker<T> {
         self
     }
 
-    pub fn with_footer_builder(mut self, builder: fn() -> Line<'static>) -> Self {
-        self.footer = Some(builder);
+    pub fn with_footer(mut self, hints: Hints) -> Self {
+        self.footer = hints;
         self
     }
 
@@ -466,6 +455,14 @@ impl<T: PickerItem> ListPicker<T> {
         self.state.as_ref().and_then(|s| s.selected_item_index())
     }
 
+    /// Closes with the selected item, for pickers that commit on more than
+    /// Enter. Stays open when nothing is selected.
+    pub fn take_selected(&mut self) -> Option<T> {
+        let idx = self.selected_index()?;
+        let mut state = self.state.take()?;
+        Some(state.items.swap_remove(idx))
+    }
+
     pub fn item(&self, idx: usize) -> Option<&T> {
         self.state.as_ref().and_then(|s| s.items.get(idx))
     }
@@ -533,11 +530,10 @@ fn render_ready<T: PickerItem>(
     s: &mut State<T>,
     title: &str,
     max_visible: Option<u16>,
-    footer: Option<fn() -> Line<'static>>,
+    footer: Hints,
     error_text: Option<&str>,
 ) -> Rect {
     let notice = s.notice;
-    let footer_rows = if footer.is_some() { 1u16 } else { 0 };
     let content_rows = if s.filtered.is_empty() {
         1
     } else {
@@ -551,23 +547,24 @@ fn render_ready<T: PickerItem>(
     let notice_rows = notice.is_some() as u16;
     let modal = Modal {
         title,
-        width_percent: width_percent(area.width),
+        width_percent: MIN_WIDTH_PERCENT,
+        min_width: MIN_WIDTH_COLS + BORDER,
         max_height_percent: MAX_HEIGHT_PERCENT,
     };
-    let (popup, inner) = modal.render(
+    let (popup, inner) = modal.render_with_footer(
         frame,
         area,
-        content_rows + SEARCH_ROW + footer_rows + error_rows + notice_rows,
+        content_rows + SEARCH_ROW + error_rows + notice_rows,
+        (!footer.is_empty()).then(|| hint_footer(footer)),
     );
     let viewport_h = inner
         .height
-        .saturating_sub(error_rows + notice_rows + SEARCH_ROW + footer_rows);
+        .saturating_sub(error_rows + notice_rows + SEARCH_ROW);
     s.viewport_height = viewport_h as usize;
     s.ensure_visible();
 
-    let mut constraints: Vec<Constraint> = Vec::with_capacity(
-        3 + footer.is_some() as usize + error_text.is_some() as usize + notice.is_some() as usize,
-    );
+    let mut constraints: Vec<Constraint> =
+        Vec::with_capacity(3 + error_text.is_some() as usize + notice.is_some() as usize);
     if error_text.is_some() {
         constraints.push(Constraint::Length(1)); // error line
     }
@@ -576,9 +573,6 @@ fn render_ready<T: PickerItem>(
         constraints.push(Constraint::Length(1));
     }
     constraints.push(Constraint::Length(1)); // search
-    if footer.is_some() {
-        constraints.push(Constraint::Length(1));
-    }
 
     let areas = Layout::vertical(constraints).split(inner);
     let mut area_idx = 0;
@@ -605,7 +599,6 @@ fn render_ready<T: PickerItem>(
     }
 
     let search_area = areas[area_idx];
-    area_idx += 1;
 
     render_list(
         frame,
@@ -618,10 +611,6 @@ fn render_ready<T: PickerItem>(
         s.enabled.as_deref(),
     );
     render_search(frame, search_area, &s.search);
-
-    if let Some(build) = footer {
-        frame.render_widget(Paragraph::new(build()), areas[area_idx]);
-    }
 
     let total_visual = visual_rows_in_range(&s.filtered, &s.items, 0, s.filtered.len());
     if total_visual as u16 > viewport_h {
@@ -688,14 +677,6 @@ fn find_scroll_offset_for_bottom<T: PickerItem>(
         return 0;
     }
     find_scroll_offset_for(filtered, items, len - 1, viewport_height)
-}
-
-/// On a narrow screen the percentage alone leaves the label a sliver next to
-/// its detail, so the picker takes more of the screen before it truncates.
-fn width_percent(screen_width: u16) -> u16 {
-    (MIN_WIDTH_COLS * 100)
-        .div_ceil(screen_width.max(1))
-        .clamp(MIN_WIDTH_PERCENT, 100)
 }
 
 fn truncate_label(label: &str, max_width: usize) -> String {
@@ -1049,13 +1030,6 @@ mod tests {
         assert!(!p.is_open());
     }
 
-    #[test_case(200, MIN_WIDTH_PERCENT ; "wide_screen_keeps_the_default")]
-    #[test_case(80,  90                ; "narrow_screen_grows_to_fit")]
-    #[test_case(60,  100               ; "tiny_screen_takes_it_all")]
-    fn picker_width_percent(screen_width: u16, expected: u16) {
-        assert_eq!(width_percent(screen_width), expected);
-    }
-
     #[test_case(key(KeyCode::Esc) ; "esc_returns_close")]
     #[test_case(kb::QUIT.to_key_event() ; "ctrl_c_returns_close")]
     fn cancel_returns_close(cancel_key: KeyEvent) {
@@ -1156,25 +1130,6 @@ mod tests {
         ]
     }
 
-    /// Openrouter is collapsed: its row is the only thing left of it.
-    fn collapsed_entries() -> Vec<SectionEntry> {
-        vec![
-            heading("Anthropic"),
-            in_section("a1", "Anthropic"),
-            heading("Openrouter"),
-        ]
-    }
-
-    fn filter_labels(p: &mut ListPicker<SectionEntry>, query: &str) -> Vec<String> {
-        let s = ready_state_mut(p);
-        s.search.insert_text(query);
-        s.update_search_and_clamp();
-        s.filtered
-            .iter()
-            .map(|&i| s.items[i].label.clone())
-            .collect()
-    }
-
     #[test]
     fn section_headers_counted_in_visual_rows() {
         let items = section_entries();
@@ -1194,29 +1149,6 @@ mod tests {
             find_scroll_offset_for(&filtered, &items, 3, 3),
             2,
             "scrolling has to count the spacer the second heading brings"
-        );
-    }
-
-    #[test]
-    fn a_collapsed_section_row_answers_a_query_for_its_own_name() {
-        let mut p = ListPicker::new();
-        p.open(collapsed_entries(), " Test ");
-
-        assert_eq!(
-            filter_labels(&mut p, "openr"),
-            ["Openrouter"],
-            "a collapsed section is only reachable through its own row"
-        );
-    }
-
-    #[test]
-    fn a_populated_section_row_stays_out_of_a_search() {
-        let mut p = ListPicker::new();
-        p.open(collapsed_entries(), " Test ");
-
-        assert!(
-            filter_labels(&mut p, "anth").is_empty(),
-            "a header matching the query would take the Enter meant for a row under it"
         );
     }
 

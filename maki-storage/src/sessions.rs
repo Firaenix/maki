@@ -28,7 +28,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::lock::{Lock, LockError};
-use crate::{StateDir, StorageError, atomic_write, now_epoch};
+use crate::{StateDir, StorageError, atomic_write, now_epoch, plans};
 
 const SESSION_VERSION: u32 = 1;
 const LOG_FORMAT_VERSION: u32 = 2;
@@ -636,7 +636,7 @@ impl fmt::Display for StoredThinking {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredSubagent {
     pub tool_use_id: String,
     pub name: String,
@@ -648,6 +648,11 @@ pub struct StoredSubagent {
     pub thinking: Option<StoredThinking>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fast: bool,
+    /// The plugin that opened it, absent on a task a tool call spawned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<Arc<str>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -1872,14 +1877,30 @@ where
     /// for the turns it runs, and counting the original's again would bill them
     /// twice. The epoch is minted fresh because no append cursor into the file
     /// this was read from says anything about the new one.
-    pub fn fork(mut self, id: MakiId, cwd: &str) -> Self {
+    ///
+    /// The fork runs beside the original, so nothing the original still owns
+    /// can be shared. Queued prompts stay behind, or both would run them. The
+    /// plan is copied into a file of its own, or planning in one would write
+    /// over the other's.
+    pub fn fork(mut self, id: MakiId, cwd: &str, storage: &StateDir) -> Result<Self, StorageError> {
+        self.meta.queued_messages.clear();
+        if let Some(plan_path) = &mut self.meta.plan_path {
+            let own_path = plans::new_plan_path(storage)?;
+            // A plan mode session that has not written its plan yet has no file.
+            if let Err(e) = fs::copy(&*plan_path, &own_path)
+                && e.kind() != ErrorKind::NotFound
+            {
+                return Err(e.into());
+            }
+            *plan_path = own_path.to_string_lossy().into_owned();
+        }
         self.id = id;
         self.cwd = cwd.into();
         self.token_usage = U::default();
         self.usage_by_model.clear();
         self.created_at = now_epoch();
         self.rewrite_messages();
-        self
+        Ok(self)
     }
 
     pub fn push_message(&mut self, msg: M) {
@@ -1951,12 +1972,26 @@ where
         }
     }
 
-    pub fn set_subagent_messages(&mut self, id: String, msgs: Vec<M>) {
-        if self.subagent_messages.insert(id, Arc::new(msgs)).is_some() {
-            self.rewrite();
-        } else {
-            self.touch();
-        }
+    /// A transcript that only grew is appended like the main log. A plugin
+    /// task hands its whole history over after every prompt, so without this
+    /// each prompt would rewrite the session file. Anything else (a
+    /// compaction, a rewritten turn) still starts the file over.
+    pub fn set_subagent_messages(&mut self, id: String, msgs: Vec<M>)
+    where
+        M: PartialEq,
+    {
+        let grew = match self.subagent_messages.get(&id) {
+            Some(old) if msgs.starts_with(old) => {
+                if msgs.len() == old.len() {
+                    return;
+                }
+                true
+            }
+            Some(_) => false,
+            None => true,
+        };
+        self.subagent_messages.insert(id, Arc::new(msgs));
+        if grew { self.touch() } else { self.rewrite() }
     }
 
     fn set_token_usage(&mut self, usage: U)
@@ -2053,21 +2088,27 @@ where
     /// After `messages` is truncated (rewind), state keyed by tool_use_id can
     /// point at calls that no longer exist. On restore that shows up as ghost
     /// subagent tabs and leaked tool outputs, so this drops everything not
-    /// reachable from `messages`.
+    /// reachable from `messages`. A plugin task is never reachable from them:
+    /// its plugin runs it beside the chat, so a rewind leaves it alone.
     ///
     /// If you add another field keyed by tool_use_id, prune it here too.
     pub fn prune_orphans(&mut self, tool_ids: impl Fn(&M) -> Vec<String>) {
-        let main_ids: HashSet<String> = self.messages.iter().flat_map(&tool_ids).collect();
-        self.subagent_messages.retain(|id, _| main_ids.contains(id));
-        self.subagents
-            .retain(|sa| main_ids.contains(&sa.tool_use_id));
+        let mut kept: HashSet<String> = self.messages.iter().flat_map(&tool_ids).collect();
+        kept.extend(
+            self.subagents
+                .iter()
+                .filter(|sa| sa.plugin.is_some())
+                .map(|sa| sa.tool_use_id.clone()),
+        );
+        self.subagent_messages.retain(|id, _| kept.contains(id));
+        self.subagents.retain(|sa| kept.contains(&sa.tool_use_id));
 
         let live: HashSet<String> = self
             .subagent_messages
             .values()
             .flat_map(|msgs| msgs.iter())
             .flat_map(&tool_ids)
-            .chain(main_ids)
+            .chain(kept)
             .collect();
         self.tool_outputs.retain(|id, _| live.contains(id));
         self.rewrite();
@@ -2281,6 +2322,8 @@ mod tests {
     const READ_UNDER_CLAIM: &str = "the transcript must be read under a claim still held";
     const SHARED_CLAIM_HELD: &str = "a claim is held until its last clone drops";
     const PENDING_DRAFT: &str = "half typed thought";
+    const QUEUED_PROMPT: &str = "and then the tests";
+    const FORK_PLAN: &str = "1. split the parser";
     /// Two of these already break the byte budget.
     const FAKE_ARCHIVE_BYTES: u64 = ARCHIVE_MAX_BYTES / 2;
     const EXISTING_ARCHIVE_SEQ: u64 = 7;
@@ -2350,44 +2393,58 @@ mod tests {
         fn ids(m: &Value) -> Vec<String> {
             vec![m.as_str().unwrap().to_owned()]
         }
-        fn subagent(id: &str) -> StoredSubagent {
+        fn subagent(id: &str, plugin: Option<&str>) -> StoredSubagent {
             StoredSubagent {
                 tool_use_id: id.into(),
                 name: "sub".into(),
                 model: None,
                 thinking: None,
                 fast: false,
+                plugin: plugin.map(Arc::from),
+                cost: None,
             }
         }
 
         let mut session: TestSession = Session::new("model", "/p");
         session.push_message("task-live".into());
-        session
-            .subagent_messages
-            .insert("task-live".into(), Arc::new(vec!["sub-tool".into()]));
-        session
-            .subagent_messages
-            .insert("task-stale".into(), Arc::new(vec!["stale-sub-tool".into()]));
-        session.set_subagents(vec![subagent("task-live"), subagent("task-stale")]);
-        for id in ["task-live", "sub-tool", "stale-sub-tool", "orphan"] {
+        for (task, tool) in [
+            ("task-live", "sub-tool"),
+            ("task-stale", "stale-sub-tool"),
+            ("session-monitor", "monitor-tool"),
+        ] {
+            session
+                .subagent_messages
+                .insert(task.into(), Arc::new(vec![tool.into()]));
+        }
+        session.set_subagents(vec![
+            subagent("task-live", None),
+            subagent("task-stale", None),
+            subagent("session-monitor", Some("ci")),
+        ]);
+        for id in [
+            "task-live",
+            "sub-tool",
+            "stale-sub-tool",
+            "monitor-tool",
+            "orphan",
+        ] {
             session.insert_tool_output(id.into(), Arc::new(Value::Null));
         }
 
         session.prune_orphans(ids);
 
-        assert_eq!(
-            session.subagent_messages().keys().collect::<Vec<_>>(),
-            ["task-live"]
-        );
+        let mut transcripts: Vec<_> = session.subagent_messages().keys().collect();
+        transcripts.sort();
+        assert_eq!(transcripts, ["session-monitor", "task-live"]);
         let subagent_ids: Vec<_> = session
             .subagents()
             .iter()
             .map(|sa| sa.tool_use_id.as_str())
             .collect();
-        assert_eq!(subagent_ids, ["task-live"]);
+        assert_eq!(subagent_ids, ["task-live", "session-monitor"]);
         let mut outputs: Vec<_> = session.tool_outputs().keys().cloned().collect();
         outputs.sort();
-        assert_eq!(outputs, ["sub-tool", "task-live"]);
+        assert_eq!(outputs, ["monitor-tool", "sub-tool", "task-live"]);
     }
 
     #[test]
@@ -2595,8 +2652,11 @@ mod tests {
         session.token_usage = Value::from(1_000);
         session.add_model_usage("m", usage(1_000, Some(SONNET_COST)));
         let id = MakiId::generate();
+        let tmp = TempDir::new().unwrap();
 
-        let forked = session.fork(id, FORK_CWD);
+        let forked = session
+            .fork(id, FORK_CWD, &StateDir::from_path(tmp.path().to_path_buf()))
+            .unwrap();
 
         assert_eq!(forked.id, id);
         assert_eq!(forked.cwd, FORK_CWD);
@@ -2604,6 +2664,35 @@ mod tests {
         assert!(forked.tool_outputs().contains_key(TOOL_ID));
         assert_eq!(forked.token_usage, Value::default());
         assert!(forked.usage_by_model().is_empty());
+    }
+
+    /// A fork runs beside the original, so it leaves the queue to the original
+    /// and plans in a file of its own, starting from the plan so far if there
+    /// is one.
+    #[test_case(Some(FORK_PLAN) ; "written_plan_is_copied")]
+    #[test_case(None ; "unwritten_plan_gets_a_fresh_path")]
+    fn fork_shares_neither_the_queue_nor_the_plan_file(plan: Option<&str>) {
+        let tmp = TempDir::new().unwrap();
+        let original_plan = tmp.path().join("original.md");
+        if let Some(plan) = plan {
+            fs::write(&original_plan, plan).unwrap();
+        }
+        let mut session: TestSession = Session::new("m", "/project");
+        session.meta.queued_messages = vec![QUEUED_PROMPT.into()];
+        session.meta.plan_path = Some(original_plan.to_string_lossy().into_owned());
+
+        let forked = session
+            .fork(
+                MakiId::generate(),
+                "/project",
+                &StateDir::from_path(tmp.path().to_path_buf()),
+            )
+            .unwrap();
+
+        assert!(forked.meta.queued_messages.is_empty());
+        let fork_plan = PathBuf::from(forked.meta.plan_path.unwrap());
+        assert_ne!(fork_plan, original_plan);
+        assert_eq!(fs::read_to_string(&fork_plan).ok().as_deref(), plan);
     }
 
     #[test]
@@ -2761,6 +2850,35 @@ mod tests {
         write_through(&mut log, dir, &session);
 
         let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_same_session(&loaded, &session);
+    }
+
+    /// The whole transcript comes back after every prompt of a plugin task.
+    /// One that only grew appends its tail; one handed over unchanged is not
+    /// even a write.
+    #[test]
+    fn extending_subagent_messages_appends_to_the_log() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut session: TestSession = Session::new("m", "/project");
+        let mut log = SessionLog::rewrite(dir, &claim_for(dir, &session), &session).unwrap();
+        session.set_subagent_messages("sub-1".into(), vec![user_message("first")]);
+        write_through(&mut log, dir, &session);
+        let (rewrites, revision) = (session.rewrites, session.revision);
+
+        session.set_subagent_messages("sub-1".into(), vec![user_message("first")]);
+        assert_eq!(session.revision, revision);
+
+        session.set_subagent_messages(
+            "sub-1".into(),
+            vec![user_message("first"), assistant_message("reply")],
+        );
+        assert_eq!(session.rewrites, rewrites);
+        assert!(session.revision > revision);
+        log.append(&claim_for(dir, &session), &session).unwrap();
+
+        let loaded = TestSession::load_from(session.id, dir).unwrap();
+        assert_eq!(loaded.subagent_messages["sub-1"].len(), 2);
         assert_same_session(&loaded, &session);
     }
 

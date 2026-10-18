@@ -21,7 +21,7 @@ use crate::runtime::{HookRun, PromptRun, Request};
 /// Every `agent.*` slot steers what the agent does next: the prompt it
 /// answers, whether it stops, what it remembers after a compaction. No
 /// narrower price would be honest.
-const AGENT_SLOT_AUTHORITY: Authority = Authority::Unbounded;
+const AGENT_SLOT_AUTHORITY: Authority = Authority::Total;
 
 pub(crate) struct SlotHook {
     pub(crate) tx: Sender<Request>,

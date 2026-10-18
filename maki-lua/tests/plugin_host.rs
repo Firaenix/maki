@@ -12,10 +12,13 @@ use maki_agent::template::Vars;
 use maki_agent::tools::test_support::stub_seed;
 use maki_agent::tools::{
     DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolAudience,
-    ToolContext, ToolExecResult, ToolFilter, ToolInvocation, ToolLive, ToolRegistry, ToolSource,
-    timeout_annotation,
+    ToolContext, ToolExecResult, ToolFilter, ToolInvocation, ToolLive, ToolReach, ToolRegistry,
+    ToolSource, timeout_annotation,
 };
-use maki_agent::{AgentMode, AgentSeed, CancelToken, ModelSlot, SessionMailbox, ToolOutput};
+use maki_agent::{
+    AgentEvent, AgentMode, AgentSeed, CancelToken, ModelSlot, SessionMailbox, ToolOutput,
+    TurnCompleteEvent,
+};
 use maki_config::{
     AlwaysThinking, EDIT_SUB_TOOLS, Effect, FILE_WRITE_TOOLS, Permission, PluginsConfig,
     ThinkingLines, ToolKey, ToolOutputLines,
@@ -213,8 +216,6 @@ const WRONG_TYPE_SCOPES_SRC: &str =
     r#"name = "num_scope", description = "test", permission = "fs_write", permission_scopes = 42"#;
 const SCOPES_WITHOUT_PERMISSION_SRC: &str =
     r#"name = "no_perm", description = "test", permission_scopes = "url""#;
-const PERMISSION_WITHOUT_SCOPES_SRC: &str =
-    r#"name = "no_scopes", description = "test", permission = "fs_write""#;
 const UNKNOWN_PERMISSION_SRC: &str = r#"name = "bad_perm", description = "test", permission = "filesystem", permission_scopes = "url""#;
 const FS_WRITE_WITHOUT_MUTABLE_PATH_SRC: &str = r#"name = "no_mpath", description = "test", permission = "fs_write", permission_scopes = "url""#;
 const NON_STRING_FIELD_SCHEMA: &str = r#"{
@@ -492,6 +493,14 @@ const UNCHECKED_EDIT_TOOL_SRC: &str = r#"maki.api.register_tool({
     schema = { type = "object", properties = {} },
     handler = function() return "" end,
 })"#;
+/// Declares what it reaches, still nothing to prompt.
+const READ_ONLY_EDIT_TOOL_SRC: &str = r#"maki.api.register_tool({
+    name = "edit",
+    description = "read-only",
+    schema = { type = "object", properties = {} },
+    permission = "fs_read",
+    handler = function() return "" end,
+})"#;
 
 /// A package is the only entry point that runs lua under a permission set the
 /// plugin did not pick for itself.
@@ -512,6 +521,7 @@ fn load_package_with(
 #[test_case::test_case(EDIT_TOOL_SRC, false => 0 ; "plugin_granted_nothing_pre_approves_nothing")]
 #[test_case::test_case(NO_RULE_SRC, true => 0 ; "no_such_tool_is_registered")]
 #[test_case::test_case(UNCHECKED_EDIT_TOOL_SRC, true => 0 ; "tool_is_never_permission_checked")]
+#[test_case::test_case(READ_ONLY_EDIT_TOOL_SRC, true => 0 ; "tool_declares_reach_but_never_prompts")]
 fn allow_rule_survives_only_when_delegated(owner_src: &str, granted: bool) -> usize {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -613,7 +623,6 @@ fn permission_rule_validation_rejects(spec: &str, expected_err: &str) {
 #[test_case::test_case(OLD_SCOPE_KEY_SRC, MINIMAL_SCHEMA, "'permission_scope' was removed" ; "old_permission_scope_key")]
 #[test_case::test_case(WRONG_TYPE_SCOPES_SRC, MINIMAL_SCHEMA, "'permission_scopes' must be a string field name or a function" ; "permission_scopes_wrong_type")]
 #[test_case::test_case(SCOPES_WITHOUT_PERMISSION_SRC, STRING_FIELD_SCHEMA, "must declare 'permission'" ; "scopes_without_permission")]
-#[test_case::test_case(PERMISSION_WITHOUT_SCOPES_SRC, STRING_FIELD_SCHEMA, "needs 'permission_scopes'" ; "permission_without_scopes")]
 #[test_case::test_case(UNKNOWN_PERMISSION_SRC, STRING_FIELD_SCHEMA, "unknown permission 'filesystem'" ; "unknown_permission")]
 #[test_case::test_case(FS_WRITE_WITHOUT_MUTABLE_PATH_SRC, STRING_FIELD_SCHEMA, "no 'mutable_path'" ; "fs_write_without_mutable_path")]
 fn registration_validation_rejects(fields: &str, schema: &str, expected_err: &str) {
@@ -631,6 +640,28 @@ fn registration_validation_rejects(fields: &str, schema: &str, expected_err: &st
         .expect_err("expected validation error");
     assert!(matches!(err, PluginError::Lua { .. }));
     assert!(err.to_string().contains(expected_err), "got: {err}");
+}
+
+/// `permission` alone is the read-only shape: it names what the tool reaches
+/// for hooks and sessions handed it, and no call ever stops at the prompt.
+#[test]
+fn permission_without_scopes_declares_reach_and_never_prompts() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("tool_owner", READ_ONLY_EDIT_TOOL_SRC)
+        .unwrap();
+
+    let tool = &reg.get("edit").unwrap().tool;
+    let inv = tool.parse(&json!({})).unwrap();
+
+    assert_eq!(
+        tool.reach(),
+        Some(ToolReach {
+            permission: Permission::FsRead,
+            prompted: false,
+        })
+    );
+    assert!(smol::block_on(inv.permission_scopes()).is_none());
 }
 
 #[test]
@@ -3850,7 +3881,7 @@ fn fs_write_tools_match_file_write_tools() {
     let snapshot = reg.iter();
     let mut declared: Vec<&str> = snapshot
         .iter()
-        .filter(|t| t.tool.required_permission() == Some(Permission::FsWrite))
+        .filter(|t| t.tool.reach().map(|r| r.permission) == Some(Permission::FsWrite))
         .map(|t| t.name())
         .collect();
     declared.sort_unstable();
@@ -4118,12 +4149,16 @@ const RUN_COMMAND_NO_ACTION: &str = "run_command did not reach the UI";
 /// `/go` asks for `/cd ~/src` and flashes the `ok, err` pair it gets back. The
 /// command line travels untouched, since the UI is the side that parses it, and
 /// a handler reached at depth 0 asks for depth 1 so a chain of aliases keeps
-/// counting toward the cap.
+/// counting toward the cap. The plugin lacks `agent`, so we can tell its own
+/// permissions rode along on the request and on the command it registered,
+/// and not some trusted default.
 #[test_case::test_case(Ok(()), "true|nil" ; "dispatched")]
 #[test_case::test_case(Err("unknown command".into()), "nil|unknown command" ; "rejected")]
 fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash: &str) {
     let host = PluginHost::new(fresh_registry()).unwrap();
-    host.load_source(
+    let mut perms = maki_lua::PluginPermissions::trusted();
+    perms.set(maki_lua::Permission::Agent, false);
+    host.load_source_with_permissions(
         "p",
         r#"
         maki.api.register_command({
@@ -4134,8 +4169,14 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
             end,
         })
         "#,
+        perms,
     )
     .unwrap();
+    assert!(
+        !host.command_reader().load().commands[0]
+            .reach
+            .is_allowed(maki_lua::Permission::Agent)
+    );
     let rx = host.ui_action_rx();
     host.event_handle()
         .run_command(Arc::from("p"), Arc::from("/go"), String::new(), 0);
@@ -4143,6 +4184,7 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
     let maki_lua::UiAction::RunCommand {
         cmdline,
         depth,
+        caller,
         reply_tx,
     } = rx
         .recv_timeout(Duration::from_secs(5))
@@ -4151,6 +4193,7 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
         panic!("{RUN_COMMAND_NO_ACTION}");
     };
     assert_eq!((cmdline.as_str(), depth), ("/cd ~/src", 1));
+    assert!(!caller.is_allowed(maki_lua::Permission::Agent));
     reply_tx.send(reply).unwrap();
 
     let action = rx
@@ -7239,6 +7282,7 @@ const BACKGROUND_NAME: &str = "ci-monitor";
 const BACKGROUND_PLUGIN: &str = "background_monitor";
 const OPTS_RECORDER: &str = "recorded the request options";
 const CANCELLED_MSG: &str = "cancelled";
+const STOPPED_BY_USER_ERR: &str = "stopped by user";
 const PAID_TOOL_USE_ID: &str = "toolu_paid";
 const PAID_TOOL_NAME: &str = "not_a_tool";
 const PAID_TURN_INPUT: u32 = 1234;
@@ -7324,6 +7368,25 @@ maki.api.register_tool({{
     audiences = {{ "main" }},
     handler = function()
         sess:close()
+        prompt_settled:acquire():release()
+        return tostring(prompt_err)
+    end,
+}})
+maki.api.register_tool({{
+    name = "background_id",
+    description = "the task id of the open background session",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        return maki.agent.list({{ session = "{sid}" }})[1].id
+    end,
+}})
+maki.api.register_tool({{
+    name = "await_prompt",
+    description = "waits for the prompting task and reports how its prompt ended",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
         prompt_settled:acquire():release()
         return tostring(prompt_err)
     end,
@@ -7427,11 +7490,56 @@ impl Provider for TurnThenPark {
     }
 }
 
+/// The paid turns the tab was told about, in order.
+fn billed_turns(
+    ui: &flume::Receiver<maki_lua::UiAction>,
+    session: MakiId,
+) -> Vec<TurnCompleteEvent> {
+    ui.drain()
+        .filter_map(|action| match action {
+            maki_lua::UiAction::PluginTaskEvent {
+                session: owner,
+                envelope,
+                ..
+            } if owner == session => match envelope.event {
+                AgentEvent::TurnComplete(turn) => Some(*turn),
+                _ => None,
+            },
+            _ => panic!("only this chat session's task events go to the UI here"),
+        })
+        .collect()
+}
+
+/// The transcript the tab was last handed for task `id`.
+fn handed_over_history(
+    ui: &flume::Receiver<maki_lua::UiAction>,
+    session: MakiId,
+    id: &str,
+) -> Option<Vec<Message>> {
+    ui.drain()
+        .filter_map(|action| match action {
+            maki_lua::UiAction::PluginTaskEvent {
+                session: owner,
+                envelope,
+                ..
+            } if owner == session => match envelope.event {
+                AgentEvent::SubagentHistory {
+                    tool_use_id,
+                    messages,
+                } if tool_use_id == id => Some(messages),
+                _ => None,
+            },
+            _ => panic!("only this chat session's task events go to the UI here"),
+        })
+        .last()
+}
+
 /// One task opens the session and stays alive, another prompts it and gets
 /// cancelled. The cancel drops the prompt future mid-run, so nothing after its
 /// `await` runs, yet the entry must still go back to idle. The paid turn has to
-/// be billed before the cancel, because on quit the UI stops listening before
-/// anything gets cancelled. Billing it again on the cancel would count it twice.
+/// reach the tab before the cancel, because on quit the UI stops listening
+/// before anything gets cancelled. Sending it again on the cancel would count
+/// it twice.
 #[test]
 fn cancelled_background_prompt_goes_idle_and_bills_its_paid_turn() {
     let reg = fresh_registry();
@@ -7455,19 +7563,12 @@ fn cancelled_background_prompt_goes_idle_and_bills_its_paid_turn() {
     parked
         .recv_timeout(CANCEL_TEST_TIMEOUT)
         .expect("the prompt must reach its second turn");
-    let action = ui
-        .recv_timeout(CANCEL_TEST_TIMEOUT)
-        .expect("the paid turn must be billed while the prompt still runs");
-    let maki_lua::UiAction::BackgroundUsage {
-        session: billed,
-        usage,
-        ..
-    } = action
-    else {
-        panic!("only background usage goes to the UI here");
+    let turns = billed_turns(&ui, session);
+    let [turn] = turns.as_slice() else {
+        panic!("the paid turn must reach the tab while the prompt still runs");
     };
-    assert_eq!((billed, usage.input), (session, PAID_TURN_INPUT));
-    let billed_cost = usage.cost.expect("the paid turn must have a price");
+    assert_eq!(turn.usage.input, PAID_TURN_INPUT);
+    let billed_cost = turn.cost.expect("the paid turn must have a price");
     let listed_cost = format!("{billed_cost:.COST_DECIMALS$}");
     assert_eq!(
         exec_tool(&reg, "background_cost", json!({})).unwrap(),
@@ -7485,7 +7586,58 @@ fn cancelled_background_prompt_goes_idle_and_bills_its_paid_turn() {
         exec_tool(&reg, "background_cost", json!({})).unwrap(),
         listed_cost
     );
-    assert!(ui.is_empty(), "the cancel must not bill the turn again");
+    assert!(
+        billed_turns(&ui, session).is_empty(),
+        "the cancel must not bill the turn again"
+    );
+}
+
+/// Esc in the task's tab reaches the session through the handle the event
+/// loop holds, with no Lua-thread hop. The prompt it cuts short says so, not
+/// "cancelled", so a monitor loop knows not to reopen. What it streamed
+/// before the stop still reaches the tab's transcript: the plugin may never
+/// close a stopped session, and nothing else would write it.
+#[test]
+fn stopping_a_plugin_task_from_the_tab_ends_its_prompt_as_stopped_by_user() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = MakiId::generate();
+    let mailbox = SessionMailbox::register(session);
+    let seed = mailbox.publish_seed(stub_seed(session));
+    let parked = TurnThenPark::install(&seed);
+    let ui = host.ui_action_rx();
+    host.load_source(
+        BACKGROUND_PLUGIN,
+        &background_monitor_src(&session.to_string()),
+    )
+    .unwrap();
+    assert_eq!(
+        exec_tool(&reg, "open_background", json!({})).unwrap(),
+        "nil"
+    );
+    let id = exec_tool(&reg, "background_id", json!({})).unwrap();
+    exec_tool(&reg, "prompt_in_task", json!({})).unwrap();
+    parked
+        .recv_timeout(CANCEL_TEST_TIMEOUT)
+        .expect("the prompt must reach its second turn");
+
+    host.event_handle().cancel_plugin_session(&id);
+
+    let ended = call_on_thread(&reg, "await_prompt", CancelToken::none())
+        .recv_timeout(CANCEL_TEST_TIMEOUT)
+        .expect("the stopped prompt must settle");
+    assert_eq!(ended, Ok(STOPPED_BY_USER_ERR.to_owned()));
+    let history = handed_over_history(&ui, session, &id)
+        .expect("the stopped prompt must hand its transcript to the tab");
+    assert!(
+        history.iter().any(|m| matches!(m.role, Role::Assistant)),
+        "the paid turn must be in the transcript"
+    );
+    assert_eq!(exec_tool(&reg, "list_background", json!({})).unwrap(), "");
+    assert_eq!(
+        exec_tool(&reg, "prompt_background", json!({})).unwrap(),
+        STOPPED_BY_USER_ERR
+    );
 }
 
 /// The provider parks the second turn forever, so only a cancel can end this
@@ -8040,13 +8192,12 @@ fn a_plugin_session_can_only_reach_what_its_plugin_holds(
     assert!(result.contains(expected), "got: {result}");
 }
 
-/// The ctx form is one hop away from a session nobody answers for: a tool
-/// the plugin registered gets a ctx inside its own background session, or
-/// under `maki -p`. There it pays the same price. With a user to ask, the
-/// prompt stays in its place and the session opens.
-#[test_case::test_case(false, "fs_write" ; "unanswerable_ctx_pays_for_reach")]
-#[test_case::test_case(true, "nil" ; "answerable_ctx_keeps_the_prompt")]
-fn a_ctx_session_pays_for_reach_only_when_nobody_can_answer(answerable: bool, expected: &str) {
+/// The ctx form pays the same price whether or not a user could answer: a
+/// prompt is no gate under YOLO or an allow rule, and a handler inside a
+/// background session or under `maki -p` has nobody to ask anyway.
+#[test_case::test_case(false ; "unanswerable_ctx")]
+#[test_case::test_case(true ; "answerable_ctx")]
+fn a_ctx_session_pays_for_reach_whoever_could_answer(answerable: bool) {
     let (reg, _host) = reach_probe_host(r#"ctx, { tools = { { name = "edit" } }, mcp = false }"#);
     let inv = reg
         .get("open_reaching")
@@ -8063,5 +8214,5 @@ fn a_ctx_session_pays_for_reach_only_when_nobody_can_answer(answerable: bool, ex
     let Ok(maki_agent::ToolOutput::Plain(text)) = result else {
         panic!("unexpected output: {result:?}");
     };
-    assert!(text.text.contains(expected), "got: {}", text.text);
+    assert!(text.text.contains("fs_write"), "got: {}", text.text);
 }

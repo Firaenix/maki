@@ -443,7 +443,7 @@ only in compact mode.
   - `describe` (`function`) Optional. Returns a custom description string for the current context.
   - `examples` (`table`) Optional. Array of example input objects for documentation.
   - `permission_scopes` (`string|function`) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission. Declaring it is what puts the tool in front of the permission prompt, and it requires `permission`.
-  - `permission` (`string`) Required with `permission_scopes`. The capability the tool exposes to the model: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves this tool.
+  - `permission` (`string`) The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. A tool declaring neither costs those plugins every permission.
   - `mutable_path` (`string`) Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
   - `start_annotation` (`string|table`) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 
@@ -488,7 +488,9 @@ deny rules always win over a plugin allow.
 
 An allow is delegation, not escalation: it needs the `permission` the
 target tool declares, so a plugin can only pre-approve what it could
-already do itself. A deny needs no permission.
+already do itself. A deny needs no permission. An allow on a tool that
+never prompts (`permission` without `permission_scopes`) has nothing to
+pre-approve and is dropped.
 
 Allows are checked once the plugin finishes loading, so a plugin may
 pre-approve a tool it registers itself. One that does not hold up (no such
@@ -587,7 +589,7 @@ until the next compaction.
 **Parameters:**
 
 - `{spec}` (`table`) Hint specification:
-  - `slot` (`string`) Required. Aggregate slot name (e.g. "tool_usage", "general").
+  - `slot` (`string`) Required. Aggregate slot name (e.g. "tool_usage", "conventions").
   - `content` (`string|function`) Required. Static text, or a `function()` that returns a string. Max 1 MiB.
   - `prompt` (`string|string[]`) Optional. Restrict to specific prompt ids (e.g. "system").
 
@@ -643,29 +645,45 @@ local opts = maki.api.register_options({
 maki.api.set_prompt({spec})
 ```
 
-Set a singleton prompt slot. Only one plugin owns each singleton slot at a
-time, so calling this replaces any previous value from your plugin.
+Replace a complete prompt or one named section. Section replacements
+preserve additive hints registered through `register_prompt_hint`.
 
-Use this for slots like "identity" or "tone" where a single coherent value
-makes more sense than combining fragments. For aggregate slots like
-"tool_usage", use `register_prompt_hint` instead.
+Omit `slot` to replace a whole template; this requires one explicit prompt
+ID. A replacement inserts section defaults, hints, and instructions only
+through explicit `{{section}}` and `{{instructions}}` markers. An empty
+string clears a template or section. The alphabetically last plugin wins,
+and its last registration wins within that plugin. Unload removes its values.
 
-Throws if you pass an aggregate slot name. A function `content` behaves
-as in `register_prompt_hint`.
+Prompt IDs: `system`, `research`, `general`, and `plan`.
+Sections: `identity`, `tone`, `tool_usage`, `efficient_tools`, `conventions`,
+`after_instructions`, `objectivity`, and `completion`.
+
+Identity and tone are available in system, research, and general prompts.
+Sections target the main agent when `prompt` is omitted. Only identity and
+tone accept a function called before every run. Its first value goes in the
+system prompt. Later changes reach the main agent as a context update.
+Other replacements require static strings.
+A known section missing from the resolved template is ignored, with a warning
+for explicit prompt targets.
 
 **Parameters:**
 
-- `{spec}` (`table`) Spec fields mirror `register_prompt_hint`:
-  - `slot` (`string`) Required. Singleton slot name (e.g. "identity", "tone").
-  - `content` (`string|function`) Required. Static text or a `function()` returning a string. Max 1 MiB.
-  - `prompt` (`string|string[]`) Optional. Restrict to specific prompt ids.
+- `{spec}` (`table`) Prompt replacement:
+  - `slot` (`string`) Optional. Named section, e.g. "identity", "tone", "conventions".
+  - `content` (`string|function`) Required. Replacement text, including empty text. Max 1 MiB. Only identity and tone accept functions.
+  - `prompt` (`string|string[]`) Optional for sections; defaults to "system". A whole replacement requires one explicit prompt ID.
 
 **Example:**
 
 ```lua
 maki.api.set_prompt({
-  slot = "tone",
-  content = "Be concise. No filler words.",
+  prompt = "system",
+  slot = "conventions",
+  content = "State uncertainty and cite your evidence.",
+})
+maki.api.set_prompt({
+  prompt = "system",
+  content = "You help analyse information.\n{{tool_usage}}",
 })
 ```
 
@@ -752,11 +770,15 @@ This returns as soon as the command has been dispatched, not when it
 finishes, so aliasing something long-running like `/compact` does not
 block your handler.
 
+A command outside the calling plugin's grants returns an error, and a few
+only run when you type them. [Commands](/docs/commands/#plugin-access)
+lists what each one needs.
+
 **Parameters:**
 
 - `{cmdline}` (`string`) Command line, e.g. `"/new"` or `"/cd ~/src"`.
 
-**Returns:** (`boolean|nil`, `string|nil`) `true` once dispatched, or nil and an error message for an unknown command.
+**Returns:** (`boolean|nil`, `string|nil`) `true` once dispatched, or nil and an error message for an unknown or denied command.
 
 **Example:**
 
@@ -828,9 +850,11 @@ name the session now running or focused. What each event adds:
 - `"SessionTitleChanged"`: `data.title` and `data.focused` (boolean),
   when the title changes (rename or auto-generation).
 - `"TaskStatusChanged"`: `data.id`, `data.name`, and `data.status`
-  (`"working"`, `"done"`, or `"error"`), when a subagent starts or
-  changes status. A task that comes back from disk already finished
-  stays quiet, so reloading a session does not replay old tasks.
+  (`"working"`, `"idle"`, `"done"`, or `"error"`), when a subagent starts
+  or changes status. A task a plugin opened with `maki.agent.session`
+  carries `data.plugin`, and `"idle"` is such a task between prompts. A
+  task that comes back from disk already finished stays quiet, so
+  reloading a session does not replay old tasks.
 - `"TaskFocusChanged"`: `data.id`, the task now on screen (`"main"` or a
   subagent's id, what `ctx:task_id()` reports inside a tool). Fires for
   the chat cycling keys, `maki.task.focus`, and a session switch that
@@ -894,6 +918,13 @@ is nil.
 
 `"SessionReset"` stays TUI-only (`/new`) and fires on the same path as
 `"SessionEnd"` with `reason = "reset"`.
+
+The bundled `question` tool fires two events of its own, both with
+`data.session_id` and `data.tool_id`, the handle
+`maki.session.answer_question` takes. `"QuestionAsked"` carries
+`data.questions` as the model sent them and fires once the form is on
+screen. `"QuestionResolved"` carries `data.by`: `"user"`, `"plugin"`, or
+`"cancelled"` when the turn was interrupted.
 
 Jobs started inside a callback die with the dispatch unless you await
 them there (`jobwait`) or hand them to a session
@@ -987,9 +1018,8 @@ You set it, because you are the only one who knows what your default does
 with the arguments it is handed. Pass `{ capability = { "net" } }` to
 charge the permissions you name, all of them at once; `{ capability = {} }`
 to let anyone layer for free, which is the honest price for a slot whose
-arguments are inert; or leave {opts} out to charge every permission, what a
-tool declaring no capability charges. You can only name permissions your
-own plugin holds.
+arguments are inert; or leave {opts} out to charge every permission. You
+can only name permissions your own plugin holds.
 
 Throws if another plugin already owns a slot with the same {name}, or
 if {name} starts with `"tool."`, `"ui."`, `"agent."`, or `"permission."`,
@@ -1318,7 +1348,8 @@ print(model.spec, model.tier)
 maki.agent.system_prompt({ctx}, {opts})
 ```
 
-Build a system prompt from a built-in template. Environment variables like
+Build a system prompt from the parent's resolved prompt catalogue.
+Plugin template and section replacements apply. Environment variables like
 `{cwd}` are substituted automatically. Use this when you need a ready-made
 prompt for a subagent session.
 
@@ -1330,8 +1361,9 @@ prompt for a subagent session.
 
   Optional fields:
 
-  - `instructions` (`string|boolean?`) extra text appended to the prompt.
-    `true` loads instructions from the project `.maki/instructions` file.
+  - `instructions` (`string|boolean?`) text inserted at the template's
+    `{{instructions}}` marker.
+    `true` loads project instruction files.
     `false` or nil omits them.
 
 **Returns:** (`string?`, `string?`) The assembled prompt string, or `(nil, err)` on failure.
@@ -1375,9 +1407,9 @@ background session of that chat would have.
   - `except` (`string[]?`) exclude these tool names.
   - `workflow` (`boolean?`) use workflow-mode descriptions. Default: `false`.
   - `spec` (`string?`) evaluate capability exclusions against this model spec.
-  - `mcp` (`boolean?`) describe tools as if MCP is reachable. Default: `true`.
-    Pass what you pass to `maki.agent.session()`. Otherwise the descriptions
-    advertise MCP tools that the session has no way to call.
+  - `mcp` (`boolean?`) describe tools as if MCP is reachable. Default: `false`.
+    Match what you pass to `maki.agent.session()`, or the descriptions
+    advertise MCP tools the session cannot call.
 
 **Returns:** (`table?`, `string?`) Array of tool definition tables, or `(nil, err)` on failure.
 
@@ -1462,7 +1494,9 @@ through optional callbacks while the tool runs.
   - `on_live_buf` (`function?`) called with a `BufHandle` for each live buffer
     the tool publishes. Must not yield.
   - `on_annotation` (`function?`) called with an annotation string for each
-    annotation event. Must not yield.
+    annotation event. Must not yield. A call a `permission.prompt` layer
+    allowed arrives as `"allowed by <plugin>"`. Without this callback that
+    mark goes on your own tool's row instead.
   - `on_usage` (`function?`) called with a formatted cumulative token usage
     string. Must not yield.
 
@@ -1509,14 +1543,14 @@ answers and YOLO still apply, so add allow rules for what it runs (see
 chat is in plan mode its file-write tools are denied. Its thinking never
 goes above the chat's current setting.
 
-Since nothing can prompt, the plugin must itself hold what its tools
-reach. A tool that declares a permission, like `bash` with `run`, needs
-that one. A tool that declares none, or `mcp` on a chat with MCP servers,
-needs every permission except `agent`. The read-only tools (`read`,
-`grep`, `glob`) declare none today, so handing them over takes all of
-them. `local_tools` need nothing, they run as the plugin. The ctx form
-follows the same rule when its own session cannot prompt: a tool handler
-inside such a session, or `maki -p`.
+With or without a ctx, the plugin must hold what its tools reach. A prompt
+is no gate under YOLO or an allow rule, and a background session has
+nobody to prompt. A tool declaring a permission (`bash` with `run`, `read`
+with `fs_read`) costs that one. A tool declaring none (`batch`,
+`code_execution`), or `mcp = true` on a chat with MCP servers, costs every
+permission except `agent`. `local_tools` cost nothing, they run as the
+plugin. The bundled `task` hands over the whole chat, so it holds all
+five.
 
 `scope` sets the lifetime. `"task"`, the default, ends the session with
 the task that opened it: an autocmd callback when it returns, a tool
@@ -1530,10 +1564,18 @@ A polling monitor opens one per round inside a `maki.async.spawn` loop.
 An event-driven one opens once with `scope = "session"`, keeps the handle
 and prompts it from autocmd callbacks.
 
-Its spend counts in the chat's totals after each turn, and `/tasks` lists
-it but cannot stop it yet. Setting `plugins.<name>.enabled = false` stops a
-plugin's monitors from the next `/reload`. Under `maki -p` and ACP there is
-no live chat session, so opening one fails with "session not live". The
+Opened by chat session id, it shows up in that chat as a task owned by
+the plugin from its first prompt on: a transcript tab, a `plugin` field
+in `/tasks` and `maki.task.list()`, `"idle"` between prompts, and its
+spend in the chat's totals after each turn. Esc in its tab closes it,
+and the pending `:prompt()` returns `"stopped by user"` rather than
+`"cancelled"`, so a loop can tell the user's Esc from its own task
+ending and stop rather than reopen. Permission prompts stay denied even
+though the task has a tab: a prompt in an unfocused tab would stall a
+monitor silently, a denial reaches the plugin as an error it can handle.
+Setting `plugins.<name>.enabled = false` stops a plugin's monitors from
+the next `/reload`. Under `maki -p` and ACP there is no live chat
+session, so opening one fails with "session not live". The
 [maki.agent](#maki-agent) overview has a full monitor.
 
 **Parameters:**
@@ -1556,10 +1598,9 @@ no live chat session, so opening one fails with "session not live". The
     model alone, so a script cannot reach it through `code_execution`.
   - `name` (`string?`) display name for logs and UI.
   - `audience` (`string?`) tool audience for capability gating. Default: `"general_sub"`.
-  - `mcp` (`boolean?`) give the session access to MCP tools. Their
-    definitions are injected automatically each turn (deferred behind
-    `tool_search`), so don't put MCP definitions in `tools`. The session
-    starts with no loaded tools of its own. Default: `true`.
+  - `mcp` (`boolean?`) give the session MCP tools. Their definitions are
+    injected each turn (deferred behind `tool_search`), so do not put MCP
+    definitions in `tools`. Default: `false`.
   - `thinking` (`string|integer?`) thinking mode: `"off"`, `"adaptive"`, an
     effort level (`"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`,
     `"max"`), or a budget integer (token count). Inherits the parent
@@ -1657,7 +1698,10 @@ tools).
 
 **Returns:** (`table?`, `string?`) Result table on success, or `(nil, err)` on
 failure. A run cut short after streaming some text hands you both: the
-error and a `{ text = <what it streamed> }` table.
+error and a `{ text = <what it streamed> }` table. `"cancelled"` means the
+task that opened or prompted the session ended. `"stopped by user"` means
+Esc in its tab closed a session opened by chat session id, and every
+later prompt answers the same.
 
 **Example:**
 
@@ -1683,8 +1727,8 @@ Close on every path, error paths included. Dropping the session instead
 leaves the work to the Lua garbage collector, which may never run while
 the VM sits idle, and the subagent's event relay stays alive until it does.
 
-On a background session, `close` cancels a running prompt rather than
-waiting for it.
+Close cancels a running prompt before waiting to flush its history. That
+prompt returns a cancelled error and any partial text.
 
 
 ## maki.async {#maki-async}
@@ -4278,7 +4322,8 @@ it does for a built-in provider.
     `connection` are refused.
   - `extra_body` (`table`) Merged into every request body.
   - `session_id` (`table`) Sends the session id, as
-    `{ header = "x-affinity" }` or `{ body_field = "session_id" }`.
+    `{ header = "x-affinity" }`, `{ body_field = "prompt_cache_key" }`,
+    or both at once.
   - `thinking_overrides` (`table`) Model id prefix to `"no"`, `"yes"` or
     `"required"`, overriding the model table. Longest prefix wins.
 - `models` (`table`) Static model rows, read once at registration. They
@@ -4753,6 +4798,36 @@ local state, err = maki.session.prompt("run the tests", { session = id })
 
 ---
 
+### `maki.session.cancel()` {#maki-session-cancel}
+
+```lua
+maki.session.cancel({opts?})
+```
+
+Interrupts the running turn of a live session, the way a double Esc does
+in the TUI: the agent stops, in-flight tools are cancelled and queued
+prompts are dropped.
+
+Requires the `agent` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Optional fields: session (string) id of a live
+
+  session; defaults to the focused one.
+
+
+**Returns:** (`boolean|nil`, `string|nil`) true if a turn was interrupted, false
+  if the session was idle, or nil and an error.
+
+**Example:**
+
+```lua
+local interrupted, err = maki.session.cancel({ session = id })
+```
+
+---
+
 ### `maki.session.notify()` {#maki-session-notify}
 
 ```lua
@@ -4865,6 +4940,103 @@ maki.api.create_autocmd("PermissionRequested", {
 })
 ```
 
+---
+
+### `maki.session.register_question()` {#maki-session-register_question}
+
+```lua
+maki.session.register_question({tool_id}, {win}, {opts?})
+```
+
+Opens the question form {win} shows for the `question` tool call
+{tool_id} to `maki.session.answer_question`. The bundled `question`
+plugin calls this. The form stays the user's: a plugin's answer closes
+{win}, and `settle_question` hands it back.
+
+**Parameters:**
+
+- `{tool_id}` (`string`) The `question` tool call id, `ctx:tool_id()`.
+- `{win}` ([`maki.ui.Win`](#maki-ui-Win)) The open form.
+- `{opts?}` (`table?`) Optional fields: session (string) id of the session
+
+  that asked.
+
+
+**Example:**
+
+```lua
+maki.session.register_question(ctx:tool_id(), win, { session = ctx:session_id() })
+```
+
+---
+
+### `maki.session.settle_question()` {#maki-session-settle_question}
+
+```lua
+maki.session.settle_question({tool_id})
+```
+
+Closes {tool_id} to plugin answers once its form returned.
+
+**Parameters:**
+
+- `{tool_id}` (`string`) The id given to `register_question`.
+
+**Returns:** (`table|nil`) `{type = "submit", answers}` or `{type = "dismiss"}`
+  if a plugin answered first, the way the form reports a result. nil when
+  the user did.
+
+**Example:**
+
+```lua
+local remote = maki.session.settle_question(ctx:tool_id())
+```
+
+---
+
+### `maki.session.answer_question()` {#maki-session-answer_question}
+
+```lua
+maki.session.answer_question({tool_id}, {reply}, {opts?})
+```
+
+Answers an open question form, racing the user at it, as if they had
+submitted or dismissed it. The form closes, and whichever answer lands
+first is the one the agent reads. Answering for the user takes every
+permission in the plugin's `plugin.toml`.
+
+**Parameters:**
+
+- `{tool_id}` (`string`) The `tool_id` of a `QuestionAsked` event.
+- `{reply}` (`table`) `{ answers = { { label, ... }, ... } }`, one list of
+
+  picked labels per question, free text counting as a label, or
+
+
+  `{ dismiss = true }`.
+
+- `{opts?}` (`table?`) Optional fields: session (string) id the question must
+
+  belong to. Tool call ids are unique, so this only guards against a
+
+
+  stale id.
+
+
+**Returns:** (`boolean|nil`, `string|nil`) true if this answer settled the form,
+  false if it is no longer open or someone answered first, or nil and an
+  error.
+
+**Example:**
+
+```lua
+maki.api.create_autocmd("QuestionAsked", {
+  callback = function(ev)
+    maki.session.answer_question(ev.data.tool_id, { answers = { { "Yes" } } })
+  end,
+})
+```
+
 
 ## maki.Timer {#maki-Timer}
 
@@ -4907,11 +5079,14 @@ maki.task.list()
 
 Lists the focused session's chats in chat order. Entry 1 is always the main
 chat, with id `"main"` and no `status`: its work is the session's own, and
-`maki.session.live()` already reports that. The rest are subagents, keyed by
-the tool call that spawned them.
+`maki.session.live()` already reports that. The rest are subagents: one a
+tool spawned has its tool call's id, one a plugin opened with
+[maki.agent.session](#maki-agent-session) has its session id and a
+`plugin` field.
 
-**Returns:** (`table|nil`, `string|nil`) Array of `{id, name, focused, status?}` where
-  `status` is `"working"`, `"done"`, or `"error"`, or nil and an error.
+**Returns:** (`table|nil`, `string|nil`) Array of `{id, name, focused, status?, plugin?}`
+  where `status` is `"working"`, `"idle"` (a plugin task between prompts),
+  `"done"`, or `"error"`, or nil and an error.
 
 **Example:**
 
@@ -7696,7 +7871,7 @@ function ToolView:append_text(text)
 
 -- Append {content} with line numbers, then syntax-highlight it for {ext}
 -- asynchronously. Returns false when {content} is empty.
-function ToolView:set_highlight(content, ext)
+function ToolView:set_highlight(content: string, ext)
 
 -- Content rows on screen, for callers with their own per-row click targets. A
 -- single hidden line is drawn as itself instead of a notice, so it counts as

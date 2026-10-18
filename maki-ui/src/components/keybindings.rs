@@ -149,10 +149,11 @@ pub mod key {
     pub const POP_QUEUE: Bind = ctrl_bind!('q');
     pub const DELETE_WORD: Bind = ctrl_bind!('w');
     pub const SEARCH: Bind = ctrl_bind!('f');
+    pub const FORK: Bind = ctrl_bind!('f');
     pub const FILE_PICKER: Bind = ctrl_bind!('s');
     pub const OPEN_EDITOR: Bind = ctrl_bind!('o');
     pub const PLAN_TOGGLE: Bind = ctrl_bind!('t');
-    pub const MODEL_PICKER: Bind = ctrl_bind!('m');
+    pub const MODEL_PICKER: Bind = ctrl_bind!('l');
     pub const REFRESH: Bind = ctrl_bind!('r');
     pub const SUSPEND: Bind = ctrl_bind!('z');
     pub const DELETE: Bind = ctrl_bind!('d');
@@ -557,6 +558,12 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Single(key::FORK.label),
+        description: "Fork up to the selected prompt and switch to it",
+        context: KeybindContext::RewindPicker,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single("Enter"),
         description: "Remove item",
         context: KeybindContext::QueueFocus,
@@ -571,6 +578,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single("!/@/#/$"),
         description: "Set tier (strong/medium/weak/compaction)",
+        context: KeybindContext::ModelPicker,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("%"),
+        description: "Fold or unfold provider",
         context: KeybindContext::ModelPicker,
         platform: Platform::All,
     },

@@ -18,6 +18,7 @@ use crate::api::slot::{LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT};
 use crate::api::util::command::{
     HintReader, LuaCommandReader, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction, UiAttachment,
 };
+use crate::background::BackgroundSessions;
 use crate::error::PluginError;
 use crate::pack::{DiscoveredPackage, Interaction};
 use crate::plugin_permissions::{
@@ -28,7 +29,7 @@ use crate::runtime::{
     self, ClickFallback, ConfigScope, EndSession, LoadChunk, LoadContext, LuaThread, Request,
     RestoreItem,
 };
-use maki_agent::prompt::ResolvedSlots;
+use maki_agent::prompt::ResolvedPrompts;
 use maki_storage::id::MakiId;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -999,6 +1000,7 @@ impl PluginHost {
             tx: self.inner.tx.clone(),
             prio_tx: self.inner.prio_tx.clone(),
             layered: Arc::clone(&self.inner.layered),
+            background: self.inner.background.clone(),
         }
     }
 
@@ -1040,6 +1042,7 @@ pub struct EventHandle {
     /// Published by the Lua thread and read without touching it: whether
     /// asking a chain can change the answer at all.
     layered: Arc<LayeredTools>,
+    background: BackgroundSessions,
 }
 
 impl EventHandle {
@@ -1048,7 +1051,16 @@ impl EventHandle {
             tx,
             prio_tx: flume::unbounded().0,
             layered: Arc::default(),
+            background: BackgroundSessions::default(),
         }
+    }
+
+    /// Esc in a plugin task's tab. Drops the session's registry entry, which
+    /// fires its cancel, and the plugin's pending `:prompt()` returns
+    /// "stopped by user". Synchronous on purpose: the registry is a mutex the
+    /// Lua thread shares, so a busy Lua thread cannot delay the stop.
+    pub fn cancel_plugin_session(&self, id: &str) {
+        self.background.stop(id);
     }
 
     #[doc(hidden)]
@@ -1130,6 +1142,7 @@ impl EventHandle {
             tx: shared.clone(),
             prio_tx: shared,
             layered: Arc::default(),
+            background: BackgroundSessions::default(),
         }
     }
 
@@ -1149,7 +1162,7 @@ impl EventHandle {
         });
     }
 
-    pub fn collect_prompt_slots(&self) -> ResolvedSlots {
+    pub fn collect_prompt_slots(&self) -> ResolvedPrompts {
         let (tx, rx) = flume::bounded(1);
         let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
         rx.recv().unwrap_or_default()
@@ -1169,7 +1182,7 @@ impl EventHandle {
         Ok(crate::pack::PackContext::new(declared, installed, active))
     }
 
-    pub async fn collect_prompt_slots_async(&self) -> ResolvedSlots {
+    pub async fn collect_prompt_slots_async(&self) -> ResolvedPrompts {
         let (tx, rx) = flume::bounded(1);
         let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
         rx.recv_async().await.unwrap_or_default()
@@ -1326,8 +1339,9 @@ mod tests {
     use super::*;
     use crate::api::keymap::TAKEN_ERR;
     use crate::api::util::command::{LuaCommandInfo, LuaCommandWriter};
+    use crate::plugin_permissions::PluginReach;
     use crossterm::event::KeyCode;
-    use maki_agent::prompt::{PromptId, ResolvedSlots, Slot};
+    use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, assemble};
     use maki_agent::tools::ToolRegistry;
     use std::time::Instant;
     use test_case::test_case;
@@ -1409,14 +1423,14 @@ mod tests {
 
     /// Load `src` as one plugin, collect resolved slots.
     /// Panics on failure; use `load_err` to inspect errors.
-    fn slots_from(plugin: &str, src: &str) -> (PluginHost, ResolvedSlots) {
+    fn slots_from(plugin: &str, src: &str) -> (PluginHost, ResolvedPrompts) {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(plugin, src).unwrap();
         let slots = host.event_handle().collect_prompt_slots();
         (host, slots)
     }
 
-    fn contents(slots: &ResolvedSlots, prompt: PromptId, slot: Slot) -> Vec<&str> {
+    fn contents(slots: &ResolvedPrompts, prompt: PromptId, slot: Slot) -> Vec<&str> {
         slots
             .get(prompt, slot)
             .iter()
@@ -1434,6 +1448,7 @@ mod tests {
             name: Arc::from("/test"),
             description: Arc::from("desc"),
             plugin: Arc::from("p"),
+            reach: PluginReach::new(PluginPermissions::trusted()),
             max_args: 0,
         }]);
         let snap = reader.load();
@@ -1466,6 +1481,7 @@ mod tests {
             tx,
             prio_tx,
             layered: Arc::default(),
+            background: BackgroundSessions::default(),
         };
         handle.run_command(
             Arc::from("myplugin"),
@@ -1908,9 +1924,8 @@ mod tests {
 
     /// Targeting a prompt that does not have the slot quietly drops the hint.
     #[test]
-    fn register_prompt_hint_rejects_incompatible_slot_prompt() {
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-        let r = host.load_source(
+    fn register_prompt_hint_ignores_missing_slot() {
+        let (_host, slots) = slots_from(
             "drop",
             r#"
             maki.api.register_prompt_hint({
@@ -1920,8 +1935,8 @@ mod tests {
             })
             "#,
         );
-        assert!(r.is_err());
-        assert!(r.unwrap_err().to_string().contains("not available"));
+        assert!(contents(&slots, PromptId::Research, Slot::AfterInstructions).is_empty());
+        assert!(!assemble(PromptId::Research, &slots, "").contains("never lands"));
     }
 
     #[test]
@@ -2013,42 +2028,22 @@ mod tests {
         assert!(host.load_source("bad", &src).is_err());
     }
 
-    #[test]
-    fn identity_slot_lands_on_system_only() {
-        let (_host, slots) = slots_from(
-            "id",
-            r#"
-            maki.api.set_prompt({
-                slot = "identity",
-                content = "Custom identity",
-            })
-            "#,
+    #[test_case(Slot::Identity ; "identity")]
+    #[test_case(Slot::Tone ; "tone")]
+    #[test_case(Slot::Conventions ; "static_section")]
+    fn omitted_replacement_targets_only_the_main_prompt(slot: Slot) {
+        const CONTENT: &str = "Custom policy";
+        let (_host, prompts) = slots_from(
+            "persona",
+            &format!("maki.api.set_prompt({{ slot = \"{slot}\", content = {CONTENT:?} }})"),
         );
-        assert_eq!(
-            contents(&slots, PromptId::System, Slot::Identity),
-            ["Custom identity"]
-        );
-        assert!(contents(&slots, PromptId::Research, Slot::Identity).is_empty());
-        assert!(contents(&slots, PromptId::General, Slot::Identity).is_empty());
-    }
-
-    #[test]
-    fn tone_slot_lands_on_system_only() {
-        let (_host, slots) = slots_from(
-            "tone",
-            r#"
-            maki.api.set_prompt({
-                slot = "tone",
-                content = "Custom tone",
-            })
-            "#,
-        );
-        assert_eq!(
-            contents(&slots, PromptId::System, Slot::Tone),
-            ["Custom tone"]
-        );
-        assert!(contents(&slots, PromptId::Research, Slot::Tone).is_empty());
-        assert!(contents(&slots, PromptId::General, Slot::Tone).is_empty());
+        assert!(assemble(PromptId::System, &prompts, "").contains(CONTENT));
+        for pid in [PromptId::Research, PromptId::General] {
+            assert_eq!(
+                assemble(pid, &prompts, ""),
+                assemble(pid, &ResolvedPrompts::default(), ""),
+            );
+        }
     }
 
     #[test]
@@ -2111,6 +2106,8 @@ mod tests {
             contents(&slots, PromptId::System, Slot::Identity),
             ["Explicit identity"]
         );
+        assert!(contents(&slots, PromptId::Research, Slot::Identity).is_empty());
+        assert!(contents(&slots, PromptId::General, Slot::Identity).is_empty());
     }
 
     #[test]
@@ -2164,24 +2161,31 @@ mod tests {
     }
 
     #[test]
-    fn set_prompt_rejects_aggregate_slot() {
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-        let r = host.load_source(
-            "bad",
-            r#"maki.api.set_prompt({ slot = "tool_usage", content = "nope" })"#,
+    fn set_prompt_replaces_aggregate_default_and_preserves_hints() {
+        const REPLACEMENT: &str = "Analyse information without coding guidance.";
+        const HINT: &str = "Use the library catalogue.";
+        let (_host, slots) = slots_from(
+            "sections",
+            r#"
+            maki.api.set_prompt({ slot = "conventions", prompt = "system", content = "Analyse information without coding guidance." })
+            maki.api.register_prompt_hint({ slot = "conventions", prompt = "system", content = "Use the library catalogue." })
+            "#,
         );
-        assert!(r.is_err());
+        let rendered = assemble(PromptId::System, &slots, "");
+        assert!(rendered.contains(&format!("{REPLACEMENT}\n{HINT}")));
+        assert!(!rendered.contains("Never assume a library is available."));
+        assert!(slots.has_replacements());
+        assert!(!slots.policy_key().is_empty());
     }
 
     #[test]
-    fn set_prompt_rejects_incompatible_slot_prompt() {
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-        let r = host.load_source(
-            "bad",
-            r#"maki.api.set_prompt({ slot = "identity", prompt = "research", content = "x" })"#,
+    fn set_prompt_ignores_known_section_missing_from_template() {
+        let (_host, slots) = slots_from(
+            "absent",
+            r#"maki.api.set_prompt({ slot = "identity", prompt = "plan", content = "never lands" })"#,
         );
-        assert!(r.is_err());
-        assert!(r.unwrap_err().to_string().contains("not available"));
+        assert!(contents(&slots, PromptId::Plan, Slot::Identity).is_empty());
+        assert!(!assemble(PromptId::Plan, &slots, "").contains("never lands"));
     }
 
     #[test]
@@ -2200,7 +2204,7 @@ mod tests {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         let r = host.load_source(
             "bad",
-            r#"maki.api.set_prompt({ slot = "identity", content = "" })"#,
+            r#"maki.api.register_prompt_hint({ slot = "tool_usage", content = "" })"#,
         );
         assert!(r.is_err());
         assert!(r.unwrap_err().to_string().contains("empty"));
@@ -2220,6 +2224,236 @@ mod tests {
         assert_eq!(
             contents(&slots, PromptId::System, Slot::Identity),
             ["Dyn identity"]
+        );
+    }
+
+    #[test]
+    fn singleton_callback_is_collected_once_per_snapshot() {
+        let (host, first) = slots_from(
+            "live",
+            r#"
+            local count = 0
+            maki.api.set_prompt({ prompt = {"system", "research", "general"}, slot = "identity", content = function()
+                count += 1
+                return tostring(count)
+            end })
+            "#,
+        );
+        let second = host.event_handle().collect_prompt_slots();
+        for &pid in PromptId::ALL {
+            assert_eq!(contents(&first, pid, Slot::Identity), ["1"]);
+            assert_eq!(contents(&second, pid, Slot::Identity), ["2"]);
+        }
+        assert!(!first.has_replacements());
+        assert!(!second.has_replacements());
+    }
+
+    #[test]
+    fn init_lua_replaces_template_and_section() {
+        const TEMPLATE: &str = "Analysis policy.\n{{conventions}}\n{{instructions}}";
+        const SECTION: &str = "Follow primary sources.";
+        const INSTRUCTIONS: &str = "Keep {{identity}} literal.";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.send_global_init_lua(
+            format!(
+                "maki.api.set_prompt({{prompt = \"system\", slot = \"conventions\", content = {SECTION:?}}})\n\
+                 maki.api.set_prompt({{prompt = \"system\", content = {TEMPLATE:?}}})\n\
+                 maki.setup({{}})"
+            ),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            assemble(
+                PromptId::System,
+                &host.event_handle().collect_prompt_slots(),
+                INSTRUCTIONS,
+            ),
+            format!("Analysis policy.\n{SECTION}\n{INSTRUCTIONS}")
+        );
+    }
+
+    #[test]
+    fn empty_replacements_clear_default_content() {
+        let (_host, slots) = slots_from(
+            "clear",
+            r#"
+            maki.api.set_prompt({ prompt = "system", slot = "identity", content = "" })
+            maki.api.set_prompt({ prompt = "system", slot = "conventions", content = "" })
+            maki.api.set_prompt({ prompt = "plan", content = "" })
+            "#,
+        );
+        const CODING_CONVENTION: &str = "Never assume a library is available.";
+        let defaults = assemble(PromptId::System, &ResolvedPrompts::default(), "");
+        assert!(defaults.contains(CODING_CONVENTION));
+        let rendered = assemble(PromptId::System, &slots, "");
+        assert!(!rendered.contains("You are Maki"));
+        assert!(!rendered.contains(CODING_CONVENTION));
+        assert_eq!(assemble(PromptId::Plan, &slots, ""), "");
+        assert!(slots.has_template(PromptId::Plan));
+    }
+
+    #[test_case("system", PromptId::System ; "system")]
+    #[test_case("research", PromptId::Research ; "research")]
+    #[test_case("general", PromptId::General ; "general")]
+    #[test_case("plan", PromptId::Plan ; "plan")]
+    fn complete_replacement_has_no_implicit_sections(name: &str, id: PromptId) {
+        const TEMPLATE: &str = "You help analyse information.";
+        let (_host, slots) = slots_from(
+            "author",
+            &format!("maki.api.set_prompt({{ prompt = {name:?}, content = {TEMPLATE:?} }})"),
+        );
+        assert_eq!(assemble(id, &slots, "coding instructions"), TEMPLATE);
+    }
+
+    #[test]
+    fn template_and_section_compose_independent_of_owner_order() {
+        const CONTENT: &str = "Follow the evidence.\nUse the library catalogue.";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "aaa_section",
+            r#"
+            maki.api.set_prompt({ prompt = "plan", slot = "conventions", content = "Follow the evidence." })
+            maki.api.register_prompt_hint({ prompt = "plan", slot = "conventions", content = "Use the library catalogue." })
+            "#,
+        ).unwrap();
+        host.load_source(
+            "zzz_template",
+            r#"maki.api.set_prompt({ prompt = "plan", content = "{{conventions}}" })"#,
+        )
+        .unwrap();
+        let slots = host.event_handle().collect_prompt_slots();
+        assert_eq!(assemble(PromptId::Plan, &slots, ""), CONTENT);
+    }
+
+    #[test]
+    fn replacements_use_alphabetical_owner_and_last_registration() {
+        const CONTENT: &str = "last template: last section";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "zzz",
+            r#"
+            maki.api.set_prompt({ prompt = "system", content = "old template: {{conventions}}" })
+            maki.api.set_prompt({ prompt = "system", slot = "conventions", content = "old section" })
+            maki.api.set_prompt({ prompt = "system", content = "last template: {{conventions}}" })
+            maki.api.set_prompt({ prompt = "system", slot = "conventions", content = "last section" })
+            "#,
+        ).unwrap();
+        host.load_source(
+            "aaa",
+            r#"
+            maki.api.set_prompt({ prompt = "system", content = "first template: {{conventions}}" })
+            maki.api.set_prompt({ prompt = "system", slot = "conventions", content = "first section" })
+            "#,
+        ).unwrap();
+        let slots = host.event_handle().collect_prompt_slots();
+        assert_eq!(assemble(PromptId::System, &slots, ""), CONTENT);
+        host.unload("zzz").unwrap();
+        assert_eq!(
+            assemble(
+                PromptId::System,
+                &host.event_handle().collect_prompt_slots(),
+                ""
+            ),
+            "first template: first section"
+        );
+    }
+
+    #[test]
+    fn repeated_singleton_discards_callback_and_replaces_only_its_targets() {
+        let (_host, slots) = slots_from(
+            "singleton",
+            r#"
+            maki.api.set_prompt({ prompt = { "system", "general" }, slot = "identity", content = function() return "first" end })
+            maki.api.set_prompt({ prompt = "system", slot = "identity", content = function() return "last" end })
+            "#,
+        );
+        assert_eq!(contents(&slots, PromptId::System, Slot::Identity), ["last"]);
+        assert_eq!(
+            contents(&slots, PromptId::General, Slot::Identity),
+            ["first"]
+        );
+    }
+
+    #[test]
+    fn replaced_singleton_callback_is_not_invoked() {
+        let (_host, slots) = slots_from(
+            "singleton",
+            r#"
+            local calls = 0
+            maki.api.set_prompt({ slot = "identity", content = function() calls += 1; return "old" end })
+            maki.api.set_prompt({ slot = "identity", content = function() return tostring(calls) end })
+            "#,
+        );
+        assert_eq!(contents(&slots, PromptId::System, Slot::Identity), ["0"]);
+    }
+
+    #[test]
+    fn unload_reload_and_failed_load_remove_all_replacements() {
+        const TEMPLATE: &str = "replacement: selected";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let source = r#"
+            maki.api.set_prompt({ prompt = "system", content = "replacement: {{conventions}}" })
+            maki.api.set_prompt({ prompt = "system", slot = "conventions", content = "selected" })
+            maki.api.set_prompt({ prompt = "system", slot = "identity", content = function() return "unused identity" end })
+        "#;
+        host.load_source("owned", source).unwrap();
+        let handle = host.event_handle();
+        assert_eq!(
+            assemble(PromptId::System, &handle.collect_prompt_slots(), ""),
+            TEMPLATE
+        );
+        host.unload("owned").unwrap();
+        assert!(!handle.collect_prompt_slots().has_replacements());
+        host.load_source("owned", source).unwrap();
+        host.load_source(
+            "owned",
+            r#"maki.api.set_prompt({ prompt = "system", content = "new" })"#,
+        )
+        .unwrap();
+        let reloaded = handle.collect_prompt_slots();
+        assert_eq!(assemble(PromptId::System, &reloaded, ""), "new");
+        assert!(contents(&reloaded, PromptId::System, Slot::Identity).is_empty());
+        assert!(
+            host.load_source("owned", &format!("{source}\nerror('failed load')"))
+                .is_err()
+        );
+        let failed = handle.collect_prompt_slots();
+        assert!(!failed.has_replacements());
+        assert!(contents(&failed, PromptId::System, Slot::Identity).is_empty());
+        assert_eq!(
+            assemble(PromptId::System, &failed, ""),
+            assemble(PromptId::System, &ResolvedPrompts::default(), "")
+        );
+    }
+
+    #[test_case(r#"{ content = "x" }"# ; "whole_requires_prompt")]
+    #[test_case(r#"{ prompt = { "system", "general" }, content = "x" }"# ; "whole_requires_one_prompt")]
+    #[test_case(r#"{ prompt = "nope", content = "x" }"# ; "unknown_prompt")]
+    #[test_case(r#"{ prompt = "btw_fallback", content = "x" }"# ; "unsupported_btw_fallback")]
+    #[test_case(r#"{ prompt = "continuation", content = "x" }"# ; "unsupported_continuation")]
+    #[test_case(r#"{ prompt = "compaction_user", content = "x" }"# ; "unsupported_compaction_user")]
+    #[test_case(r#"{ prompt = "compaction_system", content = "x" }"# ; "unsupported_compaction_system")]
+    #[test_case(r#"{ prompt = "plan_end", content = "x" }"# ; "unsupported_plan_end")]
+    #[test_case(r#"{ prompt = "system" }"# ; "missing_whole_content")]
+    #[test_case(r#"{ prompt = "system", content = function() return "x" end }"# ; "whole_callback")]
+    #[test_case(r#"{ slot = "conventions", content = function() return "x" end }"# ; "section_callback")]
+    #[test_case(r#"{ slot = "conventions", content = 42 }"# ; "section_wrong_type")]
+    #[test_case(r#"{ slot = "unknown", content = "x" }"# ; "unknown_section")]
+    #[test_case(r#"{ slot = "conventions" }"# ; "missing_section_content")]
+    #[test_case(r#"{ prompt = "system", content = string.rep("x", 1024 * 1024 + 1) }"# ; "oversized_whole")]
+    #[test_case(r#"{ slot = "conventions", content = string.rep("x", 1024 * 1024 + 1) }"# ; "oversized_section")]
+    fn invalid_replacement_is_rejected(spec: &str) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        assert!(
+            host.load_source("invalid", &format!("maki.api.set_prompt({spec})"))
+                .is_err()
+        );
+        assert!(
+            !host
+                .event_handle()
+                .collect_prompt_slots()
+                .has_replacements()
         );
     }
 }
@@ -2246,6 +2480,7 @@ mod bundled_manifests {
     const REQUIRE_CALL: &str = "require(";
     const PROVIDER_REGISTER: &str = "maki.provider.register";
     const API_KEY_ENV_FIELD: &str = "api_key_env";
+    const AGENT_SESSION: &str = "maki.agent.session";
 
     /// Every guarded `maki.*` function under the dotted name lua calls it by.
     fn guarded_calls() -> Vec<(String, Permission)> {
@@ -2272,14 +2507,13 @@ mod bundled_manifests {
 
         let mut out: BTreeMap<String, BTreeSet<Permission>> = BTreeMap::new();
         for tool in registry.iter().iter() {
-            let (ToolSource::Lua { plugin }, Some(permission)) =
-                (&tool.source, tool.tool.required_permission())
+            let (ToolSource::Lua { plugin }, Some(reach)) = (&tool.source, tool.tool.reach())
             else {
                 continue;
             };
             out.entry(plugin.to_string())
                 .or_default()
-                .insert(permission);
+                .insert(reach.permission);
         }
         out
     }
@@ -2399,6 +2633,17 @@ mod bundled_manifests {
                     needed
                         .entry(Permission::Env)
                         .or_insert_with(|| format!("{PROVIDER_REGISTER} with {API_KEY_ENV_FIELD}"));
+                }
+                // A bundled plugin opening a session hands over whatever the
+                // chat has, and a session pays for everything it hands over.
+                if calls(source, AGENT_SESSION) {
+                    for &permission in Permission::ALL {
+                        if permission != Permission::Agent {
+                            needed
+                                .entry(permission)
+                                .or_insert_with(|| AGENT_SESSION.to_owned());
+                        }
+                    }
                 }
             }
 

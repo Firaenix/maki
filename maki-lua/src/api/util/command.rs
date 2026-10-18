@@ -5,16 +5,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
-use maki_agent::SharedBuf;
 use maki_agent::permissions::PermissionAnswer;
+use maki_agent::{Envelope, SharedBuf};
 use maki_storage::id::MakiId;
-use maki_storage::sessions::StoredTokenUsage;
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
 
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::{Pair, try_pair};
 use crate::key::Key;
+use crate::plugin_permissions::PluginReach;
 
 pub const NO_UI_ERR: &str = "no interactive UI attached";
 pub(crate) const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
@@ -28,6 +28,10 @@ pub struct LuaCommandInfo {
     pub name: Arc<str>,
     pub description: Arc<str>,
     pub plugin: Arc<str>,
+    /// The handler runs with this, so a plugin calling it through
+    /// `maki.api.run_command` must reach as far. Otherwise it could borrow
+    /// this plugin's reach and pick the arguments.
+    pub reach: PluginReach,
     pub max_args: usize,
 }
 
@@ -138,6 +142,7 @@ impl HintWriter {
 pub(crate) struct CommandEntry {
     pub handler: RegistryKey,
     pub description: Arc<str>,
+    pub reach: PluginReach,
     pub max_args: usize,
 }
 
@@ -151,6 +156,7 @@ pub(crate) fn publish_command_snapshot(map: &CommandHandlerMap, writer: &LuaComm
                 name: Arc::clone(name),
                 description: Arc::clone(&entry.description),
                 plugin: Arc::clone(plugin),
+                reach: entry.reach.clone(),
                 max_args: entry.max_args,
             })
         })
@@ -471,6 +477,11 @@ pub enum SessionRequest {
         answer: PermissionAnswer,
         plugin: Arc<str>,
     },
+    /// Interrupts the running turn of the live session {id} names, or the
+    /// focused one. The UI replies whether a turn was running.
+    Cancel {
+        id: Option<String>,
+    },
 }
 
 pub enum TaskRequest {
@@ -677,15 +688,19 @@ pub enum UiAction {
     RunCommand {
         cmdline: String,
         depth: u8,
+        /// Checked on the UI side, since only the UI knows what each command
+        /// can reach.
+        caller: PluginReach,
         reply_tx: flume::Sender<Result<(), String>>,
     },
-    /// What one background subagent turn spent. A tab keeps its channels
-    /// across `/new`, so the chat session id is the only way to tell if the
-    /// tab still shows the session that paid.
-    BackgroundUsage {
+    /// An event from a subagent session a plugin opened on a chat session,
+    /// which shows it as a task. A tab keeps its channels across `/new`, so
+    /// the chat session id is the only way to tell if the tab still shows the
+    /// session that owns it.
+    PluginTaskEvent {
         session: MakiId,
-        model: String,
-        usage: StoredTokenUsage,
+        plugin: Arc<str>,
+        envelope: Box<Envelope>,
     },
 }
 
@@ -782,6 +797,7 @@ pub(crate) async fn ui_json_roundtrip(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin_permissions::PluginPermissions;
     use mlua::Lua;
     use test_case::test_case;
 
@@ -791,6 +807,7 @@ mod tests {
         CommandEntry {
             handler: key,
             description: Arc::from(desc),
+            reach: PluginReach::new(PluginPermissions::trusted()),
             max_args: 0,
         }
     }

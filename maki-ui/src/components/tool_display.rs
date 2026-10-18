@@ -38,6 +38,7 @@ pub(crate) const SPINNER_STYLE_NAME: &str = "spinner";
 pub(crate) const SPINNER_STYLE_PREFIX: &str = "spinner:";
 
 const CODE_OUTPUT_DIVIDER: &str = "  ────────────";
+const ANNOTATION_SEP: &str = " · ";
 /// Instruction blocks have no tool of their own, so they render under this name.
 const INSTRUCTIONS_TOOL: &str = "load";
 /// Stands in for a tool message whose role carries no name.
@@ -752,10 +753,13 @@ pub fn truncate_to_header(text: &mut String) {
     text.truncate(end);
 }
 
-pub(crate) fn append_annotation(ann: &mut Option<String>, suffix: &str) {
+/// Skips a note the row already shows. A `code_execution` run sends the same
+/// "allowed by" mark for every call a plugin let through.
+pub(crate) fn append_annotation(ann: &mut Option<String>, note: &str) {
     match ann {
-        Some(a) => write!(a, " · {suffix}").unwrap(),
-        None => *ann = Some(suffix.to_owned()),
+        Some(a) if a.split(ANNOTATION_SEP).any(|shown| shown == note) => {}
+        Some(a) => write!(a, "{ANNOTATION_SEP}{note}").unwrap(),
+        None => *ann = Some(note.to_owned()),
     }
 }
 

@@ -15,7 +15,7 @@ use maki_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, vali
 use maki_agent::tools::{
     BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
     PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation,
-    is_tool_enabled, timeout_annotation,
+    ToolReach, is_tool_enabled, timeout_annotation,
 };
 use maki_agent::{
     AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, SharedBuf, TextOutput, ToolOutput,
@@ -37,9 +37,10 @@ use crate::api::util::command::{
 use crate::api::util::convert::{json_to_lua, lua_to_json};
 use crate::api::util::ctx::{LuaCtx, RestoreCtx};
 use crate::api::util::pair::{Pair, try_pair};
-use crate::plugin_permissions::{MANIFEST_FILE, Permission, PluginPermissions};
+use crate::plugin_permissions::{MANIFEST_FILE, Permission, PluginPermissions, PluginReach};
 use crate::runtime::{
-    HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, Request, command_depth,
+    HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, PromptTarget, Request,
+    command_depth,
 };
 
 const TOOL_NAME_MAX: usize = 64;
@@ -130,20 +131,19 @@ impl PermissionScopeSpec {
     }
 }
 
-/// What a tool exposes to the model: the capability, plus the scopes every
-/// call is checked against. One field rather than two, because a capability
-/// without scopes is never checked and scopes without a capability cannot be
-/// delegated, so neither half can exist alone.
+/// What a tool exposes to the model. Scopes never come alone, since without a
+/// capability there is nothing to delegate. A capability alone is the
+/// read-only shape: hooks and sessions still price it, no call ever prompts.
 pub(crate) struct ToolPermission<S> {
     pub(crate) permission: Permission,
-    pub(crate) scopes: S,
+    pub(crate) scopes: Option<S>,
 }
 
 impl ToolPermission<PermissionScopeSpec> {
     pub(crate) fn kind(&self) -> ToolPermission<PermissionScopeKind> {
         ToolPermission {
             permission: self.permission,
-            scopes: self.scopes.kind(),
+            scopes: self.scopes.as_ref().map(PermissionScopeSpec::kind),
         }
     }
 }
@@ -176,7 +176,7 @@ impl PendingTool {
             self.restore_key,
             self.start_key,
             self.describe_key,
-            self.permission.and_then(|p| p.scopes.callback_key()),
+            self.permission.and_then(|p| p.scopes?.callback_key()),
         ]
         .into_iter()
         .flatten()
@@ -270,13 +270,16 @@ impl Tool for LuaTool {
         self.examples.clone()
     }
 
-    fn required_permission(&self) -> Option<Permission> {
-        Some(self.permission.as_ref()?.permission)
+    fn reach(&self) -> Option<ToolReach> {
+        self.permission.as_ref().map(|p| ToolReach {
+            permission: p.permission,
+            prompted: p.scopes.is_some(),
+        })
     }
 
     fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
         let validated = validate(self.schema, input.clone())?;
-        let permission_state = match self.permission.as_ref().map(|p| &p.scopes) {
+        let permission_state = match self.permission.as_ref().and_then(|p| p.scopes.as_ref()) {
             Some(PermissionScopeKind::Field(field)) => {
                 let scope = validated.get(field.as_ref()).and_then(|v| v.as_str());
                 PermissionState::Ready(Some(match scope {
@@ -597,33 +600,16 @@ fn parse_prompt_field(spec: &Table) -> LuaResult<Option<Vec<PromptId>>> {
     }
 }
 
-fn validate_slot_prompt_compatibility(
-    slot: Slot,
-    prompts: &Option<Vec<PromptId>>,
-) -> LuaResult<()> {
-    if let Some(prompts) = prompts {
-        for &pid in prompts {
-            if !pid.has_slot(slot) {
-                return Err(mlua::Error::runtime(format!(
-                    "slot '{}' is not available for prompt '{}'",
-                    slot, pid
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
-    let has_content = spec.contains_key("content")?;
-    if !has_content {
+fn parse_hint_content(lua: &Lua, spec: &Table, target: PromptTarget) -> LuaResult<HintContent> {
+    if !spec.contains_key("content")? {
         return Err(mlua::Error::runtime("'content' is required"));
     }
-
     match spec.get("content")? {
         LuaValue::String(s) => {
             let text = s.to_string_lossy();
-            if text.is_empty() {
+            if text.is_empty()
+                && matches!(target, PromptTarget::Slot(slot) if slot.kind() == SlotKind::Aggregate)
+            {
                 return Err(mlua::Error::runtime("'content' must not be empty"));
             }
             if text.len() > MAX_HINT_CONTENT_SIZE {
@@ -634,11 +620,65 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
             }
             Ok(HintContent::Static(text))
         }
-        LuaValue::Function(f) => Ok(HintContent::Callback(lua.create_registry_value(f)?)),
-        _ => Err(mlua::Error::runtime(
+        LuaValue::Function(f) if matches!(target, PromptTarget::Slot(_)) => {
+            Ok(HintContent::Callback(lua.create_registry_value(f)?))
+        }
+        _ if matches!(target, PromptTarget::Slot(_)) => Err(mlua::Error::runtime(
             "'content' must be a string or function",
         )),
+        _ => Err(mlua::Error::runtime("'content' must be a string")),
     }
+}
+
+fn register_prompt(
+    lua: &Lua,
+    plugin: Arc<str>,
+    prompts: Option<Vec<PromptId>>,
+    target: PromptTarget,
+    content: HintContent,
+) -> LuaResult<()> {
+    let explicit = prompts.is_some();
+    let replacing = match target {
+        PromptTarget::Slot(slot) => slot.kind() == SlotKind::Singleton,
+        PromptTarget::Section(_) | PromptTarget::Template => true,
+    };
+    let prompts = prompts.unwrap_or_else(|| {
+        if replacing {
+            vec![PromptId::System]
+        } else {
+            PromptId::ALL.to_vec()
+        }
+    });
+    let mut map = lua
+        .app_data_mut::<PromptHintCallbacks>()
+        .ok_or_else(|| mlua::Error::runtime("not initialized"))?;
+    let registrations = map.entry(plugin).or_default();
+    let discarded = if replacing {
+        registrations
+            .extract_if(.., |registration| {
+                if registration.target != target {
+                    return false;
+                }
+                registration.prompts.retain(|pid| !prompts.contains(pid));
+                registration.prompts.is_empty()
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    registrations.push(PromptHintRegistration {
+        prompts,
+        explicit,
+        target,
+        content,
+    });
+    drop(map);
+    for registration in discarded {
+        if let HintContent::Callback(key) = registration.content {
+            lua.remove_registry_value(key)?;
+        }
+    }
+    Ok(())
 }
 
 /// Register a new tool the agent can call. This is the main way plugins add
@@ -681,7 +721,7 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 ///   describe        (function) Optional. Returns a custom description string for the current context.
 ///   examples        (table)    Optional. Array of example input objects for documentation.
 ///   permission_scopes (string|function) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission. Declaring it is what puts the tool in front of the permission prompt, and it requires `permission`.
-///   permission      (string)   Required with `permission_scopes`. The capability the tool exposes to the model: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves this tool.
+///   permission      (string)   The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. A tool declaring neither costs those plugins every permission.
 ///   mutable_path    (string)   Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
 ///   start_annotation (string|table) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 /// @return
@@ -708,10 +748,10 @@ fn parse_hint_content(lua: &Lua, spec: &Table) -> LuaResult<HintContent> {
 fn register_tool(
     lua: &Lua,
     #[ctx] pending: PendingTools,
-    #[ctx] permissions: PluginPermissions,
+    #[ctx] reach: PluginReach,
     spec: Table,
 ) -> LuaResult<()> {
-    register_tool_from_lua(lua, &spec, pending, &permissions)
+    register_tool_from_lua(lua, &spec, pending, reach.permissions())
 }
 
 /// Declare an agent permission rule for a native tool. Use it to pre-allow
@@ -724,7 +764,9 @@ fn register_tool(
 ///
 /// An allow is delegation, not escalation: it needs the `permission` the
 /// target tool declares, so a plugin can only pre-approve what it could
-/// already do itself. A deny needs no permission.
+/// already do itself. A deny needs no permission. An allow on a tool that
+/// never prompts (`permission` without `permission_scopes`) has nothing to
+/// pre-approve and is dropped.
 ///
 /// Allows are checked once the plugin finishes loading, so a plugin may
 /// pre-approve a tool it registers itself. One that does not hold up (no such
@@ -862,7 +904,11 @@ fn allow_is_delegated(
         // Disabled by config, or owned by a plugin nobody loaded.
         return dropped("no such tool is registered");
     };
-    let Some(required) = registered.tool.required_permission() else {
+    let Some(ToolReach {
+        permission: required,
+        prompted: true,
+    }) = registered.tool.reach()
+    else {
         return dropped(
             "the tool declares no permission_scopes, so it is never permission checked",
         );
@@ -906,8 +952,13 @@ fn allow_is_delegated(
 ///   end,
 /// })
 #[lua_fn]
-fn register_command(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResult<()> {
-    register_command_from_lua(lua, &spec, plugin)
+fn register_command(
+    lua: &Lua,
+    #[ctx] plugin: Arc<str>,
+    #[ctx] reach: PluginReach,
+    spec: Table,
+) -> LuaResult<()> {
+    register_command_from_lua(lua, &spec, plugin, reach)
 }
 
 /// Runs a slash command by name, exactly as typing it in the input would.
@@ -927,8 +978,12 @@ fn register_command(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResul
 /// finishes, so aliasing something long-running like `/compact` does not
 /// block your handler.
 ///
+/// A command outside the calling plugin's grants returns an error, and a few
+/// only run when you type them. [Commands](/docs/commands/#plugin-access)
+/// lists what each one needs.
+///
 /// @param cmdline string Command line, e.g. `"/new"` or `"/cd ~/src"`.
-/// @return (boolean|nil, string|nil) `true` once dispatched, or nil and an error message for an unknown command.
+/// @return (boolean|nil, string|nil) `true` once dispatched, or nil and an error message for an unknown or denied command.
 /// @example
 /// -- /resume as an alias for the built-in session picker:
 /// maki.api.register_command({
@@ -945,6 +1000,7 @@ fn register_command(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResul
 async fn run_command(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] caller: PluginReach,
     cmdline: String,
 ) -> LuaResult<Pair<bool>> {
     let depth = command_depth(&lua).saturating_add(1);
@@ -952,6 +1008,7 @@ async fn run_command(
         ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::RunCommand {
             cmdline,
             depth,
+            caller,
             reply_tx,
         })
         .await
@@ -974,7 +1031,7 @@ async fn run_command(
 /// until the next compaction.
 ///
 /// @param spec table Hint specification:
-///   slot    (string)         Required. Aggregate slot name (e.g. "tool_usage", "general").
+///   slot    (string)         Required. Aggregate slot name (e.g. "tool_usage", "conventions").
 ///   content (string|function) Required. Static text, or a `function()` that returns a string. Max 1 MiB.
 ///   prompt  (string|string[]) Optional. Restrict to specific prompt ids (e.g. "system").
 /// @return
@@ -995,64 +1052,66 @@ fn register_prompt_hint(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaR
         )));
     }
     let prompts = parse_prompt_field(&spec)?;
-    validate_slot_prompt_compatibility(slot, &prompts)?;
-    let content = parse_hint_content(lua, &spec)?;
-    let reg = PromptHintRegistration {
-        prompts,
-        slot,
-        content,
-    };
-    let mut map = lua
-        .app_data_mut::<PromptHintCallbacks>()
-        .ok_or_else(|| mlua::Error::runtime("not initialized"))?;
-    map.entry(Arc::clone(&plugin)).or_default().push(reg);
-    Ok(())
+    let target = PromptTarget::Slot(slot);
+    let content = parse_hint_content(lua, &spec, target)?;
+    register_prompt(lua, plugin, prompts, target, content)
 }
 
-/// Set a singleton prompt slot. Only one plugin owns each singleton slot at a
-/// time, so calling this replaces any previous value from your plugin.
+/// Replace a complete prompt or one named section. Section replacements
+/// preserve additive hints registered through `register_prompt_hint`.
 ///
-/// Use this for slots like "identity" or "tone" where a single coherent value
-/// makes more sense than combining fragments. For aggregate slots like
-/// "tool_usage", use `register_prompt_hint` instead.
+/// Omit `slot` to replace a whole template; this requires one explicit prompt
+/// ID. A replacement inserts section defaults, hints, and instructions only
+/// through explicit `{{section}}` and `{{instructions}}` markers. An empty
+/// string clears a template or section. The alphabetically last plugin wins,
+/// and its last registration wins within that plugin. Unload removes its values.
 ///
-/// Throws if you pass an aggregate slot name. A function `content` behaves
-/// as in `register_prompt_hint`.
+/// Prompt IDs: `system`, `research`, `general`, and `plan`.
+/// Sections: `identity`, `tone`, `tool_usage`, `efficient_tools`, `conventions`,
+/// `after_instructions`, `objectivity`, and `completion`.
 ///
-/// @param spec table Spec fields mirror `register_prompt_hint`:
-///   slot    (string)         Required. Singleton slot name (e.g. "identity", "tone").
-///   content (string|function) Required. Static text or a `function()` returning a string. Max 1 MiB.
-///   prompt  (string|string[]) Optional. Restrict to specific prompt ids.
+/// Identity and tone are available in system, research, and general prompts.
+/// Sections target the main agent when `prompt` is omitted. Only identity and
+/// tone accept a function called before every run. Its first value goes in the
+/// system prompt. Later changes reach the main agent as a context update.
+/// Other replacements require static strings.
+/// A known section missing from the resolved template is ignored, with a warning
+/// for explicit prompt targets.
+///
+/// @param spec table Prompt replacement:
+///   slot    (string)         Optional. Named section, e.g. "identity", "tone", "conventions".
+///   content (string|function) Required. Replacement text, including empty text. Max 1 MiB. Only identity and tone accept functions.
+///   prompt  (string|string[]) Optional for sections; defaults to "system". A whole replacement requires one explicit prompt ID.
 /// @return
 /// @example
 /// maki.api.set_prompt({
-///   slot = "tone",
-///   content = "Be concise. No filler words.",
+///   prompt = "system",
+///   slot = "conventions",
+///   content = "State uncertainty and cite your evidence.",
+/// })
+/// maki.api.set_prompt({
+///   prompt = "system",
+///   content = "You help analyse information.\n{{tool_usage}}",
 /// })
 #[lua_fn]
 fn set_prompt(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResult<()> {
-    let slot: Slot = parse_slot(&spec)?;
-    if slot.kind() == SlotKind::Aggregate {
-        return Err(mlua::Error::runtime(format!(
-            "set_prompt is for singleton slots ({}); \
-             use register_prompt_hint for aggregate slots ({})",
-            Slot::names_for_kind(SlotKind::Singleton),
-            Slot::names_for_kind(SlotKind::Aggregate),
-        )));
-    }
     let prompts = parse_prompt_field(&spec)?;
-    validate_slot_prompt_compatibility(slot, &prompts)?;
-    let content = parse_hint_content(lua, &spec)?;
-    let reg = PromptHintRegistration {
-        prompts,
-        slot,
-        content,
+    let target = if spec.get::<LuaValue>("slot")?.is_nil() {
+        if prompts.as_ref().is_none_or(|ids| ids.len() != 1) {
+            return Err(mlua::Error::runtime(
+                "a complete prompt replacement requires one explicit 'prompt' ID",
+            ));
+        }
+        PromptTarget::Template
+    } else {
+        let slot = parse_slot(&spec)?;
+        match slot.kind() {
+            SlotKind::Singleton => PromptTarget::Slot(slot),
+            SlotKind::Aggregate => PromptTarget::Section(slot),
+        }
     };
-    let mut map = lua
-        .app_data_mut::<PromptHintCallbacks>()
-        .ok_or_else(|| mlua::Error::runtime("not initialized"))?;
-    map.entry(Arc::clone(&plugin)).or_default().push(reg);
-    Ok(())
+    let content = parse_hint_content(lua, &spec, target)?;
+    register_prompt(lua, plugin, prompts, target, content)
 }
 
 /// Return a list of all registered tools. Useful for building UI that shows
@@ -1137,8 +1196,8 @@ lua_table! {
     /// maki.api.register_tool({ name = "greet", ... })
     /// maki.api.register_prompt_hint({ slot = "tool_usage", content = "..." })
     /// ```
-    extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, permissions: PluginPermissions, plugin: Arc<str>, opts: PluginOpts), DOCS [
-        register_tool(pending, permissions), register_permission_rule(pending_rules), register_command(plugin),
+    extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, reach: PluginReach, plugin: Arc<str>, opts: PluginOpts), DOCS [
+        register_tool(pending, reach), register_permission_rule(pending_rules), register_command(plugin, reach),
         register_prompt_hint(plugin), register_options(plugin, opts), set_prompt(plugin),
         get_tools, get_tool,
         manual run_command,
@@ -1149,14 +1208,14 @@ pub(crate) fn create_api_table(
     lua: &Lua,
     pending: PendingTools,
     pending_rules: PendingRules,
-    permissions: PluginPermissions,
+    reach: PluginReach,
     plugin: Arc<str>,
     opts: PluginOpts,
     ui_action_tx: Option<flume::Sender<UiAction>>,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
-    add_tool_fns(&t, lua, pending, pending_rules, permissions, plugin, opts)?;
-    run_command__register(&t, lua, ui_action_tx)?;
+    run_command__register(&t, lua, ui_action_tx, reach.clone())?;
+    add_tool_fns(&t, lua, pending, pending_rules, reach, plugin, opts)?;
     Ok(t)
 }
 
@@ -1428,20 +1487,14 @@ fn parse_tool_permission(
         .transpose()?;
     let scopes = spec.get::<LuaValue>("permission_scopes")?;
 
-    let permission = match (declared, scopes.is_nil()) {
-        (None, true) => return Ok(None),
-        (Some(permission), false) => permission,
-        (None, false) => {
+    let permission = match declared {
+        Some(permission) => permission,
+        None if scopes.is_nil() => return Ok(None),
+        None => {
             return Err(mlua::Error::runtime(format!(
                 "register_tool: '{tool}' has 'permission_scopes', so it must declare 'permission', the capability it exposes to the model. \
                  Add it next to 'permission_scopes' in the register_tool spec, one of: {}",
                 permission_keys()
-            )));
-        }
-        (Some(permission), true) => {
-            return Err(mlua::Error::runtime(format!(
-                "register_tool: '{tool}' declares permission '{permission}' but needs 'permission_scopes' too, without scopes the tool is never permission checked. \
-                 Add 'permission_scopes' next to it, either the name of the schema field holding the path or a function(input) returning the scopes"
             )));
         }
     };
@@ -1453,12 +1506,13 @@ fn parse_tool_permission(
     }
 
     let scopes = match scopes {
+        LuaValue::Nil => None,
         LuaValue::String(s) => {
             let field = s.to_str()?.to_owned();
             check_schema_field(schema, "permission_scopes", &field, "string")?;
-            PermissionScopeSpec::Field(Arc::from(field.as_str()))
+            Some(PermissionScopeSpec::Field(Arc::from(field.as_str())))
         }
-        LuaValue::Function(f) => PermissionScopeSpec::Callback(lua.create_registry_value(f)?),
+        LuaValue::Function(f) => Some(PermissionScopeSpec::Callback(lua.create_registry_value(f)?)),
         _ => {
             return Err(mlua::Error::runtime(
                 "register_tool: 'permission_scopes' must be a string field name or a function",
@@ -1590,7 +1644,12 @@ fn parse_nargs(spec: &Table) -> LuaResult<usize> {
     }
 }
 
-fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaResult<()> {
+fn register_command_from_lua(
+    lua: &Lua,
+    spec: &Table,
+    plugin: Arc<str>,
+    reach: PluginReach,
+) -> LuaResult<()> {
     let mut name: String = spec
         .get("name")
         .map_err(|_| mlua::Error::runtime("register_command: missing 'name'"))?;
@@ -1621,6 +1680,7 @@ fn register_command_from_lua(lua: &Lua, spec: &Table, plugin: Arc<str>) -> LuaRe
             CommandEntry {
                 handler: handler_key,
                 description,
+                reach,
                 max_args,
             },
         );
@@ -1941,7 +2001,7 @@ mod tests {
             has_header_fn: false,
             permission: scopes.map(|scopes| ToolPermission {
                 permission: Permission::FsWrite,
-                scopes,
+                scopes: Some(scopes),
             }),
             mutable_path_field: None,
             timeout: Some(Duration::from_secs(60)),

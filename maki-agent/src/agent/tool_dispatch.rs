@@ -19,7 +19,6 @@ use crate::tools::{
     CallOrigin, FileKey, LocalTool, LocalToolFn, PermissionScopes, ToolAudience, ToolContext,
     ToolLive, truncate_bytes,
 };
-use crate::types::ALLOWED_BY;
 use crate::{
     AgentError, AgentEvent, AgentSeed, CallRecord, TextOutput, ToolDoneEvent, ToolOutput,
     ToolStartEvent,
@@ -335,14 +334,6 @@ impl<'a> Hook<'a> {
             .unwrap_or(on_cancel)
     }
 
-    fn prompt_layers<'b>(&'b self, tool_id: &'b str, input: &'b Value) -> PromptAsk<'b> {
-        PromptAsk {
-            hook: self,
-            tool_id,
-            input,
-        }
-    }
-
     fn call<'b>(&'b self, tool_id: &'b str, input: Option<&'b Value>) -> HookCall<'b> {
         HookCall {
             tool: self.tool,
@@ -416,12 +407,7 @@ impl Route<'_> {
     /// likes.
     fn authority(&self) -> Option<Authority> {
         match self {
-            Self::Native(entry) => Some(
-                entry
-                    .tool
-                    .required_permission()
-                    .map_or(Authority::Unbounded, Authority::Capability),
-            ),
+            Self::Native(entry) => Some(Authority::from(entry.tool.reach())),
             Self::ToolSearch(_) | Self::Local(_) | Self::Mcp(..) => Some(Authority::Unbounded),
             // A rewrite cannot make the name exist, so firing here would hand
             // out a tool's authority without the tool.
@@ -734,17 +720,7 @@ async fn run_native_tool(
 
     invocation.start(ctx).await;
 
-    let layers = hook.map(|hook| hook.prompt_layers(&id, input));
-    if let Err(e) = enforce_permission(
-        invocation.as_ref(),
-        name,
-        input,
-        ctx,
-        &id,
-        ask,
-        layers.as_ref(),
-    )
-    .await
+    if let Err(e) = enforce_permission(invocation.as_ref(), name, input, ctx, &id, ask, hook).await
     {
         return done_error(e);
     }
@@ -910,17 +886,18 @@ async fn enforce_permission(
     ctx: &ToolContext,
     id: &str,
     ask: Option<&str>,
-    layers: Option<&PromptAsk<'_>>,
+    hook: Option<&Hook<'_>>,
 ) -> Result<(), String> {
     if name.contains('.') {
         return Err(format!(
             "enforce_permission called with dotted name: {name}"
         ));
     }
-    let layers = layers.map(|l| l as &dyn PromptLayers);
     match (inv.permission_scopes().await, ask) {
-        (Some(scopes), ask) => gate(ctx, &ToolKey::native(name), &scopes, id, ask, layers).await,
-        (None, Some(_)) => gate_on_input(ctx, &ToolKey::native(name), id, input, ask, layers).await,
+        (Some(scopes), ask) => {
+            gate(ctx, &ToolKey::native(name), &scopes, id, input, ask, hook).await
+        }
+        (None, Some(_)) => gate_on_input(ctx, &ToolKey::native(name), id, input, ask, hook).await,
         (None, None) => Ok(()),
     }
 }
@@ -928,15 +905,20 @@ async fn enforce_permission(
 /// Every permission check passes through here, so this is where the clock
 /// stops while the user decides. Someone who answers a minute later should
 /// not find the call already timed out before it even started.
-#[allow(clippy::too_many_arguments)]
 async fn gate(
     ctx: &ToolContext,
     tool: &ToolKey,
     scopes: &PermissionScopes,
     id: &str,
+    input: &Value,
     ask: Option<&str>,
-    layers: Option<&dyn PromptLayers>,
+    hook: Option<&Hook<'_>>,
 ) -> Result<(), String> {
+    let layers = hook.map(|hook| PromptAsk {
+        hook,
+        tool_id: id,
+        input,
+    });
     let decision = ctx.permissions.enforce(
         tool,
         scopes,
@@ -947,7 +929,7 @@ async fn gate(
         &ctx.cancel,
         ctx.mode.plan_path(),
         ask,
-        layers,
+        layers.as_ref().map(|layers| layers as &dyn PromptLayers),
     );
     let allowed_by = ctx
         .deadline
@@ -955,29 +937,23 @@ async fn gate(
         .await
         .map_err(|e| e.to_string())?;
     if let Some(plugin) = allowed_by {
-        mark_allowed_by(ctx, id, &plugin);
+        mark_allowed_by(ctx, plugin);
     }
     Ok(())
 }
 
-/// Marks a call a layer allowed, on whichever surface the call has.
-///
-/// A top-level call owns a row, named by `id`. A nested one — a batch child, a
-/// `code_execution` call — is dispatched with an empty id (`tool_dispatch::run`
-/// from `maki-lua`'s agent API and the interpreter bridge), so an event keyed by
-/// id would annotate nothing at all. Those stream through the parent's live
-/// sink, which is how a batch child gets anything of its own on screen.
-fn mark_allowed_by(ctx: &ToolContext, id: &str, plugin: &str) {
-    let note = format!("{ALLOWED_BY} {plugin}");
-    if !id.is_empty() {
+/// The user never saw a prompt for this call, so its row says who let it
+/// through. A call inside `batch` or `code_execution` has no row of its own,
+/// so the mark goes up its caller's live stream, and `maki.agent.call_tool`
+/// puts it on the closest row that can show it.
+pub fn mark_allowed_by(ctx: &ToolContext, plugin: Arc<str>) {
+    if let Some(id) = &ctx.tool_use_id {
         let _ = ctx.event_tx.send(AgentEvent::AllowedByPlugin {
-            id: id.to_owned(),
-            plugin: plugin.to_owned(),
+            id: id.clone(),
+            plugin: plugin.to_string(),
         });
-        return;
-    }
-    if let Some(sink) = &ctx.live_sink {
-        let _ = sink.send(ToolLive::Annotation(note));
+    } else if let Some(sink) = &ctx.live_sink {
+        let _ = sink.send(ToolLive::AllowedBy(plugin));
     }
 }
 
@@ -990,10 +966,19 @@ async fn gate_on_input(
     id: &str,
     input: &Value,
     ask: Option<&str>,
-    layers: Option<&dyn PromptLayers>,
+    hook: Option<&Hook<'_>>,
 ) -> Result<(), String> {
     let scope = truncate_bytes(&input.to_string(), MCP_PERM_SCOPE_MAX_BYTES);
-    gate(ctx, tool, &PermissionScopes::single(scope), id, ask, layers).await
+    gate(
+        ctx,
+        tool,
+        &PermissionScopes::single(scope),
+        id,
+        input,
+        ask,
+        hook,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1024,9 +1009,7 @@ async fn execute_mcp_tool(
             return done(format!("invalid MCP tool key '{tool}': {e}").into(), true);
         }
     };
-    let layers = hook.map(|hook| hook.prompt_layers(id, input));
-    let layers = layers.as_ref().map(|l| l as &dyn PromptLayers);
-    if let Err(e) = gate_on_input(ctx, &perm_tool, id, input, ask, layers).await {
+    if let Err(e) = gate_on_input(ctx, &perm_tool, id, input, ask, hook).await {
         return done(e.into(), true);
     }
 
@@ -1230,7 +1213,7 @@ mod tests {
     use crate::tools::{
         BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult,
         ParseError, PermissionScopes, RequestTools, TOOL_NAME_FIELD, Tool, ToolAudience,
-        ToolExecResult, ToolFilter, ToolHook, local_tool,
+        ToolExecResult, ToolFilter, ToolHook, ToolReach, local_tool,
     };
     use crate::{AgentMode, Envelope, EventSender, InstructionBlock};
 
@@ -1475,8 +1458,11 @@ mod tests {
         fn schema(&self) -> Value {
             serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}})
         }
-        fn required_permission(&self) -> Option<Permission> {
-            self.0
+        fn reach(&self) -> Option<ToolReach> {
+            self.0.map(|permission| ToolReach {
+                permission,
+                prompted: true,
+            })
         }
         fn tool_kind(&self) -> Option<&str> {
             Some(HOOK_TOOL_KIND)
@@ -2926,62 +2912,46 @@ mod telemetry_tests {
 
 #[cfg(test)]
 mod layer_mark_tests {
+    use test_case::test_case;
+
     use super::*;
-    use crate::AgentMode;
     use crate::tools::test_support::stub_ctx_with;
+    use crate::{AgentMode, EventSender};
 
     const PLUGIN: &str = "guard";
-    const NESTED_ID: &str = "";
+    const ROW_ID: &str = "t1";
 
-    /// A top-level call owns a row, so the frontend is told which plugin
-    /// allowed it and marks that row.
-    #[test]
-    fn a_top_level_call_is_marked_by_event() {
-        let (guard, mut events) = crate::event_stream();
-        let ctx = stub_ctx_with(&AgentMode::Build, Some(&guard.sender(0)), None);
-
-        mark_allowed_by(&ctx, "t1", PLUGIN);
-        drop(guard);
-
-        let mut marked = None;
-        while let Some(envelope) = smol::block_on(events.next()) {
-            if let AgentEvent::AllowedByPlugin { id, plugin } = envelope.event {
-                marked = Some((id, plugin));
-            }
-        }
-        assert_eq!(marked, Some(("t1".to_owned(), PLUGIN.to_owned())));
-    }
-
-    /// A batch child or a `code_execution` call is dispatched with no id of its
-    /// own, so an event keyed by id would annotate nothing. The mark goes up the
-    /// parent's live stream instead, which is the one surface such a call has.
-    #[test]
-    fn a_nested_call_is_marked_through_the_parents_live_stream() {
-        let (guard, mut events) = crate::event_stream();
-        let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&guard.sender(0)), None);
+    /// A nested call has no row, so its mark must go up the caller's stream
+    /// and never to a row by id.
+    #[test_case(Some(ROW_ID), &[ROW_ID], &[] ; "own_row")]
+    #[test_case(None, &[], &[PLUGIN] ; "callers_stream")]
+    fn a_plugin_allowed_call_is_marked_on_the_closest_row(
+        row: Option<&str>,
+        marked_rows: &[&str],
+        streamed: &[&str],
+    ) {
+        let (event_tx, events) = flume::unbounded();
+        let mut ctx = stub_ctx_with(&AgentMode::Build, Some(&EventSender::new(event_tx, 0)), row);
         let (sink, live) = flume::unbounded();
         ctx.live_sink = Some(sink);
 
-        mark_allowed_by(&ctx, NESTED_ID, PLUGIN);
-        drop(guard);
+        mark_allowed_by(&ctx, Arc::from(PLUGIN));
 
-        let note = match live.try_recv() {
-            Ok(ToolLive::Annotation(note)) => note,
-            _ => panic!("the live stream carried no annotation"),
-        };
-        assert_eq!(note, format!("{ALLOWED_BY} {PLUGIN}"));
-        while let Some(envelope) = smol::block_on(events.next()) {
-            assert!(
-                !matches!(envelope.event, AgentEvent::AllowedByPlugin { .. }),
-                "a nested call sent an event no row answers"
-            );
-        }
-    }
-
-    /// Nothing to mark on is not a failure: the call still ran.
-    #[test]
-    fn a_nested_call_with_no_live_stream_is_left_unmarked() {
-        let ctx = stub_ctx_with(&AgentMode::Build, None, None);
-        mark_allowed_by(&ctx, NESTED_ID, PLUGIN);
+        let rows: Vec<String> = events
+            .try_iter()
+            .filter_map(|envelope| match envelope.event {
+                AgentEvent::AllowedByPlugin { id, plugin } if plugin == PLUGIN => Some(id),
+                _ => None,
+            })
+            .collect();
+        let sent: Vec<String> = live
+            .try_iter()
+            .filter_map(|ev| match ev {
+                ToolLive::AllowedBy(plugin) => Some(plugin.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows, marked_rows);
+        assert_eq!(sent, streamed);
     }
 }

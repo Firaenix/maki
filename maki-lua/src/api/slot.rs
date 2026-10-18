@@ -53,7 +53,7 @@ pub(crate) struct SlotLayer {
 ///
 /// `None` is a slot that named no price. Like a tool that declares no
 /// capability, that is not a promise the default exercises none, only that
-/// nobody asked, so a layer pays [`Authority::Unbounded`]: every permission.
+/// nobody asked, so a layer pays [`Authority::Total`]: every permission.
 /// An empty list is the owner saying the arguments are inert, and layering is
 /// free.
 pub(crate) type SlotPrice = Option<Arc<[Permission]>>;
@@ -217,10 +217,9 @@ fn delegated(plugin: &str, authority: Authority, slot: &str) -> bool {
 ///
 /// The owner steers its own chain for free. Anyone else pays what the owner
 /// priced the slot at: the capabilities it named, all of them at once, or
-/// every permission if it named none, the toll a layer on a tool that declares
-/// no capability pays. One denied is dropped from the chain and logged, never
-/// an error, because a layer is an opinion about a call and never a
-/// precondition for making it.
+/// every permission if it named none. One denied is dropped from the chain and
+/// logged, never an error, because a layer is an opinion about a call and
+/// never a precondition for making it.
 fn entitled_layers(
     name: &str,
     owner: &str,
@@ -232,7 +231,7 @@ fn entitled_layers(
             return true;
         }
         match price {
-            None => delegated(&layer.plugin, Authority::Unbounded, name),
+            None => delegated(&layer.plugin, Authority::Total, name),
             Some(needed) => needed
                 .iter()
                 .all(|p| delegated(&layer.plugin, Authority::Capability(*p), name)),
@@ -500,9 +499,8 @@ fn make_callable(lua: &Lua, name: String) -> LuaResult<Function> {
 /// with the arguments it is handed. Pass `{ capability = { "net" } }` to
 /// charge the permissions you name, all of them at once; `{ capability = {} }`
 /// to let anyone layer for free, which is the honest price for a slot whose
-/// arguments are inert; or leave {opts} out to charge every permission, what a
-/// tool declaring no capability charges. You can only name permissions your
-/// own plugin holds.
+/// arguments are inert; or leave {opts} out to charge every permission. You
+/// can only name permissions your own plugin holds.
 ///
 /// Throws if another plugin already owns a slot with the same {name}, or
 /// if {name} starts with `"tool."`, `"ui."`, `"agent."`, or `"permission."`,

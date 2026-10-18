@@ -36,18 +36,13 @@ pub fn read_thinking(dir: &StateDir) -> Option<StoredThinking> {
     StoredThinking::parse_setting(&raw).ok()
 }
 
-#[derive(Serialize, Deserialize, Default)]
-struct RecentList(Vec<String>);
-
-/// Which providers the model picker shows folded away, by slug. A set rather
-/// than a list: the file is a membership question and sorting it keeps the
-/// writes stable, so a collapse and an expand of the same provider leave the
-/// file as it was found.
+/// Providers folded away in the model picker, by slug. Kept as a sorted set,
+/// so folding and unfolding the same provider leaves the file as it was.
 pub fn read_collapsed_providers(dir: &StateDir) -> BTreeSet<String> {
-    let Ok(raw) = fs::read_to_string(dir.path().join(COLLAPSED_FILE)) else {
-        return BTreeSet::new();
-    };
-    serde_json::from_str(raw.trim()).unwrap_or_default()
+    fs::read_to_string(dir.path().join(COLLAPSED_FILE))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
 }
 
 pub fn persist_collapsed_providers(dir: &StateDir, slugs: &BTreeSet<String>) {
@@ -55,6 +50,9 @@ pub fn persist_collapsed_providers(dir: &StateDir, slugs: &BTreeSet<String>) {
         let _ = atomic_write(&dir.path().join(COLLAPSED_FILE), &json);
     }
 }
+
+#[derive(Serialize, Deserialize, Default)]
+struct RecentList(Vec<String>);
 
 pub fn push_recent(dir: &StateDir, spec: &str) -> Vec<String> {
     let mut recents = read_recents(dir);

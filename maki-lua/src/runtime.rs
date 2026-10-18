@@ -18,7 +18,7 @@ use event_listener::Event;
 use include_dir::Dir;
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::permissions::{LayerAnswer, LayerVerdict, PluginRuleStore};
-use maki_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
+use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, SlotEntry};
 use maki_agent::tools::hook::{Authority, Verdict};
 use maki_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
@@ -156,7 +156,7 @@ pub const PLAN_FORM_SLOT_DEADLINE: Duration = Duration::from_secs(5);
 /// menu says and what pressing Enter on a row does, up to a build-mode turn
 /// with every tool behind it, and it can keep a built-in row's wording while
 /// swapping the outcome under it. No narrower price would be honest.
-const PLAN_FORM_AUTHORITY: Authority = Authority::Unbounded;
+const PLAN_FORM_AUTHORITY: Authority = Authority::Total;
 /// Wall clock a picked plan row's handler gets. The row's built-in action
 /// waits behind it, so a handler that parks for good would cost the user the
 /// outcome the row promised as well as the one the plugin wanted.
@@ -178,9 +178,17 @@ pub(crate) enum HintContent {
     Callback(RegistryKey),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptTarget {
+    Slot(Slot),
+    Section(Slot),
+    Template,
+}
+
 pub(crate) struct PromptHintRegistration {
-    pub(crate) prompts: Option<Vec<PromptId>>,
-    pub(crate) slot: Slot,
+    pub(crate) prompts: Vec<PromptId>,
+    pub(crate) explicit: bool,
+    pub(crate) target: PromptTarget,
     pub(crate) content: HintContent,
 }
 
@@ -464,7 +472,7 @@ pub enum Request {
         depth: u8,
     },
     CollectPromptSlots {
-        reply: flume::Sender<ResolvedSlots>,
+        reply: flume::Sender<ResolvedPrompts>,
     },
     CollectPluginOptions {
         reply: flume::Sender<PluginOptionSpecs>,
@@ -572,10 +580,10 @@ pub struct RestoreItem {
     pub reason: RestoreReason,
 }
 
-/// Why a call is being restored. A tool whose restore has side effects (the
-/// todo panel refilling itself) acts on `Load` only: a rerender replays a
-/// single call whose state the tool already holds, possibly an old one.
-/// Lua sees the lowercase variant names through `ctx:restore_reason()`.
+/// Why a call is being restored. A tool whose restore has side effects acts
+/// on `Load` only: a rerender replays a single call whose state the tool
+/// already holds, possibly an old one. Lua sees the lowercase variant names
+/// through `ctx:restore_reason()`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, EnumString, IntoStaticStr)]
 #[strum(serialize_all = "lowercase")]
 pub enum RestoreReason {
@@ -694,8 +702,8 @@ pub(crate) struct TaskCell {
     /// to `ctx:live_buf` or returned as a reply/restore `body`. Fallback is
     /// the first buf the task created (`bufs.live_buf()`).
     pub(crate) root_buf: Option<Arc<SharedBuf>>,
-    /// Forwards live bufs and annotations to a parent
-    /// `maki.agent.call_tool(on_live_buf/on_annotation)`.
+    /// Forwards live bufs and annotations to the `maki.agent.call_tool` that
+    /// dispatched this task.
     pub(crate) live_sink: Option<flume::Sender<ToolLive>>,
     /// When `Some`, `maki.async.run` tasks queue here instead of the global
     /// `SpawnQueue` so restore can run them inline before snapshotting.
@@ -2640,7 +2648,6 @@ impl LuaRuntime {
         lua.set_app_data(SpawnQueue::new());
         lua.set_app_data(DeferQueue::new());
         lua.set_app_data(SpawnedTasks::default());
-        lua.set_app_data(BackgroundSessions::default());
         lua.set_app_data(crate::api::top::NotifyHandler::default());
         lua.set_app_data(PluginEnvs::default());
         lua.set_app_data(HostUi(ui_action_tx.clone()));
@@ -2831,11 +2838,12 @@ impl LuaRuntime {
         }
     }
 
-    async fn collect_prompt_slots(&self) -> ResolvedSlots {
+    async fn collect_prompt_slots(&self) -> ResolvedPrompts {
         struct Pending {
             plugin: Arc<str>,
-            prompts: Option<Vec<PromptId>>,
-            slot: Slot,
+            prompts: Vec<PromptId>,
+            explicit: bool,
+            target: PromptTarget,
             content: PendingContent,
         }
         enum PendingContent {
@@ -2845,7 +2853,7 @@ impl LuaRuntime {
 
         let pending: Vec<Pending> = {
             let Some(map) = self.lua.app_data_ref::<PromptHintCallbacks>() else {
-                return ResolvedSlots::default();
+                return ResolvedPrompts::default();
             };
             map.iter()
                 .flat_map(|(plugin, regs)| {
@@ -2863,7 +2871,8 @@ impl LuaRuntime {
                         Some(Pending {
                             plugin: Arc::clone(plugin),
                             prompts: r.prompts.clone(),
-                            slot: r.slot,
+                            explicit: r.explicit,
+                            target: r.target,
                             content,
                         })
                     })
@@ -2871,34 +2880,50 @@ impl LuaRuntime {
                 .collect()
         };
 
-        let mut slots = ResolvedSlots::default();
+        let mut slots = ResolvedPrompts::default();
+        for item in &pending {
+            if item.target == PromptTarget::Template
+                && let PendingContent::Static(content) = &item.content
+            {
+                for &pid in &item.prompts {
+                    slots.set_template(pid, content.clone());
+                }
+            }
+        }
         for item in pending {
+            let slot = match item.target {
+                PromptTarget::Slot(slot) | PromptTarget::Section(slot) => slot,
+                PromptTarget::Template => continue,
+            };
             let content = match item.content {
                 PendingContent::Static(s) => Some(s),
                 PendingContent::Callback(func) => self.run_hint_callback(&item.plugin, func).await,
             };
             let Some(content) = content else { continue };
-            let explicit = item.prompts.is_some();
-            for &pid in item.prompts.as_deref().unwrap_or(PromptId::ALL) {
-                if !pid.has_slot(item.slot) {
-                    if explicit {
+            for pid in item.prompts {
+                if !slots.has_slot(pid, slot) {
+                    if item.explicit {
                         tracing::warn!(
                             plugin = %item.plugin,
-                            slot = ?item.slot,
+                            slot = ?slot,
                             prompt = ?pid,
                             "prompt hint targets a prompt that has no such slot; ignoring"
                         );
                     }
                     continue;
                 }
-                slots.insert(
-                    pid,
-                    item.slot,
-                    SlotEntry {
-                        plugin: Arc::clone(&item.plugin),
-                        content: content.clone(),
-                    },
-                );
+                if matches!(item.target, PromptTarget::Section(_)) {
+                    slots.set_section(pid, slot, content.clone());
+                } else {
+                    slots.insert(
+                        pid,
+                        slot,
+                        SlotEntry {
+                            plugin: Arc::clone(&item.plugin),
+                            content: content.clone(),
+                        },
+                    );
+                }
             }
         }
         slots
@@ -3161,7 +3186,7 @@ impl LuaRuntime {
                         header: t.header_key,
                         restore: t.restore_key,
                         start: t.start_key,
-                        permission_scopes: t.permission.and_then(|p| p.scopes.callback_key()),
+                        permission_scopes: t.permission.and_then(|p| p.scopes?.callback_key()),
                         describe: t.describe_key,
                     },
                 )
@@ -3711,7 +3736,7 @@ fn run_describe(
 /// a plugin denied `run` could turn any bash command into its own. A layer on
 /// a slot another plugin declared arrives here as the price that slot's owner
 /// named at `declare_slot`: once per capability it listed, or as
-/// [`Authority::Unbounded`] when it listed none.
+/// [`Authority::Total`] when it listed none.
 ///
 /// Decided when the chain fires rather than when the layer is registered,
 /// because a layer may legitimately be set before its target tool exists, and
@@ -3731,6 +3756,7 @@ fn layer_delegation<'a>(
             // Steering a call whose reach nobody declared takes every
             // capability: a meta-tool like `batch` names none and reaches all.
             Authority::Unbounded => granted.is_some_and(PluginPermissions::holds_all_reach),
+            Authority::Total => granted.is_some_and(PluginPermissions::holds_all),
         };
         if !held {
             // Every call of a layered tool re-decides this, so a warning here
@@ -4121,13 +4147,8 @@ async fn run_prompt(
     }
 }
 
-/// Reads a `permission.prompt` answer, `{ decision, guidance? }`.
-///
-/// Only `allow` and `deny` — not the prompt's own wider answers. Those record
-/// rules (`allow_session` on `git status` leaves `git *` behind, `always` writes
-/// it to `permissions.toml`), which would hand a plugin's judgement of one call
-/// to every call that rule covers. A plugin that wants to avoid asking its model
-/// twice caches the exact scopes on its own side.
+/// Reads a `permission.prompt` answer, `{ decision, guidance? }`. The prompt's
+/// own answers like `allow_session` are refused, see [`LayerVerdict`] for why.
 fn prompt_answer(table: &Table) -> mlua::Result<LayerVerdict> {
     let decision: String = table.get("decision")?;
     let guidance: Option<String> = table.get("guidance")?;
@@ -4305,6 +4326,9 @@ pub(crate) struct LuaThread {
     /// Shared with the runtime on the Lua thread, so a handle can answer "is
     /// anyone layering this" without a roundtrip.
     pub layered: Arc<LayeredTools>,
+    /// Shared with the runtime too: Esc on a plugin task closes its session
+    /// from the event loop, with no Lua-thread hop.
+    pub background: BackgroundSessions,
     pub join: Option<JoinHandle<()>>,
     pub shutdown: Arc<AtomicBool>,
     pub command_reader: LuaCommandReader,
@@ -4345,6 +4369,8 @@ pub fn spawn(
     let (hint_writer, hint_reader) = HintWriter::new();
     let key_lint = KeyLint::default();
     let key_lint_thread = key_lint.clone();
+    let background = BackgroundSessions::default();
+    let background_thread = background.clone();
     // The file index outlives any one plugin host, so the walks a host
     // rebuilt by `/reload` is waiting on are the ones the old host started.
     publish_walks(EventHandle::from_tx(tx.clone()));
@@ -4368,6 +4394,7 @@ pub fn spawn(
             ) {
                 Ok(r) => {
                     r.lua.set_app_data(key_lint_thread);
+                    r.lua.set_app_data(background_thread);
                     r.lua.set_app_data(ui_waker);
                     let _ = init_tx.send(Ok(()));
                     r
@@ -5002,6 +5029,7 @@ pub fn spawn(
         tx,
         prio_tx,
         layered,
+        background,
         join: Some(handle),
         shutdown,
         command_reader,

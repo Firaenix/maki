@@ -58,6 +58,7 @@ use crate::app::tasks::{TaskStatus, diff_task_states};
 use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
 use crate::color_compat;
 use crate::components::input::Submission;
+use crate::components::keybindings::key;
 use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest, Status};
 use crate::input::InputReader;
@@ -77,6 +78,7 @@ const PACK_PREPARING: &str = "Checking packages...";
 const PACK_BUSY_ERR: &str = "a package command is already running";
 const UNKNOWN_MODE_ERR: &str = "unknown mode; expected \"build\" or \"plan\"";
 const PACK_PANIC_ERR: &str = "the package command stopped unexpectedly";
+const FORKED_MSG: &str = "Forked, {key} to switch back";
 
 /// Tabs carry their in-memory sessions so `/reload` reopens them without a
 /// disk round-trip; `session_has_content` tells which ones were saved.
@@ -1020,27 +1022,31 @@ impl<'t> EventLoop<'t> {
             UiAction::RunCommand {
                 cmdline,
                 depth,
+                caller,
                 reply_tx,
             } => {
                 // Answer before dispatching: the caller only waits on the name
                 // resolving, and dispatch may take a while (or exit the app).
-                match self.focused_app().run_cmdline(&cmdline, depth) {
+                match self.focused_app().run_cmdline(&cmdline, depth, &caller) {
                     Ok(actions) => {
                         let _ = reply_tx.send(Ok(()));
                         self.dispatch(self.focused, actions);
                     }
                     Err(e) => {
+                        warn!(cmdline, depth, error = %e, "run_command refused");
                         let _ = reply_tx.send(Err(e));
                     }
                 }
             }
-            UiAction::BackgroundUsage {
+            UiAction::PluginTaskEvent {
                 session,
-                model,
-                usage,
+                plugin,
+                envelope,
             } => {
-                for rt in &mut self.sessions {
-                    rt.app.add_background_usage(session, &model, usage);
+                // A straggler after `/new` finds no tab and is dropped.
+                if let Some(idx) = self.sessions.iter().position(|rt| rt.id() == session) {
+                    let actions = self.sessions[idx].app.deliver(*envelope, Some(plugin));
+                    self.dispatch(idx, actions);
                 }
             }
         }
@@ -1110,15 +1116,16 @@ impl<'t> EventLoop<'t> {
         for rt in &mut self.sessions {
             let session_id = rt.app.state.session.id;
             diff_task_states(&mut rt.last_tasks, rt.app.task_states(), |task| {
-                handle.fire_autocmd(
-                    "TaskStatusChanged",
-                    json!({
-                        "session_id": session_id,
-                        "id": task.id,
-                        "name": task.name,
-                        "status": task.status,
-                    }),
-                );
+                let mut data = json!({
+                    "session_id": session_id,
+                    "id": task.id,
+                    "name": task.name,
+                    "status": task.status,
+                });
+                if let Some(plugin) = task.plugin {
+                    data["plugin"] = json!(plugin);
+                }
+                handle.fire_autocmd("TaskStatusChanged", data);
             });
         }
     }
@@ -1351,6 +1358,18 @@ impl<'t> EventLoop<'t> {
                     .iter_mut()
                     .any(|rt| rt.app.answer_permission(handle, answer.clone(), &plugin));
                 let _ = reply_tx.send(Ok(json!(won)));
+            }
+            SessionRequest::Cancel { id } => {
+                let reply = self.resolve_session_index(id.as_deref()).map(|idx| {
+                    match self.sessions[idx].app.cancel_turn() {
+                        Some(actions) => {
+                            self.dispatch(idx, actions);
+                            json!(true)
+                        }
+                        None => json!(false),
+                    }
+                });
+                let _ = reply_tx.send(reply);
             }
         }
     }
@@ -1695,6 +1714,17 @@ impl<'t> EventLoop<'t> {
         );
     }
 
+    /// The fork runs on the model of the session it came from, whose slot is
+    /// already built.
+    fn open_fork(&mut self, idx: usize, open: OpenSession) {
+        let slot = self.sessions[idx].slot.load_full();
+        self.focused = self.push_runtime(self.ctx.spawn_runtime(open, slot));
+        let id = self.sessions[self.focused].id();
+        maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(&id.to_string()));
+        self.focused_app()
+            .flash(FORKED_MSG.replace("{key}", key::SESSIONS.label));
+    }
+
     fn handle_action(&mut self, idx: usize, action: Action) {
         match action {
             Action::SendMessage(input) => {
@@ -1721,7 +1751,11 @@ impl<'t> EventLoop<'t> {
             Action::CancelSubagent { tool_use_id } => {
                 self.sessions[idx].handles.cancel_subagent(tool_use_id);
             }
+            Action::CancelPluginTask { id } => {
+                self.ctx.lua_event_handle.cancel_plugin_session(&id);
+            }
             Action::RestartAgent(history) => self.respawn_agent(idx, history),
+            Action::OpenFork(open) => self.open_fork(idx, *open),
             Action::ChangeModel(spec) => {
                 if let Err(e) = self.change_model(&spec) {
                     self.focused_app().flash(e);
