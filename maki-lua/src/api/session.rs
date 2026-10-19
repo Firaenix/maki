@@ -343,10 +343,14 @@ async fn new(
 ///
 /// @param text string The prompt to send. Must not be blank.
 /// @param opts table? Optional fields: session (string) id of a live
-///   session; defaults to the focused one.
-/// @return (string|nil, string|nil) "started" or "queued", or nil and an error.
+///   session, defaults to the focused one; force (boolean) when the prompt
+///   lands in the queue, force the queue through right away the way
+///   `maki.session.detach` does.
+/// @return (string|nil, string|nil) "started", "queued", or "forced" when
+///   force moved the running turn to the background, or nil and an error.
 /// @example
 /// local state, err = maki.session.prompt("run the tests", { session = id })
+/// maki.session.prompt("stop, look at this first", { session = id, force = true })
 #[lua_fn(guard = Agent)]
 async fn prompt(
     lua: Lua,
@@ -354,11 +358,40 @@ async fn prompt(
     text: String,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
+    let (id, force) = match opts {
+        Some(opts) => (
+            opts.get("session")?,
+            opts.get::<Option<bool>>("force")?.unwrap_or(false),
+        ),
+        None => (None, false),
+    };
+    roundtrip(lua, tx, SessionRequest::Prompt { id, text, force }).await
+}
+
+/// Sends the queue in, the way Ctrl+Enter does in the TUI: the running turn
+/// goes on as a background task and the queued prompts are answered next.
+/// Refused while the turn waits on a permission prompt or a question, since
+/// the answer has to reach the run that asked.
+///
+/// @param opts table? Optional fields: session (string) id of a live
+///   session; defaults to the focused one.
+/// @return (boolean|nil, string|nil) true if the running turn went to the
+///   background, false if nothing is queued, no turn is running, or the turn
+///   is waiting on the user, or nil and an error.
+/// @example
+/// maki.session.prompt("look at this first", { session = id })
+/// local forced, err = maki.session.detach({ session = id })
+#[lua_fn(guard = Agent)]
+async fn detach(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    opts: Option<Table>,
+) -> LuaResult<Pair<Value>> {
     let id = match opts {
         Some(opts) => opts.get("session")?,
         None => None,
     };
-    roundtrip(lua, tx, SessionRequest::Prompt { id, text }).await
+    roundtrip(lua, tx, SessionRequest::Detach { id }).await
 }
 
 /// Reports {text} to a live session without creating a user turn. The
@@ -457,7 +490,8 @@ lua_table! {
     ),
     DOCS [
         list(tx), live(tx), current(tx), read(tx), messages(tx), focus(tx), delete(tx),
-        new(tx, may_run_agents), prompt(perms, tx), notify(may_run_agents), set_mode(tx), set_title(tx),
+        new(tx, may_run_agents), prompt(perms, tx), detach(perms, tx), notify(may_run_agents),
+        set_mode(tx), set_title(tx),
     ]
 }
 
@@ -529,7 +563,7 @@ mod tests {
         let expected_id = expected_id.map(str::to_owned);
         let checker = std::thread::spawn(move || {
             let Ok(UiAction::Session {
-                req: SessionRequest::Prompt { id, text },
+                req: SessionRequest::Prompt { id, text, force },
                 reply_tx,
             }) = rx.recv()
             else {
@@ -537,6 +571,7 @@ mod tests {
             };
             assert_eq!(id, expected_id);
             assert_eq!(text, "hi");
+            assert!(!force);
             reply_tx.send(Ok(json!("queued"))).unwrap();
         });
         let (val, err): (String, Option<String>) =
@@ -544,6 +579,68 @@ mod tests {
         checker.join().unwrap();
         assert_eq!(err, None);
         assert_eq!(val, "queued");
+    }
+
+    #[test_case("return session.prompt('hi', { session = 'abc', force = true })", true ; "forced")]
+    #[test_case("return session.prompt('hi', { session = 'abc', force = false })", false ; "explicitly_not_forced")]
+    fn prompt_forwards_force(code: &str, expected_force: bool) {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_session(Some(tx));
+        let checker = std::thread::spawn(move || {
+            let Ok(UiAction::Session {
+                req: SessionRequest::Prompt { force, .. },
+                reply_tx,
+            }) = rx.recv()
+            else {
+                panic!("expected prompt request");
+            };
+            assert_eq!(force, expected_force);
+            reply_tx.send(Ok(json!("forced"))).unwrap();
+        });
+        let (val, err): (String, Option<String>) =
+            smol::block_on(lua.load(code).eval_async()).unwrap();
+        checker.join().unwrap();
+        assert_eq!(err, None);
+        assert_eq!(val, "forced");
+    }
+
+    #[test_case("return session.detach({ session = 'abc' })", Some("abc"), true ; "explicit_session_id")]
+    #[test_case("return session.detach()", None, false ; "defaults_to_focused")]
+    fn detach_forwards_the_session_id_and_the_verdict(
+        code: &str,
+        expected_id: Option<&str>,
+        verdict: bool,
+    ) {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_session(Some(tx));
+        let expected_id = expected_id.map(str::to_owned);
+        let checker = std::thread::spawn(move || {
+            let Ok(UiAction::Session {
+                req: SessionRequest::Detach { id },
+                reply_tx,
+            }) = rx.recv()
+            else {
+                panic!("expected detach request");
+            };
+            assert_eq!(id, expected_id);
+            reply_tx.send(Ok(json!(verdict))).unwrap();
+        });
+        let (val, err): (bool, Option<String>) =
+            smol::block_on(lua.load(code).eval_async()).unwrap();
+        checker.join().unwrap();
+        assert_eq!(err, None);
+        assert_eq!(val, verdict);
+    }
+
+    #[test]
+    fn detach_needs_the_agent_permission() {
+        let lua = Lua::new();
+        let t = create_session_table(&lua, None, &PluginPermissions::denied(), false).unwrap();
+        lua.globals().set("session", t).unwrap();
+        let err =
+            smol::block_on(lua.load("return session.detach()").eval_async::<Value>()).unwrap_err();
+        let denied = denied_error(Permission::Agent).to_string();
+        assert!(err.to_string().contains(&denied), "{err}");
     }
 
     /// Mode is per session like the plan it drives, so a row handler firing

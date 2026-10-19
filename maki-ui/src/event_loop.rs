@@ -74,6 +74,10 @@ const DRAIN_BUDGET: usize = 256;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 const NOT_LIVE_ERR: &str = "session not live";
+const QUEUED: &str = "queued";
+/// A `force` prompt that landed in the queue and pushed the running turn
+/// into the background to go next.
+const FORCED: &str = "forced";
 const PACK_PREPARING: &str = "Checking packages...";
 const PACK_BUSY_ERR: &str = "a package command is already running";
 const UNKNOWN_MODE_ERR: &str = "unknown mode; expected \"build\" or \"plan\"";
@@ -1303,7 +1307,7 @@ impl<'t> EventLoop<'t> {
                 }
                 let _ = reply_tx.send(Ok(json!(id)));
             }
-            SessionRequest::Prompt { id, text } => {
+            SessionRequest::Prompt { id, text, force } => {
                 let idx = match id {
                     None => Ok(self.focused),
                     Some(id) => parse_session_id(&id).and_then(|id| {
@@ -1311,7 +1315,20 @@ impl<'t> EventLoop<'t> {
                             .ok_or_else(|| format!("{NOT_LIVE_ERR}: {id}"))
                     }),
                 };
-                let _ = reply_tx.send(idx.and_then(|idx| self.submit_text(idx, text)));
+                let reply = idx.and_then(|idx| {
+                    let state = self.submit_text(idx, text)?;
+                    if force && state == QUEUED && self.force_queue(idx) {
+                        return Ok(json!(FORCED));
+                    }
+                    Ok(state)
+                });
+                let _ = reply_tx.send(reply);
+            }
+            SessionRequest::Detach { id } => {
+                let reply = self
+                    .resolve_session_index(id.as_deref())
+                    .map(|idx| json!(self.force_queue(idx)));
+                let _ = reply_tx.send(reply);
             }
             SessionRequest::Focus { id } => {
                 let reply = parse_session_id(&id)
@@ -1426,8 +1443,19 @@ impl<'t> EventLoop<'t> {
                 self.dispatch(idx, actions);
                 Ok(json!("started"))
             }
-            SubmitOutcome::Queued => Ok(json!("queued")),
+            SubmitOutcome::Queued => Ok(json!(QUEUED)),
             SubmitOutcome::Rejected(e) => Err(e.into()),
+        }
+    }
+
+    /// Whether the running turn of session {idx} went to the background.
+    fn force_queue(&mut self, idx: usize) -> bool {
+        match self.sessions[idx].app.force_queue() {
+            Some(actions) => {
+                self.dispatch(idx, actions);
+                true
+            }
+            None => false,
         }
     }
 

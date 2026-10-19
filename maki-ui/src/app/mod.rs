@@ -1451,6 +1451,20 @@ impl App {
         if self.status != Status::Streaming || self.queue.is_empty() {
             return actions;
         }
+        actions.extend(self.send_run_to_background());
+        actions
+    }
+
+    /// A plugin's Ctrl+Enter, for whatever is queued already. `None` when
+    /// there is nothing to force, or when the run is parked on a prompt the
+    /// user has to answer, since the answer has to reach the run that asked.
+    pub(crate) fn force_queue(&mut self) -> Option<Vec<Action>> {
+        let forceable =
+            self.status == Status::Streaming && !self.queue.is_empty() && !self.awaiting_input();
+        forceable.then(|| self.send_run_to_background())
+    }
+
+    fn send_run_to_background(&mut self) -> Vec<Action> {
         // Every subagent still running belongs to the turn that is leaving,
         // and keeps reporting from the background.
         let running = self
@@ -1461,10 +1475,9 @@ impl App {
             .collect::<Vec<_>>();
         self.background_tasks.extend(running);
         self.status_bar.flash(FLASH_DETACH.into());
-        actions.push(Action::DetachAgent {
+        vec![Action::DetachAgent {
             run_id: self.run_id,
-        });
-        actions
+        }]
     }
 
     fn handle_esc(&mut self, streaming: bool) -> Vec<Action> {

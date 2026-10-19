@@ -448,9 +448,12 @@ pub enum SessionRequest {
         prompt: Option<String>,
         focus: bool,
     },
+    /// With {force} set, a prompt that lands in the queue is forced through
+    /// the way [`Detach`](SessionRequest::Detach) does.
     Prompt {
         id: Option<String>,
         text: String,
+        force: bool,
     },
     Focus {
         id: String,
@@ -468,6 +471,12 @@ pub enum SessionRequest {
     SetTitle {
         id: String,
         title: String,
+    },
+    /// Ctrl+Enter for the live session {id} names, or the focused one: the
+    /// running turn goes on as a background task and the queue goes next.
+    /// The UI replies whether it did.
+    Detach {
+        id: Option<String>,
     },
 }
 

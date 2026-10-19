@@ -3610,6 +3610,48 @@ fn ctrl_enter_without_a_queue_to_force_does_not_detach(make: fn() -> App) {
 }
 
 #[test]
+fn force_queue_detaches_a_run_with_something_queued() {
+    let mut app = app_with_queued_message();
+    let actions = app.force_queue().expect("the queue is forced through");
+    assert!(detaches(&actions));
+    assert_eq!(app.queue.len(), 1, "the agent drains the queue");
+}
+
+fn waiting_on_permission() -> App {
+    let mut app = app_with_queued_message();
+    app.permission_prompt.push(
+        "id".into(),
+        maki_config::ToolKey::native("bash"),
+        vec!["ls".into()],
+        None,
+        true,
+        None,
+    );
+    app
+}
+
+/// Unlike Ctrl+Enter it ignores the input box and the focused chat: a plugin
+/// forces what it queued, whatever the user has on screen.
+#[test_case(test_app       as fn() -> App ; "idle")]
+#[test_case(streaming_app  as fn() -> App ; "nothing_queued")]
+#[test_case(waiting_on_permission as fn() -> App ; "permission_prompt_open")]
+fn force_queue_refuses_with_nothing_to_force_or_a_prompt_open(make: fn() -> App) {
+    let mut app = make();
+    assert!(app.force_queue().is_none());
+}
+
+#[test]
+fn force_queue_leaves_the_users_draft_alone() {
+    let mut app = app_with_queued_message();
+    for c in "draft".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    assert!(app.force_queue().is_some());
+    assert_eq!(app.input_box.buffer.value(), "draft");
+    assert_eq!(app.queue.len(), 1);
+}
+
+#[test]
 fn detached_run_events_get_a_chat_that_outlives_the_turn() {
     let mut app = streaming_app();
     app.update(subagent_msg_with_run_id(
