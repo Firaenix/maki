@@ -15,6 +15,8 @@ use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use strum::Display;
 
+use crate::PermissionPreview;
+
 pub const NO_FILES_FOUND: &str = "No files found";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -709,6 +711,9 @@ pub enum AgentEvent {
         /// Why a plugin escalated this call to the user, if one did.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        /// What a file write would put on disk, for the prompt to show.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preview: Option<PermissionPreview>,
     },
     /// A `permission.prompt` layer allowed a call that would have prompted.
     /// The prompt is where the user learns what the agent is about to do, so

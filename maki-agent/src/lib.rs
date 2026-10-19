@@ -34,6 +34,8 @@ pub use live_session::{AgentSeed, MailboxError, SessionMailbox};
 pub use maki_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOutputLines};
 pub mod command;
 pub mod diff;
+pub mod permission_preview;
+pub use permission_preview::{PermissionPreview, PreviewEdit};
 pub mod permissions;
 pub mod prompt;
 pub mod template;

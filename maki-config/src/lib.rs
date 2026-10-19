@@ -1304,7 +1304,7 @@ pub struct UiConfig {
     #[config(
         default = "DEFAULT_PERMISSION_EXPAND_KEY.to_owned()",
         default_doc = "v",
-        desc = "Key that expands the permission prompt into a scrollable, highlighted view of the full command, in `maki.keymap` notation, e.g. `v` or `<C-e>`"
+        desc = "Key that expands the permission prompt into a scrollable, highlighted view of the full command, or of the content a write or edit would put on disk, in `maki.keymap` notation, e.g. `v` or `<C-e>`"
     )]
     pub permission_expand_key: String,
 
