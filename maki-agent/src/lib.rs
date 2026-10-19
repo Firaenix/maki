@@ -41,6 +41,8 @@ pub use maki_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOutpu
 pub use session_loop::{CutShort, TurnHost, run_turns};
 pub mod command;
 pub mod diff;
+pub mod permission_preview;
+pub use permission_preview::{PermissionPreview, PreviewEdit};
 pub mod permissions;
 pub mod prompt;
 pub mod template;

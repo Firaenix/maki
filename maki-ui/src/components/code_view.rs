@@ -190,6 +190,37 @@ fn render_diff(
     lines
 }
 
+/// The whole of {content}, numbered and highlighted by {path}'s extension.
+pub(crate) fn render_file(path: &str, content: &str, highlight: bool) -> Vec<Line<'static>> {
+    let code_lines: Vec<String> = content.lines().map(String::from).collect();
+    let hl = highlight.then(|| maki_highlight::Highlighter::for_path(path));
+    render_code(hl, 1, &code_lines, code_lines.len(), usize::MAX).0
+}
+
+/// A diff of two snippets rather than two files, so line numbers count from
+/// the snippet's start.
+pub(crate) fn render_snippet_diff(
+    path: &str,
+    before: &str,
+    after: &str,
+    highlight: bool,
+) -> Vec<Line<'static>> {
+    // A diff by lines sees `x` and `x\n` as different lines, and a snippet
+    // usually ends without a break, so both get one.
+    let terminated = |s: &str| {
+        if s.is_empty() || s.ends_with('\n') {
+            s.to_owned()
+        } else {
+            format!("{s}\n")
+        }
+    };
+    render_diff(
+        highlight.then(|| maki_highlight::syntax_for_path(path)),
+        &terminated(before),
+        &terminated(after),
+    )
+}
+
 fn numbered_gutter(line_nr: &mut usize, w: usize, style: Style) -> Span<'static> {
     let span = gutter_styled(&format!("{line_nr:>w$}"), style);
     *line_nr += 1;

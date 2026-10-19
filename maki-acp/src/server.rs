@@ -978,6 +978,7 @@ fn start_event_pump(
                     tool,
                     scopes,
                     reason,
+                    ..
                 } => {
                     let tool = tool.to_string();
                     let scope = format!("{tool}: {}", scopes.join(", "));
@@ -1607,6 +1608,7 @@ mod tests {
             tool: ToolKey::native(PERMISSION_TOOL),
             scopes: vec![PUMP_CWD.to_owned()],
             reason: None,
+            preview: None,
         }
     }
 
@@ -2032,6 +2034,7 @@ mod tests {
                     tool: ToolKey::native(PERMISSION_TOOL),
                     scopes: vec![PUMP_CWD.to_owned()],
                     reason: reason.map(str::to_owned),
+                    preview: None,
                 })
                 .unwrap();
         })
