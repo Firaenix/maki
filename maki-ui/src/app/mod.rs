@@ -502,7 +502,8 @@ impl App {
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),
             pack_review: PackReview::new(),
-            permission_prompt: PermissionPrompt::new(),
+            permission_prompt: PermissionPrompt::new()
+                .with_expand_key(&ui_config.permission_expand_key),
             plan_form: PlanForm::new(),
             status_bar: StatusBar::new(flash),
             status: Status::Idle,
