@@ -5032,15 +5032,56 @@ Requires the `agent` and `session_write` [plugin permissions](#plugin-permission
 - `{text}` (`string`) The prompt to send. Must not be blank.
 - `{opts?}` (`table?`) Optional fields: session (string) id of a live
 
-  session; defaults to the focused one.
+  session, defaults to the focused one; force (boolean) when the prompt
 
 
-**Returns:** (`string|nil`, `string|nil`) "started" or "queued", or nil and an error.
+  lands in the queue, force the queue through right away the way
+
+
+  `maki.session.detach` does.
+
+
+**Returns:** (`string|nil`, `string|nil`) "started", "queued", or "forced" when
+  force moved the running turn to the background, or nil and an error.
 
 **Example:**
 
 ```lua
 local state, err = maki.session.prompt("run the tests", { session = id })
+maki.session.prompt("stop, look at this first", { session = id, force = true })
+```
+
+---
+
+### `maki.session.detach()` {#maki-session-detach}
+
+```lua
+maki.session.detach({opts?})
+```
+
+Sends the queue in, the way Ctrl+Enter does in the TUI: the running turn
+goes on as a background task and the queued prompts are answered next.
+Refused while the turn waits on a permission prompt or a question, since
+the answer has to reach the run that asked.
+
+Requires the `agent` and `session_write` [plugin permissions](#plugin-permissions).
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Optional fields: session (string) id of a live
+
+  session; defaults to the focused one.
+
+
+**Returns:** (`boolean|nil`, `string|nil`) true if the running turn went to the
+  background, false if nothing is queued, no turn is running, or the turn
+  is waiting on the user, or nil and an error.
+
+**Example:**
+
+```lua
+maki.session.prompt("look at this first", { session = id })
+local forced, err = maki.session.detach({ session = id })
 ```
 
 ---
