@@ -1917,6 +1917,9 @@ impl App {
         self.chats[idx].idle = true;
     }
 
+    pub(crate) fn command_listing(&self) -> Vec<crate::components::command::CommandListing> {
+        self.command_palette.listing()
+    }
     /// Entry point for `maki.api.run_command`: splits a command line into the
     /// name and args the input bar would hand over, leading slash optional.
     /// `Err` means nothing ran at all, so the Lua caller can say why.
