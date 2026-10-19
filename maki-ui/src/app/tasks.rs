@@ -980,6 +980,7 @@ mod tests {
             tool: ToolKey::native(SLOW_TOOL),
             scopes: vec![],
             reason: None,
+            preview: None,
         }));
         assert!(app.permission_prompt.is_open());
 
@@ -1023,6 +1024,7 @@ mod tests {
                     tool: ToolKey::native(SUB_TOOL),
                     scopes: vec![],
                     reason: None,
+                    preview: None,
                 },
             );
         }

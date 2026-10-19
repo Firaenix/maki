@@ -1744,6 +1744,7 @@ mod tests {
                 tool: ToolKey::parse(TEST_TOOL).unwrap(),
                 scopes: Vec::new(),
                 reason: None,
+                preview: None,
             },
             subagent: None,
             run_id: 0,

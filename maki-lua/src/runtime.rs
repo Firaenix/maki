@@ -4271,6 +4271,7 @@ impl LuaRuntime {
         Some(PermissionScopes {
             scopes,
             force_prompt,
+            preview: None,
         })
     }
 

@@ -15,7 +15,7 @@ use maki_config::Permission;
 use serde_json::{Value, json};
 
 use crate::template::Vars;
-use crate::{BufferSnapshot, ToolDoneEvent, ToolOutput};
+use crate::{BufferSnapshot, PermissionPreview, ToolDoneEvent, ToolOutput};
 
 use super::hook::ToolHook;
 use super::schema::sanitize_tool_input_schema;
@@ -209,6 +209,8 @@ impl Future for HeaderFuture {
 pub struct PermissionScopes {
     pub scopes: Vec<String>,
     pub force_prompt: bool,
+    /// Shown by the prompt's expanded view in place of the scopes.
+    pub preview: Option<PermissionPreview>,
 }
 
 impl PermissionScopes {
@@ -216,6 +218,7 @@ impl PermissionScopes {
         Self {
             scopes: vec![scope],
             force_prompt: false,
+            preview: None,
         }
     }
 
@@ -223,6 +226,7 @@ impl PermissionScopes {
         Self {
             scopes: vec![scope],
             force_prompt: true,
+            preview: None,
         }
     }
 }
