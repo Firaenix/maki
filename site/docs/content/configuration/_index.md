@@ -82,6 +82,7 @@ All fields are optional. Typos in field names cause an error right away.
 | `max_input_lines` | u32 | `20` | 1 | Maximum visible input lines |
 | `thinking_lines` | integer | `3` | - | Collapse model reasoning to its header and last N lines. Click to toggle. 0 shows only the header, -1 never collapses |
 | `clock_format` | String | `system` | - | Clock format for timestamps: "12h", "24h", or "system" (follow the OS preference, 24h when unknown) |
+| `permission_expand_key` | String | `v` | - | Key that expands the permission prompt into a scrollable, highlighted view of the full command, or of the content a write or edit would put on disk, in `maki.keymap` notation, e.g. `v` or `<C-e>` |
 
 ### `ui.theme`
 

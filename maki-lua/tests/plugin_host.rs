@@ -4136,7 +4136,7 @@ fn command_handler_receives_args_and_fargs(args: &str, expected_flash: &str) {
     .unwrap();
     let rx = host.ui_action_rx();
     host.event_handle()
-        .run_command(Arc::from("p"), Arc::from("/echo"), args.into(), 0);
+        .run_command(Arc::from("p"), Arc::from("/echo"), args.into(), 0, None);
 
     let action = rx
         .recv_timeout(Duration::from_secs(5))
@@ -4179,12 +4179,13 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
     );
     let rx = host.ui_action_rx();
     host.event_handle()
-        .run_command(Arc::from("p"), Arc::from("/go"), String::new(), 0);
+        .run_command(Arc::from("p"), Arc::from("/go"), String::new(), 0, None);
 
     let maki_lua::UiAction::RunCommand {
         cmdline,
         depth,
         caller,
+        session,
         reply_tx,
     } = rx
         .recv_timeout(Duration::from_secs(5))
@@ -4193,6 +4194,7 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
         panic!("{RUN_COMMAND_NO_ACTION}");
     };
     assert_eq!((cmdline.as_str(), depth), ("/cd ~/src", 1));
+    assert_eq!(session, None, "no opts means the focused session");
     assert!(!caller.is_allowed(maki_lua::Permission::Agent));
     reply_tx.send(reply).unwrap();
 
@@ -4200,6 +4202,80 @@ fn run_command_round_trips_through_ui(reply: Result<(), String>, expected_flash:
         .recv_timeout(Duration::from_secs(5))
         .expect(RUN_COMMAND_NO_ACTION);
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == expected_flash));
+}
+/// The UI answers with JSON and the handler sees it as a Lua array.
+#[test]
+fn list_commands_round_trips_through_ui() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "p",
+        r#"
+        maki.api.register_command({
+            name = "/ls",
+            handler = function()
+                local cmds = maki.api.list_commands()
+                local c = cmds[1]
+                maki.ui.flash(c.name .. "|" .. c.source .. "|" .. tostring(c.interactive))
+            end,
+        })
+        "#,
+    )
+    .unwrap();
+    let rx = host.ui_action_rx();
+    host.event_handle()
+        .run_command(Arc::from("p"), Arc::from("/ls"), String::new(), 0, None);
+
+    let maki_lua::UiAction::ListCommands { reply_tx } = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("list_commands did not reach the UI")
+    else {
+        panic!("expected ListCommands");
+    };
+    reply_tx
+        .send(Ok(serde_json::json!([
+            {"name": "/model", "source": "builtin", "interactive": true}
+        ])))
+        .unwrap();
+    let action = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == "/model|builtin|true"));
+}
+
+/// A handler learns which chat it runs in, and can aim the next command at
+/// that same chat even when it is not the focused one.
+#[test]
+fn run_command_forwards_session_both_ways() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "p",
+        r#"
+        maki.api.register_command({
+            name = "/here",
+            handler = function(opts)
+                maki.api.run_command("/new", { session = opts.session })
+            end,
+        })
+        "#,
+    )
+    .unwrap();
+    let rx = host.ui_action_rx();
+    host.event_handle().run_command(
+        Arc::from("p"),
+        Arc::from("/here"),
+        String::new(),
+        0,
+        Some("s-bg".into()),
+    );
+
+    let maki_lua::UiAction::RunCommand {
+        cmdline, session, ..
+    } = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect(RUN_COMMAND_NO_ACTION)
+    else {
+        panic!("{RUN_COMMAND_NO_ACTION}");
+    };
+    assert_eq!(cmdline, "/new");
+    assert_eq!(session.as_deref(), Some("s-bg"));
 }
 #[test_case::test_case(
     r#"maki.api.register_command({ name = "", handler = function() end })"#,
@@ -6442,7 +6518,7 @@ fn async_run_from_parked_command_handler_runs_promptly() {
     .unwrap();
     let rx = host.ui_action_rx();
     let handle = host.event_handle();
-    handle.run_command(Arc::from("p"), Arc::from("/park"), String::new(), 0);
+    handle.run_command(Arc::from("p"), Arc::from("/park"), String::new(), 0, None);
 
     let action = rx
         .recv_timeout(Duration::from_secs(5))
@@ -6473,7 +6549,7 @@ fn job_callbacks_fire_while_command_handler_parked() {
     .unwrap();
     let rx = host.ui_action_rx();
     let handle = host.event_handle();
-    handle.run_command(Arc::from("p"), Arc::from("/stream"), String::new(), 0);
+    handle.run_command(Arc::from("p"), Arc::from("/stream"), String::new(), 0, None);
 
     let action = rx
         .recv_timeout(Duration::from_secs(5))
@@ -8215,4 +8291,57 @@ fn a_ctx_session_pays_for_reach_whoever_could_answer(answerable: bool) {
         panic!("unexpected output: {result:?}");
     };
     assert!(text.text.contains("fs_write"), "got: {}", text.text);
+}
+
+#[test]
+fn list_plugins_reports_registrations_load_failures_and_runtime_errors() {
+    let (reg, host) = builtins_host();
+    let src = format!(
+        r#"
+maki.api.create_autocmd("ProbeFailure", {{
+    callback = function() error("kaboom") end,
+}})
+maki.api.register_command({{ name = "/probe", handler = function() end }})
+maki.api.register_tool({{
+    name = "list_plugins_probe",
+    description = "returns list_plugins as json",
+    schema = {MINIMAL_SCHEMA},
+    audiences = {{ "main" }},
+    handler = function()
+        return maki.json.encode(maki.api.list_plugins())
+    end,
+}})
+"#
+    );
+    host.load_source("probe", &src).unwrap();
+    host.load_source("broken", "error('nope')")
+        .expect_err("load must fail");
+    host.event_handle().fire_autocmd("ProbeFailure", json!({}));
+
+    let out = exec_tool(&reg, "list_plugins_probe", json!({})).unwrap();
+    let list: Vec<Value> = serde_json::from_str(&out).unwrap();
+    let find = |name: &str| {
+        list.iter()
+            .find(|p| p["name"] == name)
+            .unwrap_or_else(|| panic!("{name} missing from {out}"))
+    };
+
+    let probe = find("probe");
+    assert_eq!(probe["loaded"], true);
+    assert_eq!(probe["commands"], json!(["/probe"]));
+    assert_eq!(probe["tools"], json!(["list_plugins_probe"]));
+    assert_eq!(probe["autocmds"], 1);
+    let errors = probe["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "{out}");
+    assert_eq!(errors[0]["seam"], "autocmd");
+    assert!(errors[0]["msg"].as_str().unwrap().contains("kaboom"));
+
+    let broken = find("broken");
+    assert_eq!(broken["loaded"], false);
+    assert!(broken["load_error"].as_str().unwrap().contains("nope"));
+
+    let optional = find(maki_config::OPTIONAL_BUILTINS[0]);
+    assert_eq!(optional["source"], "bundled");
+    assert_eq!(optional["enabled"], false);
+    assert_eq!(optional["loaded"], false);
 }

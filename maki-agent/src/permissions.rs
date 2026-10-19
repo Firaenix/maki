@@ -858,6 +858,7 @@ impl PermissionManager {
             tool: t2.clone(),
             scopes: s2.clone(),
             reason: ask.map(str::to_owned),
+            preview: scopes.preview.clone(),
         });
         // Only the answer naming this ask may be applied. Anything else is a
         // leftover from a cancelled or reassigned ask, so it is dropped and the

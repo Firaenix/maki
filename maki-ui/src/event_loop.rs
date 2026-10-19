@@ -74,6 +74,10 @@ const DRAIN_BUDGET: usize = 256;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 const NOT_LIVE_ERR: &str = "session not live";
+const QUEUED: &str = "queued";
+/// A `force` prompt that landed in the queue and pushed the running turn
+/// into the background to go next.
+const FORCED: &str = "forced";
 const PACK_PREPARING: &str = "Checking packages...";
 const PACK_BUSY_ERR: &str = "a package command is already running";
 const UNKNOWN_MODE_ERR: &str = "unknown mode; expected \"build\" or \"plan\"";
@@ -1023,20 +1027,32 @@ impl<'t> EventLoop<'t> {
                 cmdline,
                 depth,
                 caller,
+                session,
                 reply_tx,
             } => {
                 // Answer before dispatching: the caller only waits on the name
                 // resolving, and dispatch may take a while (or exit the app).
-                match self.focused_app().run_cmdline(&cmdline, depth, &caller) {
-                    Ok(actions) => {
+                let ran = self
+                    .resolve_session_index(session.as_deref())
+                    .and_then(|idx| {
+                        let actions = self.sessions[idx]
+                            .app
+                            .run_cmdline(&cmdline, depth, &caller)?;
+                        Ok((idx, actions))
+                    });
+                match ran {
+                    Ok((idx, actions)) => {
                         let _ = reply_tx.send(Ok(()));
-                        self.dispatch(self.focused, actions);
+                        self.dispatch(idx, actions);
                     }
                     Err(e) => {
                         warn!(cmdline, depth, error = %e, "run_command refused");
                         let _ = reply_tx.send(Err(e));
                     }
                 }
+            }
+            UiAction::ListCommands { reply_tx } => {
+                let _ = reply_tx.send(Ok(json!(self.focused_app().command_listing())));
             }
             UiAction::PluginTaskEvent {
                 session,
@@ -1303,7 +1319,7 @@ impl<'t> EventLoop<'t> {
                 }
                 let _ = reply_tx.send(Ok(json!(id)));
             }
-            SessionRequest::Prompt { id, text } => {
+            SessionRequest::Prompt { id, text, force } => {
                 let idx = match id {
                     None => Ok(self.focused),
                     Some(id) => parse_session_id(&id).and_then(|id| {
@@ -1311,7 +1327,20 @@ impl<'t> EventLoop<'t> {
                             .ok_or_else(|| format!("{NOT_LIVE_ERR}: {id}"))
                     }),
                 };
-                let _ = reply_tx.send(idx.and_then(|idx| self.submit_text(idx, text)));
+                let reply = idx.and_then(|idx| {
+                    let state = self.submit_text(idx, text)?;
+                    if force && state == QUEUED && self.force_queue(idx) {
+                        return Ok(json!(FORCED));
+                    }
+                    Ok(state)
+                });
+                let _ = reply_tx.send(reply);
+            }
+            SessionRequest::Detach { id } => {
+                let reply = self
+                    .resolve_session_index(id.as_deref())
+                    .map(|idx| json!(self.force_queue(idx)));
+                let _ = reply_tx.send(reply);
             }
             SessionRequest::Focus { id } => {
                 let reply = parse_session_id(&id)
@@ -1389,11 +1418,14 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    /// Lua acts on the focused session, the same target the model picker
-    /// writes to.
+    /// Lua acts on the session it names, or the focused one, the same target
+    /// the model picker writes to.
     fn handle_model_request(&mut self, req: ModelRequest) -> UiReply {
         match req {
-            ModelRequest::Get => Ok(self.focused_app().model_state()),
+            ModelRequest::Get { session } => {
+                let idx = self.resolve_session_index(session.as_deref())?;
+                Ok(self.sessions[idx].app.model_state())
+            }
             ModelRequest::Available => {
                 let available = self.ctx.available_models.load();
                 Ok(json!(
@@ -1407,11 +1439,14 @@ impl<'t> EventLoop<'t> {
                 spec,
                 thinking,
                 fast,
+                session,
+                persist,
             } => {
+                let idx = self.resolve_session_index(session.as_deref())?;
                 if let Some(spec) = spec {
-                    self.change_model(&spec)?;
+                    self.change_model_in(idx, &spec, persist)?;
                 }
-                let app = self.focused_app();
+                let app = &mut self.sessions[idx].app;
                 if let Some(thinking) = thinking {
                     app.set_thinking(&thinking)?;
                 }
@@ -1451,8 +1486,19 @@ impl<'t> EventLoop<'t> {
                 self.dispatch(idx, actions);
                 Ok(json!("started"))
             }
-            SubmitOutcome::Queued => Ok(json!("queued")),
+            SubmitOutcome::Queued => Ok(json!(QUEUED)),
             SubmitOutcome::Rejected(e) => Err(e.into()),
+        }
+    }
+
+    /// Whether the running turn of session {idx} went to the background.
+    fn force_queue(&mut self, idx: usize) -> bool {
+        match self.sessions[idx].app.force_queue() {
+            Some(actions) => {
+                self.dispatch(idx, actions);
+                true
+            }
+            None => false,
         }
     }
 
@@ -1840,12 +1886,19 @@ impl<'t> EventLoop<'t> {
     /// The one explicit pick, which is why it alone writes the last-used file.
     /// Opening an old session must not change what the next `maki` starts on.
     fn change_model(&mut self, spec: &str) -> Result<(), String> {
+        self.change_model_in(self.focused, spec, true)
+    }
+
+    /// Without {persist} only the tab at {idx} switches: a plugin steering a
+    /// background session from elsewhere is not the user picking a default.
+    fn change_model_in(&mut self, idx: usize, spec: &str, persist: bool) -> Result<(), String> {
         let slot = self.slots.try_get(spec)?;
         let picked = slot.model.spec();
-        let idx = self.focused;
         self.apply_model(idx, slot);
-        self.sessions[idx].app.record_recent_model(spec);
-        persist_model(&self.ctx.storage, &picked);
+        if persist {
+            self.sessions[idx].app.record_recent_model(spec);
+            persist_model(&self.ctx.storage, &picked);
+        }
         Ok(())
     }
 

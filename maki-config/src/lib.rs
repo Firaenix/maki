@@ -32,6 +32,7 @@ pub const DEFAULT_FLASH_DURATION_MS: u64 = 1500;
 pub const DEFAULT_TYPEWRITER_MS_PER_CHAR: u64 = 4;
 pub const DEFAULT_MOUSE_SCROLL_LINES: u32 = 3;
 pub const DEFAULT_MAX_INPUT_LINES: u32 = 20;
+pub const DEFAULT_PERMISSION_EXPAND_KEY: &str = "v";
 pub const DEFAULT_THINKING_LINES: usize = 3;
 const NEVER_COLLAPSE_THINKING: i64 = -1;
 const THINKING_LINES_RANGE: &str =
@@ -645,6 +646,7 @@ pub struct UiFileConfig {
     pub clock_format: Option<ClockFormat>,
     pub tool_output_lines: Option<ToolOutputLinesFile>,
     pub max_input_lines: Option<u32>,
+    pub permission_expand_key: Option<String>,
 }
 
 impl UiFileConfig {
@@ -663,7 +665,8 @@ impl UiFileConfig {
             show_thinking,
             theme,
             clock_format,
-            max_input_lines
+            max_input_lines,
+            permission_expand_key
         );
         match (self.tool_output_lines.as_mut(), overlay.tool_output_lines) {
             (Some(base), Some(over)) => base.merge(over),
@@ -1283,6 +1286,13 @@ pub struct UiConfig {
     #[config(default = ClockFormat::System, ty = "String", default_doc = "system", desc = "Clock format for timestamps: \"12h\", \"24h\", or \"system\" (follow the OS preference, 24h when unknown)")]
     pub clock_format: ClockFormat,
 
+    #[config(
+        default = "DEFAULT_PERMISSION_EXPAND_KEY.to_owned()",
+        default_doc = "v",
+        desc = "Key that expands the permission prompt into a scrollable, highlighted view of the full command, or of the content a write or edit would put on disk, in `maki.keymap` notation, e.g. `v` or `<C-e>`"
+    )]
+    pub permission_expand_key: String,
+
     #[config(skip, default = "None")]
     pub theme: Option<String>,
 
@@ -1311,6 +1321,9 @@ impl UiConfig {
                 .thinking_lines
                 .unwrap_or(ThinkingLines::Tail(DEFAULT_THINKING_LINES)),
             clock_format: f.clock_format.unwrap_or_default(),
+            permission_expand_key: f
+                .permission_expand_key
+                .unwrap_or_else(|| DEFAULT_PERMISSION_EXPAND_KEY.to_owned()),
             theme: f.theme,
             tool_output_lines: ToolOutputLines::from_file(f.tool_output_lines),
         }

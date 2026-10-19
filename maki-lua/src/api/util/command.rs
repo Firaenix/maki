@@ -449,9 +449,12 @@ pub enum SessionRequest {
         prompt: Option<String>,
         focus: bool,
     },
+    /// With {force} set, a prompt that lands in the queue is forced through
+    /// the way [`Detach`](SessionRequest::Detach) does.
     Prompt {
         id: Option<String>,
         text: String,
+        force: bool,
     },
     Focus {
         id: String,
@@ -482,6 +485,12 @@ pub enum SessionRequest {
     Cancel {
         id: Option<String>,
     },
+    /// Ctrl+Enter for the live session {id} names, or the focused one: the
+    /// running turn goes on as a background task and the queue goes next.
+    /// The UI replies whether it did.
+    Detach {
+        id: Option<String>,
+    },
 }
 
 pub enum TaskRequest {
@@ -490,13 +499,20 @@ pub enum TaskRequest {
     Remove { id: String },
 }
 
+/// `session` names a live session; `None` is the focused one.
 pub enum ModelRequest {
-    Get,
+    Get {
+        session: Option<String>,
+    },
     Available,
     Set {
         spec: Option<String>,
         thinking: Option<String>,
         fast: Option<bool>,
+        session: Option<String>,
+        /// Whether a new spec also becomes the default the next `maki`
+        /// starts on and joins the recent list.
+        persist: bool,
     },
 }
 
@@ -691,7 +707,14 @@ pub enum UiAction {
         /// Checked on the UI side, since only the UI knows what each command
         /// can reach.
         caller: PluginReach,
+        /// Live session to run in; `None` is the focused one.
+        session: Option<String>,
         reply_tx: flume::Sender<Result<(), String>>,
+    },
+    /// Every slash command the focused session's palette offers, as a JSON
+    /// array.
+    ListCommands {
+        reply_tx: flume::Sender<UiReply>,
     },
     /// An event from a subagent session a plugin opened on a chat session,
     /// which shows it as a task. A tab keeps its channels across `/new`, so

@@ -32,7 +32,7 @@ use crate::api::options::{PluginOpts, register_options__doc, register_options__r
 use crate::api::ui::buf::{BufHandle, line_to_lua};
 use crate::api::util::command::{
     CommandEntry, CommandHandlerMap, LuaCommandWriter, UiAction, publish_command_snapshot,
-    ui_roundtrip,
+    ui_json_roundtrip, ui_roundtrip,
 };
 use crate::api::util::convert::{json_to_lua, lua_to_json};
 use crate::api::util::ctx::{LuaCtx, RestoreCtx};
@@ -940,8 +940,10 @@ fn allow_is_delegated(
 ///                          handle an empty `opts.args` yourself.
 ///   handler     (function) Required. Called when the user runs the command,
 ///                          with one opts table: `opts.args` is the raw
-///                          argument string (whitespace kept, may be empty)
-///                          and `opts.fargs` is the same split into words.
+///                          argument string (whitespace kept, may be empty),
+///                          `opts.fargs` is the same split into words, and
+///                          `opts.session` is the id of the session it runs
+///                          in.
 /// @return
 /// @example
 /// maki.api.register_command({
@@ -982,7 +984,12 @@ fn register_command(
 /// only run when you type them. [Commands](/docs/commands/#plugin-access)
 /// lists what each one needs.
 ///
+/// Pass `opts.session` to run it in a background tab instead of the focused
+/// one; a Lua handler sees that id as its own `opts.session`.
+///
 /// @param cmdline string Command line, e.g. `"/new"` or `"/cd ~/src"`.
+/// @param opts table? Options:
+///   session (string) id of a live session, defaults to the focused one.
 /// @return (boolean|nil, string|nil) `true` once dispatched, or nil and an error message for an unknown or denied command.
 /// @example
 /// -- /resume as an alias for the built-in session picker:
@@ -1002,19 +1009,56 @@ async fn run_command(
     #[ctx] tx: Option<flume::Sender<UiAction>>,
     #[ctx] caller: PluginReach,
     cmdline: String,
+    opts: Option<Table>,
 ) -> LuaResult<Pair<bool>> {
+    let session = match opts {
+        Some(opts) => opts.get("session")?,
+        None => None,
+    };
     let depth = command_depth(&lua).saturating_add(1);
     let reply = try_pair!(
         ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::RunCommand {
             cmdline,
             depth,
             caller,
+            session,
             reply_tx,
         })
         .await
     );
     try_pair!(reply);
     Ok((Some(true), None))
+}
+
+/// Lists every slash command the input bar offers: built-ins, custom
+/// `/project:` and `/user:` commands, MCP prompts, and plugin commands, in
+/// the order the palette shows them.
+///
+/// Each entry is `{ name, description, source, plugin?, max_args, bang,
+/// argument_hint?, interactive }`. `source` is `"builtin"`, `"custom"`,
+/// `"mcp"` or `"lua"`, and `plugin` names the plugin that registered a
+/// `"lua"` one. `max_args` is -1 for a command that takes any number of
+/// arguments. `bang` is true when the command reads a trailing `!`.
+/// `interactive` marks commands that only open a picker or modal, such as
+/// `/model`, which do nothing useful when nobody is looking at the terminal.
+///
+/// @return (table[]|nil, string|nil) The command entries, or nil and an error when no UI is attached.
+/// @example
+/// local cmds = maki.api.list_commands()
+/// for _, c in ipairs(cmds or {}) do
+///   if not c.interactive then
+///     print(c.name, c.source, c.description)
+///   end
+/// end
+#[lua_fn]
+async fn list_commands(
+    lua: Lua,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+) -> LuaResult<Pair<LuaValue>> {
+    ui_json_roundtrip(&lua, tx.as_ref(), |reply_tx| UiAction::ListCommands {
+        reply_tx,
+    })
+    .await
 }
 
 /// Add a piece of text to an aggregate prompt slot. Multiple plugins can each
@@ -1114,6 +1158,28 @@ fn set_prompt(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResult<()> 
     register_prompt(lua, plugin, prompts, target, content)
 }
 
+/// List every plugin maki knows about, loaded or not, with what each one
+/// registered and the errors it raised recently.
+///
+/// Covers bundled plugins (including disabled ones), installed packages
+/// (including disabled and never-activated `opt/` ones, and ones discovery
+/// refused), and `init.lua` files. `errors` keeps the 20 newest runtime
+/// errors, oldest first; `seam` names where the error surfaced, such as
+/// `"autocmd"`, `"command"`, `"keybind"`, `"defer_fn"`, `"async"`,
+/// `"hint"`, `"header"`, `"describe"`, `"watchdog"` or a slot name.
+///
+/// @return (table[]) Entries sorted by name: { name, source = "bundled"|"package"|"init", path?, enabled, loaded, load_error?, errors = { { t, seam, msg } }, commands = string[], tools = string[], autocmds = integer }.
+/// @example
+/// for _, p in ipairs(maki.api.list_plugins()) do
+///   if p.load_error or #p.errors > 0 then
+///     print(p.name, p.load_error or p.errors[#p.errors].msg)
+///   end
+/// end
+#[lua_fn]
+fn list_plugins(lua: &Lua) -> LuaResult<mlua::Value> {
+    lua.to_value(&crate::plugin_status::plugin_listing(lua))
+}
+
 /// Return a list of all registered tools. Useful for building UI that shows
 /// available tools or for checking which tools are enabled.
 ///
@@ -1199,8 +1265,8 @@ lua_table! {
     extend "maki.api" => pub(crate) fn add_tool_fns(pending: PendingTools, pending_rules: PendingRules, reach: PluginReach, plugin: Arc<str>, opts: PluginOpts), DOCS [
         register_tool(pending, reach), register_permission_rule(pending_rules), register_command(plugin, reach),
         register_prompt_hint(plugin), register_options(plugin, opts), set_prompt(plugin),
-        get_tools, get_tool,
-        manual run_command,
+        get_tools, get_tool, list_plugins,
+        manual run_command, manual list_commands,
     ]
 }
 
@@ -1214,7 +1280,8 @@ pub(crate) fn create_api_table(
     ui_action_tx: Option<flume::Sender<UiAction>>,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
-    run_command__register(&t, lua, ui_action_tx, reach.clone())?;
+    run_command__register(&t, lua, ui_action_tx.clone(), reach.clone())?;
+    list_commands__register(&t, lua, ui_action_tx)?;
     add_tool_fns(&t, lua, pending, pending_rules, reach, plugin, opts)?;
     Ok(t)
 }
@@ -2159,6 +2226,7 @@ mod tests {
                 let _ = reply.send(Some(PermissionScopes {
                     scopes: vec!["cargo".into(), "test".into()],
                     force_prompt: false,
+                    preview: None,
                 }));
             }
         });

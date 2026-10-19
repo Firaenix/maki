@@ -513,7 +513,8 @@ impl App {
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),
             pack_review: PackReview::new(),
-            permission_prompt: PermissionPrompt::new(),
+            permission_prompt: PermissionPrompt::new()
+                .with_expand_key(&ui_config.permission_expand_key),
             plan_form: PlanForm::new(),
             status_bar: StatusBar::new(flash),
             status: Status::Idle,
@@ -1454,6 +1455,20 @@ impl App {
         if self.status != Status::Streaming || self.queue.is_empty() {
             return actions;
         }
+        actions.extend(self.send_run_to_background());
+        actions
+    }
+
+    /// A plugin's Ctrl+Enter, for whatever is queued already. `None` when
+    /// there is nothing to force, or when the run is parked on a prompt the
+    /// user has to answer, since the answer has to reach the run that asked.
+    pub(crate) fn force_queue(&mut self) -> Option<Vec<Action>> {
+        let forceable =
+            self.status == Status::Streaming && !self.queue.is_empty() && !self.awaiting_input();
+        forceable.then(|| self.send_run_to_background())
+    }
+
+    fn send_run_to_background(&mut self) -> Vec<Action> {
         // Every subagent still running belongs to the turn that is leaving,
         // and keeps reporting from the background.
         let running = self
@@ -1464,10 +1479,9 @@ impl App {
             .collect::<Vec<_>>();
         self.background_tasks.extend(running);
         self.status_bar.flash(FLASH_DETACH.into());
-        actions.push(Action::DetachAgent {
+        vec![Action::DetachAgent {
             run_id: self.run_id,
-        });
-        actions
+        }]
     }
 
     fn handle_esc(&mut self, streaming: bool) -> Vec<Action> {
@@ -1854,6 +1868,7 @@ impl App {
             tool,
             scopes,
             reason,
+            preview,
         } = result
         {
             let project_trusted = self.permissions.project_is_trusted();
@@ -1871,6 +1886,7 @@ impl App {
                 subagent_id.clone(),
                 project_trusted,
                 reason,
+                preview,
             );
             data["request_id"] = handle.into();
             self.fire_session_autocmd(PERMISSION_REQUESTED_EVENT, data);
@@ -2012,6 +2028,10 @@ impl App {
         self.chats.push(chat);
         self.sync_subagents();
         idx
+    }
+
+    pub(crate) fn command_listing(&self) -> Vec<crate::components::command::CommandListing> {
+        self.command_palette.listing()
     }
 
     /// Entry point for `maki.api.run_command`: splits a command line into the
@@ -2175,6 +2195,7 @@ impl App {
             Arc::clone(&lua_cmd.name),
             args,
             depth,
+            Some(self.state.session.id.to_string()),
         );
     }
 

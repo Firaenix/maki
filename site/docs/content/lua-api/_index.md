@@ -550,8 +550,10 @@ browsing memory files or toggling settings.
     handle an empty `opts.args` yourself.
   - `handler` (`function`) Required. Called when the user runs the command,
     with one opts table: `opts.args` is the raw
-    argument string (whitespace kept, may be empty)
-    and `opts.fargs` is the same split into words.
+    argument string (whitespace kept, may be empty),
+    `opts.fargs` is the same split into words, and
+    `opts.session` is the id of the session it runs
+    in.
 
 **Example:**
 
@@ -747,10 +749,40 @@ end
 
 ---
 
+### `maki.api.list_plugins()` {#maki-api-list_plugins}
+
+```lua
+maki.api.list_plugins()
+```
+
+List every plugin maki knows about, loaded or not, with what each one
+registered and the errors it raised recently.
+
+Covers bundled plugins (including disabled ones), installed packages
+(including disabled and never-activated `opt/` ones, and ones discovery
+refused), and `init.lua` files. `errors` keeps the 20 newest runtime
+errors, oldest first; `seam` names where the error surfaced, such as
+`"autocmd"`, `"command"`, `"keybind"`, `"defer_fn"`, `"async"`,
+`"hint"`, `"header"`, `"describe"`, `"watchdog"` or a slot name.
+
+**Returns:** (`table[]`) Entries sorted by name: { name, source = "bundled"|"package"|"init", path?, enabled, loaded, load_error?, errors = { { t, seam, msg } }, commands = string[], tools = string[], autocmds = integer }.
+
+**Example:**
+
+```lua
+for _, p in ipairs(maki.api.list_plugins()) do
+  if p.load_error or #p.errors > 0 then
+    print(p.name, p.load_error or p.errors[#p.errors].msg)
+  end
+end
+```
+
+---
+
 ### `maki.api.run_command()` {#maki-api-run_command}
 
 ```lua
-maki.api.run_command({cmdline})
+maki.api.run_command({cmdline}, {opts?})
 ```
 
 Runs a slash command by name, exactly as typing it in the input would.
@@ -774,9 +806,14 @@ A command outside the calling plugin's grants returns an error, and a few
 only run when you type them. [Commands](/docs/commands/#plugin-access)
 lists what each one needs.
 
+Pass `opts.session` to run it in a background tab instead of the focused
+one; a Lua handler sees that id as its own `opts.session`.
+
 **Parameters:**
 
 - `{cmdline}` (`string`) Command line, e.g. `"/new"` or `"/cd ~/src"`.
+- `{opts?}` (`table?`) Options:
+  - `session` (`string`) id of a live session, defaults to the focused one.
 
 **Returns:** (`boolean|nil`, `string|nil`) `true` once dispatched, or nil and an error message for an unknown or denied command.
 
@@ -794,6 +831,39 @@ maki.api.register_command({
     end
   end,
 })
+```
+
+---
+
+### `maki.api.list_commands()` {#maki-api-list_commands}
+
+```lua
+maki.api.list_commands()
+```
+
+Lists every slash command the input bar offers: built-ins, custom
+`/project:` and `/user:` commands, MCP prompts, and plugin commands, in
+the order the palette shows them.
+
+Each entry is `{ name, description, source, plugin?, max_args, bang,
+argument_hint?, interactive }`. `source` is `"builtin"`, `"custom"`,
+`"mcp"` or `"lua"`, and `plugin` names the plugin that registered a
+`"lua"` one. `max_args` is -1 for a command that takes any number of
+arguments. `bang` is true when the command reads a trailing `!`.
+`interactive` marks commands that only open a picker or modal, such as
+`/model`, which do nothing useful when nobody is looking at the terminal.
+
+**Returns:** (`table[]|nil`, `string|nil`) The command entries, or nil and an error when no UI is attached.
+
+**Example:**
+
+```lua
+local cmds = maki.api.list_commands()
+for _, c in ipairs(cmds or {}) do
+  if not c.interactive then
+    print(c.name, c.source, c.description)
+  end
+end
 ```
 
 ---
@@ -3847,11 +3917,11 @@ Without an interactive UI every function returns
 ### `maki.model.get()` {#maki-model-get}
 
 ```lua
-maki.model.get()
+maki.model.get({opts?})
 ```
 
-Reads the focused session's model, thinking level, and fast mode.
-`thinking` comes back in the spelling `set` accepts, so a table from here
+Reads a session's model, thinking level, and fast mode, the focused one
+unless `opts.session` names another. `thinking` comes back in the spelling `set` accepts, so a table from here
 can go straight back in.
 
 `thinking_options` is every thinking value this model accepts, cheapest
@@ -3859,6 +3929,11 @@ first: `{name, tokens?}` per row, where `tokens` is the budget maki would
 send for that row and is absent on `off` and `adaptive`. It is empty exactly
 when `supports_thinking` is false, so a picker can render the ladder from it
 without knowing the levels.
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Options:
+  - `session` (`string`) id of a live session, defaults to the focused one.
 
 **Returns:** (`table|nil`, `string|nil`) `{spec, id, provider, thinking,
   thinking_options, fast, supports_thinking, supports_fast}`, or nil and an
@@ -3899,22 +3974,30 @@ local specs = maki.model.available()
 ### `maki.model.set()` {#maki-model-set}
 
 ```lua
-maki.model.set({opts})
+maki.model.set({spec}, {opts?})
 ```
 
-Switches the focused session's model, thinking level, or fast mode. Fields
-you leave out stay as they are, so this doubles as a thinking-only switch.
-Answers with the new state, in the same shape `get` returns.
+Switches a session's model, thinking level, or fast mode, the focused one
+unless `opts.session` names another. Fields you leave out stay as they
+are, so this doubles as a thinking-only switch. Answers with the new
+state, in the same shape `get` returns.
+
+A new spec also becomes the model the next `maki` starts on, like picking
+it in `/model`, unless `opts.persist` is false. Naming a session turns
+that off by default, since steering one tab is not choosing a default.
 
 **Parameters:**
 
-- `{opts}` (`string|table`) A model spec, or a table with any of:
+- `{spec}` (`string|table`) A model spec, or a table with any of:
   - `spec` (`string`) `"provider/id"`, as listed by `available()`;
   - `thinking` (`string|number`) `"off"`, `"adaptive"`, an effort level
 
   (`"minimal"` to `"max"`), a token budget, or `""` to toggle it on and off;
 
   - `fast` (`boolean`) Anthropic fast mode.
+- `{opts?}` (`table?`) Options:
+  - `session` (`string`) id of a live session, defaults to the focused one.
+  - `persist` (`boolean`) remember a new spec as the default; true unless `session` is set.
 
 **Returns:** (`table|nil`, `string|nil`) The new state, or nil and an error.
 
@@ -3924,6 +4007,7 @@ Answers with the new state, in the same shape `get` returns.
 maki.model.set("anthropic/claude-opus-4-6")
 maki.model.set({ spec = "zai/glm-5", thinking = "high" })
 maki.keymap.set("n", "<M-t>", function() maki.model.set({ thinking = "" }) end)
+maki.model.set({ thinking = "high" }, { session = id })
 ```
 
 ---
@@ -4785,15 +4869,23 @@ Requires the `agent` [plugin permission](#plugin-permissions).
 - `{text}` (`string`) The prompt to send. Must not be blank.
 - `{opts?}` (`table?`) Optional fields: session (string) id of a live
 
-  session; defaults to the focused one.
+  session, defaults to the focused one; force (boolean) when the prompt
 
 
-**Returns:** (`string|nil`, `string|nil`) "started" or "queued", or nil and an error.
+  lands in the queue, force the queue through right away the way
+
+
+  `maki.session.detach` does.
+
+
+**Returns:** (`string|nil`, `string|nil`) "started", "queued", or "forced" when
+  force moved the running turn to the background, or nil and an error.
 
 **Example:**
 
 ```lua
 local state, err = maki.session.prompt("run the tests", { session = id })
+maki.session.prompt("stop, look at this first", { session = id, force = true })
 ```
 
 ---
@@ -4824,6 +4916,39 @@ Requires the `agent` [plugin permission](#plugin-permissions).
 
 ```lua
 local interrupted, err = maki.session.cancel({ session = id })
+```
+
+---
+
+### `maki.session.detach()` {#maki-session-detach}
+
+```lua
+maki.session.detach({opts?})
+```
+
+Sends the queue in, the way Ctrl+Enter does in the TUI: the running turn
+goes on as a background task and the queued prompts are answered next.
+Refused while the turn waits on a permission prompt or a question, since
+the answer has to reach the run that asked.
+
+Requires the `agent` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Optional fields: session (string) id of a live
+
+  session; defaults to the focused one.
+
+
+**Returns:** (`boolean|nil`, `string|nil`) true if the running turn went to the
+  background, false if nothing is queued, no turn is running, or the turn
+  is waiting on the user, or nil and an error.
+
+**Example:**
+
+```lua
+maki.session.prompt("look at this first", { session = id })
+local forced, err = maki.session.detach({ session = id })
 ```
 
 ---

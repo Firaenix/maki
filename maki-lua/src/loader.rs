@@ -20,11 +20,12 @@ use crate::api::util::command::{
 };
 use crate::background::BackgroundSessions;
 use crate::error::PluginError;
-use crate::pack::{DiscoveredPackage, Interaction};
+use crate::pack::{DiscoveredPackage, Discovery, Interaction};
 use crate::plugin_permissions::{
     MANIFEST_FILE, PluginPermissions, Requested, check_plugin_compatibility,
     load_plugin_permissions,
 };
+use crate::plugin_status::PluginKind;
 use crate::runtime::{
     self, ClickFallback, ConfigScope, EndSession, LoadChunk, LoadContext, LuaThread, Request,
     RestoreItem,
@@ -518,6 +519,12 @@ impl PluginHost {
         // the config surface.
         for bundled in BUNDLED_PLUGINS {
             let Some(builtin) = config.names.iter().find(|n| n.as_str() == bundled.name) else {
+                self.inner.plugin_status.record_idle(
+                    bundled.name,
+                    PluginKind::Bundled,
+                    None,
+                    false,
+                );
                 continue;
             };
             let dir = &bundled.dir;
@@ -926,6 +933,7 @@ impl PluginHost {
                 match result {
                     Ok(()) => warnings.extend(self.permission_name_warning(&pkg.name)),
                     Err(e) if e.is_version_floor() => {
+                        self.record_package_failure(pkg, &e);
                         tracing::warn!(
                             package = %pkg.name,
                             path = %pkg.dir.display(),
@@ -935,6 +943,7 @@ impl PluginHost {
                         warnings.push(format!("{SKIPPED_PLUGIN_WARNING}: {e}"));
                     }
                     Err(e) => {
+                        self.record_package_failure(pkg, &e);
                         tracing::error!(
                             package = %pkg.name,
                             path = %pkg.dir.display(),
@@ -992,7 +1001,43 @@ impl PluginHost {
                 tracing::warn!(error = %e, "could not close the package activation queue");
             }
         }
+        for pkg in packages
+            .iter()
+            .filter(|pkg| !loaded.contains(&pkg.name.as_str()))
+        {
+            let enabled = config.packages.iter().any(|n| n == &pkg.name);
+            self.inner.plugin_status.record_idle(
+                &pkg.name,
+                PluginKind::Package,
+                Some(pkg.dir.clone()),
+                enabled,
+            );
+        }
         warnings
+    }
+
+    fn record_package_failure(&self, pkg: &DiscoveredPackage, e: &PluginError) {
+        self.inner.plugin_status.record_load(
+            &pkg.name,
+            PluginKind::Package,
+            Some(pkg.dir.clone()),
+            Err(e.to_string()),
+        );
+    }
+
+    /// Packages discovery refused never reach a load, so this is the only
+    /// place `list_plugins` can learn about them.
+    pub fn record_discovery_problems(&self, discovery: &Discovery) {
+        for problem in &discovery.problems {
+            if let Some(name) = &problem.name {
+                self.inner.plugin_status.record_load(
+                    name,
+                    PluginKind::Package,
+                    None,
+                    Err(problem.to_string()),
+                );
+            }
+        }
     }
 
     pub fn event_handle(&self) -> EventHandle {
@@ -1153,12 +1198,22 @@ impl EventHandle {
         self
     }
 
-    pub fn run_command(&self, plugin: Arc<str>, command: Arc<str>, args: String, depth: u8) {
+    /// {session} is the id of the chat the command runs in, handed to the
+    /// handler as `opts.session`.
+    pub fn run_command(
+        &self,
+        plugin: Arc<str>,
+        command: Arc<str>,
+        args: String,
+        depth: u8,
+        session: Option<String>,
+    ) {
         let _ = self.prio_tx.try_send(Request::RunCommand {
             plugin,
             command,
             args,
             depth,
+            session,
         });
     }
 
@@ -1488,6 +1543,7 @@ mod tests {
             Arc::from("/greet"),
             "world".into(),
             2,
+            Some("s1".into()),
         );
         let req = prio_rx.try_recv().unwrap();
         match req {
@@ -1496,11 +1552,13 @@ mod tests {
                 command,
                 args,
                 depth,
+                session,
             } => {
                 assert_eq!(plugin.as_ref(), "myplugin");
                 assert_eq!(command.as_ref(), "/greet");
                 assert_eq!(args, "world");
                 assert_eq!(depth, 2);
+                assert_eq!(session.as_deref(), Some("s1"));
             }
             _ => panic!("expected RunCommand"),
         }

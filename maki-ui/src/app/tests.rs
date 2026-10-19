@@ -3132,6 +3132,7 @@ fn an_input_edit_meets_a_prompt_opened_since_the_last_frame() {
         None,
         true,
         None,
+        None,
     );
 
     let planned = planned_edit(&app, 0, 5, "bye");
@@ -3624,6 +3625,49 @@ fn ctrl_enter_without_a_queue_to_force_does_not_detach(make: fn() -> App) {
     let actions = app.update(Msg::Key(kb::DETACH_RUN.to_key_event()));
     assert!(!detaches(&actions));
     assert!(app.queue.is_empty());
+}
+
+#[test]
+fn force_queue_detaches_a_run_with_something_queued() {
+    let mut app = app_with_queued_message();
+    let actions = app.force_queue().expect("the queue is forced through");
+    assert!(detaches(&actions));
+    assert_eq!(app.queue.len(), 1, "the agent drains the queue");
+}
+
+fn waiting_on_permission() -> App {
+    let mut app = app_with_queued_message();
+    app.permission_prompt.push(
+        "id".into(),
+        maki_config::ToolKey::native("bash"),
+        vec!["ls".into()],
+        None,
+        true,
+        None,
+        None,
+    );
+    app
+}
+
+/// Unlike Ctrl+Enter it ignores the input box and the focused chat: a plugin
+/// forces what it queued, whatever the user has on screen.
+#[test_case(test_app       as fn() -> App ; "idle")]
+#[test_case(streaming_app  as fn() -> App ; "nothing_queued")]
+#[test_case(waiting_on_permission as fn() -> App ; "permission_prompt_open")]
+fn force_queue_refuses_with_nothing_to_force_or_a_prompt_open(make: fn() -> App) {
+    let mut app = make();
+    assert!(app.force_queue().is_none());
+}
+
+#[test]
+fn force_queue_leaves_the_users_draft_alone() {
+    let mut app = app_with_queued_message();
+    for c in "draft".chars() {
+        app.update(Msg::Key(key(KeyCode::Char(c))));
+    }
+    assert!(app.force_queue().is_some());
+    assert_eq!(app.input_box.buffer.value(), "draft");
+    assert_eq!(app.queue.len(), 1);
 }
 
 #[test]
@@ -4302,6 +4346,7 @@ fn run_cmdline_needs_what_the_command_reaches(cmdline: &str, needed: Permission)
             content: CUSTOM_COMMAND_CONTENT.into(),
             scope: CommandScope::User,
             accepts_args: true,
+            argument_hint: None,
         }]),
         McpSnapshotReader::empty(),
         LuaCommandReader::from_commands(vec![LuaCommandInfo {
@@ -4340,7 +4385,8 @@ fn run_cmdline_leaves_user_only_commands_to_the_user(cmdline: &str) {
 
 /// A Lua command reached through an alias carries the hop count onward, or a
 /// cycle of Lua aliases would never trip the cap. It goes out spelled as
-/// registered, since only that spelling dispatches.
+/// registered, since only that spelling dispatches, and names the session it
+/// runs in so the handler can aim follow-ups at the same tab.
 #[test]
 fn run_cmdline_forwards_depth_to_lua_command() {
     let dir = StateDir::from_path(env::temp_dir());
@@ -4362,7 +4408,12 @@ fn run_cmdline_forwards_depth_to_lua_command() {
 
     assert_eq!(
         probe.try_recv_command(),
-        Some(("/Sessions".to_string(), String::new(), 3))
+        Some((
+            "/Sessions".to_string(),
+            String::new(),
+            3,
+            Some(app.state.session.id.to_string())
+        ))
     );
 }
 
@@ -4631,6 +4682,7 @@ fn ask_main(app: &mut App, ask: &str) {
             tool: ToolKey::native("bash"),
             scopes: vec!["ls".into()],
             reason: None,
+            preview: None,
         },
         subagent: None,
         run_id: 1,
@@ -4727,6 +4779,7 @@ fn concurrent_subagent_permission_requests_are_each_answered() {
                 tool: ToolKey::native("bash"),
                 scopes: vec!["ls".into()],
                 reason: None,
+                preview: None,
             },
             subagent: Some(subagent_info_with_tx(parent, RESEARCH_NAME, Some(tx))),
             run_id: 1,
@@ -6110,6 +6163,7 @@ fn a_pending_permission_prompt_answers_before_the_package_review() {
         None,
         true,
         None,
+        None,
     );
 
     app.update(Msg::Key(KeyEvent::from(KeyCode::Char('y'))));
@@ -6847,6 +6901,7 @@ fn focused_float_takes_keys_ahead_of_permission_prompt() {
         None,
         true,
         None,
+        None,
     );
     let buf = Arc::new(maki_agent::SharedBuf::new());
     let (event_tx, event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
@@ -6895,6 +6950,7 @@ fn ctrl_c_denies_permission_prompt() {
         vec!["execute".into()],
         None,
         true,
+        None,
         None,
     );
     assert!(app.permission_prompt.is_open());
@@ -7115,6 +7171,7 @@ fn permission_prompt_takes_bottom_precedence_over_below_split() {
         vec!["ls".into()],
         None,
         true,
+        None,
         None,
     );
 
@@ -7533,6 +7590,7 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
         None,
         true,
         None,
+        None,
     );
     assert_eq!(
         app.attention(),
@@ -7548,6 +7606,7 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
         vec![],
         None,
         true,
+        None,
         None,
     );
     assert_eq!(
