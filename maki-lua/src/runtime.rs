@@ -473,6 +473,8 @@ pub enum Request {
         /// How many `maki.api.run_command` hops led here; seeds the handler's
         /// [`TaskCell::command_depth`] so an alias cycle terminates.
         depth: u8,
+        /// The chat it runs in, passed to the handler as `opts.session`.
+        session: Option<String>,
     },
     CollectPromptSlots {
         reply: flume::Sender<ResolvedPrompts>,
@@ -4828,6 +4830,7 @@ pub fn spawn(
                             command,
                             args,
                             depth,
+                            session,
                         } => {
                             let handler_fn =
                                 rt.lua.app_data_ref::<CommandHandlerMap>().and_then(|m| {
@@ -4844,6 +4847,7 @@ pub fn spawn(
                                             lua.create_sequence_from(args.split_whitespace())?,
                                         )?;
                                         opts.set("args", args)?;
+                                        opts.set("session", session)?;
                                         let thread = lua.create_thread(func)?;
                                         thread.into_async::<()>(opts)?.await
                                     };
