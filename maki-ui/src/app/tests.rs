@@ -3115,6 +3115,7 @@ fn an_input_edit_meets_a_prompt_opened_since_the_last_frame() {
         None,
         true,
         None,
+        None,
     );
 
     let planned = planned_edit(&app, 0, 5, "bye");
@@ -4543,6 +4544,7 @@ fn concurrent_subagent_permission_requests_are_each_answered() {
                 tool: ToolKey::native("bash"),
                 scopes: vec!["ls".into()],
                 reason: None,
+                preview: None,
             },
             subagent: Some(subagent_info_with_tx(parent, RESEARCH_NAME, Some(tx))),
             run_id: 1,
@@ -5926,6 +5928,7 @@ fn a_pending_permission_prompt_answers_before_the_package_review() {
         None,
         true,
         None,
+        None,
     );
 
     app.update(Msg::Key(KeyEvent::from(KeyCode::Char('y'))));
@@ -6660,6 +6663,7 @@ fn ctrl_c_denies_permission_prompt() {
         None,
         true,
         None,
+        None,
     );
     assert!(app.permission_prompt.is_open());
 
@@ -6879,6 +6883,7 @@ fn permission_prompt_takes_bottom_precedence_over_below_split() {
         vec!["ls".into()],
         None,
         true,
+        None,
         None,
     );
 
@@ -7297,6 +7302,7 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
         None,
         true,
         None,
+        None,
     );
     assert_eq!(
         app.attention(),
@@ -7312,6 +7318,7 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
         vec![],
         None,
         true,
+        None,
         None,
     );
     assert_eq!(

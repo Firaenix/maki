@@ -1781,6 +1781,7 @@ impl App {
             tool,
             scopes,
             reason,
+            preview,
         } = result
         {
             let project_trusted = self.permissions.project_is_trusted();
@@ -1791,6 +1792,7 @@ impl App {
                 subagent_id.clone(),
                 project_trusted,
                 reason,
+                preview,
             );
             return vec![];
         }

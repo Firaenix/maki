@@ -16,7 +16,8 @@ use crate::selection::{DocPos, RowPos, Selection};
 use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use maki_agent::types::ALLOWED_BY;
 use maki_agent::{
-    AgentEvent, BufferSnapshot, SteerKind, SubagentInbox, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    AgentEvent, BufferSnapshot, PermissionPreview, SteerKind, SubagentInbox, ToolDoneEvent,
+    ToolOutput, ToolStartEvent,
 };
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
 use maki_lua::{LuaCommandInfo, WinView};
@@ -53,6 +54,7 @@ pub enum ChatEventResult {
         tool: ToolKey,
         scopes: Vec<String>,
         reason: Option<String>,
+        preview: Option<PermissionPreview>,
     },
     AuthRequired,
 }
@@ -228,12 +230,14 @@ impl Chat {
                 tool,
                 scopes,
                 reason,
+                preview,
             } => {
                 return ChatEventResult::PermissionRequest {
                     id,
                     tool,
                     scopes,
                     reason,
+                    preview,
                 };
             }
             AgentEvent::Steered { kind, text } => {
@@ -1591,6 +1595,7 @@ mod tests {
                 tool: ToolKey::native("bash"),
                 scopes: Vec::new(),
                 reason: Some(ASK_REASON.into()),
+                preview: None,
             },
             None,
         );

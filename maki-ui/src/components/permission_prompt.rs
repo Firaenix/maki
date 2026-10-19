@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -9,11 +9,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use unicode_width::UnicodeWidthChar;
 
+use maki_agent::PermissionPreview;
 use maki_agent::permissions::{DEFAULT_DENY_GUIDANCE, PermissionAnswer, generalized_scopes};
 use maki_config::{DEFAULT_PERMISSION_EXPAND_KEY, ToolKey};
 use maki_lua::Key;
 
 use crate::components::Overlay;
+use crate::components::code_view::{render_file, render_snippet_diff};
 use crate::components::form::render_form;
 use crate::components::hint_line;
 use crate::components::is_ctrl;
@@ -89,6 +91,7 @@ const EXPANDED_NAV_ROW: &[(&str, &str)] = &[
     ("g/G", "Top/bottom"),
     ("Esc/q", "Collapse"),
 ];
+const PREVIEW_TRUNCATED: &str = "… cut short, the call carries more than this";
 const TITLE: &str = " Permission Required ";
 /// Answer keys win over the expand key, so one bound on top of them would
 /// leave nothing to expand with.
@@ -175,6 +178,76 @@ fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>
     rows
 }
 
+/// Wraps rendered code to {width}, treating each line's first span as its
+/// gutter: continuation rows hang under the code, not under the number.
+fn hang_wrap(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let mut spans = line
+            .spans
+            .into_iter()
+            .map(|span| Span::styled(span.content.trim_end_matches('\n').to_owned(), span.style))
+            .filter(|span| !span.content.is_empty());
+        let Some(gutter) = spans.next() else {
+            out.push(Line::raw(""));
+            continue;
+        };
+        let gutter_width = gutter.width();
+        let avail = (width as usize).saturating_sub(2 + gutter_width).max(1);
+        for (k, piece) in wrap_spans(spans.collect(), avail).into_iter().enumerate() {
+            let lead = if k == 0 {
+                gutter.clone()
+            } else {
+                Span::raw(" ".repeat(gutter_width))
+            };
+            let mut row = vec![Span::raw("  "), lead];
+            row.extend(piece);
+            out.push(Line::from(row));
+        }
+    }
+    out
+}
+
+/// A write as the file it leaves, an edit as a diff per replacement.
+fn preview_lines(preview: &PermissionPreview, highlight: bool) -> Vec<Line<'static>> {
+    let t = theme::current();
+    let heading = |label: &'static str, path: &str| {
+        Line::from(vec![
+            Span::styled(label, t.tool_dim),
+            Span::styled(path.to_owned(), Style::new().fg(t.foreground)),
+        ])
+    };
+    let mut lines = Vec::new();
+    match preview {
+        PermissionPreview::Write {
+            path,
+            content,
+            append,
+            ..
+        } => {
+            lines.push(heading(if *append { "append " } else { "write " }, path));
+            lines.extend(render_file(path, content, highlight));
+        }
+        PermissionPreview::Edit { path, edits, .. } => {
+            lines.push(heading("edit ", path));
+            for (i, edit) in edits.iter().enumerate() {
+                if edits.len() > 1 {
+                    lines.push(Line::raw(""));
+                    lines.push(Line::from(Span::styled(
+                        format!("edit {}/{}", i + 1, edits.len()),
+                        t.tool_dim,
+                    )));
+                }
+                lines.extend(render_snippet_diff(path, &edit.old, &edit.new, highlight));
+            }
+        }
+    }
+    if preview.truncated() {
+        lines.push(Line::from(Span::styled(PREVIEW_TRUNCATED, t.tool_dim)));
+    }
+    lines
+}
+
 fn wrapped_height(lines: &[Line<'static>], width: u16) -> u16 {
     Paragraph::new(lines.to_vec())
         .wrap(Wrap { trim: false })
@@ -234,6 +307,13 @@ struct Request {
     /// Set when a plugin escalated the call, so the user sees why they are
     /// asked about a call their rules might have let through.
     reason: Option<String>,
+    /// What a file write would put on disk. The expanded view shows it in
+    /// place of the scopes, which only name the file.
+    preview: Option<PermissionPreview>,
+    /// The preview highlighted, kept since every frame draws it and a big
+    /// write is slow to highlight. Tagged with whether highlighting was ready,
+    /// so a plain copy made during warmup is redone once it is.
+    preview_lines: RefCell<Option<(bool, Vec<Line<'static>>)>>,
 }
 
 /// An answer carries the ask it settles: the agent only accepts one naming the
@@ -360,6 +440,7 @@ impl PermissionPrompt {
         true
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn push(
         &mut self,
         id: String,
@@ -368,6 +449,7 @@ impl PermissionPrompt {
         subagent_id: Option<String>,
         project_trusted: bool,
         reason: Option<String>,
+        preview: Option<PermissionPreview>,
     ) {
         let allow_scopes = generalized_scopes(&tool, &scopes);
         let allow_scopes = if allow_scopes == scopes {
@@ -383,6 +465,8 @@ impl PermissionPrompt {
             allow_scopes,
             project_trusted,
             reason,
+            preview,
+            preview_lines: RefCell::default(),
         });
     }
 
@@ -576,12 +660,32 @@ impl PermissionPrompt {
         lines
     }
 
-    /// The expanded body: every scope, a bash one laid out one step per line,
-    /// numbered by source line and wrapped to {width}.
+    /// The expanded body: a file write's preview when it has one, else every
+    /// scope, a bash one laid out one step per line, numbered by source line
+    /// and wrapped to {width}.
     fn expanded_rows(&self, width: u16) -> Vec<Line<'static>> {
-        let Some(Request { tool, scopes, .. }) = self.queue.front() else {
+        let Some(Request {
+            tool,
+            scopes,
+            preview,
+            preview_lines: cached,
+            ..
+        }) = self.queue.front()
+        else {
             return vec![];
         };
+        if let Some(preview) = preview {
+            let ready = highlight::is_ready();
+            let mut cached = cached.borrow_mut();
+            if cached
+                .as_ref()
+                .is_none_or(|(was_ready, _)| *was_ready != ready)
+            {
+                *cached = Some((ready, preview_lines(preview, ready)));
+            }
+            let lines = cached.as_ref().map(|(_, lines)| lines.clone());
+            return hang_wrap(lines.unwrap_or_default(), width);
+        }
         let t = theme::current();
         let shell = is_shell(tool);
         let text = scopes
@@ -819,10 +923,14 @@ mod tests {
     use maki_config::ToolKey;
     use test_case::test_case;
 
+    use maki_agent::PermissionPreview;
+    use ratatui::text::Line;
+
     use super::{
         COLLAPSE_HINT, CONFIRM_ALLOW_PROJECT_HINTS, CONFIRM_ALLOW_PROJECT_SESSION_HINTS,
         CONFIRM_DENY_PROJECT_HINTS, CONFIRM_DENY_PROJECT_SESSION_HINTS, EXPAND_HINT, Overlay,
-        PermissionPrompt, PromptState, QUEUED_NOTICE, UNTRUSTED_DURABLE_ANSWER, UNTRUSTED_NOTICE,
+        PREVIEW_TRUNCATED, PermissionPrompt, PromptState, QUEUED_NOTICE, UNTRUSTED_DURABLE_ANSWER,
+        UNTRUSTED_NOTICE, theme,
     };
 
     const MAIN_ID: &str = "id";
@@ -837,6 +945,7 @@ mod tests {
             None,
             project_trusted,
             None,
+            None,
         );
     }
 
@@ -847,6 +956,7 @@ mod tests {
             vec!["/tmp/x".into()],
             Some(SUB_AGENT.into()),
             true,
+            None,
             None,
         );
     }
@@ -891,6 +1001,7 @@ mod tests {
             None,
             true,
             None,
+            None,
         );
         let rows = row_texts(&prompt);
         let at = rows.iter().position(|r| r.contains("scope ")).unwrap();
@@ -908,6 +1019,7 @@ mod tests {
             vec!["a\nb".into()],
             None,
             true,
+            None,
             None,
         );
         assert!(row_texts(&prompt).contains(&"  scope a\nb".to_owned()));
@@ -982,7 +1094,15 @@ mod tests {
     #[test]
     fn wildcard_tool_key_opens() {
         let mut prompt = PermissionPrompt::new();
-        prompt.push(MAIN_ID.into(), ToolKey::Wildcard, vec![], None, true, None);
+        prompt.push(
+            MAIN_ID.into(),
+            ToolKey::Wildcard,
+            vec![],
+            None,
+            true,
+            None,
+            None,
+        );
         assert!(prompt.is_open());
     }
 
@@ -1096,6 +1216,7 @@ mod tests {
             None,
             true,
             reason.map(str::to_owned),
+            None,
         );
 
         let why_row = prompt.build_lines().iter().find_map(|line| {
@@ -1118,6 +1239,7 @@ mod tests {
             vec![command.into()],
             None,
             true,
+            None,
             None,
         );
     }
@@ -1276,6 +1398,124 @@ mod tests {
         prompt.handle_key(key(KeyCode::Char('y')));
         assert!(prompt.is_open());
         assert!(!prompt.expanded);
+    }
+
+    fn push_preview(prompt: &mut PermissionPrompt, tool: &str, preview: PermissionPreview) {
+        prompt.push(
+            MAIN_ID.into(),
+            ToolKey::native(tool),
+            vec![preview.path().to_owned()],
+            None,
+            true,
+            None,
+            Some(preview),
+        );
+        prompt.handle_key(key(KeyCode::Char('v')));
+    }
+
+    fn row_strings(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    fn write_preview(content: &str, truncated: bool) -> PermissionPreview {
+        PermissionPreview::Write {
+            path: "/p/main.rs".into(),
+            content: content.into(),
+            append: false,
+            truncated,
+        }
+    }
+
+    #[test]
+    fn expanded_write_shows_the_numbered_highlighted_content() {
+        crate::highlight::warmup();
+        let mut prompt = PermissionPrompt::new();
+        push_preview(
+            &mut prompt,
+            "write",
+            write_preview("fn main() {\n    run();\n}\n", false),
+        );
+        let lines = prompt.expanded_rows(60);
+        let rows = row_strings(&lines);
+        assert_eq!(rows[0], "  write /p/main.rs", "{rows:#?}");
+        assert_eq!(rows[1], "  1 fn main() {", "{rows:#?}");
+        assert_eq!(rows[2], "  2     run();", "{rows:#?}");
+        assert_eq!(rows[3], "  3 }", "{rows:#?}");
+        let styles: std::collections::HashSet<_> =
+            lines[1].spans.iter().skip(2).map(|s| s.style).collect();
+        assert!(styles.len() > 1, "highlighted as rust: {:?}", lines[1]);
+        assert!(!rows.iter().any(|r| r.contains(PREVIEW_TRUNCATED)));
+    }
+
+    #[test]
+    fn expanded_edit_shows_each_replacement_as_a_coloured_diff() {
+        crate::highlight::warmup();
+        let mut prompt = PermissionPrompt::new();
+        push_preview(
+            &mut prompt,
+            "multiedit",
+            PermissionPreview::Edit {
+                path: "/p/main.rs".into(),
+                edits: vec![
+                    maki_agent::PreviewEdit {
+                        old: "let a = 1;".into(),
+                        new: "let a = 2;".into(),
+                    },
+                    maki_agent::PreviewEdit {
+                        old: "old_call();".into(),
+                        new: "new_call();".into(),
+                    },
+                ],
+                truncated: true,
+            },
+        );
+        let lines = prompt.expanded_rows(60);
+        let rows = row_strings(&lines);
+        assert_eq!(rows[0], "  edit /p/main.rs", "{rows:#?}");
+        assert!(rows.contains(&"  edit 1/2".to_owned()), "{rows:#?}");
+        assert!(rows.contains(&"  edit 2/2".to_owned()), "{rows:#?}");
+        let t = theme::current();
+        let sign_of = |needle: &str| {
+            let at = rows.iter().position(|r| r.contains(needle)).unwrap();
+            lines[at]
+                .spans
+                .iter()
+                .find(|s| s.content.trim() == "-" || s.content.trim() == "+")
+                .map(|s| (s.content.trim().to_owned(), s.style))
+                .unwrap()
+        };
+        let (removed, removed_style) = sign_of("let a = 1;");
+        let (added, added_style) = sign_of("let a = 2;");
+        assert_eq!(removed, "-");
+        assert_eq!(added, "+");
+        assert_eq!(removed_style.fg, t.code_block.patch(t.diff_old_sign).fg);
+        assert_eq!(added_style.fg, t.code_block.patch(t.diff_new_sign).fg);
+        assert!(has_row(&rows, "new_call();"), "{rows:#?}");
+        assert_eq!(rows.last().unwrap(), &format!("  {PREVIEW_TRUNCATED}"));
+    }
+
+    #[test]
+    fn a_preview_line_wraps_under_its_code_not_its_number() {
+        let mut prompt = PermissionPrompt::new();
+        push_preview(&mut prompt, "write", write_preview(&"x".repeat(50), false));
+        let rows = row_strings(&prompt.expanded_rows(30));
+        assert!(rows[1].starts_with("  1 x"), "{rows:#?}");
+        assert!(rows[2].starts_with("    x"), "{rows:#?}");
+        assert!(rows.iter().all(|r| r.chars().count() <= 30), "{rows:#?}");
+    }
+
+    #[test]
+    fn the_collapsed_view_still_names_only_the_file() {
+        let mut prompt = PermissionPrompt::new();
+        push_preview(&mut prompt, "write", write_preview("secret body", false));
+        prompt.handle_key(key(KeyCode::Char('v')));
+        assert!(!prompt.expanded);
+        let text = rendered(&prompt);
+        assert!(text.contains("/p/main.rs"), "{text}");
+        assert!(!text.contains("secret body"), "{text}");
     }
 
     #[test]

@@ -20,8 +20,8 @@ use crate::tools::{
     ToolLive, truncate_bytes,
 };
 use crate::{
-    AgentError, AgentEvent, AgentSeed, CallRecord, TextOutput, ToolDoneEvent, ToolOutput,
-    ToolStartEvent,
+    AgentError, AgentEvent, AgentSeed, CallRecord, PermissionPreview, TextOutput, ToolDoneEvent,
+    ToolOutput, ToolStartEvent,
 };
 use maki_config::ToolKey;
 use maki_storage::id::SessionRef;
@@ -894,7 +894,8 @@ async fn enforce_permission(
         ));
     }
     match (inv.permission_scopes().await, ask) {
-        (Some(scopes), ask) => {
+        (Some(mut scopes), ask) => {
+            scopes.preview = PermissionPreview::from_tool_input(name, input);
             gate(ctx, &ToolKey::native(name), &scopes, id, input, ask, hook).await
         }
         (None, Some(_)) => gate_on_input(ctx, &ToolKey::native(name), id, input, ask, hook).await,
@@ -2135,6 +2136,47 @@ mod tests {
             );
             let text = done.output.as_text();
             assert!(text.starts_with(&expected_start), "got: {text}");
+        });
+    }
+
+    fn previews(events: &Receiver<Envelope>) -> Vec<Option<PermissionPreview>> {
+        events
+            .try_iter()
+            .filter_map(|envelope| match envelope.event {
+                AgentEvent::PermissionRequest { preview, .. } => Some(preview),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The prompt is where the user reads what a write would do, so the ask
+    /// carries the content and not only the path it goes to.
+    #[test_case(crate::tools::WRITE_TOOL_NAME, true  ; "write_is_previewed")]
+    #[test_case(HOOK_TOOL_NAME,         false ; "other_tools_are_not")]
+    fn a_prompted_write_carries_its_preview(tool: &str, previewed: bool) {
+        const PATH: &str = "/elsewhere/a.rs";
+        smol::block_on(async {
+            let (ctx, events) = answered(build_ctx(), PermissionAnswer::AllowOnce);
+            let input = json!({"path": PATH, "content": "fn a() {}\n"});
+            enforce_permission(
+                &HookMockInvocation(PATH.into()),
+                tool,
+                &input,
+                &ctx,
+                TEST_ID,
+                Some(HOOK_ASK_REASON),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let expected = previewed.then(|| PermissionPreview::Write {
+                path: PATH.into(),
+                content: "fn a() {}\n".into(),
+                append: false,
+                truncated: false,
+            });
+            assert_eq!(previews(&events), vec![expected]);
         });
     }
 
