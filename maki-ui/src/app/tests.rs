@@ -3797,6 +3797,7 @@ fn open_deny_prompt(app: &mut App, scope: &str) {
         None,
         ProjectAnswers::Saved,
         None,
+        None,
     );
     press(app, KeyCode::Char(IME_DENY_KEY));
 }
@@ -4295,6 +4296,7 @@ fn an_input_edit_meets_a_prompt_opened_since_the_last_frame() {
         vec!["execute".into()],
         None,
         ProjectAnswers::Saved,
+        None,
         None,
     );
 
@@ -5838,6 +5840,7 @@ fn concurrent_subagent_permission_requests_are_each_answered() {
                 tool: ToolKey::native("bash"),
                 scopes: vec!["ls".into()],
                 reason: None,
+                preview: None,
             },
             subagent: Some(subagent_info_with_tx(parent, RESEARCH_NAME, Some(tx))),
             run_id: 1,
@@ -7096,6 +7099,7 @@ fn ask_permission(app: &mut App) {
         tool: ToolKey::native("bash"),
         scopes: vec!["ls".into()],
         reason: None,
+        preview: None,
     }));
 }
 
@@ -7110,6 +7114,7 @@ fn permission_request_reason_reaches_the_prompt() {
         tool: ToolKey::native("bash"),
         scopes: vec!["ls".into()],
         reason: Some(ASK_REASON.into()),
+        preview: None,
     }));
 
     assert!(app.permission_prompt.is_asking(FIRST_ASK));
@@ -7809,6 +7814,7 @@ pub(crate) fn ask_tool_permission(app: &mut App, tool: &str) {
         vec!["execute".into()],
         None,
         ProjectAnswers::Saved,
+        None,
         None,
     );
 }
@@ -9980,6 +9986,7 @@ fn a_pending_permission_prompt_answers_before_the_package_review() {
         None,
         ProjectAnswers::Saved,
         None,
+        None,
     );
 
     app.update(Msg::Key(KeyEvent::from(KeyCode::Char('y'))));
@@ -10838,6 +10845,7 @@ fn ctrl_c_denies_permission_prompt() {
         None,
         ProjectAnswers::Saved,
         None,
+        None,
     );
     assert!(app.permission_prompt.is_open());
 
@@ -11065,6 +11073,7 @@ fn permission_prompt_takes_bottom_precedence_over_below_split() {
         vec!["ls".into()],
         None,
         ProjectAnswers::Saved,
+        None,
         None,
     );
 
@@ -11497,6 +11506,7 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
         None,
         ProjectAnswers::Saved,
         None,
+        None,
     );
     assert_eq!(
         app.attention(),
@@ -11512,6 +11522,7 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
         vec![],
         None,
         ProjectAnswers::Saved,
+        None,
         None,
     );
     assert_eq!(app.attention(), Some(Attention::Permission { tool: None }));
@@ -13000,6 +13011,7 @@ fn a_moved_subagent_asking_after_its_turn_ended_gets_its_answer() {
             tool: ToolKey::native("bash"),
             scopes: vec!["ls".into()],
             reason: None,
+            preview: None,
         },
     );
     assert!(app.permission_prompt.is_open());
@@ -13024,6 +13036,7 @@ fn esc_cannot_cancel_the_turn_over_a_moved_subagents_ask() {
             tool: ToolKey::native("bash"),
             scopes: vec!["ls".into()],
             reason: None,
+            preview: None,
         },
     );
 

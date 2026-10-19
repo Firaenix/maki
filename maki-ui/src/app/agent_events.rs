@@ -399,6 +399,7 @@ impl App {
                 tool,
                 scopes,
                 reason,
+                preview,
             } => {
                 let project_answers =
                     ProjectAnswers::new(self.permissions.project_is_trusted(), &self.trust);
@@ -410,6 +411,7 @@ impl App {
                         subagent_id,
                         project_answers,
                         reason,
+                        preview,
                     );
                 });
             }

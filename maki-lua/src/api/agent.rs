@@ -3090,6 +3090,7 @@ mod tests {
             tool: ToolKey::native(ASKING_TOOL),
             scopes: Vec::new(),
             reason: None,
+            preview: None,
         }
     }
 
