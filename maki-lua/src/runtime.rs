@@ -74,6 +74,7 @@ use crate::pack::Interaction;
 use crate::plugin_permissions::{
     Permission, PluginPermissions, grant_hint, load_plugin_permissions,
 };
+use crate::plugin_status::{PluginKind, PluginStatusStore, record_error};
 
 const INTERRUPT_SHUTDOWN_MSG: &str = "plugin interrupted: host shutting down";
 const INTERRUPT_CANCELLED_MSG: &str = "plugin interrupted: task cancelled";
@@ -1320,6 +1321,12 @@ fn interrupt_reason(state: *mut ffi::lua_State) -> Option<Cow<'static, str>> {
             let blame = Blame::of(lua, state);
             let msg = stuck_message(&blame.plugin);
             tracing::warn!(plugin = %blame.plugin, at = %blame.location, task, "{msg}");
+            record_error(
+                lua,
+                &blame.plugin,
+                "watchdog",
+                format!("{msg} (at {})", blame.location),
+            );
             host_flash(lua, msg.clone());
             msg.into()
         }
@@ -2414,7 +2421,9 @@ fn spawn_deferred_callback(
             thread.into_async::<()>(())?.await
         };
         if let Err(e) = run_detached(&lua, run).await {
-            tracing::warn!(plugin = %cb.plugin, error = %strip_traceback(&e), "defer_fn callback failed");
+            let error = strip_traceback(&e);
+            tracing::warn!(plugin = %cb.plugin, error = %error, "defer_fn callback failed");
+            record_error(&lua, &cb.plugin, "defer_fn", error);
         }
         let _ = lua.remove_registry_value(cb.func);
     })
@@ -2471,7 +2480,9 @@ fn spawn_keybind_callback(
     ex.spawn(async move {
         let _done = done_tx;
         if let Err(e) = run_command_scoped(&handler_lua, 0, func.call_async::<LuaValue>(())).await {
-            tracing::warn!(?key, plugin = %plugin, error = %strip_traceback(&e), "keybind callback failed, key spent");
+            let error = strip_traceback(&e);
+            tracing::warn!(?key, plugin = %plugin, error = %error, "keybind callback failed, key spent");
+            record_error(&handler_lua, &plugin, "keybind", error);
         }
     })
     .detach();
@@ -2600,8 +2611,10 @@ fn spawn_plugin_task(
             let error = strip_traceback(&e);
             let plugin = &spawned.plugin;
             tracing::warn!(plugin = %plugin, error = %error, "maki.async.spawn task failed");
-            // The watchdog already flashed this one when it stopped the loop.
+            // The watchdog already flashed and recorded this one when it
+            // stopped the loop.
             if !error.contains(&stuck_message(plugin)) {
+                record_error(&lua, plugin, "async", &error);
                 host_flash(&lua, spawn_failed_message(plugin, &error));
             }
         }
@@ -2903,10 +2916,12 @@ impl LuaRuntime {
             Ok(LuaValue::Nil) => None,
             Ok(_) => {
                 tracing::warn!(plugin, "prompt hint callback returned non-string");
+                record_error(&self.lua, plugin, "hint", "callback returned non-string");
                 None
             }
             Err(e) => {
                 tracing::warn!(plugin, error = %e, "prompt hint callback failed");
+                record_error(&self.lua, plugin, "hint", strip_traceback(&e));
                 None
             }
         }
@@ -3467,6 +3482,7 @@ async fn compute_header(
         Ok(_) => HeaderResult::plain(tool.to_string()),
         Err(e) => {
             tracing::warn!(plugin, tool, error = %e, "header fn call failed");
+            record_error(lua, plugin, "header", strip_traceback(&e));
             HeaderResult::plain(tool.to_string())
         }
     }
@@ -3798,6 +3814,7 @@ fn run_describe(
         Ok(s) => Some(s),
         Err(e) => {
             tracing::warn!(plugin, tool, error = %e, "describe callback failed");
+            record_error(lua, plugin, "describe", strip_traceback(&e));
             None
         }
     }
@@ -4410,6 +4427,19 @@ async fn run_tool_call(
     reply
 }
 
+fn record_load<T, E: std::fmt::Display>(
+    lua: &Lua,
+    name: &str,
+    kind: PluginKind,
+    path: Option<PathBuf>,
+    res: &Result<T, E>,
+) {
+    if let Some(store) = lua.app_data_ref::<PluginStatusStore>() {
+        let result = res.as_ref().map(|_| ()).map_err(ToString::to_string);
+        store.record_load(name, kind, path, result);
+    }
+}
+
 pub(crate) struct LuaThread {
     pub tx: flume::Sender<Request>,
     pub prio_tx: flume::Sender<Request>,
@@ -4430,6 +4460,7 @@ pub(crate) struct LuaThread {
     /// What [`load_user_source`] found on the Lua thread, for the host to
     /// report.
     pub key_lint: KeyLint,
+    pub plugin_status: PluginStatusStore,
 }
 
 /// Lua lives on its own OS thread (no Send needed). `smol::block_on`
@@ -4459,6 +4490,8 @@ pub fn spawn(
     let (hint_writer, hint_reader) = HintWriter::new();
     let key_lint = KeyLint::default();
     let key_lint_thread = key_lint.clone();
+    let plugin_status = PluginStatusStore::default();
+    let plugin_status_thread = plugin_status.clone();
     let background = BackgroundSessions::default();
     let background_thread = background.clone();
     // The file index outlives any one plugin host, so the walks a host
@@ -4484,6 +4517,7 @@ pub fn spawn(
             ) {
                 Ok(r) => {
                     r.lua.set_app_data(key_lint_thread);
+                    r.lua.set_app_data(plugin_status_thread);
                     r.lua.set_app_data(background_thread);
                     r.lua.set_app_data(ui_waker);
                     let _ = init_tx.send(Ok(()));
@@ -4621,6 +4655,11 @@ pub fn spawn(
                             reply,
                         } => {
                             drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
+                            let kind = match context.authority {
+                                DeclAuthority::Bundled => PluginKind::Bundled,
+                                DeclAuthority::ThirdParty => PluginKind::Package,
+                            };
+                            let path = context.plugin_dir.clone();
                             let res = rt
                                 .load_source(
                                     Arc::clone(&name),
@@ -4629,6 +4668,7 @@ pub fn spawn(
                                     None,
                                 )
                                 .await;
+                            record_load(&rt.lua, &name, kind, path, &res);
                             let _ = reply.send(res);
                         }
                         Request::CallProviderHook {
@@ -4720,6 +4760,9 @@ pub fn spawn(
                         Request::ClearPlugin { plugin, reply } => {
                             drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
                             rt.clear_plugin(&plugin);
+                            if let Some(store) = rt.lua.app_data_ref::<PluginStatusStore>() {
+                                store.record_unload(&plugin);
+                            }
                             let _ = reply.send(());
                         }
                         Request::RunPlanAction {
@@ -4849,6 +4892,7 @@ pub fn spawn(
                                     };
                                     if let Err(e) = run_command_scoped(&lua, depth, run).await {
                                         tracing::warn!(plugin = %plugin, command = %command, error = %e, "command handler failed");
+                                        record_error(&lua, &plugin, "command", strip_traceback(&e));
                                     }
                                 })
                                 .detach();
@@ -4903,7 +4947,16 @@ pub fn spawn(
                             reply,
                         } => {
                             drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
+                            let label = scope.label().to_owned();
+                            let path = plugin_dir.clone();
                             let res = rt.run_init_lua(&source, scope, plugin_dir).await;
+                            record_load(
+                                &rt.lua,
+                                &label,
+                                PluginKind::Init,
+                                path,
+                                &res,
+                            );
                             let _ = reply.send(res);
                         }
                         Request::CollectPromptSlots { reply } => {
@@ -4930,6 +4983,7 @@ pub fn spawn(
                         } => {
                             drain_barrier(&rt.lua, &ex, &gate, &spawn_rx).await;
                             let name = declared.spec.name.clone();
+                            let path = context.plugin_dir.clone();
                             let input = (|| {
                                 let crate::api::pack::LoadMode::Custom(loader) = &declared.load
                                 else {
@@ -4975,6 +5029,7 @@ pub fn spawn(
                                 }
                                 Err(error) => Err(error),
                             };
+                            record_load(&rt.lua, &name, PluginKind::Package, path, &result);
                             let _ = reply.send(result);
                         }
                         Request::RestoreToolAsync { item, event_tx } => {
@@ -5129,6 +5184,7 @@ pub fn spawn(
         ui_wake_rx,
         ui_attachment,
         key_lint,
+        plugin_status,
     })
 }
 
