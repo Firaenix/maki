@@ -1,19 +1,23 @@
+use std::cell::Cell;
 use std::collections::VecDeque;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+use unicode_width::UnicodeWidthChar;
 
 use maki_agent::permissions::{DEFAULT_DENY_GUIDANCE, PermissionAnswer, generalized_scopes};
-use maki_config::ToolKey;
+use maki_config::{DEFAULT_PERMISSION_EXPAND_KEY, ToolKey};
+use maki_lua::Key;
 
 use crate::components::Overlay;
 use crate::components::form::render_form;
 use crate::components::hint_line;
 use crate::components::is_ctrl;
+use crate::components::shell_format::format_command;
 use crate::highlight;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
@@ -77,6 +81,43 @@ const CONFIRM_DENY_PROJECT_SESSION_HINTS: &[(&str, &str)] = &[
 
 const DENY_GUIDANCE_HINTS: &[(&str, &str)] = &[("Enter", "Deny"), ("Esc", "Cancel")];
 const QUEUED_NOTICE: &str = "more request(s) waiting";
+const EXPAND_HINT: &str = "Expand";
+const COLLAPSE_HINT: &str = "Collapse";
+const EXPANDED_NAV_ROW: &[(&str, &str)] = &[
+    ("j/k", "Scroll"),
+    ("PgUp/PgDn", "Page"),
+    ("g/G", "Top/bottom"),
+    ("Esc/q", "Collapse"),
+];
+const TITLE: &str = " Permission Required ";
+/// Answer keys win over the expand key, so one bound on top of them would
+/// leave nothing to expand with.
+const ANSWER_KEYS: &[char] = &['y', 'n', 'a', 'A', 'd', 'D', 's'];
+
+fn is_shell(tool: &ToolKey) -> bool {
+    matches!(tool, ToolKey::Native(name) if &**name == "bash")
+}
+
+/// One row of spans per line of {text}, highlighted as bash when {shell}.
+/// Highlighting runs over the lines in order so a heredoc or a quote that
+/// spans lines keeps its colour.
+fn highlighted_rows(text: &str, shell: bool, value_style: Style) -> Vec<Vec<Span<'static>>> {
+    let mut hl =
+        (shell && highlight::is_ready()).then(|| maki_highlight::Highlighter::for_token("bash"));
+    text.split('\n')
+        .map(|line| match hl.as_mut() {
+            Some(hl) => highlight::highlight_line(hl, &format!("{line}\n"))
+                .into_iter()
+                .map(|span| {
+                    let content = span.content.trim_end_matches('\n').to_owned();
+                    Span::styled(content, span.style)
+                })
+                .filter(|span| !span.content.is_empty())
+                .collect(),
+            None => vec![Span::styled(line.to_owned(), value_style)],
+        })
+        .collect()
+}
 
 /// A bash scope is the command itself: each line of it gets its own row,
 /// highlighted as bash, with the label on the first.
@@ -87,35 +128,57 @@ fn scope_lines(
     label_style: Style,
     value_style: Style,
 ) -> Vec<Line<'static>> {
-    let mut hl =
-        (shell && highlight::is_ready()).then(|| maki_highlight::Highlighter::for_token("bash"));
-    let rows: Vec<&str> = if shell {
-        scope.split('\n').collect()
+    let rows = if shell {
+        highlighted_rows(scope, true, value_style)
     } else {
-        vec![scope]
+        vec![vec![Span::styled(scope.to_owned(), value_style)]]
     };
     rows.into_iter()
         .enumerate()
-        .map(|(i, text)| {
+        .map(|(i, row)| {
             let mut spans = vec![
                 Span::raw("  "),
                 Span::styled(if i == 0 { label } else { "      " }, label_style),
             ];
-            match hl.as_mut() {
-                Some(hl) => spans.extend(
-                    highlight::highlight_line(hl, &format!("{text}\n"))
-                        .into_iter()
-                        .map(|span| {
-                            let content = span.content.trim_end_matches('\n').to_owned();
-                            Span::styled(content, span.style)
-                        })
-                        .filter(|span| !span.content.is_empty()),
-                ),
-                None => spans.push(Span::styled(text.to_owned(), value_style)),
-            }
+            spans.extend(row);
             Line::from(spans)
         })
         .collect()
+}
+
+/// Cuts {spans} into rows at most {width} columns wide, keeping each piece's
+/// style, so the expanded view can number source lines and still wrap them.
+fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>> {
+    let mut rows = vec![Vec::new()];
+    let mut used = 0;
+    for span in spans {
+        let mut chunk = String::new();
+        for ch in span.content.chars() {
+            let w = ch.width().unwrap_or(0);
+            if used > 0 && used + w > width {
+                if !chunk.is_empty() {
+                    let piece = Span::styled(std::mem::take(&mut chunk), span.style);
+                    rows.last_mut().expect("never empty").push(piece);
+                }
+                rows.push(Vec::new());
+                used = 0;
+            }
+            chunk.push(ch);
+            used += w;
+        }
+        if !chunk.is_empty() {
+            rows.last_mut()
+                .expect("never empty")
+                .push(Span::styled(chunk, span.style));
+        }
+    }
+    rows
+}
+
+fn wrapped_height(lines: &[Line<'static>], width: u16) -> u16 {
+    Paragraph::new(lines.to_vec())
+        .wrap(Wrap { trim: false })
+        .line_count(width) as u16
 }
 
 fn aligned_hint_rows(rows: &[&[(&str, &str)]]) -> Vec<Line<'static>> {
@@ -190,6 +253,14 @@ pub struct PermissionPrompt {
     queue: VecDeque<Request>,
     state: PromptState,
     buffer: TextBuffer,
+    expand_key: Key,
+    expanded: bool,
+    /// The expanded view's first body row. Cells because only drawing knows
+    /// how many rows the body wraps to and how many fit, and the keys that
+    /// page and clamp need both.
+    scroll: Cell<u16>,
+    page: Cell<u16>,
+    total: Cell<u16>,
 }
 
 impl Overlay for PermissionPrompt {
@@ -215,7 +286,78 @@ impl PermissionPrompt {
             queue: VecDeque::new(),
             state: PromptState::Normal,
             buffer: TextBuffer::new(String::new()),
+            expand_key: default_expand_key(),
+            expanded: false,
+            scroll: Cell::new(0),
+            page: Cell::new(0),
+            total: Cell::new(0),
         }
+    }
+
+    /// Takes `ui.permission_expand_key`. A key that does not parse, that the
+    /// host reserves, or that is already an answer keeps the default, since
+    /// the prompt must stay answerable either way.
+    pub fn with_expand_key(mut self, notation: &str) -> Self {
+        match parse_expand_key(notation) {
+            Ok(key) => self.expand_key = key,
+            Err(error) => tracing::warn!(
+                key = notation,
+                error,
+                "ignoring ui.permission_expand_key, using \"{DEFAULT_PERMISSION_EXPAND_KEY}\""
+            ),
+        }
+        self
+    }
+
+    fn set_expanded(&mut self, expanded: bool) {
+        self.expanded = expanded;
+        self.scroll.set(0);
+    }
+
+    fn max_scroll(&self) -> u16 {
+        self.total.get().saturating_sub(self.page.get())
+    }
+
+    /// Expand, collapse and scroll. Only in the plain prompt: a half-typed
+    /// deny reason takes every letter, and a confirm takes any key to cancel.
+    fn view_key(&mut self, key: KeyEvent) -> bool {
+        if self.state != PromptState::Normal {
+            return false;
+        }
+        if Key::from_event(key) == Some(self.expand_key) {
+            self.set_expanded(!self.expanded);
+            return true;
+        }
+        if !self.expanded
+            || key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return false;
+        }
+        let (scroll, page) = (self.scroll.get(), self.page.get().max(1));
+        let to = match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.set_expanded(false);
+                return true;
+            }
+            KeyCode::Char('j') | KeyCode::Down => scroll.saturating_add(1),
+            KeyCode::Char('k') | KeyCode::Up => scroll.saturating_sub(1),
+            KeyCode::PageDown => scroll.saturating_add(page),
+            KeyCode::PageUp => scroll.saturating_sub(page),
+            KeyCode::Char('g') | KeyCode::Home => 0,
+            KeyCode::Char('G') | KeyCode::End => u16::MAX,
+            _ => return false,
+        };
+        // Before the first draw nothing is known to clamp against; the draw
+        // clamps then.
+        let to = if self.total.get() > 0 {
+            to.min(self.max_scroll())
+        } else {
+            to
+        };
+        self.scroll.set(to);
+        true
     }
 
     pub fn push(
@@ -247,6 +389,7 @@ impl PermissionPrompt {
     fn reset_entry(&mut self) {
         self.state = PromptState::Normal;
         self.buffer = TextBuffer::new(String::new());
+        self.set_expanded(false);
     }
 
     /// A cancelled subagent has nothing left to answer with, so its asks leave
@@ -278,10 +421,13 @@ impl PermissionPrompt {
         if !self.is_open() {
             return None;
         }
-        let (state, buffer) = (&mut self.state, &mut self.buffer);
         if is_ctrl(&key) && key.code == KeyCode::Char('c') {
             return Some(PermissionAnswer::Deny);
         }
+        if self.view_key(key) {
+            return None;
+        }
+        let (state, buffer) = (&mut self.state, &mut self.buffer);
         if *state == PromptState::DenyEditing {
             return match key.code {
                 KeyCode::Enter => {
@@ -365,19 +511,22 @@ impl PermissionPrompt {
     }
 
     fn build_lines(&self) -> Vec<Line<'static>> {
+        let mut lines = self.header_lines();
+        lines.extend(self.scope_rows());
+        lines.extend(self.footer_lines());
+        lines
+    }
+
+    fn header_lines(&self) -> Vec<Line<'static>> {
         let Some(Request {
             tool,
-            scopes,
             subagent_id,
-            allow_scopes,
-            project_trusted,
             reason,
             ..
         }) = self.queue.front()
         else {
             return vec![];
         };
-        let (state, buffer) = (&self.state, &self.buffer);
         let t = theme::current();
         let label_style = t.tool_dim;
         let value_style = Style::new().fg(t.foreground);
@@ -404,11 +553,76 @@ impl PermissionPrompt {
                 Span::styled(format!("{waiting} {QUEUED_NOTICE}"), t.item_desc),
             ]));
         }
-        let shell = matches!(tool, ToolKey::Native(name) if &**name == "bash");
+        lines
+    }
+
+    fn scope_rows(&self) -> Vec<Line<'static>> {
+        let Some(Request { tool, scopes, .. }) = self.queue.front() else {
+            return vec![];
+        };
+        let t = theme::current();
+        let shell = is_shell(tool);
+        let mut lines = Vec::new();
         for (i, s) in scopes.iter().enumerate() {
             let label = if i == 0 { "scope " } else { "    + " };
-            lines.extend(scope_lines(label, s, shell, label_style, value_style));
+            lines.extend(scope_lines(
+                label,
+                s,
+                shell,
+                t.tool_dim,
+                Style::new().fg(t.foreground),
+            ));
         }
+        lines
+    }
+
+    /// The expanded body: every scope, a bash one laid out one step per line,
+    /// numbered by source line and wrapped to {width}.
+    fn expanded_rows(&self, width: u16) -> Vec<Line<'static>> {
+        let Some(Request { tool, scopes, .. }) = self.queue.front() else {
+            return vec![];
+        };
+        let t = theme::current();
+        let shell = is_shell(tool);
+        let text = scopes
+            .iter()
+            .map(|s| if shell { format_command(s) } else { s.clone() })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let rows = highlighted_rows(&text, shell, Style::new().fg(t.foreground));
+        let digits = rows.len().to_string().len();
+        let gutter = digits + 3;
+        let avail = (width as usize).saturating_sub(gutter).max(1);
+        let mut lines = Vec::with_capacity(rows.len());
+        for (n, row) in rows.into_iter().enumerate() {
+            for (k, piece) in wrap_spans(row, avail).into_iter().enumerate() {
+                let number = if k == 0 {
+                    format!("  {:>digits$} ", n + 1)
+                } else {
+                    " ".repeat(gutter)
+                };
+                let mut spans = vec![Span::styled(number, t.tool_dim)];
+                spans.extend(piece);
+                lines.push(Line::from(spans));
+            }
+        }
+        lines
+    }
+
+    fn footer_lines(&self) -> Vec<Line<'static>> {
+        let Some(Request {
+            allow_scopes,
+            project_trusted,
+            ..
+        }) = self.queue.front()
+        else {
+            return vec![];
+        };
+        let (state, buffer) = (&self.state, &self.buffer);
+        let t = theme::current();
+        let label_style = t.tool_dim;
+        let value_style = Style::new().fg(t.foreground);
+        let mut lines = Vec::new();
 
         if !allow_scopes.is_empty() {
             for (i, g) in allow_scopes.iter().enumerate() {
@@ -485,12 +699,25 @@ impl PermissionPrompt {
                 lines.push(hint_line(DENY_GUIDANCE_HINTS));
             }
             PromptState::Normal => {
-                let rows: &[&[(&str, &str)]] = if *project_trusted {
-                    &[HINT_ALLOW_ROW, HINT_DENY_ROW]
+                let (allow, deny) = if *project_trusted {
+                    (HINT_ALLOW_ROW, HINT_DENY_ROW)
                 } else {
-                    &[HINT_ALLOW_ROW_UNTRUSTED, HINT_DENY_ROW_UNTRUSTED]
+                    (HINT_ALLOW_ROW_UNTRUSTED, HINT_DENY_ROW_UNTRUSTED)
                 };
-                lines.extend(aligned_hint_rows(rows));
+                // The deny row has a free column, so the toggle costs no row.
+                let toggle = self.expand_key.notation();
+                let toggle_hint = if self.expanded {
+                    COLLAPSE_HINT
+                } else {
+                    EXPAND_HINT
+                };
+                let mut deny = deny.to_vec();
+                deny.push((toggle.as_str(), toggle_hint));
+                let mut rows: Vec<&[(&str, &str)]> = vec![allow, &deny];
+                if self.expanded {
+                    rows.push(EXPANDED_NAV_ROW);
+                }
+                lines.extend(aligned_hint_rows(&rows));
             }
         }
         lines.push(Line::raw(""));
@@ -501,17 +728,88 @@ impl PermissionPrompt {
         if !self.is_open() {
             return;
         }
-        let lines = self.build_lines();
         let t = theme::current();
-        render_form(&t, " Permission Required ", frame, area, lines, (0, 0));
+        if !self.expanded {
+            render_form(&t, TITLE, frame, area, self.build_lines(), (0, 0));
+            return;
+        }
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(t.panel_border)
+            .title_top(Line::from(TITLE).left_aligned())
+            .title_style(t.panel_title);
+        let inner = block.inner(area);
+
+        let header = self.header_lines();
+        let footer = self.footer_lines();
+        let [header_area, body_area, footer_area] = Layout::vertical([
+            Constraint::Length(wrapped_height(&header, inner.width)),
+            Constraint::Min(1),
+            Constraint::Length(wrapped_height(&footer, inner.width)),
+        ])
+        .areas(inner);
+
+        let body = self.expanded_rows(body_area.width);
+        let total = body.len().min(u16::MAX as usize) as u16;
+        self.total.set(total);
+        self.page.set(body_area.height);
+        let scroll = self.scroll.get().min(self.max_scroll());
+        self.scroll.set(scroll);
+
+        let block = if total > body_area.height {
+            let last = scroll.saturating_add(body_area.height).min(total);
+            block.title_top(Line::from(format!(" {}-{last}/{total} ", scroll + 1)).right_aligned())
+        } else {
+            block
+        };
+        frame.render_widget(block, area);
+        let style = Style::new().fg(t.foreground);
+        let wrapped = |lines| {
+            Paragraph::new(lines)
+                .style(style)
+                .wrap(Wrap { trim: false })
+        };
+        frame.render_widget(wrapped(header), header_area);
+        frame.render_widget(
+            Paragraph::new(body).style(style).scroll((scroll, 0)),
+            body_area,
+        );
+        frame.render_widget(wrapped(footer), footer_area);
     }
 
     pub fn height(&self, width: u16) -> u16 {
         let inner_width = width.saturating_sub(2);
-        let lines = self.build_lines();
-        let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-        para.line_count(inner_width) as u16 + 2
+        let rows = if self.expanded {
+            let mut lines = self.header_lines();
+            lines.extend(self.footer_lines());
+            wrapped_height(&lines, inner_width)
+                .saturating_add(self.expanded_rows(inner_width).len() as u16)
+        } else {
+            wrapped_height(&self.build_lines(), inner_width)
+        };
+        rows.saturating_add(2)
     }
+}
+
+fn default_expand_key() -> Key {
+    Key::parse(DEFAULT_PERMISSION_EXPAND_KEY).expect("default expand key parses")
+}
+
+fn parse_expand_key(notation: &str) -> Result<Key, String> {
+    let key = Key::parse(notation)?;
+    if key.is_reserved() {
+        return Err(format!("{notation} is reserved by the host"));
+    }
+    let event = KeyEvent::from(key);
+    if !event
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && matches!(event.code, KeyCode::Char(c) if ANSWER_KEYS.contains(&c))
+    {
+        return Err(format!("{notation} already answers the prompt"));
+    }
+    Ok(key)
 }
 
 #[cfg(test)]
@@ -522,9 +820,9 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        CONFIRM_ALLOW_PROJECT_HINTS, CONFIRM_ALLOW_PROJECT_SESSION_HINTS,
-        CONFIRM_DENY_PROJECT_HINTS, CONFIRM_DENY_PROJECT_SESSION_HINTS, Overlay, PermissionPrompt,
-        PromptState, QUEUED_NOTICE, UNTRUSTED_DURABLE_ANSWER, UNTRUSTED_NOTICE,
+        COLLAPSE_HINT, CONFIRM_ALLOW_PROJECT_HINTS, CONFIRM_ALLOW_PROJECT_SESSION_HINTS,
+        CONFIRM_DENY_PROJECT_HINTS, CONFIRM_DENY_PROJECT_SESSION_HINTS, EXPAND_HINT, Overlay,
+        PermissionPrompt, PromptState, QUEUED_NOTICE, UNTRUSTED_DURABLE_ANSWER, UNTRUSTED_NOTICE,
     };
 
     const MAIN_ID: &str = "id";
@@ -811,5 +1109,194 @@ mod tests {
                 .then(|| text.trim_start()[WHY_LABEL.len()..].trim().to_owned())
         });
         assert_eq!(why_row.as_deref(), reason);
+    }
+
+    fn push_bash(prompt: &mut PermissionPrompt, command: &str) {
+        prompt.push(
+            MAIN_ID.into(),
+            ToolKey::native("bash"),
+            vec![command.into()],
+            None,
+            true,
+            None,
+        );
+    }
+
+    /// The drawn screen, one string per row with trailing blanks trimmed.
+    fn screen(prompt: &PermissionPrompt, width: u16, height: u16) -> Vec<String> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| prompt.view(f, f.area())).unwrap();
+        let buf = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    fn has_row(rows: &[String], needle: &str) -> bool {
+        rows.iter().any(|r| r.contains(needle))
+    }
+
+    const LONG_LINES: usize = 40;
+
+    fn long_script() -> String {
+        (1..=LONG_LINES)
+            .map(|n| format!("echo line{n}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn collapsed_footer_offers_the_expand_key() {
+        let prompt = open_prompt();
+        let text = rendered(&prompt);
+        assert!(text.contains(&format!("  v {EXPAND_HINT}")), "{text}");
+    }
+
+    #[test]
+    fn expanded_view_numbers_the_formatted_command() {
+        let mut prompt = PermissionPrompt::new();
+        push_bash(&mut prompt, "cd a && make 'x | y' | tee log");
+        assert_eq!(answer(&mut prompt, key(KeyCode::Char('v'))), None);
+        assert!(prompt.expanded);
+
+        let rows = screen(&prompt, 60, 20);
+        assert!(has_row(&rows, "│  1 cd a &&"), "{rows:#?}");
+        assert!(has_row(&rows, "│  2   make 'x | y' |"), "{rows:#?}");
+        assert!(has_row(&rows, "│  3   tee log"), "{rows:#?}");
+        assert!(has_row(&rows, COLLAPSE_HINT), "{rows:#?}");
+    }
+
+    #[test]
+    fn expanded_view_wraps_long_lines_under_one_number() {
+        let mut prompt = PermissionPrompt::new();
+        push_bash(&mut prompt, &format!("echo {}", "x".repeat(50)));
+        prompt.handle_key(key(KeyCode::Char('v')));
+        let rows = prompt.expanded_rows(30);
+        let texts: Vec<String> = rows
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(texts.len() > 1, "{texts:#?}");
+        assert!(texts[0].starts_with("  1 echo "));
+        assert!(texts[1].starts_with("    x"), "{texts:#?}");
+        assert!(texts.iter().all(|t| t.chars().count() <= 30), "{texts:#?}");
+    }
+
+    #[test_case(KeyCode::Char('v') ; "toggle_key")]
+    #[test_case(KeyCode::Esc ; "esc")]
+    #[test_case(KeyCode::Char('q') ; "q")]
+    fn collapse_keys_close_the_expanded_view(code: KeyCode) {
+        let mut prompt = open_prompt();
+        prompt.handle_key(key(KeyCode::Char('v')));
+        assert_eq!(answer(&mut prompt, key(code)), None);
+        assert!(!prompt.expanded);
+        assert!(prompt.is_open());
+    }
+
+    #[test]
+    fn expanded_view_scrolls() {
+        let mut prompt = PermissionPrompt::new();
+        push_bash(&mut prompt, &long_script());
+        prompt.handle_key(key(KeyCode::Char('v')));
+        let (w, h) = (60, 16);
+
+        let rows = screen(&prompt, w, h);
+        assert!(has_row(&rows, " 1 echo line1"), "{rows:#?}");
+        assert!(!has_row(&rows, &format!("echo line{LONG_LINES}")));
+        let page = prompt.page.get();
+        assert!(page > 0 && (page as usize) < LONG_LINES);
+
+        prompt.handle_key(key(KeyCode::Char('j')));
+        prompt.handle_key(key(KeyCode::Down));
+        assert_eq!(prompt.scroll.get(), 2);
+        prompt.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(prompt.scroll.get(), 1);
+        prompt.handle_key(key(KeyCode::PageDown));
+        assert_eq!(prompt.scroll.get(), 1 + page);
+        prompt.handle_key(key(KeyCode::PageUp));
+        assert_eq!(prompt.scroll.get(), 1);
+
+        prompt.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        assert_eq!(prompt.scroll.get(), LONG_LINES as u16 - page);
+        let rows = screen(&prompt, w, h);
+        assert!(
+            has_row(&rows, &format!("echo line{LONG_LINES}")),
+            "{rows:#?}"
+        );
+        assert!(has_row(&rows, &format!("/{LONG_LINES} ")), "{rows:#?}");
+
+        prompt.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(
+            prompt.scroll.get(),
+            LONG_LINES as u16 - page,
+            "clamped at the bottom"
+        );
+        prompt.handle_key(key(KeyCode::Char('g')));
+        assert_eq!(prompt.scroll.get(), 0);
+    }
+
+    #[test]
+    fn answers_still_work_while_expanded() {
+        let mut prompt = open_prompt();
+        prompt.handle_key(key(KeyCode::Char('v')));
+        assert_eq!(
+            answer(&mut prompt, key(KeyCode::Char('y'))),
+            Some(PermissionAnswer::AllowOnce)
+        );
+    }
+
+    /// A deny reason takes every letter, scroll and toggle keys included.
+    #[test]
+    fn deny_reason_typed_while_expanded_keeps_its_letters() {
+        let mut prompt = open_prompt();
+        prompt.handle_key(key(KeyCode::Char('v')));
+        prompt.handle_key(key(KeyCode::Char('n')));
+        for c in "vjqg".chars() {
+            prompt.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(prompt.buffer.value(), "vjqg");
+        assert!(prompt.expanded);
+        prompt.handle_key(key(KeyCode::Esc));
+        assert_eq!(prompt.state, PromptState::Normal);
+        assert!(prompt.expanded, "Esc leaves the reason, not the view");
+    }
+
+    #[test]
+    fn the_next_request_starts_collapsed() {
+        let mut prompt = open_prompt();
+        push_subagent_ask(&mut prompt);
+        prompt.handle_key(key(KeyCode::Char('v')));
+        prompt.handle_key(key(KeyCode::Char('y')));
+        assert!(prompt.is_open());
+        assert!(!prompt.expanded);
+    }
+
+    #[test]
+    fn expanding_asks_for_more_height() {
+        let mut prompt = PermissionPrompt::new();
+        push_bash(&mut prompt, "a && b && c && d");
+        let collapsed = prompt.height(80);
+        prompt.handle_key(key(KeyCode::Char('v')));
+        assert!(prompt.height(80) > collapsed);
+    }
+
+    #[test_case("<C-e>", KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL), true ; "ctrl_key")]
+    #[test_case("x", key(KeyCode::Char('x')), true ; "letter")]
+    #[test_case("y", key(KeyCode::Char('v')), true ; "answer_key_keeps_default")]
+    #[test_case("<C-c>", key(KeyCode::Char('v')), true ; "reserved_key_keeps_default")]
+    #[test_case("<nope>", key(KeyCode::Char('v')), true ; "bad_notation_keeps_default")]
+    #[test_case("x", key(KeyCode::Char('v')), false ; "rebound_default_is_free")]
+    fn expand_key_follows_config(notation: &str, press: KeyEvent, expands: bool) {
+        let mut prompt = PermissionPrompt::new().with_expand_key(notation);
+        open_trusted(&mut prompt, true);
+        prompt.handle_key(press);
+        assert_eq!(prompt.expanded, expands);
     }
 }
