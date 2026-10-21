@@ -27,8 +27,8 @@ use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::session::Resumed;
 use maki_agent::{
-    AgentConfig, AgentEvent, CancelToken, CompactReason, Envelope, HostPrompt, McpCommand,
-    McpConfigErrors, McpHandle, SessionMailbox, Transcript, UiWaker, mcp,
+    AgentConfig, AgentEvent, CancelToken, CompactReason, Envelope, HostPrompt, ImageSource,
+    McpCommand, McpConfigErrors, McpHandle, SessionMailbox, Transcript, UiWaker, mcp,
 };
 use maki_config::project::TrustState;
 use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
@@ -1790,7 +1790,7 @@ impl<'t> EventLoop<'t> {
                 prompt,
                 focus,
             } => self.create_session(*transcript, prompt, focus, reply_tx),
-            SessionRequest::Prompt { id, text } => {
+            SessionRequest::Prompt { id, text, images } => {
                 let idx = match id {
                     None => Ok(self.focused),
                     Some(id) => parse_session_id(&id).and_then(|id| {
@@ -1798,7 +1798,7 @@ impl<'t> EventLoop<'t> {
                             .ok_or_else(|| format!("{NOT_LIVE_ERR}: {id}"))
                     }),
                 };
-                let _ = reply_tx.send(idx.and_then(|idx| self.submit_text(idx, text)));
+                let _ = reply_tx.send(idx.and_then(|idx| self.submit_text(idx, text, images)));
             }
             SessionRequest::Focus { id } => match parse_session_id(&id) {
                 Ok(id) => self.focus_session(id, reply_tx),
@@ -1937,11 +1937,8 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    fn submit_text(&mut self, idx: usize, text: String) -> UiReply {
-        let msg = QueuedMessage {
-            text,
-            images: Vec::new(),
-        };
+    fn submit_text(&mut self, idx: usize, text: String, images: Vec<ImageSource>) -> UiReply {
+        let msg = QueuedMessage { text, images };
         match self.sessions[idx].app.submit_prompt(msg) {
             SubmitOutcome::Started(actions) => {
                 self.dispatch(idx, actions);
@@ -2013,7 +2010,7 @@ impl<'t> EventLoop<'t> {
             self.sessions[idx].app.flash(reason);
         }
         if let Some(prompt) = prompt {
-            let _ = self.submit_text(idx, prompt);
+            let _ = self.submit_text(idx, prompt, Vec::new());
         }
         if focus {
             self.set_focused(idx);

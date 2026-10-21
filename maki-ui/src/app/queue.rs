@@ -8,6 +8,7 @@ use maki_agent::{
 };
 use maki_lua::agent_autocmd::HostEvent;
 
+use super::image_paste::IMAGE_NOT_SUPPORTED_MSG;
 use super::{Action, App, Status};
 
 use crate::agent::shared_queue::{Compaction, QueueItem, QueueSender, QueuedInput};
@@ -130,6 +131,9 @@ impl App {
     pub(crate) fn submit_prompt(&mut self, msg: QueuedMessage) -> SubmitOutcome {
         if msg.text.trim().is_empty() && msg.images.is_empty() {
             return SubmitOutcome::Rejected(EMPTY_PROMPT_ERR);
+        }
+        if !msg.images.is_empty() && !self.state.model.supports_vision() {
+            return SubmitOutcome::Rejected(IMAGE_NOT_SUPPORTED_MSG);
         }
         if self.status == Status::Streaming {
             if self.queue_and_notify(msg) {
