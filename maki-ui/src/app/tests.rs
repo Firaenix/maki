@@ -899,6 +899,32 @@ fn submit_prompt_rejects(mk: fn() -> App, text: &str, expected: &str) {
     }
 }
 
+fn image_msg(text: &str) -> QueuedMessage {
+    QueuedMessage {
+        text: text.into(),
+        images: vec![ImageSource::new(ImageMediaType::Png, Arc::from("dGVzdA=="))],
+    }
+}
+
+#[test]
+fn submit_prompt_starts_blank_text_with_images() {
+    let mut app = test_app();
+    assert!(matches!(
+        app.submit_prompt(image_msg("  ")),
+        SubmitOutcome::Started(_)
+    ));
+}
+
+#[test]
+fn submit_prompt_rejects_images_without_vision() {
+    let mut app = test_app();
+    app.state.model.supports_vision_override = Some(false);
+    match app.submit_prompt(image_msg("look")) {
+        SubmitOutcome::Rejected(e) => assert_eq!(e, image_paste::IMAGE_NOT_SUPPORTED_MSG),
+        _ => panic!("expected rejection"),
+    }
+}
+
 fn streaming_app_without_queue() -> App {
     let dir = StateDir::from_path(env::temp_dir());
     let mut app = build_app(dir.clone(), Arc::new(test_writer(dir)));

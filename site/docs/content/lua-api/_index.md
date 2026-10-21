@@ -5029,10 +5029,22 @@ Requires the `agent` and `session_write` [plugin permissions](#plugin-permission
 
 **Parameters:**
 
-- `{text}` (`string`) The prompt to send. Must not be blank.
+- `{text}` (`string`) The prompt to send. Must not be blank unless images
+
+  are attached.
+
 - `{opts?}` (`table?`) Optional fields: session (string) id of a live
 
-  session; defaults to the focused one.
+  session; defaults to the focused one. images (table) up to 8
+
+
+  `{ media_type, data }` entries, where media_type is "image/png",
+
+
+  "image/jpeg", "image/gif", or "image/webp" and data is base64 without
+
+
+  a `data:` prefix. Fails if the session's model has no vision support.
 
 
 **Returns:** (`string|nil`, `string|nil`) "started" or "queued", or nil and an error.
@@ -5041,6 +5053,7 @@ Requires the `agent` and `session_write` [plugin permissions](#plugin-permission
 
 ```lua
 local state, err = maki.session.prompt("run the tests", { session = id })
+maki.session.prompt("", { images = { { media_type = "image/png", data = png_b64 } } })
 ```
 
 ---
