@@ -10,7 +10,7 @@ use crate::repaint::Dirty;
 
 use super::{App, Msg};
 
-const IMAGE_NOT_SUPPORTED_MSG: &str = "Model does not support image input";
+pub(super) const IMAGE_NOT_SUPPORTED_MSG: &str = "Model does not support image input";
 pub(super) const READING_CLIPBOARD_MSG: &str = "Reading clipboard...";
 const NO_TEXT_NO_VISION_MSG: &str =
     "clipboard has no text, and the model does not support image input";
