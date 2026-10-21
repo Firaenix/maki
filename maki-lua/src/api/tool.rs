@@ -4,8 +4,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use flume::Sender;
 use maki_agent::agent::tool_dispatch::routed_view;
 use maki_agent::permissions::is_universal_scope;
@@ -19,8 +17,7 @@ use maki_agent::tools::{
     ToolReach, is_tool_enabled, timeout_annotation,
 };
 use maki_agent::{
-    AgentEvent, BufferSnapshot, CallScope, ImageMediaType, ImageSource, SharedBuf, TextOutput,
-    ToolOutput,
+    AgentEvent, BufferSnapshot, CallScope, ImageSource, SharedBuf, TextOutput, ToolOutput,
 };
 use maki_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
 use maki_lua_macro::{lua_fn, lua_table};
@@ -42,6 +39,7 @@ use crate::api::util::command::{
 };
 use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json};
 use crate::api::util::ctx::{LuaCtx, RestoreCtx};
+use crate::api::util::image::image_from_table;
 use crate::api::util::pair::{Pair, try_pair};
 use crate::plugin_permissions::{
     MANIFEST_FILE, Permission, PluginPermissions, PluginReach, require,
@@ -2084,28 +2082,7 @@ fn extract_image(t: &mlua::Table) -> Result<Option<ImageSource>, String> {
             ));
         }
     };
-    let media_type = entry
-        .get::<String>("media_type")
-        .map_err(|_| "tool image is missing 'media_type'".to_owned())?;
-    let media_type = ImageMediaType::from_mime(&media_type).ok_or_else(|| {
-        let supported: Vec<&str> = ImageMediaType::ALL.iter().map(|m| m.mime()).collect();
-        format!(
-            "unsupported tool image media_type '{media_type}' ({})",
-            supported.join(", ")
-        )
-    })?;
-    let data = entry
-        .get::<String>("data")
-        .map_err(|_| "tool image is missing base64 'data'".to_owned())?;
-    // Bad base64 would land in history and fail every later request;
-    // validate once at the boundary.
-    if data.is_empty() {
-        return Err("tool image 'data' is empty".to_owned());
-    }
-    BASE64
-        .decode(data.as_bytes())
-        .map_err(|e| format!("tool image 'data' is not valid base64: {e}"))?;
-    Ok(Some(ImageSource::new(media_type, Arc::from(data))))
+    image_from_table(&entry, "tool image").map(Some)
 }
 
 pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
@@ -2151,6 +2128,7 @@ mod tests {
 
         assert_eq!(background_params(&schema, offered), expected);
     }
+    use maki_agent::ImageMediaType;
 
     const LEGACY_TEXT: &[u8] = b"caf\xe9";
     const DISPLAY_TEXT: &str = "caf\u{fffd}";

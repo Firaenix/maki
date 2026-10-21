@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use maki_agent::agent::SessionExport;
-use maki_agent::{Envelope, SharedBuf, SubagentInfo, TaskEnd, Transcript};
+use maki_agent::{Envelope, ImageSource, SharedBuf, SubagentInfo, TaskEnd, Transcript};
 use maki_storage::id::MakiId;
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
@@ -494,6 +494,7 @@ pub enum SessionRequest {
     Prompt {
         id: Option<String>,
         text: String,
+        images: Vec<ImageSource>,
     },
     Focus {
         id: String,
