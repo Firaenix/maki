@@ -12,7 +12,7 @@ use maki_agent::agent::{SessionExport, live_header, live_history, live_snapshot}
 use maki_agent::session::{StoredSession, store_new};
 use maki_agent::{SessionMailbox, Transcript};
 use maki_lua_macro::{lua_fn, lua_table};
-use maki_providers::{ContentBlock, Message, Role};
+use maki_providers::{ContentBlock, ImageSource, Message, Role};
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
 use mlua::{IntoLua, Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
@@ -24,6 +24,7 @@ use crate::api::util::command::{
     NO_UI_ERR, SessionRequest, UiAction, ui_json_roundtrip, ui_reachable, ui_roundtrip,
 };
 use crate::api::util::convert::{TableExt, json_to_lua, json_to_lua_exact, lua_to_json};
+use crate::api::util::image::image_from_table;
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::plugin_permissions::{Permission, PluginPermissions, require};
 use crate::session_snapshot::SessionSnapshot;
@@ -69,6 +70,7 @@ const DOCUMENT_KEYS: [&str; 8] = [
     "facts",
     MESSAGES_KEY,
 ];
+const MAX_PROMPT_IMAGES: usize = 8;
 
 /// Rewind and fork put a user turn back in the chat input, and Enter runs it
 /// as if a plugin that could send prompts wrote it. So a turn that runs
@@ -702,12 +704,17 @@ async fn new(
 /// all sent to the model verbatim. If the session is currently streaming,
 /// the prompt is queued and picked up when the agent reaches it.
 ///
-/// @param text string The prompt to send. Must not be blank.
+/// @param text string The prompt to send. Must not be blank unless images
+///   are attached.
 /// @param opts table? Optional fields: session (string) id of a live
-///   session; defaults to the focused one.
+///   session; defaults to the focused one. images (table) up to 8
+///   `{ media_type, data }` entries, where media_type is "image/png",
+///   "image/jpeg", "image/gif", or "image/webp" and data is base64 without
+///   a `data:` prefix. Fails if the session's model has no vision support.
 /// @return (string|nil, string|nil) "started" or "queued", or nil and an error.
 /// @example
 /// local state, err = maki.session.prompt("run the tests", { session = id })
+/// maki.session.prompt("", { images = { { media_type = "image/png", data = png_b64 } } })
 #[lua_fn(guard = [Agent, SessionWrite])]
 async fn prompt(
     lua: Lua,
@@ -715,11 +722,43 @@ async fn prompt(
     text: String,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
-    let id = match opts {
-        Some(opts) => opts.opt("session")?,
-        None => None,
+    let (id, images) = match opts {
+        Some(opts) => (opts.opt("session")?, prompt_images(&opts)?),
+        None => (None, Vec::new()),
     };
-    roundtrip(lua, tx, SessionRequest::Prompt { id, text }).await
+    roundtrip(lua, tx, SessionRequest::Prompt { id, text, images }).await
+}
+
+fn prompt_images(opts: &Table) -> LuaResult<Vec<ImageSource>> {
+    let images = match opts.get::<Value>("images")? {
+        Value::Nil => return Ok(Vec::new()),
+        Value::Table(images) => images,
+        other => {
+            return Err(mlua::Error::runtime(format!(
+                "images must be a list, got {}",
+                other.type_name()
+            )));
+        }
+    };
+    let len = images.raw_len();
+    if len > MAX_PROMPT_IMAGES {
+        return Err(mlua::Error::runtime(format!(
+            "at most {MAX_PROMPT_IMAGES} images per prompt, got {len}"
+        )));
+    }
+    (1..=len)
+        .map(|i| {
+            let what = format!("images[{i}]");
+            match images.raw_get::<Value>(i)? {
+                Value::Table(entry) => image_from_table(&entry, &what),
+                other => Err(format!(
+                    "{what} must be a table {{ media_type, data }}, got {}",
+                    other.type_name()
+                )),
+            }
+            .map_err(mlua::Error::runtime)
+        })
+        .collect()
 }
 
 /// Reports {text} to a live session without creating a user turn. The
@@ -924,29 +963,82 @@ mod tests {
         assert_eq!(val.get::<String>("focused").unwrap(), "abc");
     }
 
-    #[test_case("return session.prompt('hi', { session = 'abc' })", Some("abc") ; "explicit_session_id")]
-    #[test_case("return session.prompt('hi')", None ; "defaults_to_focused")]
-    #[tokio::test]
-    async fn prompt_forwards_text_and_session_id(code: &str, expected_id: Option<&str>) {
+    async fn run_prompt(code: &str) -> (Option<String>, String, Vec<ImageSource>) {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_session(Some(tx));
-        let expected_id = expected_id.map(str::to_owned);
         let checker = std::thread::spawn(move || {
             let Ok(UiAction::Session {
-                req: SessionRequest::Prompt { id, text },
+                req: SessionRequest::Prompt { id, text, images },
                 reply_tx,
             }) = rx.recv()
             else {
                 panic!("expected prompt request");
             };
-            assert_eq!(id, expected_id);
-            assert_eq!(text, "hi");
             reply_tx.send(Ok(json!("queued"))).unwrap();
+            (id, text, images)
         });
         let (val, err): (String, Option<String>) = lua.load(code).eval_async().await.unwrap();
-        checker.join().unwrap();
         assert_eq!(err, None);
         assert_eq!(val, "queued");
+        checker.join().unwrap()
+    }
+
+    #[test_case("return session.prompt('hi', { session = 'abc' })", Some("abc") ; "explicit_session_id")]
+    #[test_case("return session.prompt('hi')", None ; "defaults_to_focused")]
+    #[tokio::test]
+    async fn prompt_forwards_text_and_session_id(code: &str, expected_id: Option<&str>) {
+        let (id, text, images) = run_prompt(code).await;
+        assert_eq!(id.as_deref(), expected_id);
+        assert_eq!(text, "hi");
+        assert!(images.is_empty());
+    }
+
+    #[test_case("hi" ; "with_text")]
+    #[test_case("  " ; "blank_text")]
+    #[tokio::test]
+    async fn prompt_forwards_images(text: &str) {
+        let code = format!(
+            r#"return session.prompt('{text}', {{ images = {{
+                {{ media_type = 'image/png', data = '{IMAGE_DATA}' }},
+                {{ media_type = 'image/webp', data = '{IMAGE_DATA}' }},
+            }} }})"#
+        );
+        let (_, sent, images) = run_prompt(&code).await;
+        assert_eq!(sent, text);
+        let got: Vec<_> = images.iter().map(|i| (i.media_type, &*i.data)).collect();
+        assert_eq!(
+            got,
+            [
+                (ImageMediaType::Png, IMAGE_DATA),
+                (ImageMediaType::Webp, IMAGE_DATA)
+            ]
+        );
+    }
+
+    #[test_case("images = 'x'", "images must be a list" ; "images_not_a_table")]
+    #[test_case("images = { 'x' }", "images[1] must be a table" ; "entry_not_a_table")]
+    #[test_case(
+        "images = { e, { media_type = 'image/bmp', data = 'aGk=' } }",
+        "unsupported images[2] media_type 'image/bmp'" ; "bad_mime")]
+    #[test_case(
+        "images = { { media_type = 'image/png', data = '!!!' } }",
+        "images[1] 'data' is not valid base64" ; "bad_base64")]
+    #[test_case(
+        "images = { { media_type = 'image/png' } }",
+        "images[1] is missing base64 'data'" ; "missing_data")]
+    #[test_case(
+        "images = { e, e, e, e, e, e, e, e, e }",
+        "at most 8 images per prompt, got 9" ; "too_many")]
+    #[tokio::test]
+    async fn prompt_rejects_invalid_images(opts: &str, expected: &str) {
+        let (tx, _rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_session(Some(tx));
+        let code = format!(
+            "local e = {{ media_type = 'image/png', data = 'aGk=' }}
+             return session.prompt('hi', {{ {opts} }})"
+        );
+        let err = lua.load(code).exec_async().await.unwrap_err();
+        assert!(err.to_string().contains(expected), "got: {err}");
     }
 
     /// Mode is per session like the plan it drives, so a row handler firing
