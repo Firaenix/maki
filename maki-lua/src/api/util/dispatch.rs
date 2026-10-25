@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use mlua::{FromLuaMulti, Function, IntoLuaMulti, Lua};
 
-use crate::plugin_status::record_error;
+use crate::plugin_status::record_slot_error;
 use crate::runtime::{TaskHandle, lock_cell, strip_traceback};
 
 pub const MAX_HOOK_DEPTH: u8 = 8;
@@ -94,8 +94,8 @@ impl Drop for DepthGuard {
     }
 }
 
-/// Calls a plugin callback so its failure stays its own: errors are logged
-/// with plugin and seam name, then swallowed.
+/// Calls a slot layer so its failure stays its own: errors are logged and
+/// recorded against the plugin under the slot's name, then swallowed.
 ///
 /// Runs in the caller's task, not a detached one. Every seam using this waits
 /// for the answer, so the caller's cancellation and deadline belong on the
@@ -105,15 +105,13 @@ pub(crate) async fn call_swallowing<R: FromLuaMulti>(
     lua: &Lua,
     func: &Function,
     args: impl IntoLuaMulti,
-    seam: &str,
+    slot: &str,
     plugin: &str,
 ) -> Option<R> {
     match func.call_async::<R>(args).await {
         Ok(r) => Some(r),
         Err(e) => {
-            let error = strip_traceback(&e);
-            tracing::warn!(seam, plugin, error = %error, "plugin callback failed");
-            record_error(lua, plugin, seam, error);
+            record_slot_error(lua, plugin, slot, strip_traceback(&e));
             None
         }
     }

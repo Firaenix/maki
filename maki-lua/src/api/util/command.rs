@@ -34,6 +34,9 @@ pub struct LuaCommandInfo {
     /// this plugin's reach and pick the arguments.
     pub reach: PluginReach,
     pub max_args: usize,
+    /// Declared by the plugin: the handler only opens a picker or modal, so
+    /// a front end that cannot show one should not offer it.
+    pub interactive: bool,
 }
 
 #[derive(Clone, Default)]
@@ -145,6 +148,7 @@ pub(crate) struct CommandEntry {
     pub description: Arc<str>,
     pub reach: PluginReach,
     pub max_args: usize,
+    pub interactive: bool,
 }
 
 pub(crate) type CommandHandlerMap = HashMap<Arc<str>, HashMap<Arc<str>, CommandEntry>>;
@@ -159,6 +163,7 @@ pub(crate) fn publish_command_snapshot(map: &CommandHandlerMap, writer: &LuaComm
                 plugin: Arc::clone(plugin),
                 reach: entry.reach.clone(),
                 max_args: entry.max_args,
+                interactive: entry.interactive,
             })
         })
         .collect();
@@ -435,6 +440,15 @@ pub enum WinCommand {
     Close,
 }
 
+/// What `maki.session.prompt` answers: the text started a turn, or waits
+/// behind the one running.
+pub const PROMPT_STARTED: &str = "started";
+pub const PROMPT_QUEUED: &str = "queued";
+/// What `maki.session.cancel` answers: a turn was interrupted, or there was
+/// none to interrupt. Both are successes, so neither is a `(nil, err)`.
+pub const CANCEL_CANCELLED: &str = "cancelled";
+pub const CANCEL_IDLE: &str = "idle";
+
 pub enum SessionRequest {
     List,
     Live,
@@ -482,7 +496,7 @@ pub enum SessionRequest {
         title: String,
     },
     /// Interrupts the running turn of the live session {id} names, or the
-    /// focused one. The UI replies whether a turn was running.
+    /// focused one. The UI replies [`CANCEL_CANCELLED`] or [`CANCEL_IDLE`].
     Cancel {
         id: Option<String>,
     },
@@ -753,9 +767,10 @@ pub enum UiAction {
         session: Option<String>,
         reply_tx: flume::Sender<Result<(), String>>,
     },
-    /// Every slash command the focused session's palette offers, as a JSON
-    /// array.
+    /// Every slash command the focused session's palette offers to `caller`,
+    /// as a JSON array.
     ListCommands {
+        caller: PluginReach,
         reply_tx: flume::Sender<UiReply>,
     },
     /// An event from a subagent session a plugin opened on a chat session,
@@ -885,6 +900,7 @@ mod tests {
             description: Arc::from(desc),
             reach: PluginReach::new(PluginPermissions::trusted()),
             max_args: 0,
+            interactive: false,
         }
     }
 

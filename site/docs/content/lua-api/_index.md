@@ -612,6 +612,11 @@ browsing memory files or toggling settings.
     `opts.fargs` is the same split into words, and
     `opts.session` is the id of the session it runs
     in.
+  - `interactive` (`boolean`) Optional, default false. Set it when the handler
+    only opens a picker or modal. `maki.api.list_commands`
+    reports it, so a front end that cannot show one
+    (a remote client, a headless session) can leave
+    the command out instead of running it to no effect.
 
 **Example:**
 
@@ -826,9 +831,12 @@ registered and the errors it raised recently.
 Covers bundled plugins (including disabled ones), installed packages
 (including disabled and never-activated `opt/` ones, and ones discovery
 refused), and `init.lua` files. `errors` keeps the 20 newest runtime
-errors, oldest first; `seam` names where the error surfaced, such as
+errors, oldest first; `seam` names where the error surfaced: one of
 `"autocmd"`, `"command"`, `"keybind"`, `"defer_fn"`, `"async"`,
-`"hint"`, `"header"`, `"describe"`, `"watchdog"` or a slot name.
+`"job"`, `"cancel_hook"`, `"hint"`, `"header"`, `"describe"`,
+`"permission_scopes"`, `"start"`, `"restore"`, `"click"`,
+`"buf_change"`, `"plan_row"`, `"notify"`, `"watchdog"`, or the name
+of the slot a layer failed on.
 
 **Returns:** (`table[]`) Entries sorted by name: { name, source = "bundled"|"package"|"init", path?, enabled, loaded, load_error?, errors = { { t, seam, msg } }, commands = string[], tools = string[], autocmds = integer }.
 
@@ -872,13 +880,16 @@ only run when you type them. [Commands](/docs/commands/#plugin-access)
 lists what each one needs.
 
 Pass `opts.session` to run it in a background tab instead of the focused
-one; a Lua handler sees that id as its own `opts.session`.
+one; a Lua handler sees that id as its own `opts.session`. Called from
+inside a command handler without one, it stays in the handler's session,
+so an alias sent to a background tab does not reset the one in view.
 
 **Parameters:**
 
 - `{cmdline}` (`string`) Command line, e.g. `"/new"` or `"/cd ~/src"`.
 - `{opts?}` (`table?`) Options:
-  - `session` (`string`) id of a live session, defaults to the focused one.
+  - `session` (`string`) id of a live session. Defaults to the session the
+    calling command handler runs in, else the focused one.
 
 **Returns:** (`boolean|nil`, `string|nil`) `true` once dispatched, or nil and an error message for an unknown or denied command.
 
@@ -906,17 +917,19 @@ maki.api.register_command({
 maki.api.list_commands()
 ```
 
-Lists every slash command the input bar offers: built-ins, custom
-`/project:` and `/user:` commands, MCP prompts, and plugin commands, in
-the order the palette shows them.
+Lists every slash command `maki.api.run_command` accepts from this
+plugin: built-ins, custom `/project:` and `/user:` commands, MCP
+prompts, and plugin commands, in the order the palette shows them.
+Commands outside the calling plugin's grants, and the few that only run
+when the user types them, are left out, so every entry here runs.
 
-Each entry is `{ name, description, source, plugin?, max_args, bang,
+Each entry is `{ name, description, source, plugin?, max_args,
 argument_hint?, interactive }`. `source` is `"builtin"`, `"custom"`,
 `"mcp"` or `"lua"`, and `plugin` names the plugin that registered a
 `"lua"` one. `max_args` is -1 for a command that takes any number of
-arguments. `bang` is true when the command reads a trailing `!`.
-`interactive` marks commands that only open a picker or modal, such as
-`/model`, which do nothing useful when nobody is looking at the terminal.
+arguments. `interactive` marks commands that only open a picker or
+modal, such as `/model`, which do nothing useful when nobody is looking
+at the terminal; plugins declare it in `maki.api.register_command`.
 
 **Returns:** (`table[]|nil`, `string|nil`) The command entries, or nil and an error when no UI is attached.
 
@@ -4129,9 +4142,10 @@ unless `opts.session` names another. Fields you leave out stay as they
 are, so this doubles as a thinking-only switch. Answers with the new
 state, in the same shape `get` returns.
 
-A new spec also becomes the model the next `maki` starts on, like picking
-it in `/model`, unless `opts.persist` is false. Naming a session turns
-that off by default, since steering one tab is not choosing a default.
+A new spec or thinking level also becomes what the next `maki` starts on,
+like picking it in `/model` or `/thinking`, unless `opts.persist` is
+false. Naming a session turns that off by default, since steering one tab
+is not choosing a default. `fast` is only ever remembered per session.
 
 Requires the `session_settings` [plugin permission](#plugin-permissions).
 
@@ -4146,7 +4160,7 @@ Requires the `session_settings` [plugin permission](#plugin-permissions).
   - `fast` (`boolean`) Anthropic fast mode.
 - `{opts?}` (`table?`) Options:
   - `session` (`string`) id of a live session, defaults to the focused one.
-  - `persist` (`boolean`) remember a new spec as the default; true unless `session` is set.
+  - `persist` (`boolean`) remember a new spec and thinking level as the default; true unless `session` is set.
 
 **Returns:** (`table|nil`, `string|nil`) The new state, or nil and an error.
 
@@ -5187,13 +5201,14 @@ Requires the `agent` and `session_write` [plugin permissions](#plugin-permission
   session; defaults to the focused one.
 
 
-**Returns:** (`boolean|nil`, `string|nil`) true if a turn was interrupted, false
-  if the session was idle, or nil and an error.
+**Returns:** (`string|nil`, `string|nil`) "cancelled" if a turn was interrupted,
+  "idle" if the session had none running, or nil and an error.
 
 **Example:**
 
 ```lua
-local interrupted, err = maki.session.cancel({ session = id })
+local state, err = maki.session.cancel({ session = id })
+if state == "cancelled" then maki.notify("turn stopped") end
 ```
 
 ---

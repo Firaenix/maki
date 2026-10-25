@@ -1,7 +1,7 @@
 //! Elm-style `update(Msg) -> Vec<Action>`; side effects are dispatched by the caller.
 //! Double-esc: first esc flashes a hint, second within `flash_duration` cancels/rewinds.
 //! `run_id` invalidates in-flight agent events. It bumps in exactly three
-//! places, one per transition: `start_run`, `handle_cancel`, and
+//! places, one per transition: `start_run`, `cancel_run`, and
 //! `AgentHandles::respawn`. Everything else only reads it.
 
 mod btw;
@@ -33,7 +33,7 @@ use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::ClipboardState;
 use crate::components::alert_modal::AlertModal;
 use crate::components::btw_modal::BtwModal;
-use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
+use crate::components::command::{CommandAction, CommandListing, CommandPalette, ParsedCommand};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::help_modal::HelpModal;
 use crate::components::input::{InputAction, InputBox, Submission};
@@ -641,11 +641,16 @@ impl App {
     /// Stores the clamped value rather than the typed one, so the status bar
     /// can never read `off` on a model that is really sending minimal effort.
     ///
-    /// The value is also written to disk here, and only here: the next run
-    /// seeds its sessions from it (`SessionDefaults`), the same way the model
-    /// is remembered. A clamp on model change is not the user's choice, so it
-    /// does not overwrite the file.
-    pub(crate) fn set_thinking(&mut self, input: &str) -> Result<ThinkingConfig, String> {
+    /// With {persist} the value is also written to disk here, and only here:
+    /// the next run seeds its sessions from it (`SessionDefaults`), the same
+    /// way the model is remembered. A clamp on model change is not the user's
+    /// choice, so it does not overwrite the file, and neither does a plugin
+    /// steering one tab.
+    pub(crate) fn set_thinking(
+        &mut self,
+        input: &str,
+        persist: bool,
+    ) -> Result<ThinkingConfig, String> {
         if !self.state.model.supports_thinking() {
             return Err(THINKING_UNSUPPORTED_MSG.into());
         }
@@ -653,7 +658,9 @@ impl App {
             .map_err(str::to_owned)?
             .clamped(&self.state.model);
         self.state.pending_thinking = None;
-        persist_thinking(&self.storage, self.state.thinking.into());
+        if persist {
+            persist_thinking(&self.storage, self.state.thinking.into());
+        }
         Ok(self.state.thinking)
     }
 
@@ -1572,10 +1579,27 @@ impl App {
     }
 
     fn handle_cancel(&mut self) -> Vec<Action> {
+        self.close_all_overlays();
+        self.cancel_run()
+    }
+
+    /// A plugin's interrupt, the one a double Esc fires. `None` when no turn
+    /// is running, so there is nothing to cancel.
+    ///
+    /// Unlike the keys, this closes only the permission prompt: it belongs to
+    /// the turn being stopped, while a picker or a plugin window the user has
+    /// open is theirs and must survive a watchdog firing underneath it.
+    pub(crate) fn cancel_turn(&mut self) -> Option<Vec<Action>> {
+        (self.status == Status::Streaming).then(|| {
+            self.permission_prompt.close();
+            self.cancel_run()
+        })
+    }
+
+    fn cancel_run(&mut self) -> Vec<Action> {
         let cancelled_run = self.run_id;
         self.run_id += 1;
         self.retry_info = None;
-        self.close_all_overlays();
         self.pending_input = PendingInput::None;
         self.finish_subagents(TaskOutcome::Error, CANCELLED_TEXT);
         self.shell.cancel_all();
@@ -1600,11 +1624,6 @@ impl App {
         }]
     }
 
-    /// A plugin's interrupt, the one a double Esc fires. `None` when no turn
-    /// is running, so there is nothing to cancel.
-    pub(crate) fn cancel_turn(&mut self) -> Option<Vec<Action>> {
-        (self.status == Status::Streaming).then(|| self.handle_cancel())
-    }
     fn handle_subagent_cancel(&mut self) -> Vec<Action> {
         let id = self.active_task_id();
         self.stop_task(&id).into_iter().collect()
@@ -2009,9 +2028,10 @@ impl App {
         self.chats[idx].idle = true;
     }
 
-    pub(crate) fn command_listing(&self) -> Vec<crate::components::command::CommandListing> {
-        self.command_palette.listing()
+    pub(crate) fn command_listing(&mut self, caller: &PluginReach) -> Vec<CommandListing> {
+        self.command_palette.listing(caller)
     }
+
     /// Entry point for `maki.api.run_command`: splits a command line into the
     /// name and args the input bar would hand over, leading slash optional.
     /// `Err` means nothing ran at all, so the Lua caller can say why.

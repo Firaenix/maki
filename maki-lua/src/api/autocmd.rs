@@ -10,6 +10,7 @@ use crate::agent_autocmd::host_event_fields;
 use crate::api::util::convert::TableExt;
 use crate::api::util::dispatch::{DepthGuard, Reentry};
 use crate::plugin_permissions::{Permission, grant_hint};
+use crate::plugin_status::{ErrorSeam, record_error};
 use crate::runtime::{quoted_list, run_detached, strip_traceback, warn_plugin_once};
 
 static NEXT_AUTOCMD_ID: AtomicU64 = AtomicU64::new(1);
@@ -144,9 +145,8 @@ pub(crate) async fn dispatch(lua: Lua, event: String, pattern: Option<String>, d
         })
         .await
         {
-            let error = strip_traceback(&e);
-            tracing::warn!(event, plugin = &*plugin, error = %error, "plugin callback failed");
-            crate::plugin_status::record_error(&lua, &plugin, "autocmd", error);
+            let error = format!("{event}: {}", strip_traceback(&e));
+            record_error(&lua, &plugin, ErrorSeam::Autocmd, error);
         }
     }
 }

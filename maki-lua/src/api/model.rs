@@ -193,9 +193,10 @@ async fn available(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaR
 /// are, so this doubles as a thinking-only switch. Answers with the new
 /// state, in the same shape `get` returns.
 ///
-/// A new spec also becomes the model the next `maki` starts on, like picking
-/// it in `/model`, unless `opts.persist` is false. Naming a session turns
-/// that off by default, since steering one tab is not choosing a default.
+/// A new spec or thinking level also becomes what the next `maki` starts on,
+/// like picking it in `/model` or `/thinking`, unless `opts.persist` is
+/// false. Naming a session turns that off by default, since steering one tab
+/// is not choosing a default. `fast` is only ever remembered per session.
 ///
 /// @param spec string|table A model spec, or a table with any of:
 ///   `spec` (string) `"provider/id"`, as listed by `available()`;
@@ -204,7 +205,7 @@ async fn available(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaR
 ///   `fast` (boolean) Anthropic fast mode.
 /// @param opts table? Options:
 ///   session (string) id of a live session, defaults to the focused one.
-///   persist (boolean) remember a new spec as the default; true unless `session` is set.
+///   persist (boolean) remember a new spec and thinking level as the default; true unless `session` is set.
 /// @return (table|nil, string|nil) The new state, or nil and an error.
 /// @example
 /// maki.model.set("anthropic/claude-opus-4-6")

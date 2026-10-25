@@ -2994,6 +2994,73 @@ fn cancel_turn_interrupts_only_a_running_turn() {
     assert_eq!(app.status, Status::Idle);
     assert!(app.cancel_turn().is_none());
 }
+
+/// A watchdog firing while the user is in a picker or has a plugin panel
+/// open must not take those away: only the permission prompt belongs to the
+/// turn being stopped.
+#[test]
+fn plugin_cancel_turn_keeps_the_users_windows_open() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.run_builtin(BuiltinAction::ModelPicker);
+    open_split_window(&mut app, maki_lua::Split::Below);
+    app.permission_prompt.push(
+        "perm-1".into(),
+        maki_config::ToolKey::native("bash"),
+        vec!["ls".into()],
+        None,
+        true,
+        None,
+        None,
+    );
+
+    let actions = app.cancel_turn().expect("a running turn is cancelled");
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::CancelAgent { run_id: 1 }]
+    ));
+    assert_eq!(app.status, Status::Idle);
+    assert!(!app.permission_prompt.is_open());
+    assert!(app.model_picker.is_open());
+    assert!(app.float_mgr.is_open());
+}
+
+/// The keys keep their old meaning: a double Esc is the user asking for a
+/// clean slate, so every overlay goes with the turn.
+#[test]
+fn double_esc_closes_every_overlay_with_the_turn() {
+    let mut app = test_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    // Unfocused, so the Esc reaches the chat input rather than the window.
+    let (event_tx, _event_rx) = flume::bounded::<maki_lua::WinEvent>(8);
+    let (_cmd_tx, cmd_rx) = flume::bounded::<maki_lua::WinCommand>(8);
+    app.float_mgr.open(
+        Arc::new(maki_agent::SharedBuf::new()),
+        maki_lua::FloatConfig {
+            split: maki_lua::Split::Below,
+            ..maki_lua::FloatConfig::default()
+        },
+        false,
+        event_tx,
+        cmd_rx,
+    );
+    assert!(app.float_mgr.is_open());
+
+    cancel_app(&mut app);
+    assert_eq!(app.status, Status::Idle);
+    assert!(!app.float_mgr.is_open());
+
+    app.status = Status::Streaming;
+    app.run_builtin(BuiltinAction::ModelPicker);
+    open_split_window(&mut app, maki_lua::Split::Below);
+    let actions = app.handle_cancel();
+    assert!(matches!(actions.as_slice(), [Action::CancelAgent { .. }]));
+    assert!(!app.model_picker.is_open());
+    assert!(!app.float_mgr.is_open());
+}
+
 #[test]
 fn double_esc_idle_opens_rewind_picker() {
     let mut app = test_app();
@@ -4559,6 +4626,7 @@ fn typed_lua_command_with_args_executes() {
             plugin: "sessions".into(),
             reach: trusted(),
             max_args: usize::MAX,
+            interactive: false,
         }]),
     );
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
@@ -4688,6 +4756,7 @@ fn run_cmdline_needs_what_the_command_reaches(cmdline: &str, needed: &[Permissio
             plugin: RUNNING_PLUGIN.into(),
             reach: only(Permission::Run),
             max_args: 0,
+            interactive: false,
         }]),
     );
 
@@ -4753,6 +4822,7 @@ fn run_cmdline_forwards_depth_to_lua_command() {
             plugin: "sessions".into(),
             reach: trusted(),
             max_args: 0,
+            interactive: false,
         }]),
     );
     let (handle, probe) = maki_lua::test_support::probed_event_handle();
@@ -6672,7 +6742,7 @@ fn model_state_reports_the_model_and_what_it_supports() {
     );
 
     set_opus_model(&mut app);
-    app.set_thinking("high").unwrap();
+    app.set_thinking("high", true).unwrap();
     app.set_fast(true).unwrap();
     assert_eq!(
         model_state_scalars(&app),
@@ -6732,7 +6802,7 @@ fn set_thinking_clamps_to_what_the_model_will_run() {
     app.state.model.thinking_override = Some(ThinkingSupport::Required);
 
     let lifted = ThinkingConfig::Effort(Effort::Minimal);
-    assert_eq!(app.set_thinking("off").unwrap(), lifted);
+    assert_eq!(app.set_thinking("off", true).unwrap(), lifted);
     assert_eq!(app.state.thinking, lifted);
 }
 
@@ -6793,7 +6863,7 @@ fn restored_and_switched_thinking_selects_a_declared_picker_row(
                 .iter()
                 .any(|option| option["name"] == expected)
         );
-        assert_eq!(app.set_thinking(&intent.to_string()).unwrap(), intent);
+        assert_eq!(app.set_thinking(&intent.to_string(), true).unwrap(), intent);
         assert_eq!(app.model_state(), state);
     }
 }
@@ -6802,7 +6872,7 @@ fn restored_and_switched_thinking_selects_a_declared_picker_row(
 #[test_case("low", ThinkingConfig::Effort(Effort::Low))]
 fn explicit_thinking_choice_replaces_pending_level(input: &str, expected: ThinkingConfig) {
     let (_tmp, _dir, _writer, mut app) = tempdir_app();
-    app.set_thinking("high").unwrap();
+    app.set_thinking("high", true).unwrap();
     let mut model = app.state.model.clone();
     model.thinking_override = Some(ThinkingSupport::No);
     app.state.update_model(&model);
@@ -6810,7 +6880,7 @@ fn explicit_thinking_choice_replaces_pending_level(input: &str, expected: Thinki
 
     model.thinking_override = Some(ThinkingSupport::Yes);
     app.state.model = model.clone();
-    assert_eq!(app.set_thinking(input).unwrap(), expected);
+    assert_eq!(app.set_thinking(input, true).unwrap(), expected);
     app.state.update_model(&model);
     app.checkpoint();
 
@@ -7223,8 +7293,8 @@ fn model_state_thinking_round_trips_into_set_thinking(thinking: ThinkingConfig, 
 
     let reported = app.model_state()["thinking"].as_str().unwrap().to_owned();
     assert_eq!(reported, expected);
-    assert_eq!(app.set_thinking(&reported).unwrap(), thinking);
-    assert_eq!(app.set_thinking(&reported).unwrap(), thinking);
+    assert_eq!(app.set_thinking(&reported, true).unwrap(), thinking);
+    assert_eq!(app.set_thinking(&reported, true).unwrap(), thinking);
 }
 
 /// xAI sends `high` for `adaptive`. The picker and the flash read the level,
@@ -7244,11 +7314,31 @@ fn model_state_shows_the_level_a_hidden_adaptive_is_sent_as() {
     assert!(offered.iter().all(|row| row["name"] != THINKING_ADAPTIVE));
 }
 
+/// `maki.model.set({ thinking = ... }, { session = id })` steers one tab;
+/// it must not become the default every new session starts on.
+#[test]
+fn set_thinking_without_persist_leaves_the_stored_default_alone() {
+    let mut app = test_app();
+    app.set_thinking("low", true).unwrap();
+    let stored = read_thinking(&app.storage);
+    assert_eq!(stored, Some(ThinkingConfig::Effort(Effort::Low).into()));
+
+    assert_eq!(
+        app.set_thinking("high", false).unwrap(),
+        ThinkingConfig::Effort(Effort::High)
+    );
+    assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::High));
+    assert_eq!(read_thinking(&app.storage), stored);
+}
+
 #[test]
 fn set_thinking_toggles_on_blank_input() {
     let mut app = test_app();
-    assert_eq!(app.set_thinking("").unwrap(), ThinkingConfig::Adaptive);
-    assert_eq!(app.set_thinking("").unwrap(), ThinkingConfig::Off);
+    assert_eq!(
+        app.set_thinking("", true).unwrap(),
+        ThinkingConfig::Adaptive
+    );
+    assert_eq!(app.set_thinking("", true).unwrap(), ThinkingConfig::Off);
 }
 
 #[test_case(true, "garbage", THINKING_USAGE ; "unknown_word")]
@@ -7256,12 +7346,12 @@ fn set_thinking_toggles_on_blank_input() {
 #[test_case(false, "low", THINKING_UNSUPPORTED_MSG ; "model_without_thinking")]
 fn set_thinking_keeps_state_on_rejected_input(supported: bool, input: &str, expected: &str) {
     let mut app = test_app();
-    app.set_thinking("high").unwrap();
+    app.set_thinking("high", true).unwrap();
     if !supported {
         app.state.model.thinking_override = Some(ThinkingSupport::No);
     }
 
-    assert_eq!(app.set_thinking(input).unwrap_err(), expected);
+    assert_eq!(app.set_thinking(input, true).unwrap_err(), expected);
     assert_eq!(app.state.thinking, ThinkingConfig::Effort(Effort::High));
 }
 

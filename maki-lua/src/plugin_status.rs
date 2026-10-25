@@ -11,15 +11,18 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use maki_agent::tools::{ToolRegistry, ToolSource};
-use mlua::Lua;
+use mlua::{Function, Lua};
 use serde::Serialize;
+use strum::{IntoStaticStr, VariantNames};
 
 use crate::api::autocmd::AutocmdStore;
 use crate::api::util::command::CommandHandlerMap;
+use crate::runtime::plugin_of;
 
 /// Enough to see what keeps failing without letting a plugin that errors on
 /// every keystroke grow without bound.
 pub(crate) const ERROR_RING: usize = 20;
+const CALLBACK_FAILED_MSG: &str = "plugin callback failed";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -27,6 +30,33 @@ pub(crate) enum PluginKind {
     Bundled,
     Package,
     Init,
+}
+
+/// Where a runtime error surfaced, as `maki.api.list_plugins` reports it in
+/// `seam`. A layer failing on a slot reports the slot's name instead
+/// ([`record_slot_error`]). The snake_case names are public API: plugins
+/// filter on them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoStaticStr, VariantNames)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum ErrorSeam {
+    Autocmd,
+    Command,
+    Keybind,
+    DeferFn,
+    Async,
+    Job,
+    CancelHook,
+    Hint,
+    Header,
+    Describe,
+    PermissionScopes,
+    Start,
+    Restore,
+    Click,
+    BufChange,
+    PlanRow,
+    Notify,
+    Watchdog,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -157,9 +187,36 @@ impl PluginStatusStore {
     }
 }
 
-/// Records a runtime error against `plugin`, beside the `tracing::warn!` that
-/// already logs it. A runtime without the store (some unit tests) skips it.
-pub(crate) fn record_error(lua: &Lua, plugin: &str, seam: &str, err: impl Display) {
+/// Logs a runtime error and records it against `plugin`. The one place every
+/// callback failure goes through, so a new hook cannot log without also
+/// showing up in `list_plugins`. A runtime without the store (some unit
+/// tests) only logs.
+pub(crate) fn record_error(lua: &Lua, plugin: &str, seam: ErrorSeam, err: impl Display) {
+    record_at(lua, plugin, seam.into(), err);
+}
+
+/// [`record_error`] for a slot layer, whose seam is the slot it sits on.
+pub(crate) fn record_slot_error(lua: &Lua, plugin: &str, slot: &str, err: impl Display) {
+    record_at(lua, plugin, slot, err);
+}
+
+/// [`record_error`] for a callback nobody wrote an owner down for: the
+/// plugin is the one whose env `func` closes over. A function from no
+/// plugin env (host code) is only logged.
+pub(crate) fn record_callback_error(
+    lua: &Lua,
+    func: &Function,
+    seam: ErrorSeam,
+    err: impl Display,
+) {
+    match plugin_of(lua, func) {
+        Some(plugin) => record_at(lua, &plugin, seam.into(), err),
+        None => tracing::warn!(seam = <&str>::from(seam), error = %err, CALLBACK_FAILED_MSG),
+    }
+}
+
+fn record_at(lua: &Lua, plugin: &str, seam: &str, err: impl Display) {
+    tracing::warn!(plugin, seam, error = %err, CALLBACK_FAILED_MSG);
     if let Some(store) = lua.app_data_ref::<PluginStatusStore>() {
         store.record_error(plugin, seam, err.to_string());
     }
@@ -253,7 +310,7 @@ mod tests {
     fn the_ring_keeps_the_newest_errors() {
         let store = PluginStatusStore::default();
         for i in 0..ERROR_RING + 5 {
-            store.record_error("p", "autocmd", format!("e{i}"));
+            store.record_error("p", ErrorSeam::Autocmd.into(), format!("e{i}"));
         }
         let errors = &store.snapshot()["p"].errors;
         assert_eq!(errors.len(), ERROR_RING);
@@ -264,7 +321,7 @@ mod tests {
     #[test]
     fn a_later_success_clears_the_load_error_but_keeps_runtime_errors() {
         let store = PluginStatusStore::default();
-        store.record_error("p", "command", "boom".into());
+        store.record_error("p", ErrorSeam::Command.into(), "boom".into());
         store.record_load("p", PluginKind::Package, None, Err("bad".into()));
         store.record_load("p", PluginKind::Package, None, Ok(()));
         let status = &store.snapshot()["p"];

@@ -4235,6 +4235,22 @@ fn register_command_nargs_values(nargs_field: &str) -> usize {
     host.command_reader().load().commands[0].max_args
 }
 
+#[test_case::test_case("" => false ; "default_off")]
+#[test_case::test_case("interactive = true," => true ; "declared")]
+#[test_case::test_case("interactive = false," => false ; "declared_off")]
+fn register_command_interactive_flag(field: &str) -> bool {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "cmd_interactive",
+        &format!(
+            r#"maki.api.register_command({{ name = "/pick", {field} handler = function() end }})"#
+        ),
+    )
+    .unwrap();
+
+    host.command_reader().load().commands[0].interactive
+}
+
 #[test_case::test_case("a  b c", "a  b c|a,b,c" ; "raw_text_and_split_list")]
 #[test_case::test_case("", "|" ; "empty_args")]
 fn command_handler_receives_args_and_fargs(args: &str, expected_flash: &str) {
@@ -4343,7 +4359,7 @@ fn list_commands_round_trips_through_ui() {
     host.event_handle()
         .run_command(Arc::from("p"), Arc::from("/ls"), String::new(), 0, None);
 
-    let maki_lua::UiAction::ListCommands { reply_tx } = rx
+    let maki_lua::UiAction::ListCommands { reply_tx, .. } = rx
         .recv_timeout(Duration::from_secs(5))
         .expect("list_commands did not reach the UI")
     else {
@@ -4395,6 +4411,45 @@ fn run_command_forwards_session_both_ways() {
     assert_eq!(cmdline, "/new");
     assert_eq!(session.as_deref(), Some("s-bg"));
 }
+
+/// An alias like `/clear` calls `run_command` with no session. Run in a
+/// background tab, it must stay there instead of resetting the focused one.
+#[test]
+fn run_command_without_session_inherits_the_handlers() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "p",
+        r#"
+        maki.api.register_command({
+            name = "/clear",
+            handler = function()
+                maki.api.run_command("/new")
+            end,
+        })
+        "#,
+    )
+    .unwrap();
+    let rx = host.ui_action_rx();
+    host.event_handle().run_command(
+        Arc::from("p"),
+        Arc::from("/clear"),
+        String::new(),
+        0,
+        Some("s-bg".into()),
+    );
+
+    let maki_lua::UiAction::RunCommand {
+        cmdline, session, ..
+    } = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect(RUN_COMMAND_NO_ACTION)
+    else {
+        panic!("{RUN_COMMAND_NO_ACTION}");
+    };
+    assert_eq!(cmdline, "/new");
+    assert_eq!(session.as_deref(), Some("s-bg"));
+}
+
 #[test_case::test_case(
     r#"maki.api.register_command({ name = "", handler = function() end })"#,
     "non-empty" ; "empty_name"

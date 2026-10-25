@@ -811,10 +811,11 @@ async fn detach(
 ///
 /// @param opts table? Optional fields: session (string) id of a live
 ///   session; defaults to the focused one.
-/// @return (boolean|nil, string|nil) true if a turn was interrupted, false
-///   if the session was idle, or nil and an error.
+/// @return (string|nil, string|nil) "cancelled" if a turn was interrupted,
+///   "idle" if the session had none running, or nil and an error.
 /// @example
-/// local interrupted, err = maki.session.cancel({ session = id })
+/// local state, err = maki.session.cancel({ session = id })
+/// if state == "cancelled" then maki.notify("turn stopped") end
 #[lua_fn(guard = [Agent, SessionWrite])]
 async fn cancel(
     lua: Lua,
@@ -822,7 +823,7 @@ async fn cancel(
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
     let id = match opts {
-        Some(opts) => opts.get("session")?,
+        Some(opts) => opts.opt("session")?,
         None => None,
     };
     roundtrip(lua, tx, SessionRequest::Cancel { id }).await
@@ -1154,6 +1155,7 @@ mod tests {
     use crate::api::image::create_image_table;
     use crate::api::json::create_json_table;
     use crate::api::top::add_top_methods;
+    use crate::api::util::command::{CANCEL_CANCELLED, CANCEL_IDLE};
     use crate::session_snapshot::{MODE_PLAN, STATUS_IDLE, STATUS_STORED};
     use mlua::Value;
     use serde_json::json;
@@ -1494,12 +1496,17 @@ mod tests {
         assert!(err.to_string().contains(expected), "got: {err}");
     }
 
-    #[test_case("return session.cancel({ session = 'abc' })", Some("abc") ; "explicit_session_id")]
-    #[test_case("return session.cancel()", None ; "defaults_to_focused")]
-    fn cancel_forwards_the_session_id(code: &str, expected_id: Option<&str>) {
+    /// Mode is per session like the plan it drives, so a row handler firing
+    /// for a background tab has to be able to name it.
+
+    #[test_case("return session.cancel({ session = 'abc' })", Some("abc"), CANCEL_CANCELLED ; "explicit_session_id")]
+    #[test_case("return session.cancel()", None, CANCEL_IDLE ; "defaults_to_focused")]
+    fn cancel_forwards_the_session_id(code: &str, expected_id: Option<&str>, reply: &str) {
         let (tx, rx) = flume::unbounded::<UiAction>();
         let lua = lua_with_session(Some(tx));
         let expected_id = expected_id.map(str::to_owned);
+        let reply = reply.to_owned();
+        let expected_reply = reply.clone();
         let checker = std::thread::spawn(move || {
             let Ok(UiAction::Session {
                 req: SessionRequest::Cancel { id },
@@ -1509,13 +1516,13 @@ mod tests {
                 panic!("expected cancel request");
             };
             assert_eq!(id, expected_id);
-            reply_tx.send(Ok(json!(true))).unwrap();
+            reply_tx.send(Ok(json!(reply))).unwrap();
         });
-        let (val, err): (bool, Option<String>) =
+        let (val, err): (String, Option<String>) =
             smol::block_on(lua.load(code).eval_async()).unwrap();
         checker.join().unwrap();
         assert_eq!(err, None);
-        assert!(val);
+        assert_eq!(val, expected_reply);
     }
 
     #[test]

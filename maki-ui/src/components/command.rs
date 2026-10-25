@@ -58,6 +58,9 @@ pub struct BuiltinCommand {
     /// A typed `!` filters the palette down to commands that read one, so no
     /// handler can be reached by a bang it ignores.
     pub bang: bool,
+    /// Only opens a picker or modal, so running it from somewhere that cannot
+    /// see the terminal does nothing useful.
+    pub interactive: bool,
     pub plugin_access: PluginAccess,
 }
 
@@ -67,6 +70,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Summarize and compact conversation history (optional guidance)",
         max_args: usize::MAX,
         bang: false,
+        interactive: false,
         plugin_access: SUBMITS_PROMPT,
     },
     BuiltinCommand {
@@ -74,6 +78,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Start a new session",
         max_args: 0,
         bang: false,
+        interactive: false,
         plugin_access: WRITES_SESSION,
     },
     BuiltinCommand {
@@ -81,6 +86,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Fork this session and switch to the copy",
         max_args: 0,
         bang: false,
+        interactive: false,
         plugin_access: WRITES_SESSION,
     },
     BuiltinCommand {
@@ -88,6 +94,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Show keybindings",
         max_args: 0,
         bang: false,
+        interactive: true,
         plugin_access: PluginAccess::Open,
     },
     BuiltinCommand {
@@ -95,6 +102,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Show token usage breakdown",
         max_args: 0,
         bang: false,
+        interactive: true,
         plugin_access: PluginAccess::Open,
     },
     BuiltinCommand {
@@ -102,6 +110,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Remove items from queue",
         max_args: 0,
         bang: false,
+        interactive: true,
         plugin_access: PluginAccess::Open,
     },
     BuiltinCommand {
@@ -109,6 +118,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Switch model",
         max_args: 0,
         bang: false,
+        interactive: true,
         plugin_access: CHANGES_SETTINGS,
     },
     BuiltinCommand {
@@ -116,6 +126,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Switch color theme",
         max_args: 0,
         bang: false,
+        interactive: true,
         plugin_access: PluginAccess::Open,
     },
     BuiltinCommand {
@@ -123,6 +134,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Configure MCP servers",
         max_args: 0,
         bang: false,
+        interactive: true,
         plugin_access: PluginAccess::Open,
     },
     BuiltinCommand {
@@ -130,6 +142,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Authenticate with an LLM provider",
         max_args: 0,
         bang: false,
+        interactive: true,
         plugin_access: PluginAccess::Open,
     },
     BuiltinCommand {
@@ -137,6 +150,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Change working directory",
         max_args: 1,
         bang: false,
+        interactive: false,
         plugin_access: CHANGES_SETTINGS,
     },
     BuiltinCommand {
@@ -144,6 +158,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Ask a quick question (no tools, no history pollution)",
         max_args: usize::MAX,
         bang: false,
+        interactive: false,
         plugin_access: STARTS_TURNS,
     },
     BuiltinCommand {
@@ -151,6 +166,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Toggle YOLO mode (skip all permission prompts)",
         max_args: 0,
         bang: false,
+        interactive: false,
         plugin_access: PluginAccess::UserOnly,
     },
     BuiltinCommand {
@@ -158,6 +174,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Toggle fast mode (Anthropic Opus or Codex subscription models)",
         max_args: 0,
         bang: false,
+        interactive: false,
         plugin_access: CHANGES_SETTINGS,
     },
     BuiltinCommand {
@@ -165,6 +182,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Toggle workflow mode (task callable inside code_execution)",
         max_args: 0,
         bang: false,
+        interactive: false,
         plugin_access: CHANGES_SETTINGS,
     },
     BuiltinCommand {
@@ -172,6 +190,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Exit the application",
         max_args: 0,
         bang: false,
+        interactive: false,
         plugin_access: PluginAccess::Open,
     },
     BuiltinCommand {
@@ -179,6 +198,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Reload plugins and config",
         max_args: 0,
         bang: false,
+        interactive: false,
         plugin_access: PluginAccess::Open,
     },
     BuiltinCommand {
@@ -186,6 +206,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Trust this folder and load its shared project config",
         max_args: 0,
         bang: false,
+        interactive: false,
         plugin_access: PluginAccess::UserOnly,
     },
     BuiltinCommand {
@@ -193,6 +214,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Update packages (++lockfile, ! skips review)",
         max_args: 2,
         bang: true,
+        interactive: false,
         plugin_access: PluginAccess::UserOnly,
     },
     BuiltinCommand {
@@ -200,23 +222,9 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Remove undeclared packages (++all, or a name)",
         max_args: 1,
         bang: true,
+        interactive: false,
         plugin_access: PluginAccess::UserOnly,
     },
-];
-
-/// Commands that only open a picker or modal, so running them from somewhere
-/// that cannot see the terminal does nothing useful. `/sessions` and
-/// `/thinking` come from bundled Lua plugins.
-const INTERACTIVE_COMMANDS: &[&str] = &[
-    "/model",
-    "/theme",
-    "/mcp",
-    "/login",
-    "/queue",
-    "/help",
-    "/usage",
-    "/sessions",
-    "/thinking",
 ];
 
 /// `max_args` for a command that takes any number of arguments: Lua numbers
@@ -232,7 +240,6 @@ pub struct CommandListing {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plugin: Option<String>,
     pub max_args: i64,
-    pub bang: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub argument_hint: Option<String>,
     pub interactive: bool,
@@ -463,7 +470,10 @@ impl CommandPalette {
         }
     }
 
-    fn sync(&mut self, input: &str) {
+    /// Catches up with the MCP and Lua snapshots. Typing gets here through
+    /// [`Self::sync`]; the plugin entry points call it themselves, so a
+    /// command [`Self::listing`] just returned also resolves.
+    fn refresh_sources(&mut self) {
         let mcp_snap = self.mcp_reader.load();
         let lua_snap = self.lua_reader.load();
         if mcp_snap.generation != self.mcp_generation || lua_snap.generation != self.lua_generation
@@ -474,6 +484,10 @@ impl CommandPalette {
             self.lua_commands = lua_snap.commands.clone();
             self.nucleo = Self::build_nucleo(&self.custom, &self.mcp_prompts, &self.lua_commands);
         }
+    }
+
+    fn sync(&mut self, input: &str) {
+        self.refresh_sources();
         let Some(stripped) = input.strip_prefix('/') else {
             self.filtered.clear();
             self.current_arg_count = 0;
@@ -673,7 +687,12 @@ impl CommandPalette {
 
     /// Hands back the registered spelling, because that is the only one
     /// [`crate::app::App`] dispatches on. `Err` goes back to the plugin as is.
-    pub fn resolve_for_plugin(&self, name: &str, caller: &PluginReach) -> Result<String, String> {
+    pub fn resolve_for_plugin(
+        &mut self,
+        name: &str,
+        caller: &PluginReach,
+    ) -> Result<String, String> {
+        self.refresh_sources();
         let item = self
             .find_item(name)
             .ok_or_else(|| format!("unknown command '{name}'"))?;
@@ -722,43 +741,52 @@ impl CommandPalette {
         &self.lua_commands
     }
 
-    /// Every command for `maki.api.list_commands`, in palette order. Reads
-    /// the MCP and Lua snapshots afresh, since the palette only catches up
-    /// with them when the user types.
-    pub fn listing(&self) -> Vec<CommandListing> {
-        let mcp = self.mcp_reader.load();
-        let lua = self.lua_reader.load();
-        Self::items(&self.custom, &mcp.prompts, &lua.commands)
+    /// Every command `caller` may pass to [`Self::resolve_for_plugin`], in
+    /// palette order, for `maki.api.list_commands`. What the caller's grants
+    /// do not reach is left out rather than listed and refused.
+    pub fn listing(&mut self, caller: &PluginReach) -> Vec<CommandListing> {
+        self.refresh_sources();
+        Self::items(&self.custom, &self.mcp_prompts, &self.lua_commands)
+            .filter(|item| self.plugin_refusal(item, caller).is_none())
             .map(|item| {
-                let interactive = INTERACTIVE_COMMANDS.contains(&item.name.as_str());
                 let max_args = i64::try_from(item.max_args).unwrap_or(UNBOUNDED_ARGS);
-                let (source, description, plugin, bang, argument_hint) = match item.command_type {
-                    CommandType::Builtin(cmd) => {
-                        ("builtin", cmd.description.to_string(), None, cmd.bang, None)
-                    }
-                    CommandType::Custom(i) => {
-                        let cmd = &self.custom[i];
-                        let hint = cmd.argument_hint.clone();
-                        ("custom", cmd.description.clone(), None, false, hint)
-                    }
-                    CommandType::McpPrompt(i) => {
-                        let prompt = &mcp.prompts[i];
-                        let hint = mcp_argument_hint(&prompt.arguments);
-                        ("mcp", prompt.description.clone(), None, false, hint)
-                    }
-                    CommandType::Lua(i) => {
-                        let cmd = &lua.commands[i];
-                        let plugin = Some(cmd.plugin.to_string());
-                        ("lua", cmd.description.to_string(), plugin, false, None)
-                    }
-                };
+                let (source, description, plugin, argument_hint, interactive) =
+                    match item.command_type {
+                        CommandType::Builtin(cmd) => (
+                            "builtin",
+                            cmd.description.to_string(),
+                            None,
+                            None,
+                            cmd.interactive,
+                        ),
+                        CommandType::Custom(i) => {
+                            let cmd = &self.custom[i];
+                            let hint = cmd.argument_hint.clone();
+                            ("custom", cmd.description.clone(), None, hint, false)
+                        }
+                        CommandType::McpPrompt(i) => {
+                            let prompt = &self.mcp_prompts[i];
+                            let hint = mcp_argument_hint(&prompt.arguments);
+                            ("mcp", prompt.description.clone(), None, hint, false)
+                        }
+                        CommandType::Lua(i) => {
+                            let cmd = &self.lua_commands[i];
+                            let plugin = Some(cmd.plugin.to_string());
+                            (
+                                "lua",
+                                cmd.description.to_string(),
+                                plugin,
+                                None,
+                                cmd.interactive,
+                            )
+                        }
+                    };
                 CommandListing {
                     name: item.name,
                     description,
                     source,
                     plugin,
                     max_args,
-                    bang,
                     argument_hint,
                     interactive,
                 }
@@ -951,20 +979,29 @@ mod tests {
         assert_eq!(open, OPEN_TO_PLUGINS);
     }
 
+    fn trusted() -> PluginReach {
+        PluginReach::new(PluginPermissions::trusted())
+    }
+
+    fn sessions_command() -> LuaCommandInfo {
+        LuaCommandInfo {
+            name: "/sessions".into(),
+            description: "Pick a session".into(),
+            plugin: "sessions".into(),
+            reach: trusted(),
+            max_args: 0,
+            interactive: true,
+        }
+    }
+
     #[test]
     fn listing_covers_every_source_with_its_metadata() {
-        let p = CommandPalette::new(
+        let mut p = CommandPalette::new(
             sample_custom(),
             empty_snapshot(),
-            LuaCommandReader::from_commands(vec![LuaCommandInfo {
-                name: "/sessions".into(),
-                description: "Pick a session".into(),
-                plugin: "sessions".into(),
-                reach: PluginReach::new(PluginPermissions::trusted()),
-                max_args: 0,
-            }]),
+            LuaCommandReader::from_commands(vec![sessions_command()]),
         );
-        let listing = p.listing();
+        let listing = p.listing(&trusted());
         let find = |name: &str| listing.iter().find(|c| c.name == name).unwrap();
 
         let model = find("/model");
@@ -974,7 +1011,6 @@ mod tests {
             (compact.max_args, compact.interactive),
             (UNBOUNDED_ARGS, false)
         );
-        assert!(find("/packupdate").bang);
 
         let review = find("/project:review");
         assert_eq!(review.source, "custom");
@@ -984,7 +1020,50 @@ mod tests {
         assert_eq!(sessions.source, "lua");
         assert_eq!(sessions.plugin.as_deref(), Some("sessions"));
         assert!(sessions.interactive);
-        assert_eq!(listing.len(), BUILTIN_COMMANDS.len() + 3);
+
+        let user_only = BUILTIN_COMMANDS
+            .iter()
+            .filter(|cmd| cmd.plugin_access == PluginAccess::UserOnly)
+            .count();
+        assert_eq!(listing.len(), BUILTIN_COMMANDS.len() - user_only + 3);
+    }
+
+    /// Every listed command resolves for the same caller, so a plugin never
+    /// picks one from the list only to be refused.
+    #[test]
+    fn listing_only_offers_what_the_caller_can_run() {
+        let mut p = CommandPalette::new(
+            sample_custom(),
+            empty_snapshot(),
+            LuaCommandReader::from_commands(vec![sessions_command()]),
+        );
+        let caller = PluginReach::new(PluginPermissions::denied());
+        let listing = p.listing(&caller);
+        let names: Vec<&str> = listing.iter().map(|c| c.name.as_str()).collect();
+
+        assert_eq!(names, OPEN_TO_PLUGINS);
+        for name in &names {
+            assert!(p.resolve_for_plugin(name, &caller).is_ok());
+        }
+        assert!(p.resolve_for_plugin("/yolo", &caller).is_err());
+        assert!(p.resolve_for_plugin("/sessions", &caller).is_err());
+    }
+
+    /// The palette only follows the snapshots when someone types, so the
+    /// plugin entry points must catch up on their own.
+    #[test]
+    fn listing_and_resolve_see_a_command_published_after_the_last_keypress() {
+        let (writer, reader) = maki_lua::test_support::lua_command_writer_pair();
+        let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), reader);
+        p.sync("/");
+        assert!(p.resolve_for_plugin("/sessions", &trusted()).is_err());
+
+        writer.publish(vec![sessions_command()]);
+        assert!(p.listing(&trusted()).iter().any(|c| c.name == "/sessions"));
+        assert_eq!(
+            p.resolve_for_plugin("/sessions", &trusted()).as_deref(),
+            Ok("/sessions")
+        );
     }
 
     #[test_case(&[], None ; "no_args")]
@@ -1289,6 +1368,7 @@ mod tests {
                 plugin: Arc::from("memory"),
                 reach: PluginReach::new(PluginPermissions::trusted()),
                 max_args: 0,
+                interactive: false,
             },
             LuaCommandInfo {
                 name: Arc::from("/deploy"),
@@ -1296,6 +1376,7 @@ mod tests {
                 plugin: Arc::from("deploy_plugin"),
                 reach: PluginReach::new(PluginPermissions::trusted()),
                 max_args: 0,
+                interactive: false,
             },
         ])
     }
@@ -1307,6 +1388,7 @@ mod tests {
             plugin: Arc::from("sessions"),
             reach: PluginReach::new(PluginPermissions::trusted()),
             max_args,
+            interactive: false,
         }]);
         let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), reader);
         p.sync(input);
@@ -1395,6 +1477,7 @@ mod tests {
             plugin: Arc::from("models"),
             reach: PluginReach::new(PluginPermissions::trusted()),
             max_args: 0,
+            interactive: false,
         }]);
         let mut palette = CommandPalette::new(Arc::from([]), empty_snapshot(), reader);
 
@@ -1429,6 +1512,7 @@ mod tests {
             plugin: Arc::from("p"),
             reach: PluginReach::new(PluginPermissions::trusted()),
             max_args: 0,
+            interactive: false,
         }]);
         let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), reader);
         p.sync("/");
@@ -1446,6 +1530,7 @@ mod tests {
                 plugin: Arc::from("p"),
                 reach: PluginReach::new(PluginPermissions::trusted()),
                 max_args: 0,
+                interactive: false,
             },
             LuaCommandInfo {
                 name: Arc::from("/new2"),
@@ -1453,6 +1538,7 @@ mod tests {
                 plugin: Arc::from("p"),
                 reach: PluginReach::new(PluginPermissions::trusted()),
                 max_args: 0,
+                interactive: false,
             },
         ]);
         p.sync("/");

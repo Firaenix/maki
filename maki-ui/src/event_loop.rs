@@ -34,9 +34,9 @@ use maki_lua::session_snapshot::{
     SessionSnapshot,
 };
 use maki_lua::{
-    EventHandle, HintReader, InputRequest, Key, KeymapReader, LuaCommandReader, ModelRequest,
-    PackCommand, PackPreparation, PlanRequest, SessionEndReason, SessionRequest, TaskRequest,
-    UiAction, UiAttachment, UiReply,
+    CANCEL_CANCELLED, CANCEL_IDLE, EventHandle, HintReader, InputRequest, Key, KeymapReader,
+    LuaCommandReader, ModelRequest, PROMPT_QUEUED, PROMPT_STARTED, PackCommand, PackPreparation,
+    PlanRequest, SessionEndReason, SessionRequest, TaskRequest, UiAction, UiAttachment, UiReply,
 };
 use maki_providers::Timeouts;
 use maki_providers::models_cache::{ModelList, fetch_all_models_cached};
@@ -77,7 +77,6 @@ const DRAIN_BUDGET: usize = 256;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 const NOT_LIVE_ERR: &str = "session not live";
-const QUEUED: &str = "queued";
 /// A `force` prompt that landed in the queue and pushed the running turn
 /// into the background to go next.
 const FORCED: &str = "forced";
@@ -1061,8 +1060,9 @@ impl<'t> EventLoop<'t> {
                     }
                 }
             }
-            UiAction::ListCommands { reply_tx } => {
-                let _ = reply_tx.send(Ok(json!(self.focused_app().command_listing())));
+            UiAction::ListCommands { caller, reply_tx } => {
+                let listing = self.focused_app().command_listing(&caller);
+                let _ = reply_tx.send(Ok(json!(listing)));
             }
             UiAction::PluginTaskEvent {
                 session,
@@ -1370,7 +1370,7 @@ impl<'t> EventLoop<'t> {
                 };
                 let reply = idx.and_then(|idx| {
                     let state = self.submit_text(idx, text, images)?;
-                    if force && state == QUEUED && self.force_queue(idx) {
+                    if force && state == PROMPT_QUEUED && self.force_queue(idx) {
                         return Ok(json!(FORCED));
                     }
                     Ok(state)
@@ -1421,9 +1421,9 @@ impl<'t> EventLoop<'t> {
                     match self.sessions[idx].app.cancel_turn() {
                         Some(actions) => {
                             self.dispatch(idx, actions);
-                            json!(true)
+                            json!(CANCEL_CANCELLED)
                         }
-                        None => json!(false),
+                        None => json!(CANCEL_IDLE),
                     }
                 });
                 let _ = reply_tx.send(reply);
@@ -1489,7 +1489,7 @@ impl<'t> EventLoop<'t> {
                 }
                 let app = &mut self.sessions[idx].app;
                 if let Some(thinking) = thinking {
-                    app.set_thinking(&thinking)?;
+                    app.set_thinking(&thinking, persist)?;
                 }
                 if let Some(fast) = fast {
                     app.set_fast(fast)?;
@@ -1527,9 +1527,9 @@ impl<'t> EventLoop<'t> {
         match self.sessions[idx].app.submit_prompt(msg) {
             SubmitOutcome::Started(actions) => {
                 self.dispatch(idx, actions);
-                Ok(json!("started"))
+                Ok(json!(PROMPT_STARTED))
             }
-            SubmitOutcome::Queued => Ok(json!(QUEUED)),
+            SubmitOutcome::Queued => Ok(json!(PROMPT_QUEUED)),
             SubmitOutcome::Rejected(e) => Err(e.into()),
         }
     }

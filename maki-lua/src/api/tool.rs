@@ -39,7 +39,7 @@ use crate::api::util::pair::{Pair, try_pair};
 use crate::plugin_permissions::{MANIFEST_FILE, Permission, PluginPermissions, PluginReach};
 use crate::runtime::{
     HintContent, LiveCtx, PromptHintCallbacks, PromptHintRegistration, PromptTarget, Request,
-    command_depth,
+    command_depth, command_session,
 };
 
 const TOOL_NAME_MAX: usize = 64;
@@ -943,6 +943,11 @@ fn allow_is_delegated(
 ///                          `opts.fargs` is the same split into words, and
 ///                          `opts.session` is the id of the session it runs
 ///                          in.
+///   interactive (boolean)  Optional, default false. Set it when the handler
+///                          only opens a picker or modal. `maki.api.list_commands`
+///                          reports it, so a front end that cannot show one
+///                          (a remote client, a headless session) can leave
+///                          the command out instead of running it to no effect.
 /// @return
 /// @example
 /// maki.api.register_command({
@@ -984,11 +989,14 @@ fn register_command(
 /// lists what each one needs.
 ///
 /// Pass `opts.session` to run it in a background tab instead of the focused
-/// one; a Lua handler sees that id as its own `opts.session`.
+/// one; a Lua handler sees that id as its own `opts.session`. Called from
+/// inside a command handler without one, it stays in the handler's session,
+/// so an alias sent to a background tab does not reset the one in view.
 ///
 /// @param cmdline string Command line, e.g. `"/new"` or `"/cd ~/src"`.
 /// @param opts table? Options:
-///   session (string) id of a live session, defaults to the focused one.
+///   session (string) id of a live session. Defaults to the session the
+///                    calling command handler runs in, else the focused one.
 /// @return (boolean|nil, string|nil) `true` once dispatched, or nil and an error message for an unknown or denied command.
 /// @example
 /// -- /resume as an alias for the built-in session picker:
@@ -1011,9 +1019,10 @@ async fn run_command(
     opts: Option<Table>,
 ) -> LuaResult<Pair<bool>> {
     let session = match opts {
-        Some(opts) => opts.get("session")?,
+        Some(opts) => opts.opt("session")?,
         None => None,
-    };
+    }
+    .or_else(|| command_session(&lua));
     let depth = command_depth(&lua).saturating_add(1);
     let reply = try_pair!(
         ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::RunCommand {
@@ -1029,17 +1038,19 @@ async fn run_command(
     Ok((Some(true), None))
 }
 
-/// Lists every slash command the input bar offers: built-ins, custom
-/// `/project:` and `/user:` commands, MCP prompts, and plugin commands, in
-/// the order the palette shows them.
+/// Lists every slash command `maki.api.run_command` accepts from this
+/// plugin: built-ins, custom `/project:` and `/user:` commands, MCP
+/// prompts, and plugin commands, in the order the palette shows them.
+/// Commands outside the calling plugin's grants, and the few that only run
+/// when the user types them, are left out, so every entry here runs.
 ///
-/// Each entry is `{ name, description, source, plugin?, max_args, bang,
+/// Each entry is `{ name, description, source, plugin?, max_args,
 /// argument_hint?, interactive }`. `source` is `"builtin"`, `"custom"`,
 /// `"mcp"` or `"lua"`, and `plugin` names the plugin that registered a
 /// `"lua"` one. `max_args` is -1 for a command that takes any number of
-/// arguments. `bang` is true when the command reads a trailing `!`.
-/// `interactive` marks commands that only open a picker or modal, such as
-/// `/model`, which do nothing useful when nobody is looking at the terminal.
+/// arguments. `interactive` marks commands that only open a picker or
+/// modal, such as `/model`, which do nothing useful when nobody is looking
+/// at the terminal; plugins declare it in `maki.api.register_command`.
 ///
 /// @return (table[]|nil, string|nil) The command entries, or nil and an error when no UI is attached.
 /// @example
@@ -1053,8 +1064,10 @@ async fn run_command(
 async fn list_commands(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] caller: PluginReach,
 ) -> LuaResult<Pair<LuaValue>> {
     ui_json_roundtrip(&lua, tx.as_ref(), |reply_tx| UiAction::ListCommands {
+        caller,
         reply_tx,
     })
     .await
@@ -1163,9 +1176,12 @@ fn set_prompt(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaResult<()> 
 /// Covers bundled plugins (including disabled ones), installed packages
 /// (including disabled and never-activated `opt/` ones, and ones discovery
 /// refused), and `init.lua` files. `errors` keeps the 20 newest runtime
-/// errors, oldest first; `seam` names where the error surfaced, such as
+/// errors, oldest first; `seam` names where the error surfaced: one of
 /// `"autocmd"`, `"command"`, `"keybind"`, `"defer_fn"`, `"async"`,
-/// `"hint"`, `"header"`, `"describe"`, `"watchdog"` or a slot name.
+/// `"job"`, `"cancel_hook"`, `"hint"`, `"header"`, `"describe"`,
+/// `"permission_scopes"`, `"start"`, `"restore"`, `"click"`,
+/// `"buf_change"`, `"plan_row"`, `"notify"`, `"watchdog"`, or the name
+/// of the slot a layer failed on.
 ///
 /// @return (table[]) Entries sorted by name: { name, source = "bundled"|"package"|"init", path?, enabled, loaded, load_error?, errors = { { t, seam, msg } }, commands = string[], tools = string[], autocmds = integer }.
 /// @example
@@ -1287,7 +1303,7 @@ pub(crate) fn create_api_table(
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
     run_command__register(&t, lua, ui_action_tx.clone(), reach.clone())?;
-    list_commands__register(&t, lua, ui_action_tx)?;
+    list_commands__register(&t, lua, ui_action_tx, reach.clone())?;
     add_tool_fns(&t, lua, pending, pending_rules, reach, plugin, opts)?;
     Ok(t)
 }
@@ -1761,6 +1777,7 @@ fn register_command_from_lua(
     }
     let description: String = spec.get("description").unwrap_or_default();
     let max_args = parse_nargs(spec)?;
+    let interactive = spec.opt_bool("interactive").unwrap_or(false);
     let handler: Function = spec
         .get("handler")
         .map_err(|_| mlua::Error::runtime("register_command: missing 'handler'"))?;
@@ -1780,6 +1797,7 @@ fn register_command_from_lua(
                 description,
                 reach,
                 max_args,
+                interactive,
             },
         );
     }
@@ -1973,6 +1991,23 @@ pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin_status::ErrorSeam;
+    use strum::VariantNames;
+
+    /// The seam names are public API, and the doc list is the only place a
+    /// plugin author learns them.
+    #[test]
+    fn list_plugins_doc_names_every_seam() {
+        let missing: Vec<&str> = ErrorSeam::VARIANTS
+            .iter()
+            .copied()
+            .filter(|seam| !list_plugins__doc.desc.contains(&format!("`\"{seam}\"`")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "seams missing from the doc: {missing:?}"
+        );
+    }
     use maki_agent::ImageMediaType;
 
     #[test_case::test_case("echo", true ; "simple_name")]
