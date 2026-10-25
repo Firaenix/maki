@@ -15,16 +15,30 @@ use maki_storage::frame::FactsUpdate;
 use maki_storage::intern;
 pub use maki_storage::sessions::Effort;
 use maki_storage::sessions::{MIN_THINKING_BUDGET, StoredThinking, THINKING_ADAPTIVE, TitleSource};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value, json};
-use strum::{Display, IntoStaticStr};
-use tracing::warn;
+use strum::{Display, IntoStaticStr, VariantNames};
+use tracing::{debug, warn};
 
 use crate::TokenUsage;
 use crate::image::{Fix, IMAGE_EVICTION_STEP, MAX_IMAGES, fix_for_wire};
 use crate::model::Model;
 
 const LOCAL_BUDGET_FIELD: &str = "thinking_budget_tokens";
+const BLOCK_TYPE_KEY: &str = "type";
+/// Every `type` the derived impl parses. Taken from the enum so a new variant
+/// is never missing, minus `Unknown`, which is never parsed and so stays last.
+const KNOWN_BLOCK_TYPES: &[&str] = match ContentBlock::VARIANTS.split_last() {
+    Some((_unknown, known)) => known,
+    None => &[],
+};
+pub const UNTYPED_BLOCK: &str = "a content block must be an object with a string `type`";
+pub const CONTEXT_UPDATE_WITHOUT_FACTS: &str = "a context_update message must carry its facts";
+/// Facts are only ever written beside a context update, so anywhere else
+/// they are a fabricated or corrupted message, not something to drop.
+pub const FACTS_WITHOUT_CONTEXT_UPDATE: &str = "only a context_update message carries facts";
+pub const UNKNOWN_IMAGE_MEDIA_TYPE: &str = "unknown image media type";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageMediaType {
@@ -63,7 +77,7 @@ impl<'de> Deserialize<'de> for ImageMediaType {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
         Self::from_mime(&s)
-            .ok_or_else(|| serde::de::Error::custom(format!("unknown image media type '{s}'")))
+            .ok_or_else(|| serde::de::Error::custom(format!("{UNKNOWN_IMAGE_MEDIA_TYPE} '{s}'")))
     }
 }
 
@@ -91,21 +105,24 @@ impl fmt::Debug for ImageSource {
 
 impl<'de> Deserialize<'de> for ImageSource {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Borrowed so a block read from its buffered `Value` copies the
+        // payload once, into the final `Arc`. A reader that cannot lend
+        // strings hands over an owned one instead.
         #[derive(Deserialize)]
-        struct Wire {
+        struct Wire<'a> {
             media_type: ImageMediaType,
-            data: String,
+            #[serde(borrow)]
+            data: Cow<'a, str>,
         }
         let wire = Wire::deserialize(deserializer)?;
         // Base64 image payloads are the largest strings a session holds, and a
         // load decodes each one once per record that carries it.
-        Ok(Self::new(wire.media_type, intern::shared_str(wire.data)))
+        Ok(Self::new(wire.media_type, intern::shared_str(&wire.data)))
     }
 }
 
 impl Serialize for ImageSource {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
         let mut state = serializer.serialize_struct("ImageSource", 3)?;
         state.serialize_field("type", "base64")?;
         state.serialize_field("media_type", &self.media_type)?;
@@ -250,8 +267,11 @@ fn images_kept(total: usize) -> usize {
     total - over.div_ceil(IMAGE_EVICTION_STEP) * IMAGE_EVICTION_STEP
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A new variant is not skew-safe: an older build drops the whole record, so
+/// it needs a `LOG_FORMAT_VERSION` bump.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, IntoStaticStr)]
 #[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
 pub enum Role {
     #[default]
     User,
@@ -264,8 +284,24 @@ impl Role {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+/// Part of the frozen session surface (disk, exports, Lua), so it only grows:
+///
+/// - Fields and variants are only added, fields always with a default.
+///   Neither needs a log format bump.
+/// - An older build keeps a variant it does not know as [`Self::Unknown`],
+///   but drops a field it does not know on its next rewrite. So data an older
+///   build must not lose goes in a new variant, never in a new field. A field
+///   is for something whose loss falls back to a default (`loaded_tools`, a
+///   flag).
+/// - A known block holding a value an older build cannot read (a new media
+///   type, a new image source) is kept whole as [`Self::Unknown`] too, so
+///   loading never fails on a block. Strict readers ask [`Self::strict_error`].
+/// - A new variant may sit beside `ToolUse`/`ToolResult` but never replace
+///   them. An older build treats it as inert, so a call answered only by a
+///   new variant would be left unanswered there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, VariantNames, IntoStaticStr)]
+#[serde(remote = "Self", tag = "type", rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum ContentBlock {
     Text {
         text: String,
@@ -300,11 +336,71 @@ pub enum ContentBlock {
     Image {
         source: ImageSource,
     },
+    /// A block this build cannot read, most likely written by a newer one.
+    /// Kept as raw JSON and written back unchanged, never sent to a provider.
+    /// Must stay the last variant (see [`KNOWN_BLOCK_TYPES`]).
+    #[serde(skip)]
+    Unknown(Value),
+}
+
+fn block_type(raw: &Value) -> Option<&str> {
+    raw.get(BLOCK_TYPE_KEY)?.as_str()
+}
+
+impl<'de> Deserialize<'de> for ContentBlock {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Value::deserialize(deserializer)?;
+        match block_type(&raw) {
+            None => warn!("keeping a content block without a string type as unknown"),
+            Some(known) if KNOWN_BLOCK_TYPES.contains(&known) => match Self::deserialize(&raw) {
+                Ok(block) => return Ok(block),
+                // Expected under version skew and nothing the user can fix,
+                // and loads are frequent. A strict import reports it loudly.
+                Err(error) => debug!(
+                    block_type = known,
+                    %error,
+                    "keeping a content block this build cannot read as unknown"
+                ),
+            },
+            Some(newer) => debug!(
+                block_type = newer,
+                "keeping a content block of a type this build does not know"
+            ),
+        }
+        Ok(Self::Unknown(raw))
+    }
+}
+
+impl Serialize for ContentBlock {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Unknown(raw) => raw.serialize(serializer),
+            known => Self::serialize(known, serializer),
+        }
+    }
 }
 
 impl ContentBlock {
     pub fn is_thinking(&self) -> bool {
         matches!(self, Self::Thinking { .. } | Self::RedactedThinking { .. })
+    }
+
+    /// Why a strict reader (transcript import) must refuse this block, or
+    /// `None` if it may keep it. An [`Self::Unknown`] of a type this build
+    /// does not know is a newer build's block and passes. One without a
+    /// string `type` gets [`UNTYPED_BLOCK`], and one of a known type gets the
+    /// serde error that kept it from parsing.
+    pub fn strict_error(&self) -> Option<String> {
+        let Self::Unknown(raw) = self else {
+            return None;
+        };
+        match block_type(raw) {
+            None => Some(UNTYPED_BLOCK.to_owned()),
+            Some(known) if KNOWN_BLOCK_TYPES.contains(&known) => {
+                Self::deserialize(raw).err().map(|error| error.to_string())
+            }
+            Some(_) => None,
+        }
     }
 }
 
@@ -313,7 +409,13 @@ impl ContentBlock {
 /// travel as a user message, and without this there is no way to tell it
 /// apart from the user actually typing. A prefix in the text would not do:
 /// a log line can print one.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, IntoStaticStr)]
+///
+/// `Deserialize` reads a bare tag, or the nested `{"context_update": facts}`
+/// that logs held before [`Message`] went flat. Nothing writes that anymore.
+///
+/// A new variant is not skew-safe: an older build drops the whole record, so
+/// it needs a `LOG_FORMAT_VERSION` bump.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum MessageKind {
@@ -363,16 +465,96 @@ impl ContentBlock {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+/// Part of the frozen session surface (disk, exports, Lua), written flat:
+/// `{"role", "content", "display_text"?, "kind"?, "facts"?}`, with `kind` as
+/// a bare tag and `facts` beside a `context_update`. Older logs nest it as
+/// `{"kind": {"context_update": facts}}`. Those still load, and are not
+/// rewritten just for that.
+///
+/// It only grows, by the same rules as [`ContentBlock`].
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[serde(try_from = "RawMessage")]
 pub struct Message {
     pub role: Role,
     pub content: Vec<ContentBlock>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_text: Option<String>,
-    /// Skipped when it is `Turn`, so sessions written before this existed
-    /// load unchanged.
-    #[serde(default, skip_serializing_if = "MessageKind::is_turn")]
     pub kind: MessageKind,
+}
+
+/// [`Message`] as stored, before `kind` and `facts` are paired up.
+#[derive(Deserialize)]
+struct RawMessage {
+    role: Role,
+    content: Vec<ContentBlock>,
+    #[serde(default)]
+    display_text: Option<String>,
+    #[serde(default)]
+    kind: Option<RawKind>,
+    #[serde(default)]
+    facts: Option<Arc<FactsUpdate>>,
+}
+
+/// [`MessageKind`] reads every kind but the flat `context_update` tag, whose
+/// facts sit beside it.
+#[derive(Deserialize)]
+#[serde(
+    untagged,
+    expecting = "a message kind: a tag, or a nested context_update"
+)]
+enum RawKind {
+    Kind(MessageKind),
+    ContextUpdateTag(ContextUpdateTag),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ContextUpdateTag {
+    ContextUpdate,
+}
+
+impl TryFrom<RawMessage> for Message {
+    type Error = &'static str;
+
+    fn try_from(raw: RawMessage) -> Result<Self, Self::Error> {
+        let kind = match (raw.kind, raw.facts) {
+            (Some(RawKind::ContextUpdateTag(_)), Some(facts)) => MessageKind::ContextUpdate(facts),
+            (Some(RawKind::ContextUpdateTag(_)), None) => return Err(CONTEXT_UPDATE_WITHOUT_FACTS),
+            (_, Some(_)) => return Err(FACTS_WITHOUT_CONTEXT_UPDATE),
+            (Some(RawKind::Kind(kind)), None) => kind,
+            (None, None) => MessageKind::Turn,
+        };
+        Ok(Self {
+            role: raw.role,
+            content: raw.content,
+            display_text: raw.display_text,
+            kind,
+        })
+    }
+}
+
+/// By hand rather than `into = "RawMessage"`, which clones the message first,
+/// and every rewrite serializes the whole history.
+impl Serialize for Message {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let facts = self.facts_update();
+        let len = 2
+            + usize::from(self.display_text.is_some())
+            + usize::from(!self.kind.is_turn())
+            + usize::from(facts.is_some());
+        let mut state = serializer.serialize_struct("Message", len)?;
+        state.serialize_field("role", &self.role)?;
+        state.serialize_field("content", &self.content)?;
+        if let Some(display_text) = &self.display_text {
+            state.serialize_field("display_text", display_text)?;
+        }
+        if !self.kind.is_turn() {
+            state.serialize_field("kind", <&'static str>::from(&self.kind))?;
+        }
+        if let Some(facts) = facts {
+            state.serialize_field("facts", facts)?;
+        }
+        state.end()
+    }
 }
 
 impl Message {
@@ -415,6 +597,15 @@ impl Message {
 
     pub fn is_context_update(&self) -> bool {
         self.facts_update().is_some()
+    }
+
+    /// Exactly what [`Self::context_update`] builds. Anything else tagged as
+    /// one is not the host's, and a compaction would drop real content with it.
+    pub fn is_host_context_update(&self) -> bool {
+        self.is_context_update()
+            && self.role == Role::User
+            && self.display_text.is_none()
+            && matches!(&self.content[..], [ContentBlock::Text { .. }])
     }
 
     pub fn facts_update(&self) -> Option<&FactsUpdate> {
@@ -581,8 +772,11 @@ pub(crate) const FALLBACK_MAX_THINKING_BUDGET: u32 = 32_768;
 /// generation early, at 4.7; the other families joined at 5.
 const ADAPTIVE_SINCE: (u32, u32) = (5, 0);
 const ADAPTIVE_SINCE_OPUS: (u32, u32) = (4, 7);
+const GEMINI_LEVEL_SINCE: u32 = 3;
 const OPUS: &str = "opus";
 const CLAUDE: &str = "claude";
+const GEMINI: &str = "gemini";
+const LATEST: &str = "latest";
 const SNAPSHOT_DATE_LEN: usize = "20250514".len();
 
 /// `claude-opus-4.7` -> `("opus", (4, 7))`, `claude-opus-5-1m` -> `("opus", (5, 0))`.
@@ -633,12 +827,33 @@ pub(crate) fn rejects_sampling(model_id: &str) -> bool {
     requires_adaptive(model_id)
 }
 
+/// Gemini 3+ and the `-latest` aliases take `thinkingLevel` (`low`, `medium`,
+/// `high`) in place of `thinkingBudget`. Only the 2.x series speaks budgets;
+/// `minimal` is omitted from the dialect because Pro and Gemini 4 reject it
+/// with a 400.
+fn uses_google_thinking_level(model_id: &str) -> bool {
+    let mut tokens = model_id
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .skip_while(|token| *token != GEMINI)
+        .skip(1);
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    if let Some(major) = version_number(first) {
+        major >= GEMINI_LEVEL_SINCE
+    } else {
+        tokens.any(|token| token == LATEST)
+    }
+}
+
 /// How a provider's effort knob speaks: which levels its API accepts, what
 /// `adaptive` means there, and whether "off" needs an explicit string.
 /// New providers add a const in [`dialect`]; providers with dynamic model
 /// listings build one from the model's declared levels (see OpenRouter).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffortDialect<'a> {
+    /// Wire name of a declared dialect; `None` for one built at runtime.
+    pub name: Option<&'static str>,
     /// Accepted levels, non-empty and ascending (checked by test).
     pub supported: &'a [Effort],
     /// What `Adaptive` maps to. `None` means the API has its own adaptive or
@@ -648,10 +863,26 @@ pub struct EffortDialect<'a> {
     pub off: Option<&'static str>,
 }
 
+impl EffortDialect<'_> {
+    /// The level `Adaptive` goes out as, `None` where nothing is sent.
+    pub fn adaptive_effort(&self) -> Option<Effort> {
+        self.adaptive.map(|level| level.snap(self.supported))
+    }
+}
+
 /// The model's own spelling of each thinking mode, parsed and validated by
 /// maki-config. Turning one into wire bytes is this crate's job, see
 /// [`declared_fragment`].
 pub use maki_config::providers::ThinkingFields;
+
+fn declared_effort(fields: &ThinkingFields, level: Effort) -> Option<Effort> {
+    fields
+        .levels
+        .range(..=level)
+        .next_back()
+        .or_else(|| fields.levels.first_key_value())
+        .map(|(&level, _)| level)
+}
 
 /// What a request says when the model's fields do not spell the mode asked
 /// for. The fragment merge is identical everywhere, only this last step
@@ -667,34 +898,68 @@ pub enum ThinkingFallback {
     BudgetField,
 }
 
-/// The fragment that spells `thinking` for this model, if it has one. Effort
-/// levels snap to the declared ones, so a level the model never advertised is
-/// never sent, while `off` and `adaptive` need explicit keys and never snap. A
-/// token budget picks the level it lands on. A model that declares no levels
-/// at all gets `adaptive` and keeps the count, which is what the returned flag
-/// asks the caller to send alongside.
-fn declared_fragment(
+impl ThinkingFallback {
+    /// The level [`ThinkingConfig::apply_thinking`] sends for `Adaptive` on
+    /// `model`. `None` where the model spells the mode itself, or where the
+    /// endpoint is left to decide.
+    pub(crate) fn adaptive_effort(self, model: &Model) -> Option<Effort> {
+        let spelled = model
+            .effective_thinking_fields()
+            .is_some_and(|(fields, _)| fields.adaptive.is_some());
+        match self {
+            Self::Dialect(dialect) if !spelled => dialect.adaptive_effort(),
+            Self::None | Self::Dialect(_) | Self::BudgetField => None,
+        }
+    }
+}
+
+/// The setting the native fragment sends. Budgets survive only where the
+/// adapter can forward them alongside a toggle.
+fn declared_thinking(
     fields: &ThinkingFields,
     thinking: ThinkingConfig,
-    max: Option<u32>,
-) -> Option<(&Map<String, Value>, bool)> {
+    model: &Model,
+    fallback: ThinkingFallback,
+) -> Option<ThinkingConfig> {
     let level = match thinking {
-        ThinkingConfig::Off => return fields.off.as_ref().map(|f| (f, false)),
-        ThinkingConfig::Adaptive => return fields.adaptive.as_ref().map(|f| (f, false)),
+        ThinkingConfig::Off => return fields.off.as_ref().map(|_| thinking),
+        ThinkingConfig::Adaptive => return fields.adaptive.as_ref().map(|_| thinking),
         ThinkingConfig::Effort(level) => level,
         ThinkingConfig::Budget(n) => {
             if fields.levels.is_empty() {
-                return fields.adaptive.as_ref().map(|f| (f, true));
+                return fields.adaptive.as_ref().map(|_| match fallback {
+                    ThinkingFallback::BudgetField => thinking,
+                    ThinkingFallback::None | ThinkingFallback::Dialect(_) => {
+                        ThinkingConfig::Adaptive
+                    }
+                });
             }
-            Effort::from_budget(n, max.unwrap_or(FALLBACK_MAX_THINKING_BUDGET))
+            Effort::from_budget(
+                n,
+                model
+                    .max_thinking_budget()
+                    .unwrap_or(FALLBACK_MAX_THINKING_BUDGET),
+            )
         }
     };
-    let declared: Vec<Effort> = fields.levels.keys().copied().collect();
-    fields
-        .levels
-        .get(&level.snap(&declared))
-        .or(fields.adaptive.as_ref())
-        .map(|f| (f, false))
+    declared_effort(fields, level)
+        .map(ThinkingConfig::Effort)
+        .or_else(|| fields.adaptive.as_ref().map(|_| ThinkingConfig::Adaptive))
+}
+
+fn declared_fragment<'a>(
+    fields: &'a ThinkingFields,
+    thinking: ThinkingConfig,
+    model: &Model,
+    fallback: ThinkingFallback,
+) -> Option<(&'a Map<String, Value>, bool)> {
+    let resolved = declared_thinking(fields, thinking, model, fallback)?;
+    let fragment = match resolved {
+        ThinkingConfig::Off => fields.off.as_ref(),
+        ThinkingConfig::Adaptive | ThinkingConfig::Budget(_) => fields.adaptive.as_ref(),
+        ThinkingConfig::Effort(level) => fields.levels.get(&level),
+    }?;
+    Some((fragment, matches!(resolved, ThinkingConfig::Budget(_))))
 }
 
 pub(crate) fn merge_body(body: &mut Map<String, Value>, fragment: &Map<String, Value>) {
@@ -723,6 +988,7 @@ macro_rules! dialects {
         $(
             $(#[$attr])+
             pub const $konst: EffortDialect = EffortDialect {
+                name: Some($name),
                 supported: &[$($level),+],
                 adaptive: $adaptive,
                 off: $off,
@@ -742,17 +1008,11 @@ macro_rules! dialects {
 
         /// The name [`by_name`] answers this dialect to, so a declaration can
         /// serialise the dialect it holds instead of keeping the name twice.
-        /// Written as the inverse of `by_name` so the two cannot drift.
-        ///
-        /// Matched by value, not by address: a `const` is inlined at each use
-        /// site, so two `&STANDARD` need not be the same pointer. `None` for a
-        /// dialect built at runtime out of a model's declared levels (see
-        /// OpenRouter), which no declaration can name.
+        /// The macro wrote both from the same literal, so the two cannot
+        /// drift. `None` for a dialect built at runtime out of a model's
+        /// declared levels (see OpenRouter), which no declaration can name.
         pub fn name_of(dialect: &EffortDialect) -> Option<&'static str> {
-            NAMES
-                .iter()
-                .copied()
-                .find(|name| by_name(name).is_some_and(|known| known == dialect))
+            dialect.name
         }
     };
 }
@@ -834,6 +1094,12 @@ pub mod dialect {
         /// `output_config.effort` on Anthropic adaptive-thinking models. The API
         /// has native adaptive mode, so Adaptive sends no effort.
         ANTHROPIC_ADAPTIVE "anthropic-adaptive" {
+            supported: [Low, Medium, High],
+            adaptive: None,
+            off: None
+        },
+        /// Gemini 3+ `thinkingLevel`. Pro and Gemini 4 reject `minimal`.
+        GEMINI "gemini" {
             supported: [Low, Medium, High],
             adaptive: None,
             off: None
@@ -1027,7 +1293,7 @@ impl ThinkingConfig {
         fallback: ThinkingFallback,
     ) -> bool {
         let max = model.max_thinking_budget();
-        let Some((fragment, keep_budget)) = declared_fragment(fields, self, max) else {
+        let Some((fragment, keep_budget)) = declared_fragment(fields, self, model, fallback) else {
             return false;
         };
         let Some(object) = body.as_object_mut() else {
@@ -1046,13 +1312,25 @@ impl ThinkingConfig {
     /// `max` is Google's own documented ceiling on thinking, which is a
     /// capability and so part of resolving the level, not a trim.
     pub fn apply_google_thinking(self, body: &mut Value, model: &Model, max: u32) {
+        if uses_google_thinking_level(&model.id) {
+            if matches!(self, Self::Off) {
+                return;
+            }
+            let mut config = json!({"includeThoughts": true});
+            if let Some(level) = self.effort_str(&dialect::GEMINI, model) {
+                config["thinkingLevel"] = json!(level);
+            }
+            body["generationConfig"]["thinkingConfig"] = config;
+            return;
+        }
         match self.request_budget(model, Some(max)) {
             Budgeted::Off => {}
             Budgeted::Adaptive => {
                 body["generationConfig"]["thinkingConfig"] = json!({"includeThoughts": true});
             }
             Budgeted::Tokens(n) => {
-                body["generationConfig"]["thinkingConfig"] = json!({"thinkingBudget": n});
+                body["generationConfig"]["thinkingConfig"] =
+                    json!({"includeThoughts": true, "thinkingBudget": n});
             }
         }
     }
@@ -1094,18 +1372,31 @@ impl ThinkingConfig {
         }
     }
 
-    /// The status bar already wraps this in brackets, so a level just names
-    /// itself. A raw count keeps its unit, or it reads like any other number
-    /// up there.
-    /// What the model will really run, so stored state can never disagree with
-    /// the request. Clamps both ways: down to `Off` where thinking is
-    /// unsupported, up to minimal effort where it is mandatory.
+    /// Enforces thinking support without rewriting enabled intent. Effort
+    /// stays a delegation ceiling even when the wire snaps it to a native
+    /// level or sends a toggle. [`Self::shown`] resolves the displayed choice.
     pub fn clamped(self, model: &Model) -> Self {
         if !model.supports_thinking() {
             return Self::Off;
         }
         if model.requires_thinking() && !self.is_enabled() {
             return Self::Effort(Effort::Minimal);
+        }
+        self
+    }
+
+    /// The picker and badge follow the wire while stored intent keeps its
+    /// delegation ceiling. Declared fields keep `Adaptive` separate because
+    /// their level fragments can differ from the provider fallback.
+    pub fn shown(self, model: &Model) -> Self {
+        let fields = model.effective_thinking_fields();
+        if let Some((fields, fallback)) = fields
+            && let Some(shown) = declared_thinking(fields, self, model, fallback)
+        {
+            return shown;
+        }
+        if self == Self::Adaptive && fields.is_none_or(|(fields, _)| fields.levels.is_empty()) {
+            return model.adaptive_effort().map_or(self, Self::Effort);
         }
         self
     }
@@ -1310,6 +1601,12 @@ mod tests {
     const UPDATE_HINT_SLOT: &str = "memory/tags";
     const GONE_HINT_SLOT: &str = "todo/after_instructions";
     const UPDATE_HINT: &str = "rust, cache";
+    const UNKNOWN_BLOCK_TYPE: &str = "server_tool_use";
+    const NEWER_MEDIA_TYPE: &str = "image/heic";
+    const UNKNOWN_VARIANT_NAME: &str = "unknown";
+    const SERDE_UNKNOWN_VARIANT: &str = "unknown variant";
+    const SERDE_INVALID_TYPE: &str = "invalid type";
+    const SERDE_MISSING_ID: &str = "missing field `id`";
 
     #[test_case("end_turn", StopReason::EndTurn   ; "end_turn")]
     #[test_case("tool_use", StopReason::ToolUse   ; "tool_use")]
@@ -1376,25 +1673,98 @@ mod tests {
         }
     }
 
+    fn plan_mode_facts_json() -> Value {
+        json!({
+            "date": UPDATE_DATE,
+            "plan": { "entered": UPDATE_PLAN },
+            "hints": { UPDATE_HINT_SLOT: UPDATE_HINT, GONE_HINT_SLOT: null }
+        })
+    }
+
     /// A resume reads what the model holds true from the stored updates, so
     /// the format is pinned. If it drifts, a resumed session forgets plan mode
     /// or the hints.
     #[test]
-    fn context_update_keeps_its_stored_format() {
+    fn context_update_writes_the_flat_shape() {
         let stored = json!({
             "role": "user",
             "content": [{ "type": "text", "text": UPDATE_TEXT }],
-            "kind": { "context_update": {
-                "date": UPDATE_DATE,
-                "plan": { "entered": UPDATE_PLAN },
-                "hints": { UPDATE_HINT_SLOT: UPDATE_HINT, GONE_HINT_SLOT: null }
-            } }
+            "kind": "context_update",
+            "facts": plan_mode_facts_json()
         });
         let update = Message::context_update(UPDATE_TEXT.into(), plan_mode_facts());
         assert_eq!(serde_json::to_value(&update).unwrap(), stored);
 
         let loaded: Message = serde_json::from_value(stored).unwrap();
-        assert_eq!(loaded.facts_update(), Some(&plan_mode_facts()));
+        assert_eq!(loaded, update);
+    }
+
+    #[test]
+    fn context_update_reads_the_old_nested_shape() {
+        let stored = json!({
+            "role": "user",
+            "content": [{ "type": "text", "text": UPDATE_TEXT }],
+            "kind": { "context_update": plan_mode_facts_json() }
+        });
+        let loaded: Message = serde_json::from_value(stored).unwrap();
+        assert_eq!(
+            loaded,
+            Message::context_update(UPDATE_TEXT.into(), plan_mode_facts())
+        );
+    }
+
+    #[test_case(json!({ "role": "user", "content": [], "kind": "context_update" }), CONTEXT_UPDATE_WITHOUT_FACTS ; "tag_without_facts")]
+    #[test_case(json!({ "role": "user", "content": [], "facts": plan_mode_facts_json() }), FACTS_WITHOUT_CONTEXT_UPDATE ; "facts_without_tag")]
+    fn unpaired_context_update_is_an_error(stored: Value, expected: &str) {
+        let err = serde_json::from_value::<Message>(stored).unwrap_err();
+        assert!(err.to_string().contains(expected), "{err}");
+    }
+
+    #[test_case(|_: &mut Message| {}, true ; "as_built")]
+    #[test_case(|m: &mut Message| m.role = Role::Assistant, false ; "from_assistant")]
+    #[test_case(|m: &mut Message| m.display_text = Some(PROMPT.into()), false ; "visible")]
+    #[test_case(|m: &mut Message| m.content = vec![ContentBlock::tool_result("t1", PROMPT, false)], false ; "tool_result")]
+    #[test_case(|m: &mut Message| m.content.push(ContentBlock::Text { text: PROMPT.into() }), false ; "two_blocks")]
+    #[test_case(|m: &mut Message| m.kind = MessageKind::Turn, false ; "not_an_update")]
+    fn host_context_update_is_the_constructed_shape(change: fn(&mut Message), expected: bool) {
+        let mut message = Message::context_update(UPDATE_TEXT.into(), plan_mode_facts());
+        change(&mut message);
+        assert_eq!(message.is_host_context_update(), expected);
+    }
+
+    /// A block this build cannot read may hold a newer build's data, so it
+    /// loads and writes back untouched. A strict import refuses it with the
+    /// detail, unless only its type is new.
+    #[test_case(json!({ "type": UNKNOWN_BLOCK_TYPE, "id": "srvtoolu_1" }), None                 ; "newer_type")]
+    #[test_case(json!({ "type": "text", "text": 42 }), Some(SERDE_INVALID_TYPE)                     ; "text_wrong_type")]
+    #[test_case(json!({ "type": "tool_use", "name": "read", "input": {} }), Some(SERDE_MISSING_ID) ; "tool_use_missing_id")]
+    #[test_case(json!({ "type": "image", "source": { "type": "base64", "media_type": NEWER_MEDIA_TYPE, "data": INTERNED_DATA } }), Some(UNKNOWN_IMAGE_MEDIA_TYPE) ; "image_newer_media_type")]
+    #[test_case(json!({ "text": PROMPT }), Some(UNTYPED_BLOCK)                                      ; "missing_type")]
+    #[test_case(json!({ "type": 7, "text": PROMPT }), Some(UNTYPED_BLOCK)                           ; "non_string_type")]
+    #[test_case(json!(PROMPT), Some(UNTYPED_BLOCK)                                                  ; "not_an_object")]
+    fn unreadable_block_is_kept_as_written(stored: Value, strict_detail: Option<&str>) {
+        let loaded: ContentBlock = serde_json::from_value(stored.clone()).unwrap();
+        assert!(matches!(&loaded, ContentBlock::Unknown(raw) if *raw == stored));
+        assert_eq!(serde_json::to_value(&loaded).unwrap(), stored);
+        match (loaded.strict_error(), strict_detail) {
+            (None, None) => {}
+            (Some(error), Some(detail)) => assert!(error.contains(detail), "{error}"),
+            (error, detail) => panic!("strict error {error:?}, expected {detail:?}"),
+        }
+    }
+
+    /// A name strum derives but serde does not parse would turn every block
+    /// of that type into `Unknown`. Such a block may fail on its fields,
+    /// never on the tag.
+    #[test]
+    fn every_derived_block_type_is_a_serde_tag() {
+        assert_eq!(ContentBlock::VARIANTS.last(), Some(&UNKNOWN_VARIANT_NAME));
+        for &name in KNOWN_BLOCK_TYPES {
+            if let Err(error) = ContentBlock::deserialize(json!({ BLOCK_TYPE_KEY: name })) {
+                let error = error.to_string();
+                assert!(!error.contains(SERDE_UNKNOWN_VARIANT), "{name}: {error}");
+            }
+        }
     }
 
     /// A first run in plan mode tells the model before the user's prompt, and
@@ -1658,6 +2028,27 @@ mod tests {
         assert_eq!(&*deserialized.data, "abc123");
     }
 
+    fn image_block_source(wire: &[u8]) -> ImageSource {
+        match serde_json::from_slice(wire).unwrap() {
+            ContentBlock::Image { source } => source,
+            other => panic!("expected an image, got {other:?}"),
+        }
+    }
+
+    fn image_source_from_reader(wire: &[u8]) -> ImageSource {
+        serde_json::from_reader(wire).unwrap()
+    }
+
+    /// A block borrows the payload from its buffered `Value`, while a reader
+    /// cannot lend strings at all. Both must yield the same image.
+    #[test_case(json!({ "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": INTERNED_DATA } }), image_block_source ; "block_borrowed_from_value")]
+    #[test_case(json!({ "type": "base64", "media_type": "image/png", "data": INTERNED_DATA }), image_source_from_reader ; "source_owned_from_reader")]
+    fn image_source_deserializes_borrowed_or_owned(stored: Value, read: fn(&[u8]) -> ImageSource) {
+        let source = read(stored.to_string().as_bytes());
+        assert_eq!(source.media_type, ImageMediaType::Png);
+        assert_eq!(&*source.data, INTERNED_DATA);
+    }
+
     /// The payloads a session repeats across records collapse to one
     /// allocation, and only while a load is in flight.
     #[test]
@@ -1677,7 +2068,7 @@ mod tests {
         assert!(!Arc::ptr_eq(&first.data, &read(INTERNED_DATA).data));
     }
 
-    use Effort::{High, Low, Max, Minimal, XHigh};
+    use Effort::{High, Low, Max, Medium, Minimal, XHigh};
 
     /// `max_output_tokens: 8192`, so `max_thinking_budget()` is 4096.
     fn thinking_model(id: &str) -> crate::model::Model {
@@ -1689,6 +2080,7 @@ mod tests {
 
     fn native_thinking_model(id: &str, fields: Value) -> crate::model::Model {
         let mut model = thinking_model(id);
+        model.provider = Arc::from("llama-cpp");
         model.thinking_fields = Some(Box::new(serde_json::from_value(fields).unwrap()));
         model
     }
@@ -1706,11 +2098,9 @@ mod tests {
         )
     }
 
-    /// `Effort::snap` walks `supported` expecting it sorted, and `name_of`
-    /// matches on field values, so two dialects with identical fields would
-    /// hand a declaration back the wrong name.
+    /// `Effort::snap` walks `supported` expecting it sorted.
     #[test]
-    fn every_dialect_is_well_formed_and_uniquely_named() {
+    fn every_dialect_is_well_formed_and_named() {
         for name in dialect::NAMES {
             let d = dialect::by_name(name).expect(UNKNOWN_DIALECT);
             assert!(!d.supported.is_empty(), "{name} supports nothing");
@@ -1909,22 +2299,29 @@ mod tests {
     /// Roomy enough that the request ceiling is not what binds.
     const ROOMY_OUTPUT: Option<u32> = Some(65_536);
 
-    #[test_case(ThinkingConfig::Off, ROOMY_OUTPUT, json!({})                                                                  ; "off")]
-    #[test_case(ThinkingConfig::Adaptive, ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true}}}) ; "adaptive")]
-    #[test_case(ThinkingConfig::Budget(4096), ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 4096}}}) ; "budget")]
-    #[test_case(ThinkingConfig::Budget(10000), ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 8192}}}) ; "budget_clamped_to_googles_cap")]
+    #[test_case(ThinkingConfig::Off, "gemini-2.5-pro", ROOMY_OUTPUT, json!({})                                                                  ; "off")]
+    #[test_case(ThinkingConfig::Adaptive, "gemini-2.5-pro", ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true}}}) ; "adaptive")]
+    #[test_case(ThinkingConfig::Budget(4096), "gemini-2.5-pro", ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true, "thinkingBudget": 4096}}}) ; "budget")]
+    #[test_case(ThinkingConfig::Budget(10000), "gemini-2.5-pro", ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true, "thinkingBudget": 8192}}}) ; "budget_clamped_to_googles_cap")]
     // Half the `maxOutputTokens` the same request carries, or the answer has
     // nowhere to land.
-    #[test_case(ThinkingConfig::Budget(10000), Some(GOOGLE_CAP), json!({"generationConfig": {"thinkingConfig": {"thinkingBudget": 4096}}}) ; "budget_cut_to_what_the_request_can_house")]
+    #[test_case(ThinkingConfig::Budget(10000), "gemini-2.5-pro", Some(GOOGLE_CAP), json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true, "thinkingBudget": 4096}}}) ; "budget_cut_to_what_the_request_can_house")]
+    #[test_case(ThinkingConfig::Off, "gemini-4-argon", ROOMY_OUTPUT, json!({}) ; "off_level_model")]
+    #[test_case(ThinkingConfig::Adaptive, "gemini-4-argon", ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true}}}) ; "adaptive_level_model")]
+    #[test_case(ThinkingConfig::Effort(Minimal), "gemini-4-argon", ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true, "thinkingLevel": "low"}}}) ; "minimal_snaps_up_to_low_on_level_model")]
+    #[test_case(ThinkingConfig::Effort(High), "gemini-4-argon", ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true, "thinkingLevel": "high"}}}) ; "high_level_model")]
+    #[test_case(ThinkingConfig::Effort(XHigh), "gemini-3.6-flash", ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true, "thinkingLevel": "high"}}}) ; "xhigh_snaps_down_to_high_on_gemini_3")]
+    #[test_case(ThinkingConfig::Budget(32768), "gemini-pro-latest", ROOMY_OUTPUT, json!({"generationConfig": {"thinkingConfig": {"includeThoughts": true, "thinkingLevel": "high"}}}) ; "budget_maps_to_level_on_latest_alias")]
     fn thinking_apply_google_thinking(
         config: ThinkingConfig,
+        model_id: &str,
         max_output_tokens: Option<u32>,
         expected: Value,
     ) {
         let mut body = json!({});
         let model = crate::model::Model {
             max_output_tokens,
-            ..thinking_model("gemini-2.5-pro")
+            ..thinking_model(model_id)
         };
         config.apply_google_thinking(&mut body, &model, GOOGLE_CAP);
         assert_eq!(body, expected);
@@ -1960,6 +2357,46 @@ mod tests {
         assert_eq!(body, expected);
     }
 
+    #[test_case(ThinkingConfig::Effort(Minimal), ThinkingConfig::Effort(Low) ; "below_lowest")]
+    #[test_case(ThinkingConfig::Effort(Low), ThinkingConfig::Effort(Low) ; "declared_level")]
+    #[test_case(ThinkingConfig::Effort(High), ThinkingConfig::Effort(Medium) ; "gap_snaps_down")]
+    #[test_case(ThinkingConfig::Effort(Max), ThinkingConfig::Effort(XHigh) ; "above_highest")]
+    #[test_case(ThinkingConfig::Adaptive, ThinkingConfig::Adaptive ; "adaptive_stays")]
+    #[test_case(ThinkingConfig::Off, ThinkingConfig::Off ; "off_stays")]
+    #[test_case(ThinkingConfig::Budget(SMALL_BUDGET), ThinkingConfig::Effort(Medium) ; "budget_shows_its_native_level")]
+    #[test_case(ThinkingConfig::Budget(LARGE_BUDGET), ThinkingConfig::Effort(XHigh) ; "large_budget_shows_highest_native_level")]
+    fn shown_native_thinking_matches_the_encoded_level_without_rewriting_intent(
+        requested: ThinkingConfig,
+        expected: ThinkingConfig,
+    ) {
+        let model = native_effort_model();
+        assert_eq!(requested.clamped(&model), requested);
+        assert_eq!(requested.shown(&model), expected);
+        let mut original = json!({});
+        let mut normalized = json!({});
+        requested.apply_thinking(&mut original, &model, ThinkingFallback::BudgetField);
+        expected.apply_thinking(&mut normalized, &model, ThinkingFallback::BudgetField);
+        assert_eq!(original, normalized);
+    }
+
+    #[test_case(Some(8192), SMALL_BUDGET, Medium ; "declared_output_cap")]
+    #[test_case(None, SMALL_BUDGET, Low ; "unknown_cap_uses_encoder_fallback")]
+    #[test_case(Some(8192), LARGE_BUDGET, XHigh ; "budget_above_cap")]
+    fn typed_native_budget_keeps_its_ceiling_but_shows_the_encoded_level(
+        max_output_tokens: Option<u32>,
+        budget: u32,
+        expected: Effort,
+    ) {
+        let mut model = native_effort_model();
+        model.max_output_tokens = max_output_tokens;
+        let thinking = ThinkingConfig::Budget(budget);
+        assert_eq!(thinking.clamped(&model), thinking);
+        assert_eq!(thinking.shown(&model), ThinkingConfig::Effort(expected));
+        let mut body = json!({});
+        thinking.apply_thinking(&mut body, &model, ThinkingFallback::BudgetField);
+        assert_eq!(body, json!({"reasoning_effort": expected.as_str()}));
+    }
+
     #[test]
     fn local_required_thinking_maps_off_to_lowest_native_effort() {
         let mut model = native_effort_model();
@@ -1970,6 +2407,8 @@ mod tests {
         }
         .clamped(&model)
         .thinking;
+        assert_eq!(thinking, ThinkingConfig::Effort(Minimal));
+        assert_eq!(thinking.shown(&model), ThinkingConfig::Effort(Low));
         let mut body = json!({});
         thinking.apply_thinking(&mut body, &model, ThinkingFallback::BudgetField);
         assert_eq!(body, json!({"reasoning_effort": "low"}));
@@ -1990,6 +2429,59 @@ mod tests {
         let mut body = json!({"chat_template_kwargs": {"keep": 1}});
         config.apply_thinking(&mut body, &model, ThinkingFallback::BudgetField);
         assert_eq!(body, expected);
+    }
+
+    #[test_case("llama-cpp", None, ThinkingConfig::Budget(LARGE_BUDGET), Some(4096) ; "llama_cpp_sends_a_clamped_count")]
+    #[test_case("llama-cpp", Some(SMALL_BUDGET), ThinkingConfig::Budget(LARGE_BUDGET), Some(1024) ; "llama_cpp_respects_the_turn_cap")]
+    #[test_case("ollama", None, ThinkingConfig::Adaptive, None ; "ollama_sends_only_the_toggle")]
+    #[test_case("openai", None, ThinkingConfig::Adaptive, None ; "openai_chat_sends_only_the_toggle")]
+    fn toggle_budget_is_shown_only_when_the_adapter_forwards_it(
+        provider: &str,
+        turn_output_tokens: Option<u32>,
+        expected: ThinkingConfig,
+        sent_budget: Option<u32>,
+    ) {
+        let mut model = native_thinking_model(
+            "local-toggle-model",
+            json!({"adaptive": {"enable_thinking": true}}),
+        );
+        model.provider = Arc::from(provider);
+        model.thinking_override = Some(Support::Yes);
+        model.turn_output_tokens = turn_output_tokens;
+        let thinking = ThinkingConfig::Budget(LARGE_BUDGET);
+        assert_eq!(thinking.clamped(&model), thinking);
+        assert_eq!(thinking.shown(&model), expected);
+        let (_, fallback) = model.effective_thinking_fields().unwrap();
+        let mut body = json!({});
+        thinking.apply_thinking(&mut body, &model, fallback);
+        let mut expected_body = json!({"enable_thinking": true});
+        if let Some(budget) = sent_budget {
+            expected_body[LOCAL_BUDGET_FIELD] = json!(budget);
+        }
+        assert_eq!(body, expected_body);
+    }
+
+    #[test_case(Support::Yes, ThinkingConfig::Off, ThinkingConfig::Off ; "optional_off")]
+    #[test_case(Support::Required, ThinkingConfig::Off, ThinkingConfig::Adaptive ; "required_off_enables_toggle")]
+    #[test_case(Support::Yes, ThinkingConfig::Effort(High), ThinkingConfig::Adaptive ; "effort_uses_toggle")]
+    #[test_case(Support::Yes, ThinkingConfig::Adaptive, ThinkingConfig::Adaptive ; "adaptive_stays")]
+    #[test_case(Support::Yes, ThinkingConfig::Budget(SMALL_BUDGET), ThinkingConfig::Budget(SMALL_BUDGET) ; "explicit_budget_stays")]
+    #[test_case(Support::No, ThinkingConfig::Adaptive, ThinkingConfig::Off ; "unsupported_stays_off")]
+    fn shown_toggle_thinking_uses_only_the_declared_modes(
+        support: Support,
+        requested: ThinkingConfig,
+        expected: ThinkingConfig,
+    ) {
+        let mut model = native_thinking_model(
+            "local-toggle-model",
+            json!({
+                "off": {"enable_thinking": false},
+                "adaptive": {"enable_thinking": true}
+            }),
+        );
+        model.thinking_override = Some(support);
+        let clamped = requested.clamped(&model);
+        assert_eq!(clamped.shown(&model), expected);
     }
 
     /// A mode the model has no fragment for must still reach the server, so
@@ -2069,6 +2561,38 @@ mod tests {
             fast: false,
         };
         assert_eq!(opts.clamped(&model).thinking, expected);
+    }
+
+    /// The picker and the status bar read the level, but the session keeps
+    /// `Adaptive`: a stored level would cap subagents where `Adaptive` does not.
+    #[test_case(ThinkingConfig::Adaptive,    ThinkingConfig::Effort(High) ; "adaptive_reads_as_the_fixed_level")]
+    #[test_case(ThinkingConfig::Effort(Low), ThinkingConfig::Effort(Low)  ; "a_named_level_stays")]
+    #[test_case(ThinkingConfig::Off,         ThinkingConfig::Off          ; "off_stays")]
+    fn shown_resolves_adaptive_without_changing_what_is_stored(
+        thinking: ThinkingConfig,
+        expected: ThinkingConfig,
+    ) {
+        let mut model = clamp_test_model(crate::spec::ProviderRegistry::get("xai").unwrap());
+        model.thinking_override = Some(Support::Yes);
+
+        assert_eq!(thinking.shown(&model), expected);
+        assert_eq!(thinking.clamped(&model), thinking);
+    }
+
+    /// A model that spells `adaptive` itself keeps the mode, whatever the
+    /// provider's dialect would have sent.
+    #[test_case("llama-cpp", json!({"high": {"reasoning_effort": "xhigh"}}), Some(Effort::Medium) ; "unspelled_takes_the_dialect_level")]
+    #[test_case("llama-cpp", json!({"adaptive": {"reasoning_effort": "auto"}}), None ; "spelled_stays_adaptive")]
+    #[test_case("zai", json!({"adaptive": {"reasoning_effort": "auto"}}), Some(Effort::Medium) ; "inactive_fields_do_not_hide_the_fixed_mode")]
+    fn fallback_adaptive_effort_defers_to_the_models_own_fields(
+        provider: &str,
+        fields: Value,
+        expected: Option<Effort>,
+    ) {
+        let mut model = native_thinking_model("partial", fields);
+        model.provider = Arc::from(provider);
+        assert_eq!(DIALECT.adaptive_effort(&model), expected);
+        assert_eq!(ThinkingFallback::None.adaptive_effort(&model), None);
     }
 
     #[test_case(None,                           ThinkingConfig::Off      ; "absent_means_off")]

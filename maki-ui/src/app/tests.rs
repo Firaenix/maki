@@ -1,5 +1,8 @@
 use super::session::{FORK_EMPTY_MSG, FORK_TITLE_PREFIX};
 use super::*;
+
+const PERMISSION_REQUESTED_EVENT: &str = "PermissionRequested";
+const PERMISSION_RESOLVED_EVENT: &str = "PermissionResolved";
 use crate::AppSession;
 use crate::agent::shared_queue;
 use crate::app::tasks::TaskStatus;
@@ -17,12 +20,14 @@ use crate::selection::{RowPos, SelectableZone, SelectionState, SelectionZone};
 use crate::theme;
 use arc_swap::ArcSwap;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+use maki_agent::agent::TranscriptError;
 use maki_agent::command::{CommandScope, CustomCommand};
 use maki_agent::permissions::{PermissionAnswer, PermissionManager};
+use maki_agent::session::NOTHING_TO_STORE;
 use maki_agent::{
-    AgentMode, DoneReason, ImageMediaType, McpConfigErrors, McpServerInfo, McpServerStatus,
-    McpSnapshot, McpSnapshotReader, SharedBuf, SubagentInbox, ToolDoneEvent, ToolOutput,
-    ToolStartEvent, TurnCompleteEvent,
+    AgentMode, DoneReason, HistorySnapshot, ImageMediaType, McpConfigErrors, McpServerInfo,
+    McpServerStatus, McpSnapshot, McpSnapshotReader, SharedBuf, SteerKind, SubagentInbox,
+    ToolDoneEvent, ToolOutput, ToolStartEvent, Transcript, TurnCompleteEvent,
 };
 use maki_config::{Effect, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey, UiConfig};
 use maki_lua::test_support::{HintWriterHandle, hint_writer_pair};
@@ -38,7 +43,8 @@ use maki_providers::{
 use maki_storage::id::MakiId;
 use maki_storage::model::read_thinking;
 use maki_storage::sessions::{
-    SessionClaim, SessionMeta, StoredMode, StoredThinking, StoredTokenUsage,
+    SessionClaim, SessionMeta, StoredMode, StoredThinking, StoredTokenUsage, THINKING_ADAPTIVE,
+    ThinkingParseError,
 };
 use maki_storage::trusted_folders::{CanonicalFolder, TrustedFolders};
 use ratatui::Terminal;
@@ -52,6 +58,7 @@ use tempfile::TempDir;
 use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const NATIVE_OUTPUT_CAP: u32 = 8192;
 const ALL_LANDED: &str = "a drain that wrote everything reports nothing unsaved";
 const TASK_ID: &str = "task1";
 const PACKUPDATE: &str = "/packupdate";
@@ -69,12 +76,22 @@ const HINT_TEXT: &str = "2/4 staged";
 const HINT_STYLE: &str = "fg";
 const RETRY_MESSAGE: &str = "overloaded";
 const RETRY_DELAY: Duration = Duration::from_secs(5);
+const NOTICE_BODY: &str = "Background task find auth finished:\n\nok";
+const NOTICE_LINE: &str = "Background agent finished: find auth";
+const SECOND_NOTICE_LINE: &str = "Background agent failed: lint";
+const NOTICE_PROMPT: &str = "what changed";
+const QUEUED_PROMPT: &str = "and then";
+const LAST_QUEUED_PROMPT: &str = "one more";
+const NOTICE_REPLY: &str = "the build is green";
+const STEERED_TEXT: &str = "rewritten by a plugin";
 const MISSING_DIR: &str = "gone";
 const RESUMED_PROMPT: &str = "carry me over";
 const SONNET_SPEC: &str = "anthropic/claude-sonnet-4-5";
 const OPUS_SPEC: &str = "anthropic/claude-opus-4-8";
 const PLAIN_MODEL_SPEC: &str = "ollama/qwen3";
 const THINKING_OPTIONS: &str = "thinking_options";
+const THINKING_SHOWN: &str = "thinking_shown";
+const FIXED_ADAPTIVE_PROVIDER: &str = "xai";
 const MODEL_CHANGED_EVENT: &str = "ModelChanged";
 const INPUT_CHANGED_EVENT: &str = "InputChanged";
 const PLAN_READY_EVENT: &str = "PlanReady";
@@ -99,6 +116,8 @@ const OVERLAY_TAKES_THE_CURSOR: &str = "an overlay unfocuses the input box, so n
 const MEASURED_CONTEXT: u32 = 100_000;
 const TEST_MODEL_SPEC: &str = "test-model";
 const TEST_CWD: &str = "/tmp/test";
+const DOCUMENT_TEXT: &str = "moved in from another maki";
+const UNKNOWN_THINKING: &str = "lukewarm";
 const PERMISSIONS_CWD: &str = "/tmp";
 /// The rewind fixture holds a few dozen bytes of chat, far below this, so it
 /// doubles as the window the gauge is allowed to land in.
@@ -300,7 +319,7 @@ pub(crate) fn end_turn(app: &mut App) {
     app.update(done_event());
 }
 
-fn subagent_info(parent_id: &str, name: &str) -> SubagentInfo {
+pub(crate) fn subagent_info(parent_id: &str, name: &str) -> SubagentInfo {
     subagent_info_with_tx(parent_id, name, None)
 }
 
@@ -425,6 +444,136 @@ fn mailbox_wake_starts_without_an_empty_user_bubble() {
     ));
     assert_eq!(app.status, Status::Streaming);
     assert!(app.main_chat().segment_search_texts().is_empty());
+}
+
+fn labelled_notice(line: &str) -> Message {
+    let mut message = Message::observation(NOTICE_BODY.into());
+    message.display_text = Some(line.into());
+    message
+}
+
+#[test]
+fn a_notice_line_appears_when_the_loop_accepts_it() {
+    let mut app = test_app();
+    app.start_mailbox_run(vec![labelled_notice(NOTICE_LINE)]);
+    assert!(
+        app.main_chat().segment_search_texts().is_empty(),
+        "the line waits for the loop to accept the notice"
+    );
+
+    app.update(agent_msg_with_run_id(
+        AgentEvent::ObservationLine {
+            text: NOTICE_LINE.into(),
+        },
+        app.run_id,
+    ));
+
+    assert_eq!(
+        app.main_chat().last_message_role(),
+        Some(&DisplayRole::Notice)
+    );
+    assert_eq!(app.main_chat().last_message_text(), NOTICE_LINE);
+    assert_eq!(app.chats.len(), 1, "a notice must not open a chat");
+}
+
+/// What the TUI sees during a notice scenario, in order.
+#[derive(Clone, Copy)]
+enum LiveStep {
+    Submit(&'static str),
+    Consumed(&'static str),
+    Reply,
+    Steered,
+    Accepted(&'static str),
+    Done,
+    Wake,
+}
+
+/// The saved history the same scenario leaves behind.
+#[derive(Clone, Copy)]
+enum SavedStep {
+    Notice(&'static str),
+    Prompt(&'static str),
+    Reply,
+}
+
+fn notice_and_prompt_rows<'a>(
+    rows: impl Iterator<Item = &'a DisplayMessage>,
+) -> Vec<(DisplayRole, String)> {
+    rows.filter(|row| matches!(row.role, DisplayRole::Notice | DisplayRole::User))
+        .map(|row| (row.role.clone(), row.text.clone()))
+        .collect()
+}
+
+/// History keeps a notice ahead of the prompts it landed with, while the live
+/// transcript drew them first. A restore must still show notices and prompts
+/// in the order the user watched them arrive.
+#[test_case(&[LiveStep::Submit(NOTICE_PROMPT), LiveStep::Accepted(NOTICE_LINE)],
+    &[SavedStep::Notice(NOTICE_LINE), SavedStep::Prompt(NOTICE_PROMPT), SavedStep::Reply] ; "single_prompt")]
+#[test_case(&[LiveStep::Consumed(NOTICE_PROMPT), LiveStep::Consumed(QUEUED_PROMPT), LiveStep::Accepted(NOTICE_LINE)],
+    &[SavedStep::Notice(NOTICE_LINE), SavedStep::Prompt(NOTICE_PROMPT), SavedStep::Prompt(QUEUED_PROMPT), SavedStep::Reply] ; "batched_prompts")]
+#[test_case(&[LiveStep::Submit(NOTICE_PROMPT), LiveStep::Steered, LiveStep::Accepted(NOTICE_LINE)],
+    &[SavedStep::Notice(NOTICE_LINE), SavedStep::Prompt(NOTICE_PROMPT), SavedStep::Reply] ; "steered_prompt")]
+#[test_case(&[LiveStep::Submit(NOTICE_PROMPT), LiveStep::Accepted(NOTICE_LINE), LiveStep::Accepted(SECOND_NOTICE_LINE)],
+    &[SavedStep::Notice(NOTICE_LINE), SavedStep::Notice(SECOND_NOTICE_LINE), SavedStep::Prompt(NOTICE_PROMPT), SavedStep::Reply] ; "two_notices")]
+#[test_case(&[LiveStep::Submit(NOTICE_PROMPT), LiveStep::Reply, LiveStep::Consumed(QUEUED_PROMPT), LiveStep::Accepted(NOTICE_LINE)],
+    &[SavedStep::Prompt(NOTICE_PROMPT), SavedStep::Reply, SavedStep::Notice(NOTICE_LINE), SavedStep::Prompt(QUEUED_PROMPT), SavedStep::Reply] ; "interrupt")]
+#[test_case(&[LiveStep::Submit(NOTICE_PROMPT), LiveStep::Reply, LiveStep::Consumed(QUEUED_PROMPT), LiveStep::Consumed(LAST_QUEUED_PROMPT), LiveStep::Accepted(NOTICE_LINE)],
+    &[SavedStep::Prompt(NOTICE_PROMPT), SavedStep::Reply, SavedStep::Prompt(QUEUED_PROMPT), SavedStep::Notice(NOTICE_LINE), SavedStep::Prompt(LAST_QUEUED_PROMPT), SavedStep::Reply] ; "interrupt_burst")]
+#[test_case(&[LiveStep::Submit(NOTICE_PROMPT), LiveStep::Done, LiveStep::Wake, LiveStep::Accepted(NOTICE_LINE)],
+    &[SavedStep::Prompt(NOTICE_PROMPT), SavedStep::Reply, SavedStep::Notice(NOTICE_LINE), SavedStep::Reply] ; "wake_without_prompt")]
+fn a_notice_line_keeps_its_history_position(live: &[LiveStep], saved: &[SavedStep]) {
+    let mut app = test_app();
+    for step in live {
+        let event = match *step {
+            LiveStep::Submit(text) => {
+                type_and_submit(&mut app, text);
+                continue;
+            }
+            LiveStep::Wake => {
+                app.start_mailbox_run(Vec::new());
+                continue;
+            }
+            LiveStep::Consumed(text) => AgentEvent::QueueItemConsumed {
+                text: text.into(),
+                images: Vec::new(),
+            },
+            LiveStep::Reply => AgentEvent::TextDelta {
+                text: NOTICE_REPLY.into(),
+            },
+            LiveStep::Steered => AgentEvent::Steered {
+                kind: SteerKind::MessageRewritten,
+                text: STEERED_TEXT.into(),
+            },
+            LiveStep::Accepted(text) => AgentEvent::ObservationLine { text: text.into() },
+            LiveStep::Done => done(),
+        };
+        app.update(agent_msg_with_run_id(event, app.run_id));
+    }
+    let history: Vec<Message> = saved
+        .iter()
+        .map(|step| match *step {
+            SavedStep::Notice(line) => labelled_notice(line),
+            SavedStep::Prompt(text) => Message::user(text.into()),
+            SavedStep::Reply => Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: NOTICE_REPLY.into(),
+                }],
+                ..Default::default()
+            },
+        })
+        .collect();
+    let (restored, _) = crate::chat::history_to_display(
+        &history,
+        &HashMap::new(),
+        &app.ui_config.tool_output_lines,
+    );
+
+    let chat = app.main_chat();
+    let shown = notice_and_prompt_rows(
+        (0..chat.message_count()).filter_map(|index| chat.message_at(index)),
+    );
+    assert_eq!(shown, notice_and_prompt_rows(restored.iter()));
 }
 
 fn with_text(app: &mut App) {
@@ -753,6 +902,32 @@ fn submit_prompt_rejects(mk: fn() -> App, text: &str, expected: &str) {
     }
 }
 
+fn image_msg(text: &str) -> QueuedMessage {
+    QueuedMessage {
+        text: text.into(),
+        images: vec![ImageSource::new(ImageMediaType::Png, Arc::from("dGVzdA=="))],
+    }
+}
+
+#[test]
+fn submit_prompt_starts_blank_text_with_images() {
+    let mut app = test_app();
+    assert!(matches!(
+        app.submit_prompt(image_msg("  ")),
+        SubmitOutcome::Started(_)
+    ));
+}
+
+#[test]
+fn submit_prompt_rejects_images_without_vision() {
+    let mut app = test_app();
+    app.state.model.supports_vision_override = Some(false);
+    match app.submit_prompt(image_msg("look")) {
+        SubmitOutcome::Rejected(e) => assert_eq!(e, image_paste::IMAGE_NOT_SUPPORTED_MSG),
+        _ => panic!("expected rejection"),
+    }
+}
+
 fn streaming_app_without_queue() -> App {
     let dir = StateDir::from_path(env::temp_dir());
     let mut app = build_app(dir.clone(), Arc::new(test_writer(dir)));
@@ -961,6 +1136,110 @@ fn blank_session_carries_the_settings_that_outlive_a_turn() {
     assert!(session.messages().is_empty());
     assert_eq!(session.model, app.state.model.spec());
     assert_eq!(session.cwd, app.state.session.cwd);
+}
+
+/// `maki.session.new` lays its document over this same blank session, so a
+/// plugin's "new session" starts where `Ctrl-N` would. A blank one keeps the
+/// tab's yolo like `Ctrl-N` does, and a conversation never brings it along.
+#[test_case(Vec::new(), Some(true) ; "blank_keeps_yolo")]
+#[test_case(vec![Message::user(DOCUMENT_TEXT.into())], None ; "conversation_drops_yolo")]
+fn a_plugin_made_session_starts_from_the_focused_tab(messages: Vec<Message>, yolo: Option<bool>) {
+    let mut app = test_app();
+    app.state.fast = true;
+    app.state.workflow = true;
+    app.permissions.set_session_yolo(Some(true));
+    let transcript = Transcript {
+        messages,
+        ..Default::default()
+    };
+
+    let session = app.session_from(transcript).unwrap().session;
+
+    assert_eq!(session.cwd, app.state.session.cwd);
+    assert_eq!(session.model, app.state.model.spec());
+    assert!(session.meta.fast);
+    assert!(session.meta.workflow);
+    assert_eq!(session.meta.yolo, yolo);
+}
+
+/// Without `prompt` or `focus`, `maki.session.new` only stores, and a bad
+/// document has to fail before anything reaches the disk.
+#[test_case(None ; "a_valid_document_is_stored")]
+#[test_case(Some(UNKNOWN_THINKING) ; "an_invalid_document_answers_its_error_and_stores_nothing")]
+fn a_plugin_made_session_is_stored_only_when_valid(thinking: Option<&str>) {
+    let (_tmp, dir, _writer, app) = tempdir_app();
+    let transcript = Transcript {
+        thinking: thinking.map(str::to_owned),
+        messages: vec![Message::user(DOCUMENT_TEXT.into())],
+        ..Default::default()
+    };
+
+    let stored = app
+        .session_from(transcript)
+        .map(|open| open.store(&dir).unwrap());
+
+    let listed: Vec<MakiId> = AppSession::list_all(&dir)
+        .unwrap()
+        .into_iter()
+        .map(|summary| summary.id)
+        .collect();
+    match (thinking, stored) {
+        (None, Ok(id)) => assert_eq!(listed, [id]),
+        (Some(bad), Err(e)) => {
+            let expected = TranscriptError::from(ThinkingParseError::Unknown(bad.into()));
+            assert_eq!(e, expected.to_string());
+            assert!(listed.is_empty());
+        }
+        (_, stored) => panic!("unexpected outcome {stored:?}"),
+    }
+}
+
+/// A history that repairs down to nothing would be a dead entry in the
+/// picker, so it is refused at the write rather than stored empty.
+#[test]
+fn a_plugin_made_session_without_messages_is_not_stored() {
+    let (_tmp, dir, _writer, app) = tempdir_app();
+    let emptied = Message {
+        content: Vec::new(),
+        ..Message::user(DOCUMENT_TEXT.into())
+    };
+    let transcript = Transcript {
+        messages: vec![emptied],
+        ..Default::default()
+    };
+
+    let error = app
+        .session_from(transcript)
+        .unwrap()
+        .store(&dir)
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), NOTHING_TO_STORE);
+    assert!(AppSession::list_all(&dir).unwrap().is_empty());
+}
+
+/// `maki.session.export` answers an open tab from memory, so a turn that has
+/// not reached disk and a setting changed since the last checkpoint both
+/// travel.
+#[test_case(true ; "from_the_agents_mirror")]
+#[test_case(false ; "from_a_tab_whose_agent_never_started")]
+fn a_tab_exports_its_unsaved_messages_and_live_settings(agent_started: bool) {
+    let mut app = test_app();
+    let unsaved = vec![Message::user(DOCUMENT_TEXT.into())];
+    if agent_started {
+        let mirror = HistorySnapshot::new(unsaved.clone());
+        app.shared_history = Some(Arc::new(ArcSwap::from_pointee(mirror)));
+    } else {
+        app.state.session_mut().push_message(unsaved[0].clone());
+    }
+    app.state.fast = true;
+    app.state.mode = Mode::Plan;
+
+    let export = app.export();
+
+    assert_eq!(*export.messages, unsaved);
+    assert!(export.header.fast);
+    assert_eq!(export.header.mode, Some(StoredMode::Plan));
 }
 
 /// A setting written into the meta but never read back still opens the tab
@@ -2407,10 +2686,10 @@ fn tasks_report_main_chat_then_subagent_outcomes() {
     assert_eq!(
         tasks,
         serde_json::json!([
-            { "id": "main", "name": "Main", "focused": true },
-            { "id": "task1", "name": "research", "status": "done", "focused": false },
-            { "id": "task2", "name": "build", "status": "error", "focused": false },
-            { "id": "task3", "name": "deploy", "status": "working", "focused": false },
+            { "session": app.state.session.id, "id": "main", "name": "Main", "focused": true },
+            { "session": app.state.session.id, "id": "task1", "name": "research", "status": "done", "focused": false },
+            { "session": app.state.session.id, "id": "task2", "name": "build", "status": "error", "focused": false },
+            { "session": app.state.session.id, "id": "task3", "name": "deploy", "status": "working", "focused": false },
         ])
     );
 }
@@ -4184,6 +4463,54 @@ fn cd_command_behavior() {
     assert!(flash.starts_with("cd: "), "error flash={flash:?}");
 }
 
+/// Plugins that track the working directory retitle windows and rerun
+/// project detection on this event, so it has to fire only on a real move.
+#[test]
+fn cd_fires_cwd_changed_with_the_new_directory() {
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    app.execute_command(
+        ParsedCommand {
+            name: "/cd".into(),
+            args: "/tmp".into(),
+            bang: false,
+        },
+        0,
+    );
+
+    let (event, data) = probe.try_recv_autocmd().expect("SessionCwdChanged fired");
+    assert_eq!(event, "SessionCwdChanged");
+    let resolved = maki_storage::paths::canonicalize_clean(Path::new("/tmp"));
+    assert_eq!(data["cwd"], serde_json::json!(resolved.to_string_lossy()));
+    assert_eq!(
+        data["session_id"],
+        serde_json::json!(app.state.session.id.to_string())
+    );
+}
+
+#[test]
+fn failed_cd_fires_no_cwd_changed() {
+    let mut app = test_app();
+    let (handle, probe) = maki_lua::test_support::probed_event_handle();
+    app.lua_event_handle = handle;
+
+    app.execute_command(
+        ParsedCommand {
+            name: "/cd".into(),
+            args: "/nonexistent_path_12345".into(),
+            bang: false,
+        },
+        0,
+    );
+
+    assert!(
+        probe.try_recv_autocmd().is_none(),
+        "no event on a failed cd"
+    );
+}
+
 #[test]
 fn cd_swaps_input_history_to_the_new_dir() {
     let (tmp, dir, _writer, mut app) = tempdir_app();
@@ -4245,8 +4572,8 @@ fn typed_lua_command_with_args_executes() {
 
 const RUN_CMDLINE_REJECTED: &str = "a rejected cmdline must not run anything";
 
-/// The caller holds nothing at all, because a local command like `/new` runs
-/// for any plugin.
+/// The caller holds only `session_write`, all `/new` needs, as with
+/// `maki.session.new`.
 #[test_case("/new" ; "plain")]
 #[test_case("/NEW" ; "uppercase")]
 #[test_case("  /new  " ; "surrounding_whitespace")]
@@ -4255,7 +4582,7 @@ fn run_cmdline_executes_builtin(cmdline: &str) {
     let mut app = test_app();
 
     let actions = app
-        .run_cmdline(cmdline, 0, &PluginReach::new(PluginPermissions::denied()))
+        .run_cmdline(cmdline, 0, &only(Permission::SessionWrite))
         .unwrap();
 
     assert!(matches!(&actions[..], [Action::RestartAgent(h)] if h.is_empty()));
@@ -4325,19 +4652,25 @@ fn without(permission: Permission) -> PluginReach {
 }
 
 fn only(permission: Permission) -> PluginReach {
+    only_these(&[permission])
+}
+
+fn only_these(permissions: &[Permission]) -> PluginReach {
     PluginReach::new(PluginPermissions::from_approved(
-        [permission.manifest_key()],
+        permissions
+            .iter()
+            .map(|permission| permission.manifest_key()),
     ))
 }
 
-/// A model turn needs `agent`, and another plugin's command needs whatever
-/// its handler runs with. Holding only that one permission is enough, and
-/// holding everything else is not.
-#[test_case("/btw what is rust?", Permission::Agent ; "btw")]
-#[test_case("/compact", Permission::Agent ; "compact")]
-#[test_case("/user:fix the tests", Permission::Agent ; "custom_command")]
-#[test_case(RUNNING_PLUGIN_COMMAND, Permission::Run ; "plugin_command")]
-fn run_cmdline_needs_what_the_command_reaches(cmdline: &str, needed: Permission) {
+/// A model turn needs `agent`, a prompt also `session_write`, and another
+/// plugin's command needs whatever its handler runs with. Holding exactly
+/// those is enough, and lacking any one of them is not.
+#[test_case("/btw what is rust?", &[Permission::Agent] ; "btw")]
+#[test_case("/compact", &[Permission::Agent, Permission::SessionWrite] ; "compact")]
+#[test_case("/user:fix the tests", &[Permission::Agent, Permission::SessionWrite] ; "custom_command")]
+#[test_case(RUNNING_PLUGIN_COMMAND, &[Permission::Run] ; "plugin_command")]
+fn run_cmdline_needs_what_the_command_reaches(cmdline: &str, needed: &[Permission]) {
     let mut app = test_app();
     app.command_palette = CommandPalette::new(
         Arc::from([CustomCommand {
@@ -4358,14 +4691,35 @@ fn run_cmdline_needs_what_the_command_reaches(cmdline: &str, needed: Permission)
         }]),
     );
 
-    assert_eq!(
-        app.run_cmdline(cmdline, 1, &without(needed)).err(),
-        Some(missing_refusal(
-            cmdline.split_whitespace().next().unwrap(),
-            &Missing::Permission(needed)
-        ))
-    );
-    assert_eq!(app.run_cmdline(cmdline, 1, &only(needed)).err(), None);
+    let command = cmdline.split_whitespace().next().unwrap();
+    for &permission in needed {
+        assert_eq!(
+            app.run_cmdline(cmdline, 1, &without(permission)).err(),
+            Some(missing_refusal(command, &Missing::Permission(permission)))
+        );
+    }
+    assert_eq!(app.run_cmdline(cmdline, 1, &only_these(needed)).err(), None);
+}
+
+/// Most of these mirror `maki.session.new` or `maki.model.set`, and `/cd` and
+/// `/workflow` change where tools run and which exist. Holding the other
+/// session permission opens none of them.
+#[test_case("/new", Permission::SessionWrite, Permission::SessionSettings ; "new_with_only_settings")]
+#[test_case("/fork", Permission::SessionWrite, Permission::SessionSettings ; "fork_with_only_settings")]
+#[test_case("/model", Permission::SessionSettings, Permission::SessionWrite ; "model_with_only_write")]
+#[test_case("/fast", Permission::SessionSettings, Permission::SessionWrite ; "fast_with_only_write")]
+#[test_case("/cd", Permission::SessionSettings, Permission::SessionWrite ; "cd_with_only_write")]
+#[test_case("/workflow", Permission::SessionSettings, Permission::SessionWrite ; "workflow_with_only_write")]
+fn run_cmdline_refuses_session_commands_without_their_permission(
+    cmdline: &str,
+    needed: Permission,
+    held: Permission,
+) {
+    let mut app = test_app();
+    let refusal = Some(missing_refusal(cmdline, &Missing::Permission(needed)));
+
+    assert_eq!(app.run_cmdline(cmdline, 1, &without(needed)).err(), refusal);
+    assert_eq!(app.run_cmdline(cmdline, 1, &only(held)).err(), refusal);
 }
 
 #[test_case("/yolo" ; "yolo")]
@@ -6310,6 +6664,7 @@ fn model_state_reports_the_model_and_what_it_supports() {
             "id": "qwen3",
             "provider": "ollama",
             "thinking": "off",
+            "thinking_shown": "off",
             "fast": false,
             "supports_thinking": false,
             "supports_fast": false,
@@ -6326,6 +6681,7 @@ fn model_state_reports_the_model_and_what_it_supports() {
             "id": "claude-opus-4-8",
             "provider": "anthropic",
             "thinking": "high",
+            "thinking_shown": "high",
             "fast": true,
             "supports_thinking": true,
             "supports_fast": true,
@@ -6378,6 +6734,68 @@ fn set_thinking_clamps_to_what_the_model_will_run() {
     let lifted = ThinkingConfig::Effort(Effort::Minimal);
     assert_eq!(app.set_thinking("off").unwrap(), lifted);
     assert_eq!(app.state.thinking, lifted);
+}
+
+#[test_case(ThinkingConfig::Off, true, false, "low" ; "required_native_starts_at_low")]
+#[test_case(ThinkingConfig::Effort(Effort::Minimal), false, false, "low" ; "minimal_snaps_to_low")]
+#[test_case(ThinkingConfig::Effort(Effort::High), false, false, "medium" ; "high_snaps_to_medium")]
+#[test_case(ThinkingConfig::Effort(Effort::Max), false, false, "xhigh" ; "max_snaps_to_xhigh")]
+#[test_case(ThinkingConfig::Budget(NATIVE_OUTPUT_CAP), false, false, "xhigh" ; "typed_budget_selects_native_row")]
+#[test_case(ThinkingConfig::Effort(Effort::High), false, true, "adaptive" ; "effort_on_toggle_uses_adaptive")]
+#[test_case(ThinkingConfig::Off, true, true, "adaptive" ; "required_toggle_enables_thinking")]
+fn restored_and_switched_thinking_selects_a_declared_picker_row(
+    thinking: ThinkingConfig,
+    required: bool,
+    toggle_only: bool,
+    expected: &str,
+) {
+    let (_tmp, storage, _writer, mut app) = tempdir_app();
+    let mut model = test_model();
+    model.provider = Arc::from("llama-cpp");
+    model.max_output_tokens = Some(NATIVE_OUTPUT_CAP);
+    model.thinking_override = Some(if required {
+        ThinkingSupport::Required
+    } else {
+        ThinkingSupport::Yes
+    });
+    let mut fields = serde_json::json!({
+        "off": {"reasoning_effort": "none"},
+        "adaptive": {"reasoning_effort": "medium"}
+    });
+    if !toggle_only {
+        fields["low"] = serde_json::json!({"reasoning_effort": "low"});
+        fields["medium"] = serde_json::json!({"reasoning_effort": "medium"});
+        fields["xhigh"] = serde_json::json!({"reasoning_effort": "xhigh"});
+    }
+    model.thinking_fields = Some(Box::new(serde_json::from_value(fields).unwrap()));
+
+    for restored in [false, true] {
+        if restored {
+            let mut session = AppSession::new(&model.spec(), TEST_CWD);
+            session.meta.thinking = Some(thinking.into());
+            app.apply_loaded_session(OpenSession::claimed(session, &storage), &model);
+        } else {
+            app.state.thinking = thinking;
+            app.state.update_model(&model);
+        }
+        let state = app.model_state();
+        let intent = if required && thinking == ThinkingConfig::Off {
+            ThinkingConfig::Effort(Effort::Minimal)
+        } else {
+            thinking
+        };
+        assert_eq!(state["thinking"], intent.to_string());
+        assert_eq!(state[THINKING_SHOWN], expected);
+        assert!(
+            state[THINKING_OPTIONS]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|option| option["name"] == expected)
+        );
+        assert_eq!(app.set_thinking(&intent.to_string()).unwrap(), intent);
+        assert_eq!(app.model_state(), state);
+    }
 }
 
 #[test_case("off", ThinkingConfig::Off)]
@@ -6807,6 +7225,23 @@ fn model_state_thinking_round_trips_into_set_thinking(thinking: ThinkingConfig, 
     assert_eq!(reported, expected);
     assert_eq!(app.set_thinking(&reported).unwrap(), thinking);
     assert_eq!(app.set_thinking(&reported).unwrap(), thinking);
+}
+
+/// xAI sends `high` for `adaptive`. The picker and the flash read the level,
+/// while `thinking` keeps what the session holds, so handing it back to
+/// `maki.model.set` changes nothing.
+#[test]
+fn model_state_shows_the_level_a_hidden_adaptive_is_sent_as() {
+    let mut app = test_app();
+    app.state.model.provider = Arc::from(FIXED_ADAPTIVE_PROVIDER);
+    app.state.model.thinking_override = Some(ThinkingSupport::Yes);
+    app.state.thinking = ThinkingConfig::Adaptive;
+
+    let state = app.model_state();
+    assert_eq!(state[THINKING_SHOWN], Effort::High.as_str());
+    assert_eq!(state["thinking"], THINKING_ADAPTIVE);
+    let offered = state[THINKING_OPTIONS].as_array().unwrap();
+    assert!(offered.iter().all(|row| row["name"] != THINKING_ADAPTIVE));
 }
 
 #[test]

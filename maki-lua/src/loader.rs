@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,6 +13,7 @@ use maki_agent::tools::{ToolRegistry, ToolSource};
 use maki_config::{GatedFile, PluginFileConfig, PluginsConfig, ProjectConfig, RawConfig};
 use maki_providers::plugin::DeclAuthority;
 
+use crate::agent_autocmd::HostEvent;
 use crate::api::keymap::{KeybindTicket, KeymapReader};
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
 use crate::api::slot::{LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT};
@@ -1294,6 +1296,20 @@ impl EventHandle {
         }
     }
 
+    /// The one way host code fires an event, so every field it sends is one
+    /// [`HostEventKind::fields`](crate::agent_autocmd::HostEventKind::fields)
+    /// classifies. {session_id} is the session the event is about.
+    pub fn fire(&self, session_id: Option<&dyn Display>, event: HostEvent<'_>) {
+        let _ = self.tx.try_send(Request::FireAutocmd {
+            event: event.name().to_owned(),
+            data: event.payload(session_id),
+        });
+    }
+
+    /// Fires {event} with {data} as given, for tests that need a payload no
+    /// [`HostEvent`] carries. Test builds only, so host code has no way to
+    /// fire an event whose fields nobody classified.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn fire_autocmd(&self, event: &str, data: serde_json::Value) {
         let _ = self.tx.try_send(Request::FireAutocmd {
             event: event.to_owned(),
@@ -2528,8 +2544,11 @@ mod bundled_manifests {
     use include_dir::{Dir, DirEntry, File};
     use maki_agent::tools::{ToolRegistry, ToolSource};
     use maki_config::{DEFAULT_BUILTINS, PluginsConfig};
+    use strum::VariantArray;
+    use test_case::test_case;
 
     use super::{Arc, BUNDLED_PLUGINS, HashMap, PluginHost, bundled_permissions, lib_dir};
+    use crate::agent_autocmd::HostEventKind;
     use crate::docs::{DocKind, api_docs};
     use crate::plugin_permissions::Permission;
 
@@ -2539,6 +2558,11 @@ mod bundled_manifests {
     const PROVIDER_REGISTER: &str = "maki.provider.register";
     const API_KEY_ENV_FIELD: &str = "api_key_env";
     const AGENT_SESSION: &str = "maki.agent.session";
+    const SESSION_NOTIFY: &str = "maki.session.notify";
+    const WAKE_OPTION: &str = "wake =";
+    const DISABLED_WAKE: &str = "false";
+    const CREATE_AUTOCMD: &str = "maki.api.create_autocmd";
+    const LUA_QUOTES: [char; 2] = ['"', '\''];
 
     /// Every guarded `maki.*` function under the dotted name lua calls it by.
     fn guarded_calls() -> Vec<(String, Permission)> {
@@ -2546,9 +2570,13 @@ mod bundled_manifests {
             .into_iter()
             .filter(|module| module.kind == DocKind::Table)
             .flat_map(|module| {
-                module.fns.iter().filter_map(move |func| {
-                    let permission = Permission::from_key(func.guard?)?;
-                    Some((format!("{}.{}", module.name, func.name), permission))
+                module.fns.iter().flat_map(move |func| {
+                    func.guard
+                        .unwrap_or_default()
+                        .iter()
+                        .map(move |&permission| {
+                            (format!("{}.{}", module.name, func.name), permission)
+                        })
                 })
             })
             .collect()
@@ -2641,6 +2669,22 @@ mod bundled_manifests {
         })
     }
 
+    fn wakes_session(source: &str) -> bool {
+        calls(source, SESSION_NOTIFY)
+            && source.split(WAKE_OPTION).skip(1).any(|option| {
+                option.split([',', '}']).next().unwrap_or_default().trim() != DISABLED_WAKE
+            })
+    }
+
+    #[test_case("true", true ; "unconditional_wake")]
+    #[test_case("false", false ; "queue_only")]
+    #[test_case("not stopped", true ; "conditional_wake")]
+    #[test_case("false or enabled", true ; "conditional_after_false")]
+    fn notification_wake_usage_requires_the_agent_grant(value: &str, needed: bool) {
+        let source = format!("{SESSION_NOTIFY}('done', {{ session = id, wake = {value} }})");
+        assert_eq!(wakes_session(&source), needed);
+    }
+
     /// `PROVIDER_BUILTINS` is what keeps a provider plugin's name from reading
     /// as a tool, so a bundled plugin that starts registering one must join it.
     #[test]
@@ -2691,6 +2735,30 @@ mod bundled_manifests {
                     needed
                         .entry(Permission::Env)
                         .or_insert_with(|| format!("{PROVIDER_REGISTER} with {API_KEY_ENV_FIELD}"));
+                }
+                // Waking a chat is guarded only when the option is set, so
+                // it has no unconditional guard in the API metadata.
+                if wakes_session(source) {
+                    needed
+                        .entry(Permission::Agent)
+                        .or_insert_with(|| format!("{SESSION_NOTIFY} with {WAKE_OPTION}"));
+                }
+                // Events are never refused, they arrive without their content
+                // fields, so no guard records the need. A bundled plugin
+                // subscribing to an event that has content is reading it.
+                if calls(source, CREATE_AUTOCMD) {
+                    for &kind in HostEventKind::VARIANTS {
+                        let event: &str = kind.into();
+                        if !kind.fields().content.is_empty()
+                            && LUA_QUOTES
+                                .iter()
+                                .any(|q| source.contains(&format!("{q}{event}{q}")))
+                        {
+                            needed
+                                .entry(Permission::SessionRead)
+                                .or_insert_with(|| format!("subscribing to {event}"));
+                        }
+                    }
                 }
                 // A bundled plugin opening a session hands over whatever the
                 // chat has, and a session pays for everything it hands over.

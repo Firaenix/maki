@@ -4,9 +4,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use flume::Sender;
+use maki_agent::agent::tool_dispatch::routed_view;
 use maki_agent::permissions::is_universal_scope;
 use maki_agent::prompt::{PromptId, Slot, SlotKind, ValidNames};
 use maki_agent::tools::Tool;
@@ -17,9 +16,7 @@ use maki_agent::tools::{
     PermissionScopes, ToolAudience, ToolContext, ToolExecResult, ToolFilter, ToolInvocation,
     ToolReach, is_tool_enabled, timeout_annotation,
 };
-use maki_agent::{
-    AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, SharedBuf, TextOutput, ToolOutput,
-};
+use maki_agent::{AgentEvent, BufferSnapshot, ImageSource, SharedBuf, TextOutput, ToolOutput};
 use maki_config::{Effect, PermissionRule, ToolKey, ToolOutputLines};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{
@@ -28,14 +25,16 @@ use mlua::{
 };
 use serde_json::{Value, json};
 
+use crate::api::image::LuaImage;
 use crate::api::options::{PluginOpts, register_options__doc, register_options__register};
 use crate::api::ui::buf::{BufHandle, line_to_lua};
 use crate::api::util::command::{
     CommandEntry, CommandHandlerMap, LuaCommandWriter, UiAction, publish_command_snapshot,
     ui_json_roundtrip, ui_roundtrip,
 };
-use crate::api::util::convert::{json_to_lua, lua_to_json};
+use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json};
 use crate::api::util::ctx::{LuaCtx, RestoreCtx};
+use crate::api::util::image::image_from_table;
 use crate::api::util::pair::{Pair, try_pair};
 use crate::plugin_permissions::{MANIFEST_FILE, Permission, PluginPermissions, PluginReach};
 use crate::runtime::{
@@ -710,7 +709,7 @@ fn register_prompt(
 ///                                diff_path   (string)  Path for a diff output block.
 ///                                diff_before (string)  Before text of the diff.
 ///                                diff_after  (string)  After text of the diff.
-///                                image       (table)   { media_type: string, data: string } base64 image.
+///                                image       (maki.image.Image|table) An Image, or { media_type: string, data: string } base64 image.
 ///                                state       (any)     Serializable state forwarded to restore.
 ///   audiences       (string[]) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
 ///   kind            (string)   Optional grouping label (e.g. "filesystem").
@@ -832,7 +831,7 @@ fn register_permission_rule(
         ));
     }
     let effect = spec
-        .get::<Option<String>>("effect")
+        .opt::<String>("effect")
         .map_err(|_| mlua::Error::runtime("register_permission_rule: 'effect' must be a string"))?;
     let effect = match effect.as_deref() {
         None | Some("allow") => Effect::Allow,
@@ -1202,10 +1201,10 @@ fn get_tools(lua: &Lua, opts: Option<Table>) -> LuaResult<Table> {
         .ok_or_else(|| mlua::Error::runtime("get_tools: tool registry not available"))?;
     let mut disabled: Vec<String> = Vec::new();
     if let Some(o) = opts
-        && let Some(config) = o.get::<Option<Table>>("config")?
+        && let Some(config) = o.opt::<Table>("config")?
     {
         disabled = config
-            .get::<Option<Vec<String>>>("disabled_tools")?
+            .opt::<Vec<String>>("disabled_tools")?
             .unwrap_or_default();
     }
 
@@ -1223,8 +1222,15 @@ fn get_tools(lua: &Lua, opts: Option<Table>) -> LuaResult<Table> {
 /// includes `header` and `restore` handle functions (wrapped so they never
 /// throw).
 ///
+/// `tool_search` and MCP tools (`server__tool` names) never enter the
+/// registry. For them the table holds only `name`, `header`, and the
+/// `format` ("plain" or "markdown") of the standalone call, enough for a
+/// composing tool like batch to draw a child the same way. Any
+/// `server__tool` shaped name resolves whether or not a server offers it,
+/// so this is not an existence check for MCP tools.
+///
 /// @param name string Exact tool name.
-/// @return (table|nil) Tool entry with fields { name, schema, audiences, kind?, header?, restore? }, or nil if not found.
+/// @return (table|nil) Tool entry with fields { name, schema, audiences, kind?, header?, restore?, format? }, or nil if not found.
 /// @example
 /// local t = maki.api.get_tool("bash")
 /// if t then
@@ -1237,7 +1243,7 @@ fn get_tool(lua: &Lua, name: String) -> LuaResult<LuaValue> {
         .map(|r| Arc::clone(&r))
         .ok_or_else(|| mlua::Error::runtime("get_tool: tool registry not available"))?;
     let Some(entry) = registry.get(&name) else {
-        return Ok(LuaValue::Nil);
+        return routed_tool_entry(lua, name);
     };
     let t = tool_entry_to_lua(lua, &entry)?;
     if let Some((header, restore)) = local_tool_handles(&name) {
@@ -1294,6 +1300,31 @@ pub(crate) fn audiences_to_lua(lua: &Lua, audience: ToolAudience) -> LuaResult<T
         }
     }
     Ok(out)
+}
+
+fn routed_tool_entry(lua: &Lua, name: String) -> LuaResult<LuaValue> {
+    let Some(view) = routed_view(&name, &Value::Null) else {
+        return Ok(LuaValue::Nil);
+    };
+    let t = lua.create_table()?;
+    t.set("name", name.as_str())?;
+    t.set(
+        "format",
+        if view.markdown {
+            LUA_FORMAT_MARKDOWN
+        } else {
+            LUA_FORMAT_PLAIN
+        },
+    )?;
+    let summary = {
+        let name = name.clone();
+        lua.create_function(move |lua, input: LuaValue| {
+            let input = lua_to_json(lua, &input)?;
+            Ok(routed_view(&name, &input).map(|view| view.summary))
+        })?
+    };
+    t.set("header", wrap_header(lua, name, summary)?)?;
+    Ok(LuaValue::Table(t))
 }
 
 fn tool_entry_to_lua(lua: &Lua, entry: &RegisteredTool) -> LuaResult<Table> {
@@ -1394,7 +1425,7 @@ fn normalize_restore_ctx(lua: &Lua, v: Option<&LuaValue>) -> LuaResult<LuaValue>
     }
     let ctx = match v {
         Some(LuaValue::Table(t)) => {
-            let string = |key| t.get::<Option<String>>(key).ok().flatten();
+            let string = |key| t.opt::<String>(key).ok().flatten();
             RestoreCtx {
                 tool_output_lines: t
                     .get::<LuaValue>("tool_output_lines")
@@ -1470,7 +1501,7 @@ fn parse_timeout(spec: &Table) -> LuaResult<Option<Duration>> {
 }
 
 fn spec_opt<T: mlua::FromLua>(spec: &Table, key: &str, expected: &str) -> LuaResult<Option<T>> {
-    spec.get::<Option<T>>(key)
+    spec.opt::<T>(key)
         .map_err(|_| mlua::Error::runtime(format!("register_tool: '{key}' must be {expected}")))
 }
 
@@ -1499,7 +1530,7 @@ fn require_schema_field(spec: &Table, key: &str, schema: &Value) -> LuaResult<Op
 }
 
 fn parse_start_annotation(spec: &Table, schema: &Value) -> LuaResult<Option<StartAnnotation>> {
-    match spec.get::<Option<LuaValue>>("start_annotation")? {
+    match spec.opt::<LuaValue>("start_annotation")? {
         None => Ok(None),
         Some(LuaValue::String(s)) => {
             let field = s.to_str()?.to_owned();
@@ -1510,7 +1541,7 @@ fn parse_start_annotation(spec: &Table, schema: &Value) -> LuaResult<Option<Star
             let field: String = t.get("field").map_err(|_| {
                 mlua::Error::runtime("register_tool: start_annotation.field required")
             })?;
-            if t.get::<Option<String>>("kind")?.as_deref() != Some("timeout") {
+            if t.opt::<String>("kind")?.as_deref() != Some("timeout") {
                 return Err(mlua::Error::runtime(
                     "register_tool: start_annotation.kind must be 'timeout'",
                 ));
@@ -1542,7 +1573,7 @@ fn parse_tool_permission(
     permissions: &PluginPermissions,
 ) -> LuaResult<Option<ToolPermission<PermissionScopeSpec>>> {
     let declared = spec
-        .get::<Option<String>>("permission")?
+        .opt::<String>("permission")?
         .map(|key| {
             Permission::from_key(&key).ok_or_else(|| {
                 mlua::Error::runtime(format!(
@@ -1615,7 +1646,7 @@ fn register_tool_from_lua(
     let schema_table: LuaValue = spec
         .get("schema")
         .map_err(|_| mlua::Error::runtime("register_tool: missing 'schema'"))?;
-    let audiences: Option<mlua::Table> = spec.get("audiences").ok();
+    let audiences: Option<mlua::Table> = spec.opt("audiences").ok().flatten();
 
     let schema_val: Value = lua.from_value(schema_table)?;
     let param_schema = try_from_json(&schema_val).map_err(mlua::Error::runtime)?;
@@ -1640,9 +1671,9 @@ fn register_tool_from_lua(
         )));
     }
 
-    let header_fn: Option<Function> = spec.get("header").ok();
-    let restore_fn: Option<Function> = spec.get("restore").ok();
-    let start_fn: Option<Function> = spec.get("start").ok();
+    let header_fn: Option<Function> = spec.opt("header").ok().flatten();
+    let restore_fn: Option<Function> = spec.opt("restore").ok().flatten();
+    let start_fn: Option<Function> = spec.opt("start").ok().flatten();
     let kind: Option<Arc<str>> = spec
         .get::<String>("kind")
         .ok()
@@ -1659,7 +1690,7 @@ fn register_tool_from_lua(
         .transpose()?;
     let start_key = start_fn.map(|f| lua.create_registry_value(f)).transpose()?;
 
-    let describe_fn: Option<Function> = spec.get("describe").ok();
+    let describe_fn: Option<Function> = spec.opt("describe").ok().flatten();
     let describe_key = describe_fn
         .map(|f| lua.create_registry_value(f))
         .transpose()?;
@@ -1791,8 +1822,9 @@ pub(crate) struct ToolCallReply {
     pub annotation: Option<String>,
     pub written_path: Option<String>,
     pub diff: Option<DiffPayload>,
-    /// Set via `image = { media_type = "image/png", data = <base64> }` in the
-    /// handler return; becomes `ToolOutput::Image` with `llm_output` as caption.
+    /// Set via `image = <maki.image.Image>` or
+    /// `image = { media_type = "image/png", data = <base64> }` in the handler
+    /// return. It becomes `ToolOutput::Image` with `llm_output` as caption.
     pub image: Option<ImageSource>,
     pub state: Option<Value>,
 }
@@ -1900,35 +1932,19 @@ fn extract_image(t: &mlua::Table) -> Result<Option<ImageSource>, String> {
     let entry = match t.get::<LuaValue>("image") {
         Ok(LuaValue::Table(entry)) => entry,
         Ok(LuaValue::Nil) | Err(_) => return Ok(None),
+        Ok(entry) if entry.is_null() => return Ok(None),
+        Ok(LuaValue::UserData(ud)) if ud.is::<LuaImage>() => {
+            let image = ud.borrow::<LuaImage>().map_err(|e| e.to_string())?;
+            return Ok(Some(image.to_source()));
+        }
         Ok(other) => {
             return Err(format!(
-                "tool 'image' field must be a table {{ media_type, data }}, got {}",
+                "tool 'image' field must be a table {{ media_type, data }} or a maki.image.Image, got {}",
                 other.type_name()
             ));
         }
     };
-    let media_type = entry
-        .get::<String>("media_type")
-        .map_err(|_| "tool image is missing 'media_type'".to_owned())?;
-    let media_type = ImageMediaType::from_mime(&media_type).ok_or_else(|| {
-        let supported: Vec<&str> = ImageMediaType::ALL.iter().map(|m| m.mime()).collect();
-        format!(
-            "unsupported tool image media_type '{media_type}' ({})",
-            supported.join(", ")
-        )
-    })?;
-    let data = entry
-        .get::<String>("data")
-        .map_err(|_| "tool image is missing base64 'data'".to_owned())?;
-    // Bad base64 would land in history and fail every later request;
-    // validate once at the boundary.
-    if data.is_empty() {
-        return Err("tool image 'data' is empty".to_owned());
-    }
-    BASE64
-        .decode(data.as_bytes())
-        .map_err(|e| format!("tool image 'data' is not valid base64: {e}"))?;
-    Ok(Some(ImageSource::new(media_type, Arc::from(data))))
+    image_from_table(&entry, "tool image").map(Some)
 }
 
 pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
@@ -1957,6 +1973,7 @@ pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use maki_agent::ImageMediaType;
 
     #[test_case::test_case("echo", true ; "simple_name")]
     #[test_case::test_case("tool123", true ; "trailing_digits")]
@@ -2002,6 +2019,35 @@ mod tests {
         assert!(reply.image.is_none());
         let err = reply.result.expect_err("malformed image must error");
         assert!(err.contains(expected), "got: {err}");
+    }
+
+    #[test]
+    fn nil_sentinel_image_reads_as_absent() {
+        const CAPTION: &str = "c";
+        let lua = Lua::new();
+        let reply_table = lua.create_table().unwrap();
+        reply_table.set("llm_output", CAPTION).unwrap();
+        reply_table.set("image", LuaValue::NULL).unwrap();
+        let reply = ToolCallReply::from_lua_value(&lua, &LuaValue::Table(reply_table));
+        assert_eq!(reply.result.as_deref(), Ok(CAPTION));
+        assert!(reply.image.is_none());
+    }
+
+    #[test]
+    fn image_handle_reply_shares_its_payload() {
+        const CAPTION: &str = "c";
+        let source = ImageSource::new(ImageMediaType::Png, Arc::from("aGVsbG8="));
+        let lua = Lua::new();
+        let reply_table = lua.create_table().unwrap();
+        reply_table.set("llm_output", CAPTION).unwrap();
+        reply_table
+            .set("image", LuaImage::from_source(source.clone()))
+            .unwrap();
+        let reply = ToolCallReply::from_lua_value(&lua, &LuaValue::Table(reply_table));
+        assert_eq!(reply.result.as_deref(), Ok(CAPTION));
+        let image = reply.image.expect("an Image return must carry the image");
+        assert!(Arc::ptr_eq(&image.data, &source.data));
+        assert_eq!(image.media_type, ImageMediaType::Png);
     }
 
     fn invocation(input: Value) -> LuaToolInvocation {

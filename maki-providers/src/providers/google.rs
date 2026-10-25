@@ -17,6 +17,7 @@ use crate::providers::Timeouts;
 use crate::providers::aperture::GEMINI_PATH_PREFIX;
 use crate::spec::{
     ApertureRoute, AuthDoc, Build, CatalogDoc, GeneratedDocs, LoginConfig, Native, ProviderSpec,
+    api_decides,
 };
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
@@ -54,6 +55,8 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Gemini,
     supports_thinking: true,
     supports_deferred_tools: false,
+    adaptive_effort: api_decides,
+    thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(65_536),
     fallback_context_window: 1_000_000,
@@ -378,7 +381,7 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                     }
                     parts.push(part);
                 }
-                ContentBlock::RedactedThinking { .. } => {}
+                ContentBlock::RedactedThinking { .. } | ContentBlock::Unknown(_) => {}
                 ContentBlock::ToolUse {
                     id: _,
                     name,
@@ -542,6 +545,8 @@ struct SseUsageMetadata {
     #[serde(default)]
     candidates_token_count: u32,
     #[serde(default)]
+    thoughts_token_count: u32,
+    #[serde(default)]
     cached_content_token_count: Option<u32>,
 }
 
@@ -631,11 +636,14 @@ async fn parse_sse(
         };
 
         if let Some(meta) = chunk.usage_metadata {
-            usage.input = meta.prompt_token_count;
-            usage.output = meta.candidates_token_count;
             if let Some(cached) = meta.cached_content_token_count {
                 usage.cache_read = cached;
             }
+            // Google's prompt count includes cache hits; TokenUsage keeps them separate.
+            usage.input = meta.prompt_token_count.saturating_sub(usage.cache_read);
+            usage.output = meta
+                .candidates_token_count
+                .saturating_add(meta.thoughts_token_count);
         }
 
         let Some(candidates) = chunk.candidates else {
@@ -858,8 +866,8 @@ mod tests {
 
         // Clamped to the model's max thinking budget (half of 8192 output tokens).
         assert_eq!(
-            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
-            4096
+            body["generationConfig"]["thinkingConfig"],
+            json!({"includeThoughts": true, "thinkingBudget": 4096})
         );
     }
 
@@ -1221,10 +1229,11 @@ mod tests {
 
     #[test]
     fn parse_sse_thinking_part() {
-        let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"thinking...\",\"thought\":true,\"thoughtSignature\":\"sig1\"}]}},{\"content\":{\"parts\":[{\"text\":\"answer\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":20}}\n\n";
+        let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"thinking...\",\"thought\":true,\"thoughtSignature\":\"sig1\"}]}},{\"content\":{\"parts\":[{\"text\":\"answer\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":20,\"thoughtsTokenCount\":30}}\n\n";
         let response = mock_response(data);
         let (tx, _rx) = flume::unbounded();
         let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        assert_eq!(result.usage.output, 50);
         assert!(matches!(
             &result.message.content[0],
             ContentBlock::Thinking { thinking, signature } if thinking == "thinking..." && signature.as_deref() == Some("sig1")
@@ -1271,14 +1280,52 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn parse_sse_cached_tokens() {
-        let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":100,\"candidatesTokenCount\":10,\"cachedContentTokenCount\":50}}\n\n";
-        let response = mock_response(data);
+    #[test_case(None, 100 ; "missing_cache")]
+    #[test_case(Some(0), 100 ; "zero_cache")]
+    #[test_case(Some(50), 50 ; "partially_cached")]
+    #[test_case(Some(100), 0 ; "fully_cached")]
+    #[test_case(Some(150), 0 ; "cache_exceeds_prompt")]
+    fn parse_sse_cached_tokens(cached: Option<u32>, expected_input: u32) {
+        let mut metadata = json!({"promptTokenCount": 100, "candidatesTokenCount": 10});
+        if let Some(cached) = cached {
+            metadata["cachedContentTokenCount"] = json!(cached);
+        }
+        let data = format!("data: {}\n\n", json!({"usageMetadata": metadata}));
+        let response = mock_response(data.leak().as_bytes());
         let (tx, _rx) = flume::unbounded();
         let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
-        assert_eq!(result.usage.input, 100);
+        assert_eq!(result.usage.input, expected_input);
         assert_eq!(result.usage.output, 10);
-        assert_eq!(result.usage.cache_read, 50);
+        assert_eq!(result.usage.cache_read, cached.unwrap_or_default());
+    }
+
+    #[test_case(None, 50, 50 ; "missing_cache_preserves_previous")]
+    #[test_case(Some(0), 100, 0 ; "zero_cache_clears_previous")]
+    #[test_case(Some(25), 75, 25 ; "present_cache_replaces_previous")]
+    fn parse_sse_cached_tokens_across_chunks(
+        cached: Option<u32>,
+        expected_input: u32,
+        expected_cache_read: u32,
+    ) {
+        let mut metadata = json!({"promptTokenCount": 100, "candidatesTokenCount": 10});
+        if let Some(cached) = cached {
+            metadata["cachedContentTokenCount"] = json!(cached);
+        }
+        let initial_metadata = json!({
+            "promptTokenCount": 80,
+            "candidatesTokenCount": 1,
+            "cachedContentTokenCount": 50,
+        });
+        let data = format!(
+            "data: {}\n\ndata: {}\n\n",
+            json!({"usageMetadata": initial_metadata}),
+            json!({"usageMetadata": metadata}),
+        );
+        let response = mock_response(data.leak().as_bytes());
+        let (tx, _rx) = flume::unbounded();
+        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        assert_eq!(result.usage.input, expected_input);
+        assert_eq!(result.usage.output, 10);
+        assert_eq!(result.usage.cache_read, expected_cache_read);
     }
 }

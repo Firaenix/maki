@@ -269,17 +269,7 @@ impl Splash {
         render_version(area, buf, fade, area.y, self.latest_version);
     }
 
-    /// The field is a gradient of intensities between the background and the
-    /// accent, so it needs both as numbers. On a palette theme there is
-    /// nothing to interpolate and the splash simply draws without it.
     fn render_field(&self, area: Rect, buf: &mut Buffer, t: f32, fade: f32, accent: Color) {
-        let theme = theme::current();
-        let (Color::Rgb(ac_r, ac_g, ac_b), Color::Rgb(bg_r, bg_g, bg_b)) =
-            (accent, theme.background)
-        else {
-            return;
-        };
-
         let w = area.width as usize;
         let h = area.height as usize;
         if w == 0 || h == 0 {
@@ -302,17 +292,14 @@ impl Splash {
         let half_weight_sum = weight_sum * 0.5;
         let val_scale = (fade * INTENSITY_SCALE) / half_weight_sum;
 
+        let theme = theme::current();
+        let muted = theme.status_dim.fg.unwrap_or(Color::DarkGray);
         let style_lut: [(&str, Style); 4] = std::array::from_fn(|i| {
             let idx = i + 1;
             let frac = idx as f32 / FIELD_CHAR_MAX;
-            let t = FIELD_BASE_OPACITY + frac * (1.0 - FIELD_BASE_OPACITY);
             (
                 FIELD_SYMS[idx],
-                Style::new().fg(Color::Rgb(
-                    lerp_u8(bg_r, ac_r, t * 0.25),
-                    lerp_u8(bg_g, ac_g, t * 0.175),
-                    lerp_u8(bg_b, ac_b, t * 0.325),
-                )),
+                field_style(accent, theme.background, muted, frac),
             )
         });
 
@@ -546,6 +533,19 @@ fn render_centered_faded(
     render_segments(area, buf, y, x_start, &[(text, style)]);
 }
 
+/// A palette color cannot blend, so use the muted color and no DIM.
+fn field_style(accent: Color, bg: Color, muted: Color, frac: f32) -> Style {
+    let (Color::Rgb(ac_r, ac_g, ac_b), Color::Rgb(bg_r, bg_g, bg_b)) = (accent, bg) else {
+        return Style::new().fg(muted);
+    };
+    let t = FIELD_BASE_OPACITY + frac * (1.0 - FIELD_BASE_OPACITY);
+    Style::new().fg(Color::Rgb(
+        lerp_u8(bg_r, ac_r, t * 0.25),
+        lerp_u8(bg_g, ac_g, t * 0.175),
+        lerp_u8(bg_b, ac_b, t * 0.325),
+    ))
+}
+
 /// Fading means blending toward the background, which needs both ends as
 /// numbers. A palette color has no value to blend, so it is drawn flat instead
 /// of being resolved to a guess at what the terminal would have shown.
@@ -718,29 +718,35 @@ foreground = "white"
 background = { bg = "background" }
 foreground = { fg = "foreground" }
 todo_in_progress = { fg = "yellow" }
+status_dim = { fg = "magenta" }
 "#;
 
-    /// The starfield needs numbers to build its gradient; on a palette theme
-    /// the splash draws flat rather than inventing truecolor for it. The theme
-    /// is installed here rather than inherited, because the default one is
-    /// truecolor and would make this pass or fail on test ordering.
+    const NO_TRUECOLOR: &str = "a palette theme must not produce rgb cells";
+    const FIELD_DRAWN: &str = "a palette theme must draw the field in its muted color";
+
+    /// The test sets its theme because the default theme uses RGB colors.
     #[test]
-    fn a_palette_accent_keeps_the_splash_free_of_truecolor() {
+    fn a_palette_theme_draws_the_field_without_truecolor() {
         theme::set(theme::Theme::from_toml(ANSI_THEME).expect(ANSI_THEME_NAME));
 
         let mut splash = Splash::new(true);
         // At t=0 the entry fade has not started painting, so the assertion
         // below would hold no matter what the field did.
         splash.start -= Duration::from_secs_f32(FADE_DURATION);
+        // A fixed offset makes the drawn field the same on every run.
+        splash.field_offset = 0.0;
         let area = Rect::new(0, 0, 80, 20);
         let mut buf = Buffer::empty(area);
         splash.render(area, &mut buf, Color::Blue, &[]);
 
-        let rgb = buf
-            .content
-            .iter()
-            .filter_map(|c| c.style().fg)
-            .find(|fg| matches!(fg, Color::Rgb(..)));
-        assert_eq!(rgb, None, "a palette theme must not produce rgb cells");
+        let cells = || buf.content.iter();
+        assert!(
+            !cells().any(|c| matches!(c.fg, Color::Rgb(..))),
+            "{NO_TRUECOLOR}"
+        );
+        assert!(
+            cells().any(|c| c.fg == Color::Magenta && FIELD_SYMS.contains(&c.symbol())),
+            "{FIELD_DRAWN}"
+        );
     }
 }

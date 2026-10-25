@@ -49,6 +49,8 @@ pub(crate) const PLAN_MODELS: &[&str] = &[
     "gpt-5.2",
 ];
 
+/// How the chat completions path spells thinking for a model that does not.
+const CHAT_THINKING: ThinkingFallback = ThinkingFallback::Dialect(&dialect::STANDARD);
 const CODEX_PLAN_CONTEXT_WINDOW: u32 = 272_000;
 const GPT_5_6_PLAN_CONTEXT_WINDOW: u32 = 372_000;
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -137,6 +139,7 @@ pub(crate) struct PlanModelInfo {
 impl PlanModelInfo {
     fn dialect(&self) -> EffortDialect<'_> {
         EffortDialect {
+            name: None,
             supported: &self.efforts,
             adaptive: self.adaptive,
             off: self.off.then_some(dialect::OFF),
@@ -377,8 +380,6 @@ impl OpenAi {
                 }
                 Err(e) if e.is_retryable() => Err(e),
                 Err(e) => {
-                    warn!(error = %e, "OpenAI OAuth refresh failed, clearing stale tokens");
-                    let _ = maki_storage::auth::delete_tokens(&storage, auth::PROVIDER);
                     if let Ok((fallback, tokens)) = auth::resolve(&storage) {
                         *shared.lock().unwrap() = fallback;
                         *held.lock().unwrap() = tokens;
@@ -414,11 +415,12 @@ impl OpenAi {
         Fut: std::future::Future<Output = Result<T, AgentError>>,
     {
         let result = f().await;
-        if self.is_oauth()
-            && matches!(&result, Err(e) if e.is_auth_error())
-            && self.refresh_oauth().await.is_ok()
-        {
-            return f().await;
+        if self.is_oauth() && matches!(&result, Err(e) if e.is_auth_error()) {
+            match self.refresh_oauth().await {
+                Ok(()) => return f().await,
+                Err(e) if e.is_retryable() => return Err(e),
+                Err(_) => {}
+            }
         }
         result
     }
@@ -541,6 +543,32 @@ fn plan_dialect(model_id: &str) -> &'static EffortDialect<'static> {
     }
 }
 
+/// The dialect of the Codex backend for a model it serves. `None` sends the
+/// model down the chat completions path.
+fn plan_effort_dialect<'a>(
+    model_id: &str,
+    discovered: Option<&'a PlanModelInfo>,
+) -> Option<EffortDialect<'a>> {
+    discovered
+        .map(PlanModelInfo::dialect)
+        .or_else(|| is_codex_model(model_id).then(|| plan_dialect(model_id).clone()))
+}
+
+pub(super) fn adaptive_effort(model: &Model) -> Option<Effort> {
+    let discovered = model_registry::provider_info::<PlanModelInfo>(&CONFIG.slug, &model.id);
+    match plan_effort_dialect(&model.id, discovered.as_deref()) {
+        Some(dialect) => dialect.adaptive_effort(),
+        None => CHAT_THINKING.adaptive_effort(model),
+    }
+}
+
+pub(crate) fn thinking_fields_fallback(model: &Model) -> Option<ThinkingFallback> {
+    let discovered = model_registry::provider_info::<PlanModelInfo>(&CONFIG.slug, &model.id);
+    plan_effort_dialect(&model.id, discovered.as_deref())
+        .is_none()
+        .then_some(CHAT_THINKING)
+}
+
 impl Provider for OpenAi {
     fn stream_message<'a>(
         &'a self,
@@ -559,11 +587,7 @@ impl Provider for OpenAi {
 
             let discovered =
                 model_registry::provider_info::<PlanModelInfo>(&CONFIG.slug, &model.id);
-            let plan_dialect = discovered
-                .as_deref()
-                .map(PlanModelInfo::dialect)
-                .or_else(|| is_codex_model(&model.id).then(|| plan_dialect(&model.id).clone()));
-            if let Some(dialect) = plan_dialect {
+            if let Some(dialect) = plan_effort_dialect(&model.id, discovered.as_deref()) {
                 let stream_timeout = self.compat.stream_timeout();
                 return self
                     .with_oauth_retry(|| async {
@@ -596,11 +620,8 @@ impl Provider for OpenAi {
             let mut body =
                 self.compat
                     .build_body(model, messages, system, tools, opts.thinking, top_p);
-            opts.thinking.apply_thinking(
-                &mut body,
-                model,
-                ThinkingFallback::Dialect(&dialect::STANDARD),
-            );
+            opts.thinking
+                .apply_thinking(&mut body, model, CHAT_THINKING);
             self.with_oauth_retry(|| async {
                 let auth = self.current_auth();
                 self.compat
@@ -908,6 +929,26 @@ mod tests {
             supports_fast,
             account_id: Some(ACCOUNT_ID.into()),
         }
+    }
+
+    #[test_case("discovered-thinking-model" ; "opaque_id")]
+    #[test_case("gpt-6.1-unlisted" ; "gpt_id_not_in_static_fallback")]
+    fn discovered_responses_routes_ignore_native_fields(model_id: &str) {
+        let mut model = Model::from_spec(&format!("{}/{model_id}", CONFIG.slug)).unwrap();
+        model.thinking_fields = Some(Box::new(
+            serde_json::from_value(json!({"adaptive": {"enable_thinking": true}})).unwrap(),
+        ));
+        assert!(model.effective_thinking_fields().is_some());
+        model_registry::set_known_models(
+            &CONFIG.slug,
+            vec![ModelInfo {
+                id: model_id.into(),
+                provider_info: Some(Arc::new(plan_model_info(false))),
+                ..ModelInfo::default()
+            }],
+        );
+        assert!(model.effective_thinking_fields().is_none());
+        assert!(!model.thinking_options().is_empty());
     }
 
     #[test_case(true, Some(ACCOUNT_ID), None, false, FastSupport::Pending ; "oauth_waits_for_discovery")]

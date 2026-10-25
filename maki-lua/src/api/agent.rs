@@ -45,7 +45,7 @@ use crate::api::session::{not_live, required_session};
 use crate::api::tool::{audiences_to_lua, parse_audience};
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::command::UiAction;
-use crate::api::util::convert::{json_to_lua, lua_to_json, lua_tool_result};
+use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json, lua_tool_result};
 use crate::api::util::ctx::{AgentContext, LuaCtx};
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::background::{BackgroundInfo, BackgroundSession, BackgroundSessions};
@@ -244,6 +244,24 @@ impl Upstream {
         });
     }
 
+    /// A plugin task shows up in its chat as soon as it opens, so the user can
+    /// find it in `/tasks` and stop it even before its first prompt.
+    fn open_task(&self, info: SubagentInfo) {
+        if let Self::Chat {
+            session,
+            plugin,
+            ui: Some(ui),
+            ..
+        } = self
+        {
+            let _ = ui.try_send(UiAction::PluginTaskOpened {
+                session: *session,
+                plugin: Arc::clone(plugin),
+                info: Box::new(info),
+            });
+        }
+    }
+
     /// The transcript as of now. A plugin task writes it after every prompt,
     /// so a monitor that dies with the process still leaves what it did.
     fn send_history(&self, tool_use_id: &str, messages: Vec<Message>) {
@@ -336,10 +354,10 @@ async fn resolve_model(
     let agent = try_pair!(dispatch_ctx(&ctx, "resolve_model"));
     let tier_str = opts
         .as_ref()
-        .and_then(|t| t.get::<Option<String>>("tier").ok().flatten());
+        .and_then(|t| t.opt::<String>("tier").ok().flatten());
     let spec_str = opts
         .as_ref()
-        .and_then(|t| t.get::<Option<String>>("spec").ok().flatten());
+        .and_then(|t| t.opt::<String>("spec").ok().flatten());
 
     let model = match spec_str {
         Some(ref spec) => try_pair!(Model::from_spec_with_policy(spec, &agent.model_policy)),
@@ -448,11 +466,11 @@ async fn tools(
             .ok_or_else(|| format!("unknown audience: {audience_str}"))
     );
 
-    let only: Option<Vec<String>> = opts.get("only")?;
-    let except: Option<Vec<String>> = opts.get("except")?;
-    let workflow: bool = opts.get::<Option<bool>>("workflow")?.unwrap_or(false);
-    let spec_str: Option<String> = opts.get("spec")?;
-    let mcp_enabled: bool = opts.get::<Option<bool>>("mcp")?.unwrap_or(false);
+    let only: Option<Vec<String>> = opts.opt("only")?;
+    let except: Option<Vec<String>> = opts.opt("except")?;
+    let workflow: bool = opts.opt::<bool>("workflow")?.unwrap_or(false);
+    let spec_str: Option<String> = opts.opt("spec")?;
+    let mcp_enabled: bool = opts.opt::<bool>("mcp")?.unwrap_or(false);
 
     let parsed = spec_str
         .as_deref()
@@ -588,18 +606,18 @@ async fn call_tool(
     tctx.live_sink = Some(live_tx);
     let (mut on_buf, mut on_ann, mut on_usage) = (None, None, None);
     if let Some(o) = opts {
-        if let Some(mode) = o.get::<Option<String>>("output_mode")? {
+        if let Some(mode) = o.opt::<String>("output_mode")? {
             let Some(mode) = ToolOutputMode::parse(&mode) else {
                 return Ok(err_pair(OUTPUT_MODE_ERR));
             };
             tctx.output_mode = mode;
         }
-        if let Some(secs) = o.get::<Option<u64>>("timeout")? {
+        if let Some(secs) = o.opt::<u64>("timeout")? {
             tctx.deadline = Deadline::after(Duration::from_secs(secs));
         }
-        on_buf = o.get::<Option<Function>>("on_live_buf")?;
-        on_ann = o.get::<Option<Function>>("on_annotation")?;
-        on_usage = o.get::<Option<Function>>("on_usage")?;
+        on_buf = o.opt::<Function>("on_live_buf")?;
+        on_ann = o.opt::<Function>("on_annotation")?;
+        on_usage = o.opt::<Function>("on_usage")?;
     }
     let cbs = LiveCallbacks {
         tool: &name,
@@ -651,8 +669,8 @@ async fn call_tool(
 /// with `fs_read`) costs that one. A tool declaring none (`batch`,
 /// `code_execution`), or `mcp = true` on a chat with MCP servers, costs every
 /// permission except `agent`. `local_tools` cost nothing, they run as the
-/// plugin. The bundled `task` hands over the whole chat, so it holds all
-/// five.
+/// plugin. The bundled `task` hands over the whole chat, so it holds every
+/// permission.
 ///
 /// `scope` sets the lifetime. `"task"`, the default, ends the session with
 /// the task that opened it: an autocmd callback when it returns, a tool
@@ -667,12 +685,12 @@ async fn call_tool(
 /// and prompts it from autocmd callbacks.
 ///
 /// Opened by chat session id, it shows up in that chat as a task owned by
-/// the plugin from its first prompt on: a transcript tab, a `plugin` field
-/// in `/tasks` and `maki.task.list()`, `"idle"` between prompts, and its
-/// spend in the chat's totals after each turn. Esc in its tab closes it,
-/// and the pending `:prompt()` returns `"stopped by user"` rather than
-/// `"cancelled"`, so a loop can tell the user's Esc from its own task
-/// ending and stop rather than reopen. Permission prompts stay denied even
+/// the plugin as soon as it opens: a transcript tab, a `plugin` field in
+/// `/tasks` and `maki.task.list()`, `"idle"` before and between prompts, and
+/// its spend in the chat's totals after each turn. Esc in its tab or Ctrl+S in
+/// `/tasks` closes it, and the pending `:prompt()` returns `"stopped by user"`
+/// rather than `"cancelled"`, so a loop can tell the user's stop from its own
+/// task ending and stop rather than reopen. Permission prompts stay denied even
 /// though the task has a tab: a prompt in an unfocused tab would stall a
 /// monitor silently, a denial reaches the plugin as an error it can handle.
 /// Setting `plugins.<name>.enabled = false` stops a plugin's monitors from
@@ -743,7 +761,7 @@ async fn session(
             let Some((task, _)) = active_task_cancel(&lua) else {
                 return Ok(err_pair(TASK_REQUIRED_ERR));
             };
-            let task = parse_scope(opts.get("scope")?, task)?;
+            let task = parse_scope(opts.opt("scope")?, task)?;
             // A child of the task's token would leave a watcher waiting on it
             // until it fires. An autocmd's token never fires, so every open
             // would leak one. The entry keeps this trigger instead, and the
@@ -753,20 +771,20 @@ async fn session(
             (agent_ctx, opts, Some((session, task, cancel)))
         }
     };
-    let model_spec: Option<String> = opts.get("model_spec")?;
-    let system: Option<String> = opts.get("system")?;
-    let tools_val: Option<LuaValue> = opts.get("tools")?;
-    let local_tools_tbl: Option<Table> = opts.get("local_tools")?;
-    let name: Option<String> = opts.get("name")?;
-    let thinking_val: Option<LuaValue> = opts.get("thinking")?;
-    let audience = match opts.get::<Option<String>>("audience")? {
+    let model_spec: Option<String> = opts.opt("model_spec")?;
+    let system: Option<String> = opts.opt("system")?;
+    let tools_val: Option<LuaValue> = opts.opt("tools")?;
+    let local_tools_tbl: Option<Table> = opts.opt("local_tools")?;
+    let name: Option<String> = opts.opt("name")?;
+    let thinking_val: Option<LuaValue> = opts.opt("thinking")?;
+    let audience = match opts.opt::<String>("audience")? {
         Some(s) => {
             try_pair!(ToolAudience::parse_name(&s).ok_or_else(|| format!("unknown audience: {s}")))
         }
         None => DEFAULT_SESSION_AUDIENCE,
     };
-    let fast: Option<bool> = opts.get("fast")?;
-    let mcp_enabled: bool = opts.get::<Option<bool>>("mcp")?.unwrap_or(false);
+    let fast: Option<bool> = opts.opt("fast")?;
+    let mcp_enabled: bool = opts.opt::<bool>("mcp")?.unwrap_or(false);
 
     let (model, provider): (Model, Arc<dyn provider::Provider>) = if let Some(ref spec) = model_spec
     {
@@ -814,8 +832,7 @@ async fn session(
                 "description": description,
                 "input_schema": sanitized_schema,
             }));
-            let audience =
-                parse_audience(spec.get::<Option<Table>>("audiences")?, ToolAudience::MODEL)?;
+            let audience = parse_audience(spec.opt::<Table>("audiences")?, ToolAudience::MODEL)?;
             let weak = lua.weak();
             local_map.insert(
                 name,
@@ -1005,6 +1022,20 @@ async fn session(
         closed: false,
         background,
     };
+
+    if state.background.is_some() {
+        let info = SubagentInfo {
+            parent_tool_use_id: state.cancellation.ui_id.clone(),
+            name: state.name.clone(),
+            prompt: None,
+            model: Some(state.params.model.spec()),
+            opts: Some(state.opts),
+            answer_tx: None,
+            inbox: Some(Arc::clone(&state.inbox)),
+        };
+        state.upstream.open_task(info.clone());
+        let _ = state.subagent_info.set(info);
+    }
 
     let sess = lua.create_userdata(LuaSession {
         inner: Arc::new(AsyncMutex::new(state)),
@@ -1453,6 +1484,13 @@ async fn prompt(
     if s.stopped_by_user() {
         return Ok(err_pair(STOPPED_BY_USER_ERR));
     }
+    // Its chat session or its plugin may have ended while the plugin kept the
+    // handle. Refuse here, before the prompt reaches the model or the tab.
+    if let Some(background) = &s.background
+        && !background.registry.contains(&s.cancellation.ui_id)
+    {
+        return Ok(err_pair(CANCELLED_MSG));
+    }
     // The user can lower the effort while a monitor sits idle, so we ask the
     // seed again on every prompt. Plan mode is left out on purpose. Each write
     // checks it instead, see `AgentSeed::background_write_block`.
@@ -1474,7 +1512,14 @@ async fn prompt(
         }
         _ => None,
     };
-    if s.subagent_info.get().is_none() {
+    if s.background.is_some() {
+        // The tab opened with the session, so every prompt shows up the way a
+        // queued message does.
+        let _ = s.sub_event_tx.send(AgentEvent::QueueItemConsumed {
+            text: message.clone(),
+            images: Vec::new(),
+        });
+    } else if s.subagent_info.get().is_none() {
         let _ = s.subagent_info.set(SubagentInfo {
             parent_tool_use_id: s.cancellation.ui_id.clone(),
             name: s.name.clone(),
@@ -1483,13 +1528,6 @@ async fn prompt(
             opts: Some(s.opts),
             answer_tx: s.answer_tx.take(),
             inbox: Some(Arc::clone(&s.inbox)),
-        });
-    } else if s.background.is_some() {
-        // The first prompt reaches the tab on `SubagentInfo`. Every later one
-        // is shown the way a queued message is.
-        let _ = s.sub_event_tx.send(AgentEvent::QueueItemConsumed {
-            text: message.clone(),
-            images: Vec::new(),
         });
     }
 
@@ -1642,6 +1680,16 @@ async fn close(_lua: Lua, this: mlua::UserDataRef<LuaSession>) -> LuaResult<()> 
     Ok(())
 }
 
+/// The task id of this session. A session opened by chat session id goes by
+/// this id in `maki.task.list()` and the `"TaskStopped"` event, so a plugin
+/// can tell which of those are its own.
+///
+/// @return (string) Session task id.
+#[lua_fn]
+fn id(_lua: &Lua, this: &LuaSession) -> LuaResult<String> {
+    Ok(this.cancellation.ui_id.clone())
+}
+
 lua_class! {
     /// A subagent session with its own conversation history.
     ///
@@ -1652,7 +1700,7 @@ lua_class! {
     /// Always call `:close()` when you are done, on error paths too. The
     /// garbage collector is a fallback that may never run while the VM sits
     /// idle, so a session you only drop can stay open for the rest of the run.
-    "maki.agent.Session" => LuaSession, SESSION_DOCS [prompt, close]
+    "maki.agent.Session" => LuaSession, SESSION_DOCS [prompt, close, id]
 }
 
 /// Weak Lua ref avoids a reference cycle when the session is stored in userdata.
@@ -1674,12 +1722,14 @@ mod tests {
     use maki_agent::prompt::{PromptId, ResolvedPrompts};
     use maki_agent::tools::test_support::stub_ctx_with;
     use maki_agent::{DoneReason, TurnCompleteEvent};
+    use maki_providers::model::ThinkingSupport;
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
         AgentError, ContentBlock, Message, ModelInfo, ProviderEvent, Role, StopReason,
         StreamResponse, TokenUsage,
     };
     use maki_storage::id::SessionRef;
+    use maki_storage::sessions::Effort;
     use mlua::AnyUserData;
     use serde_json::json;
     use test_case::test_case;
@@ -1692,6 +1742,42 @@ mod tests {
     const PARTIAL_TEXT: &str = "partial response";
     const SESSION_TIMEOUT: Duration = Duration::from_secs(5);
     const CLOSE_SESSION: &str = "function(sess) sess:close() end";
+    const THINKING_BUDGET: u32 = 2048;
+
+    #[test_case(ThinkingConfig::Effort(Effort::Low), json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Effort::Low) ; "toggle_keeps_ancestor_effort_ceiling")]
+    #[test_case(ThinkingConfig::Adaptive, json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Adaptive, ThinkingConfig::Effort(Effort::Max) ; "explicit_adaptive_stays_unbounded")]
+    #[test_case(ThinkingConfig::Budget(THINKING_BUDGET), json!({"adaptive": {"enable_thinking": true}}), ThinkingConfig::Budget(THINKING_BUDGET), ThinkingConfig::Budget(THINKING_BUDGET) ; "toggle_keeps_ancestor_numeric_ceiling")]
+    #[test_case(ThinkingConfig::Budget(THINKING_BUDGET), json!({"max": {"reasoning_effort": "xhigh"}}), ThinkingConfig::Effort(Effort::Max), ThinkingConfig::Budget(THINKING_BUDGET) ; "native_budget_display_keeps_ancestor_numeric_ceiling")]
+    #[test_case(ThinkingConfig::Effort(Effort::Low), json!({"max": {"reasoning_effort": "xhigh"}}), ThinkingConfig::Effort(Effort::Max), ThinkingConfig::Effort(Effort::Low) ; "snapping_up_does_not_raise_ancestor_ceiling")]
+    #[test_case(ThinkingConfig::Effort(Effort::High), json!({"low": {"reasoning_effort": "low"}}), ThinkingConfig::Effort(Effort::Low), ThinkingConfig::Effort(Effort::High) ; "snapping_down_keeps_ancestor_intent")]
+    fn native_thinking_display_preserves_nested_delegation_ceiling(
+        parent: ThinkingConfig,
+        fields: JsonValue,
+        shown: ThinkingConfig,
+        expected_grandchild: ThinkingConfig,
+    ) {
+        let mut model = Model::from_spec("llama-cpp/default").unwrap();
+        model.thinking_override = Some(ThinkingSupport::Yes);
+        let mut intermediate = model.clone();
+        intermediate.thinking_fields = Some(Box::new(serde_json::from_value(fields).unwrap()));
+        let root = RequestOptions {
+            thinking: parent,
+            fast: false,
+        };
+
+        for requested in [None, Some(ThinkingConfig::Adaptive)] {
+            let child = session_opts(requested, None, root, &intermediate);
+            assert_eq!(child.thinking, parent);
+            assert_eq!(child.thinking.shown(&intermediate), shown);
+            let grandchild = session_opts(
+                Some(ThinkingConfig::Effort(Effort::Max)),
+                None,
+                child,
+                &model,
+            );
+            assert_eq!(grandchild.thinking, expected_grandchild);
+        }
+    }
 
     struct PendingProvider(flume::Sender<()>);
 

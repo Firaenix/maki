@@ -15,10 +15,11 @@ use crate::api::util::command::{
     InputRequest, Split, TitlePos, UiAction, WinCommand, WinEvent, ui_json_roundtrip, ui_roundtrip,
     ui_send,
 };
-use crate::api::util::convert::opt_bool;
+use crate::api::util::convert::TableExt;
 use crate::api::util::pair::{Pair, try_pair};
 use crate::docs::{FnDoc, ParamDoc};
 use crate::key::Key;
+use crate::plugin_permissions::{PluginPermissions, denied_error};
 pub(crate) mod blit;
 pub(crate) mod buf;
 pub(crate) mod win;
@@ -142,7 +143,7 @@ pub(crate) fn parse_footer(tbl: &Table) -> LuaResult<Vec<(String, String)>> {
 /// toast:line("copied!")
 #[lua_fn]
 fn buf(lua: &Lua, opts: Option<Table>) -> LuaResult<buf::BufHandle> {
-    let scratch = opts.and_then(|t| opt_bool(&t, "scratch")).unwrap_or(false);
+    let scratch = opts.and_then(|t| t.opt_bool("scratch")).unwrap_or(false);
     Ok(with_task_bufs(lua, |store| {
         if scratch {
             store.create()
@@ -241,7 +242,7 @@ fn theme_style(lua: &Lua, name: String) -> LuaResult<mlua::Value> {
 async fn highlight(lua: Lua, code: String, lang: String, opts: Option<Table>) -> LuaResult<Table> {
     let independent = opts
         .as_ref()
-        .and_then(|t| opt_bool(t, "independent"))
+        .and_then(|t| t.opt_bool("independent"))
         .unwrap_or(false);
     let prefix = opts
         .and_then(|t| t.get::<String>("prefix").ok())
@@ -404,6 +405,11 @@ fn set_window_title(
 /// `"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
 /// `"prev_chat"`, `"next_chat"`, `"model_picker"`.
 ///
+/// Most actions are free, since they open something the user then sees and
+/// drives. `"pop_queue"` needs `session_write`, because it throws away a
+/// queued prompt. Without it the call raises the usual `permission denied`
+/// error.
+///
 /// There is no action for sending the user's message. To take keys like
 /// `<CR>` while a popup is open, use the `keys` option of `maki.ui.open_win`.
 ///
@@ -421,12 +427,16 @@ fn set_window_title(
 fn action(
     _lua: &Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] perms: PluginPermissions,
     name: String,
 ) -> LuaResult<Pair<bool>> {
     let builtin = try_pair!(name.parse::<BuiltinAction>().map_err(|_| format!(
         "unknown action '{name}' (valid: {})",
         BuiltinAction::VARIANTS.join(", ")
     )));
+    if let Some(perm) = perms.first_denied(builtin.needs()) {
+        return Err(denied_error(perm));
+    }
     try_pair!(ui_send(tx.as_ref(), UiAction::Builtin(builtin)));
     Ok((Some(true), None))
 }
@@ -440,7 +450,7 @@ async fn input_roundtrip(
 }
 
 fn required<T: mlua::FromLua>(opts: &Table, key: &str) -> LuaResult<T> {
-    opts.get::<Option<T>>(key)?
+    opts.opt::<T>(key)?
         .ok_or_else(|| mlua::Error::runtime(format!("input_edit: '{key}' is required")))
 }
 
@@ -471,7 +481,7 @@ fn required<T: mlua::FromLua>(opts: &Table, key: &str) -> LuaResult<T> {
 /// @example
 /// local st = maki.ui.input()
 /// local before = st.text:sub(1, st.cursor)
-#[lua_fn]
+#[lua_fn(guard = SessionRead)]
 async fn input(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
@@ -503,6 +513,10 @@ async fn input(
 /// Tabs and carriage returns in {text} become spaces and newlines, and the
 /// other control characters are dropped, the way a paste is rewritten.
 ///
+/// It costs what `maki.ui.input` costs. A plugin keymap sees keys before
+/// the input does, so with this call alone a plugin could note every key and
+/// type it back unseen.
+///
 /// @param opts table Options:
 ///   `start` (integer) byte offset the replaced range starts at.
 ///   `stop` (integer) byte offset it ends at. `start == stop` inserts.
@@ -521,7 +535,7 @@ async fn input(
 ///   version = st.version,
 ///   session_id = st.session_id,
 /// })
-#[lua_fn]
+#[lua_fn(guard = SessionRead)]
 async fn input_edit(
     lua: Lua,
     #[ctx] tx: Option<flume::Sender<UiAction>>,
@@ -532,7 +546,7 @@ async fn input_edit(
         start: opts.get("start")?,
         stop: opts.get("stop")?,
         text: required(&opts, "text")?,
-        cursor: opts.get("cursor")?,
+        cursor: opts.opt("cursor")?,
         version: required(&opts, "version")?,
         session_id: required(&opts, "session_id")?,
         plugin,
@@ -572,7 +586,7 @@ async fn open_editor(
 /// Every key is parsed before the window is opened, so a typo leaves the
 /// plugin with no window rather than a window holding half a list.
 fn parse_claimed_keys(opts: &Table, focus: bool) -> LuaResult<Vec<Key>> {
-    let Some(keys) = opts.get::<Option<Table>>("keys")? else {
+    let Some(keys) = opts.opt::<Table>("keys")? else {
         return Ok(Vec::new());
     };
     if focus {
@@ -630,26 +644,26 @@ fn open_win(
 ) -> LuaResult<WinHandle> {
     let buf_handle = buf.borrow::<buf::BufHandle>()?;
     let title: String = opts.get("title").unwrap_or_default();
-    let cursor_line = opt_bool(&opts, "cursor_line").unwrap_or(false);
+    let cursor_line = opts.opt_bool("cursor_line").unwrap_or(false);
     let footer = parse_footer(&opts)?;
     let reserved_bottom: usize = opts.get("reserved_bottom").unwrap_or(0);
     let reserved_top: usize = opts.get("reserved_top").unwrap_or(0);
-    let focus = opt_bool(&opts, "focus").unwrap_or(true);
+    let focus = opts.opt_bool("focus").unwrap_or(true);
     let keys = parse_claimed_keys(&opts, focus)?;
     let zindex: u16 = opts.get("zindex").unwrap_or(50);
 
     let width = parse_dimension(&opts, "width", Dimension::Percent(60));
     let height = parse_dimension(&opts, "height", Dimension::Percent(70));
-    let row: Option<i16> = opts.get("row").ok();
-    let col: Option<i16> = opts.get("col").ok();
+    let row: Option<i16> = opts.opt("row").ok().flatten();
+    let col: Option<i16> = opts.opt("col").ok().flatten();
     let anchor = parse_anchor(&opts);
     let border = parse_border(&opts);
     let title_pos = parse_title_pos(&opts);
     let split = parse_split(&opts);
     let order: u16 = opts.get("order").unwrap_or(50);
-    let visible = opt_bool(&opts, "visible").unwrap_or(true);
-    let needs_input = opt_bool(&opts, "needs_input").unwrap_or(false);
-    let stack = opt_bool(&opts, "stack").unwrap_or(false);
+    let visible = opts.opt_bool("visible").unwrap_or(true);
+    let needs_input = opts.opt_bool("needs_input").unwrap_or(false);
+    let stack = opts.opt_bool("stack").unwrap_or(false);
 
     let config = FloatConfig {
         width,
@@ -732,6 +746,7 @@ pub(crate) const set_status_hint__doc: FnDoc = FnDoc {
     }],
     returns: "",
     guard: None,
+    value: false,
     example: "maki.ui.set_status_hint({ {\"q\", \"quit\"}, {\"j\", \"down\"} })\n-- later, clear them:\nmaki.ui.set_status_hint(nil)",
 };
 
@@ -765,16 +780,17 @@ pub(crate) fn create_ui_table(
     lua: &Lua,
     ui_action_tx: Option<flume::Sender<UiAction>>,
     plugin: Arc<str>,
+    perms: &PluginPermissions,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
     add_ui_fns(&t, lua)?;
 
     flash__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
     set_window_title__register(&t, lua, ui_action_tx.clone())?;
-    action__register(&t, lua, ui_action_tx.clone())?;
+    action__register(&t, lua, ui_action_tx.clone(), perms.clone())?;
     open_editor__register(&t, lua, ui_action_tx.clone())?;
-    input__register(&t, lua, ui_action_tx.clone())?;
-    input_edit__register(&t, lua, ui_action_tx.clone(), Arc::clone(&plugin))?;
+    input__register(&t, lua, perms, ui_action_tx.clone())?;
+    input_edit__register(&t, lua, perms, ui_action_tx.clone(), Arc::clone(&plugin))?;
     open_win__register(&t, lua, ui_action_tx, Arc::clone(&plugin))?;
 
     let p = Arc::clone(&plugin);
@@ -976,6 +992,7 @@ mod tests {
     use super::*;
     use crate::api::util::command::UiReply;
     use crate::api::util::convert::lua_to_json;
+    use crate::plugin_permissions::{Missing, Permission};
     use maki_highlight::StyledSegment;
     use mlua::Lua;
     use test_case::test_case;
@@ -1750,7 +1767,13 @@ mod tests {
             }
         });
         let lua = Lua::new();
-        let t = create_ui_table(&lua, Some(tx), Arc::from(INPUT_PLUGIN)).unwrap();
+        let t = create_ui_table(
+            &lua,
+            Some(tx),
+            Arc::from(INPUT_PLUGIN),
+            &PluginPermissions::trusted(),
+        )
+        .unwrap();
         lua.globals().set("ui", t).unwrap();
         lua
     }
@@ -1867,5 +1890,36 @@ mod tests {
         let (val, err) = eval(&lua, &edit_script("start = 0, stop = 99, text = \"x\""));
         assert_eq!(val, serde_json::Value::Null);
         assert_eq!(err.as_deref(), Some(STALE_RANGE_ERR));
+    }
+
+    /// An action is priced like the API doing the same thing, so binding a
+    /// key to it cannot reach further than calling that API would.
+    #[test_case("plan_toggle", None ; "plan_toggle_is_free")]
+    #[test_case("pop_queue", Some(Permission::SessionWrite) ; "pop_queue_needs_session_write")]
+    #[test_case("file_picker", None ; "file_picker_is_free")]
+    fn action_charges_what_its_api_would(name: &str, needed: Option<Permission>) {
+        let (tx, _rx) = flume::unbounded();
+        let run = |perms: &PluginPermissions| {
+            let lua = Lua::new();
+            let t =
+                create_ui_table(&lua, Some(tx.clone()), Arc::from(INPUT_PLUGIN), perms).unwrap();
+            lua.globals().set("ui", t).unwrap();
+            lua.load(format!("return ui.action('{name}')"))
+                .eval::<Option<bool>>()
+                .map_err(|e| e.to_string())
+        };
+        let denied = run(&PluginPermissions::denied());
+        let Some(perm) = needed else {
+            assert_eq!(denied, Ok(Some(true)));
+            return;
+        };
+        let err = denied.unwrap_err();
+        assert!(
+            err.contains(&Missing::Permission(perm).to_string()),
+            "{err}"
+        );
+        let mut granted = PluginPermissions::denied();
+        granted.set(perm, true);
+        assert_eq!(run(&granted), Ok(Some(true)));
     }
 }

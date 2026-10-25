@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Role};
@@ -11,33 +11,73 @@ use tracing::warn;
 
 use super::frame::LiveFrame;
 use crate::mcp::{McpSession, ToolDeferral};
+use crate::session::SessionHeader;
 
 const CANCEL_MARKER: &str = "[Cancelled by user]";
 pub const UNAVAILABLE_RESULT: &str = "[Tool result not available]";
 
 pub type HistorySnapshot = maki_storage::sessions::HistorySnapshot<Message>;
 pub type SharedMessages = Arc<ArcSwap<HistorySnapshot>>;
+pub type SharedHeader = Arc<ArcSwap<SessionHeader>>;
+
+struct LiveEntry {
+    history: Weak<ArcSwap<HistorySnapshot>>,
+    /// Only a driver whose settings live nowhere else publishes one: the TUI
+    /// answers for its tabs itself.
+    header: Option<Weak<ArcSwap<SessionHeader>>>,
+}
+
+impl LiveEntry {
+    fn header(&self) -> Option<Arc<SessionHeader>> {
+        Some(self.header.as_ref()?.upgrade()?.load_full())
+    }
+}
 
 /// Weak, so a session that ends takes its transcript with it. The dead entries
 /// it leaves behind get swept on the next publish.
-static LIVE_HISTORIES: LazyLock<Mutex<HashMap<MakiId, Weak<ArcSwap<HistorySnapshot>>>>> =
-    LazyLock::new(Mutex::default);
+static LIVE_HISTORIES: LazyLock<Mutex<HashMap<MakiId, LiveEntry>>> = LazyLock::new(Mutex::default);
+
+fn live_entries() -> MutexGuard<'static, HashMap<MakiId, LiveEntry>> {
+    LIVE_HISTORIES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+fn publish(session: MakiId, mirror: &SharedMessages, header: Option<&SharedHeader>) {
+    let mut live = live_entries();
+    live.retain(|_, entry| entry.history.strong_count() > 0);
+    let entry = LiveEntry {
+        history: Arc::downgrade(mirror),
+        header: header.map(Arc::downgrade),
+    };
+    live.insert(session, entry);
+}
 
 /// A second publish for the same id wins, which is what a reloaded tab wants.
 pub fn publish_live_history(session: MakiId, mirror: &SharedMessages) {
-    let mut live = LIVE_HISTORIES
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    live.retain(|_, mirror| mirror.strong_count() > 0);
-    live.insert(session, Arc::downgrade(mirror));
+    publish(session, mirror, None);
+}
+
+/// [`publish_live_history`] with the session's settings next to it, so a
+/// reader answers for a session nothing has saved yet without the disk.
+pub fn publish_live_session(session: MakiId, mirror: &SharedMessages, header: &SharedHeader) {
+    publish(session, mirror, Some(header));
 }
 
 pub fn live_history(session: MakiId) -> Option<Arc<Vec<Message>>> {
-    let live = LIVE_HISTORIES
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    let mirror = live.get(&session)?.upgrade()?;
-    Some(Arc::clone(&mirror.load().messages))
+    live_snapshot(session).map(|snapshot| Arc::clone(&snapshot.messages))
+}
+
+/// The messages together with the frame they were sent under, for a reader
+/// that has to know what the model was told.
+pub fn live_snapshot(session: MakiId) -> Option<Arc<HistorySnapshot>> {
+    let mirror = live_entries().get(&session)?.history.upgrade()?;
+    Some(mirror.load_full())
+}
+
+/// The settings of a live session a headless driver runs.
+pub fn live_header(session: MakiId) -> Option<Arc<SessionHeader>> {
+    live_entries().get(&session)?.header()
 }
 
 /// Where a [`History`] publishes. A run owns its history for as long as it
@@ -102,15 +142,14 @@ impl History {
         self.live.as_ref()
     }
 
-    /// What the model holds true: the frame's facts with every update in the
+    /// What the model holds true: the frame's facts, with what it inherited
+    /// from the start of the frame it replaced, and every update in the
     /// transcript applied in order. An update from before the frame was built
-    /// still counts, because the model reads it after the prompt.
+    /// still counts, because the model reads it after the prompt. The frame
+    /// never folds updates in itself, so cutting one also takes back what it
+    /// told.
     pub(crate) fn told(&self) -> Option<LiveFacts> {
-        let mut facts = self.frame()?.facts_at_start();
-        for update in self.as_slice().iter().filter_map(Message::facts_update) {
-            facts.apply(update);
-        }
-        Some(facts)
+        Some(facts_told(self.frame()?, self.as_slice()))
     }
 
     /// Late MCP tools go into the stored frame too, so a resumed session sends
@@ -132,7 +171,7 @@ impl History {
 
     pub(crate) fn request_prefix(&self) -> Option<(&str, &Value)> {
         Some((
-            &self.snapshot.frame.as_ref()?.system,
+            self.snapshot.frame.as_ref()?.prefix()?,
             &self.live.as_ref()?.wire,
         ))
     }
@@ -242,8 +281,11 @@ impl History {
         self.rewrite(|msgs| msgs.truncate(len));
     }
 
-    /// Drops every thinking block, the one edit that leaves later ones valid
-    /// whatever moved under them. Returns how many went.
+    /// Drops every thinking block and thought signature, the one edit that
+    /// leaves later ones valid whatever moved under them. Returns how many
+    /// thinking blocks went. With none, signatures stay too: no provider that
+    /// binds thinking is sent them, so stripping only those would replay the
+    /// same failing request.
     pub(crate) fn strip_thinking(&mut self) -> usize {
         let thinking = self
             .as_slice()
@@ -286,6 +328,16 @@ impl History {
         };
         mirror.store(Arc::new(self.snapshot.clone()));
     }
+}
+
+/// [`History::told`] for a transcript held anywhere, a stored or exported one
+/// included.
+pub(super) fn facts_told(frame: &StoredFrame, messages: &[Message]) -> LiveFacts {
+    let mut facts = frame.facts_at_start();
+    for update in messages.iter().filter_map(Message::facts_update) {
+        facts.apply(update);
+    }
+    facts
 }
 
 pub(super) fn remove_orphaned_tool_results(messages: &mut Vec<Message>) -> bool {
@@ -335,9 +387,19 @@ pub(super) fn remove_orphaned_tool_results(messages: &mut Vec<Message>) -> bool 
     changed
 }
 
+/// Thought signatures go with the thinking: they are bound to the same
+/// prefix, so whatever voids one voids the other.
 pub(super) fn strip_thinking(messages: &mut [Message]) {
     for msg in messages {
         msg.content.retain(|block| !block.is_thinking());
+        for block in &mut msg.content {
+            if let ContentBlock::ToolUse {
+                thought_signature, ..
+            } = block
+            {
+                *thought_signature = None;
+            }
+        }
     }
 }
 
@@ -362,7 +424,7 @@ fn is_empty_marker(m: &Message) -> bool {
 
 /// Restored sessions can have orphaned tool_results or unclosed tool_uses
 /// (e.g. the process was killed mid-turn). The API returns 400 if it sees those.
-fn sanitize_restored(messages: &mut Vec<Message>) {
+pub(super) fn sanitize_restored(messages: &mut Vec<Message>) {
     let len_before = messages.len();
     let mut changed = remove_orphaned_tool_results(messages);
     close_dangling_tool_calls(messages, UNAVAILABLE_RESULT);
@@ -420,6 +482,8 @@ mod tests {
     const FIRST: &str = "first";
     const SECOND: &str = "second";
     const GO: &str = "go";
+    const SIGNATURE: &str = "sig";
+    const UNKNOWN_BLOCK_TYPE: &str = "server_tool_use";
 
     #[track_caller]
     fn assert_ends_with_cancel_marker(history: &History) {
@@ -712,6 +776,49 @@ mod tests {
             [ContentBlock::Text { text }] if text == "keep me"
         ));
         assert!(!remove_orphaned_tool_results(&mut messages));
+    }
+
+    /// The count drives the unbound-thinking retry, so it counts only
+    /// thinking blocks: signatures go with them but never earn a retry.
+    #[test_case(true, 1 ; "thinking_and_signature")]
+    #[test_case(false, 0 ; "signature_only")]
+    fn strip_thinking_counts_only_thinking_blocks(with_thinking: bool, expected: usize) {
+        let mut call = make_tool_use_msg(&["t1"]);
+        let ContentBlock::ToolUse {
+            thought_signature, ..
+        } = &mut call.content[0]
+        else {
+            unreachable!()
+        };
+        *thought_signature = Some(SIGNATURE.into());
+        if with_thinking {
+            call.content.insert(
+                0,
+                ContentBlock::Thinking {
+                    thinking: GO.into(),
+                    signature: Some(SIGNATURE.into()),
+                },
+            );
+        }
+        let mut history = History::new(vec![Message::user(GO.into()), call]);
+
+        assert_eq!(history.strip_thinking(), expected);
+        let signature_kept = !with_thinking;
+        assert!(matches!(
+            &history.as_slice()[1].content[..],
+            [ContentBlock::ToolUse { thought_signature, .. }] if thought_signature.is_some() == signature_kept
+        ));
+    }
+
+    /// Dropping an orphaned result must not take a newer build's block with it.
+    #[test]
+    fn sanitize_restored_keeps_unknown_blocks() {
+        let unknown = ContentBlock::Unknown(serde_json::json!({ "type": UNKNOWN_BLOCK_TYPE }));
+        let mut orphaned = make_tool_result_msg(&["orphan"]);
+        orphaned.content.push(unknown.clone());
+        let history = History::restored(vec![Message::user(GO.into()), orphaned]);
+
+        assert_eq!(history.as_slice()[1].content, [unknown]);
     }
 
     #[test]

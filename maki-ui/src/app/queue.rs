@@ -4,7 +4,9 @@
 use std::borrow::Cow;
 
 use maki_agent::{AgentInput, AgentMode, ImageSource, InputSource};
+use maki_lua::agent_autocmd::HostEvent;
 
+use super::image_paste::IMAGE_NOT_SUPPORTED_MSG;
 use super::{Action, App, Status};
 
 use crate::agent::shared_queue::{Compaction, QueueItem, QueueSender, QueuedInput};
@@ -127,6 +129,9 @@ impl App {
     pub(crate) fn submit_prompt(&mut self, msg: QueuedMessage) -> SubmitOutcome {
         if msg.text.trim().is_empty() && msg.images.is_empty() {
             return SubmitOutcome::Rejected(EMPTY_PROMPT_ERR);
+        }
+        if !msg.images.is_empty() && !self.state.model.supports_vision() {
+            return SubmitOutcome::Rejected(IMAGE_NOT_SUPPORTED_MSG);
         }
         if self.status == Status::Streaming {
             if self.queue_and_notify(msg) {
@@ -302,7 +307,7 @@ impl App {
         // New work supersedes text held for recovery after an agent error.
         self.recoverable_queue.clear();
         self.status = Status::Streaming;
-        self.fire_session_autocmd("TurnStart", serde_json::json!({ "text": display }));
+        self.fire_session_event(HostEvent::TurnStart { text: &display });
         if !display.is_empty() || !input.images.is_empty() {
             self.main_chat()
                 .show_user_message(display, input.images.clone());

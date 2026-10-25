@@ -29,8 +29,9 @@ type FileStamp = (PathBuf, Option<SystemTime>, u64);
 /// The parse of `providers.toml`, kept until the file changes.
 /// [`ProvidersConfig::load`] runs on nearly every model resolution, and once
 /// per row while the model picker builds its list, so without this each of
-/// those costs a read plus a full TOML parse.
-static PARSED: Mutex<Option<(FileStamp, ProvidersConfig)>> = Mutex::new(None);
+/// those costs a read plus a full TOML parse. A broken file is kept too, so a
+/// caller that polls it parses and reports it once per edit.
+static PARSED: Mutex<Option<(FileStamp, Result<ProvidersConfig, String>)>> = Mutex::new(None);
 
 /// Valid `top_p` is in the open interval exclusive of 0, up to 1 inclusive.
 const TOP_P_MIN: f64 = 0.0;
@@ -122,6 +123,7 @@ impl FromStr for ModelTier {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelDef {
     pub id: String,
     #[serde(default)]
@@ -250,6 +252,7 @@ inventory::collect!(BuiltInProvider);
 static REGISTERED: RwLock<Vec<&'static BuiltInProvider>> = RwLock::new(Vec::new());
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OverrideFields {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
@@ -272,6 +275,7 @@ pub struct OverrideFields {
 /// `zai`, `ollama`, `ikora-openai`). Provider-level fields apply to every model
 /// from that provider; `models` refine individual models.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderOverride {
     #[serde(flatten)]
     pub default: OverrideFields,
@@ -279,7 +283,11 @@ pub struct ProviderOverride {
     pub models: HashMap<String, OverrideFields>,
 }
 
+/// Every struct in a provider entry refuses unknown keys. Otherwise a key maki
+/// never reads, like `drop_params` or a typo'd `api_key_evn`, parses fine and
+/// quietly does nothing.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderDef {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
@@ -384,10 +392,7 @@ impl ProvidersConfig {
     /// Same read, but a typo only costs the answer. For callers past startup,
     /// where taking the process down mid-session is never the right trade.
     pub fn load_or_default() -> Self {
-        Self::read().unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "ignoring providers.toml");
-            Self::default()
-        })
+        Self::read().unwrap_or_default()
     }
 
     fn read() -> Result<Self, String> {
@@ -402,10 +407,10 @@ impl ProvidersConfig {
         };
         let stamp = (path, meta.modified().ok(), meta.len());
         let mut parsed = PARSED.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((cached, config)) = parsed.as_ref()
+        if let Some((cached, result)) = parsed.as_ref()
             && *cached == stamp
         {
-            return Ok(config.clone());
+            return result.clone();
         }
         let content = match fs::read_to_string(&stamp.0) {
             Ok(c) => c,
@@ -414,12 +419,13 @@ impl ProvidersConfig {
                 return Ok(Self::default());
             }
         };
-        let config = toml::from_str::<ProvidersConfig>(&content)
-            .map_err(|e| format!("invalid {}: {e}", stamp.0.display()))?;
-        config.validate()?;
-        debug!(path = %stamp.0.display(), "loaded providers config");
-        *parsed = Some((stamp, config.clone()));
-        Ok(config)
+        let result = toml::from_str::<ProvidersConfig>(&content)
+            .map_err(|e| format!("invalid {}: {e}", stamp.0.display()))
+            .and_then(|config| config.validate().map(|()| config))
+            .inspect(|_| debug!(path = %stamp.0.display(), "loaded providers config"))
+            .inspect_err(|e| tracing::warn!(error = %e, "cannot use providers.toml"));
+        *parsed = Some((stamp, result.clone()));
+        result
     }
 
     pub fn save(&self) -> Result<(), std::io::Error> {
@@ -837,6 +843,31 @@ tier = "mediums"
         let err = toml::from_str::<ModelDef>(UNKNOWN_TIER_TOML).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("medium"), "expected enum hint, got: {msg}");
+    }
+
+    #[test_case("[litellm]\nprotocol = \"openai\"\ndrop_params = true\n", "drop_params" ; "provider_key")]
+    #[test_case("[litellm]\nprotocol = \"openai\"\n[[litellm.models]]\nid = \"m\"\ncontext_windw = 1\n", "context_windw" ; "model_key")]
+    #[test_case("[aperture.overrides.zai]\nbsae = \"zai\"\n", "bsae" ; "override_provider_key")]
+    #[test_case("[aperture.overrides.zai.models.glm]\npath_prefx = \"\"\n", "path_prefx" ; "override_model_key")]
+    fn an_unknown_key_fails_the_parse_and_names_itself(toml_src: &str, key: &str) {
+        let error = toml::from_str::<ProvidersConfig>(toml_src)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(key), "{error}");
+    }
+
+    /// serde does not promise `deny_unknown_fields` works with `flatten`, and
+    /// `ProviderOverride` uses both. This checks real keys still get through.
+    #[test]
+    fn override_keys_parse_at_provider_and_model_level() {
+        let config: ProvidersConfig = toml::from_str(
+            "[aperture.overrides.zai]\nbase = \"zai\"\n\
+             [aperture.overrides.zai.models.glm]\npath_prefix = \"\"\n",
+        )
+        .unwrap();
+        let zai = &config.get("aperture").unwrap().overrides["zai"];
+        assert_eq!(zai.default.base.as_deref(), Some("zai"));
+        assert_eq!(zai.models["glm"].path_prefix.as_deref(), Some(""));
     }
 
     #[test]

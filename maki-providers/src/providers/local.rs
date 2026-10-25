@@ -8,12 +8,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
 
-use maki_config::providers::Protocol;
+use maki_config::providers::{Protocol, ProvidersConfig};
 
 use crate::model::Model;
 use crate::provider::{BoxFuture, Provider};
 use crate::types::ThinkingFallback;
-use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{AgentError, Effort, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::openai::responses;
 use super::openai_compat::{DEFAULT_MAX_TOKENS_FIELD, OpenAiCompatConfig, OpenAiCompatProvider};
@@ -30,6 +30,20 @@ pub(crate) struct LocalEndpointConfig {
     pub discovery_mode: DiscoveryMode,
     pub compat: OpenAiCompatConfig,
     pub thinking_fallback: ThinkingFallback,
+}
+
+impl LocalEndpointConfig {
+    pub(crate) fn adaptive_effort(&self, model: &Model) -> Option<Effort> {
+        self.thinking_fallback.adaptive_effort(model)
+    }
+
+    pub(crate) fn fields_fallback(&self) -> Option<ThinkingFallback> {
+        (maki_config::providers::resolve_protocol(
+            self.slug,
+            ProvidersConfig::load_or_default().get(self.slug),
+        ) != Some(Protocol::OpenaiResponses))
+        .then_some(self.thinking_fallback)
+    }
 }
 
 fn resolve_protocol_for_local(slug: &str) -> Option<Protocol> {

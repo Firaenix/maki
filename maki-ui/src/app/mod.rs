@@ -66,6 +66,7 @@ use maki_agent::{
 };
 use maki_config::project::{self, GatedFile, TrustQuestion};
 use maki_config::{ModelPolicy, UiConfig};
+use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, InputEdit, Key, KeymapReader,
     LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, PackCommand,
@@ -133,8 +134,6 @@ const FAST_OFF_MSG: &str = "Fast mode: off";
 const WORKFLOW_ON_MSG: &str = "Workflow mode: on";
 const WORKFLOW_OFF_MSG: &str = "Workflow mode: off";
 pub(crate) const NOTHING_TO_TRUST_MSG: &str = "nothing to trust in this folder";
-pub(crate) const PERMISSION_REQUESTED_EVENT: &str = "PermissionRequested";
-pub(crate) const PERMISSION_RESOLVED_EVENT: &str = "PermissionResolved";
 pub(crate) const RESOLVED_BY_USER: &str = "user";
 pub(crate) const RESOLVED_BY_CANCEL: &str = "cancelled";
 const TRUSTED_PREFIX: &str = "Trusted this folder: ";
@@ -630,10 +629,10 @@ impl App {
             return;
         }
         let previous_spec = std::mem::replace(&mut self.announced_model_spec, spec);
-        self.fire_session_autocmd(
-            "ModelChanged",
-            serde_json::json!({ "model": self.model_state(), "previous_spec": previous_spec }),
-        );
+        self.fire_session_event(HostEvent::ModelChanged {
+            model: self.model_state(),
+            previous_spec,
+        });
     }
 
     /// Takes the spelling `maki.model.set` accepts, which is what the
@@ -675,6 +674,7 @@ impl App {
             "id": model.id,
             "provider": model.provider.to_string(),
             "thinking": self.state.thinking.to_string(),
+            "thinking_shown": self.state.thinking.shown(model).to_string(),
             "thinking_options": model.thinking_options(),
             "fast": self.state.fast,
             "supports_thinking": model.supports_thinking(),
@@ -804,16 +804,13 @@ impl App {
     }
 
     fn fire_input_changed(&mut self, source: Option<Arc<str>>, cursor_only: bool) {
-        self.fire_session_autocmd(
-            "InputChanged",
-            serde_json::json!({
-                "text": self.announced_input,
-                "cursor": self.announced_cursor,
-                "version": self.input_box.buffer.version(),
-                "source": source,
-                "cursor_only": cursor_only,
-            }),
-        );
+        self.fire_session_event(HostEvent::InputChanged {
+            text: &self.announced_input,
+            cursor: self.announced_cursor,
+            version: self.input_box.buffer.version(),
+            source: source.as_deref(),
+            cursor_only,
+        });
     }
 
     pub(crate) fn record_recent_model(&mut self, spec: &str) {
@@ -834,14 +831,9 @@ impl App {
         self.status_bar.queue_flash(msg);
     }
 
-    pub(crate) fn fire_session_autocmd(&self, event: &str, mut data: serde_json::Value) {
-        if let Some(map) = data.as_object_mut() {
-            map.insert(
-                "session_id".into(),
-                serde_json::Value::String(self.state.session.id.to_string()),
-            );
-        }
-        self.lua_event_handle.fire_autocmd(event, data);
+    pub(crate) fn fire_session_event(&self, event: HostEvent<'_>) {
+        self.lua_event_handle
+            .fire(Some(&self.state.session.id), event);
     }
 
     pub fn tick_error_expiry(&mut self) -> Dirty {
@@ -981,10 +973,6 @@ impl App {
         }
         if key::SCROLL_TOP.matches(key) {
             self.active_chat().scroll_to_top();
-            return Some(vec![]);
-        }
-        if key::SCROLL_BOTTOM.matches(key) {
-            self.active_chat().enable_auto_scroll();
             return Some(vec![]);
         }
         None
@@ -1316,6 +1304,10 @@ impl App {
             self.active_chat().scroll(-page);
             return vec![];
         }
+        if key::SCROLL_BOTTOM.matches(key) {
+            self.active_chat().enable_auto_scroll();
+            return vec![];
+        }
 
         self.handle_chat_key(key)
     }
@@ -1613,33 +1605,9 @@ impl App {
     pub(crate) fn cancel_turn(&mut self) -> Option<Vec<Action>> {
         (self.status == Status::Streaming).then(|| self.handle_cancel())
     }
-
-    /// A tool task can be cancelled only while its turn still routes to it.
-    /// A plugin task can be cancelled any time it is alive, idle included.
     fn handle_subagent_cancel(&mut self) -> Vec<Action> {
-        let chat = &self.chats[self.active_chat];
-        let Some(id) = chat.task_id().cloned() else {
-            return vec![];
-        };
-        let action = match chat.plugin {
-            Some(_) if !chat.is_finished() => Action::CancelPluginTask { id: id.to_string() },
-            None if self.chat_index.get(&*id) == Some(&self.active_chat) => {
-                Action::CancelSubagent {
-                    tool_use_id: id.to_string(),
-                }
-            }
-            _ => return vec![],
-        };
-
-        self.chats[self.active_chat].flush();
-        self.chats[self.active_chat].cancel_in_progress();
-        self.chats[self.active_chat].mark_finished(TaskOutcome::Error, CANCELLED_TEXT);
-        self.subagent_answers.remove(&*id);
-        for handle in self.permission_prompt.drop_subagent(&id) {
-            self.fire_permission_cancelled(handle);
-        }
-
-        vec![action]
+        let id = self.active_task_id();
+        self.stop_task(&id).into_iter().collect()
     }
 
     fn bill(&mut self, chat_idx: usize, model: &str, usage: StoredTokenUsage) {
@@ -1759,7 +1727,7 @@ impl App {
         let is_plugin_task = plugin.is_some();
         let chat_idx = match envelope.subagent {
             Some(ref subagent) => self.resolve_or_create_chat(subagent, &plugin),
-            // A plugin session that never prompted has no task to show.
+            // A plugin event without its task must never land in the main chat.
             None if is_plugin_task => return vec![],
             None => MAIN_CHAT,
         };
@@ -1872,24 +1840,24 @@ impl App {
         } = result
         {
             let project_trusted = self.permissions.project_is_trusted();
-            let mut data = serde_json::json!({
-                "tool_id": id,
-                "tool": tool.to_string(),
-                "scopes": scopes,
-                "reason": reason,
-                "subagent_id": subagent_id,
-            });
+            let tool_name = tool.to_string();
             let handle = self.permission_prompt.push(
-                id,
+                id.clone(),
                 tool,
-                scopes,
+                scopes.clone(),
                 subagent_id.clone(),
                 project_trusted,
-                reason,
+                reason.clone(),
                 preview,
             );
-            data["request_id"] = handle.into();
-            self.fire_session_autocmd(PERMISSION_REQUESTED_EVENT, data);
+            self.fire_session_event(HostEvent::PermissionRequested {
+                request_id: handle,
+                tool_id: &id,
+                tool: tool_name,
+                scopes: &scopes,
+                reason: reason.as_deref(),
+                subagent_id: subagent_id.as_deref(),
+            });
             return vec![];
         }
 
@@ -2030,10 +1998,20 @@ impl App {
         idx
     }
 
+    /// A chat this task already has, maybe one the user just stopped, stays as
+    /// it is rather than turning idle again.
+    pub(crate) fn open_plugin_task(&mut self, info: &SubagentInfo, plugin: Arc<str>) {
+        let id = &info.parent_tool_use_id;
+        if self.deleted_tasks.contains(id) || self.chat_of_task(id).is_ok() {
+            return;
+        }
+        let idx = self.resolve_or_create_chat(info, &Some(plugin));
+        self.chats[idx].idle = true;
+    }
+
     pub(crate) fn command_listing(&self) -> Vec<crate::components::command::CommandListing> {
         self.command_palette.listing()
     }
-
     /// Entry point for `maki.api.run_command`: splits a command line into the
     /// name and args the input bar would hand over, leading slash optional.
     /// `Err` means nothing ran at all, so the Lua caller can say why.
@@ -2315,6 +2293,9 @@ impl App {
                     self.state
                         .session_mut()
                         .set_cwd(canonical.to_string_lossy().into_owned());
+                    self.fire_session_event(HostEvent::SessionCwdChanged {
+                        cwd: &canonical.to_string_lossy(),
+                    });
                 }
                 self.status_bar.refresh_cwd();
                 self.flash(format!("cd {}", path.display()))
@@ -2436,23 +2417,25 @@ impl App {
     }
 
     fn settle_permission(&mut self, answered: AnsweredRequest, by: &str) {
-        self.fire_session_autocmd(
-            PERMISSION_RESOLVED_EVENT,
-            serde_json::json!({
-                "request_id": answered.handle,
-                "decision": if answered.answer.is_allow() { "allow" } else { "deny" },
-                "by": by,
+        self.fire_session_event(HostEvent::PermissionResolved {
+            request_id: answered.handle,
+            decision: Some(if answered.answer.is_allow() {
+                "allow"
+            } else {
+                "deny"
             }),
-        );
+            by,
+        });
         let encoded = TaggedAnswer::new(&answered.id, answered.answer).encode();
         self.send_to_agent(answered.subagent_id.as_deref(), encoded);
     }
 
     fn fire_permission_cancelled(&self, handle: u64) {
-        self.fire_session_autocmd(
-            PERMISSION_RESOLVED_EVENT,
-            serde_json::json!({ "request_id": handle, "by": RESOLVED_BY_CANCEL }),
-        );
+        self.fire_session_event(HostEvent::PermissionResolved {
+            request_id: handle,
+            decision: None,
+            by: RESOLVED_BY_CANCEL,
+        });
     }
 
     /// Every poller that feeds the screen, in one place and never in `view`;

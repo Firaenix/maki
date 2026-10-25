@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
+use maki_agent::agent::SessionExport;
 use maki_agent::permissions::PermissionAnswer;
-use maki_agent::{Envelope, SharedBuf};
+use maki_agent::{Envelope, ImageSource, SharedBuf, SubagentInfo, Transcript};
 use maki_storage::id::MakiId;
 use mlua::{Lua, RegistryKey, Result as LuaResult, Value};
 use strum::{EnumString, VariantNames};
@@ -14,7 +15,7 @@ use strum::{EnumString, VariantNames};
 use crate::api::util::convert::json_to_lua;
 use crate::api::util::pair::{Pair, try_pair};
 use crate::key::Key;
-use crate::plugin_permissions::PluginReach;
+use crate::plugin_permissions::{Permission, PluginReach};
 
 pub const NO_UI_ERR: &str = "no interactive UI attached";
 pub(crate) const UI_DROPPED_ERR: &str = "ui event loop dropped the request";
@@ -440,12 +441,18 @@ pub enum SessionRequest {
     Current,
     /// UI-mode fallback for `maki.session.read` when no snapshot slot is
     /// installed — the UI resolves the id and returns a `session_snapshot_json`
-    /// payload. Headless drivers install a `SessionSnapshotSlot` instead
-    /// so `read` doesn't need a UI.
+    /// payload, or [`crate::SessionSnapshot::stored`] for an id no tab has
+    /// open. Headless drivers install a `SessionSnapshotSlot` instead so
+    /// `read` doesn't need a UI.
     Read {
         id: Option<String>,
     },
+    /// {transcript} is parsed but not validated yet. The UI lays it over the
+    /// focused tab's blank session, the one place that decides a new
+    /// session's defaults, and answers what is wrong with it. Without
+    /// {prompt} or {focus} it is only stored, otherwise it opens in a tab.
     New {
+        transcript: Box<Transcript>,
         prompt: Option<String>,
         focus: bool,
     },
@@ -455,6 +462,7 @@ pub enum SessionRequest {
         id: Option<String>,
         text: String,
         force: bool,
+        images: Vec<ImageSource>,
     },
     Focus {
         id: String,
@@ -473,17 +481,17 @@ pub enum SessionRequest {
         id: String,
         title: String,
     },
+    /// Interrupts the running turn of the live session {id} names, or the
+    /// focused one. The UI replies whether a turn was running.
+    Cancel {
+        id: Option<String>,
+    },
     /// A plugin's answer to an open permission ask, racing the user at the
     /// prompt. The UI replies whether this answer was the one that settled it.
     AnswerPermission {
         handle: u64,
         answer: PermissionAnswer,
         plugin: Arc<str>,
-    },
-    /// Interrupts the running turn of the live session {id} names, or the
-    /// focused one. The UI replies whether a turn was running.
-    Cancel {
-        id: Option<String>,
     },
     /// Ctrl+Enter for the live session {id} names, or the focused one: the
     /// running turn goes on as a background task and the queue goes next.
@@ -497,6 +505,7 @@ pub enum TaskRequest {
     List,
     Focus { id: String },
     Remove { id: String },
+    Stop { id: String, session: String },
 }
 
 /// `session` names a live session; `None` is the focused one.
@@ -657,6 +666,31 @@ pub enum BuiltinAction {
     ModelPicker,
 }
 
+impl BuiltinAction {
+    /// What a plugin needs to run this through `maki.ui.action`, the same
+    /// price as the API that does the same thing. Matched without a fallback,
+    /// so a new action has to be priced before it builds.
+    ///
+    /// Most actions open something the user then sees and drives, or move
+    /// focus like `maki.task.focus`, so they are open. The plan form only
+    /// shows, and the user decides there. Popping the queue throws away a
+    /// prompt the user wrote, with nobody asked.
+    pub fn needs(self) -> &'static [Permission] {
+        match self {
+            Self::FilePicker
+            | Self::Search
+            | Self::Help
+            | Self::PlanToggle
+            | Self::PlanEditor
+            | Self::EditInput
+            | Self::PrevChat
+            | Self::NextChat
+            | Self::ModelPicker => &[],
+            Self::PopQueue => &[Permission::SessionWrite],
+        }
+    }
+}
+
 pub enum UiAction {
     OpenWin {
         buf: Arc<SharedBuf>,
@@ -674,6 +708,14 @@ pub enum UiAction {
     Session {
         req: SessionRequest,
         reply_tx: flume::Sender<UiReply>,
+    },
+    /// `maki.session.export` and `messages`: a live tab answers from memory,
+    /// unsaved messages included, any other id from disk. Typed rather than
+    /// JSON, with the messages shared, so neither the UI thread nor the Lua
+    /// thread copies them.
+    ExportSession {
+        id: MakiId,
+        reply_tx: flume::Sender<Result<SessionExport, String>>,
     },
     Model {
         req: ModelRequest,
@@ -724,6 +766,11 @@ pub enum UiAction {
         session: MakiId,
         plugin: Arc<str>,
         envelope: Box<Envelope>,
+    },
+    PluginTaskOpened {
+        session: MakiId,
+        plugin: Arc<str>,
+        info: Box<SubagentInfo>,
     },
 }
 
@@ -786,6 +833,12 @@ pub(crate) fn ui_send(
         return Err(NO_UI_ERR);
     }
     tx.ok_or(NO_UI_ERR)?.try_send(action).map_err(|_| NO_UI_ERR)
+}
+
+/// Whether an action sent now would reach an event loop, for a call that must
+/// refuse before doing anything a missing UI would leave half done.
+pub(crate) fn ui_reachable(tx: Option<&flume::Sender<UiAction>>) -> bool {
+    ui_attached() && tx.is_some_and(|tx| !tx.is_disconnected())
 }
 
 /// Send an action carrying a reply channel and await the answer. Only

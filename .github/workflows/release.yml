@@ -24,7 +24,7 @@ jobs:
     name: Create Release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Create draft release
         run: |
@@ -45,7 +45,7 @@ jobs:
             runner: ubuntu-24.04-arm
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Build in Alpine container
         run: |
@@ -95,7 +95,7 @@ jobs:
             std: build-std
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # zig bundles NetBSD 10.1 libc headers, crt objects and stub shared
       # libraries, so it is a self-contained NetBSD cross toolchain: Ubuntu has
@@ -207,7 +207,7 @@ jobs:
             runner: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -248,7 +248,7 @@ jobs:
     needs: [build-linux, build-netbsd, build-other]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Download artifacts
         run: .github/scripts/retry.sh gh release download "$GITHUB_REF_NAME" --dir artifacts

@@ -6,7 +6,11 @@ use crate::app::tasks::TaskOutcome;
 use crate::chat::{Chat, DONE_TEXT, history_to_display};
 use crate::components::Action;
 use crate::components::rewind_picker::RewindEntry;
+use maki_agent::Transcript;
+use maki_agent::agent::SessionExport;
+use maki_agent::session::SessionHeader;
 use maki_lua::SessionEndReason;
+use maki_lua::agent_autocmd::HostEvent;
 use maki_providers::{Message, Model, RequestOptions, TokenUsage, estimate_message_tokens};
 use maki_storage::id::MakiId;
 use maki_storage::sessions::{SessionClaim, SessionMeta, StoredMode, StoredSubagent};
@@ -370,6 +374,42 @@ impl App {
         open
     }
 
+    /// `maki.session.new` lays its document over [`Self::blank_session`], so
+    /// a plugin's session starts where `Ctrl-N` would.
+    pub(crate) fn session_from(&self, transcript: Transcript) -> Result<OpenSession, String> {
+        let OpenSession { session, claim } = self.blank_session();
+        let session = transcript
+            .into_session(session)
+            .map_err(|e| e.to_string())?;
+        Ok(OpenSession { session, claim })
+    }
+
+    /// Settings come from live state rather than the session, because a
+    /// plugin can change one and export in the same drain, before the next
+    /// checkpoint syncs them. The agent's mirror runs ahead of what the tab
+    /// last saved and is shared, not copied. A tab whose agent never started
+    /// shares the session's own.
+    pub(crate) fn export(&self) -> SessionExport {
+        let state = &self.state;
+        let session = &state.session;
+        let header = SessionHeader {
+            mode: Some(state.mode.into()),
+            thinking: Some(state.thinking_intent().into()),
+            fast: state.fast_intent(),
+            usage: state.token_usage,
+            context_size: state.context_size,
+            ..SessionHeader::of(session)
+        };
+        match &self.shared_history {
+            Some(mirror) => SessionExport::live(header, &mirror.load()),
+            None => SessionExport {
+                header,
+                messages: Arc::clone(session.shared_messages()),
+                frame: session.frame().cloned(),
+            },
+        }
+    }
+
     pub(super) fn reset_session(&mut self) -> Vec<Action> {
         self.checkpoint_now();
         self.state.token_usage = TokenUsage::default();
@@ -382,7 +422,7 @@ impl App {
         // Fire before the swap. A handler cleaning up after the session
         // that just ended needs its id, and the stamp always reads
         // whichever session is current.
-        self.fire_session_autocmd("SessionReset", serde_json::json!({}));
+        self.fire_session_event(HostEvent::SessionReset {});
         self.lua_event_handle
             .end_session(self.state.session.id, SessionEndReason::Reset);
         // Swapping the claim is what gives the old session back: the snapshot

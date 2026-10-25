@@ -1,7 +1,8 @@
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, c_int};
+use std::fmt::Display;
 use std::future::Future;
 use std::panic::catch_unwind;
 use std::path::{Path, PathBuf};
@@ -19,7 +20,7 @@ use include_dir::Dir;
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::permissions::{LayerAnswer, LayerVerdict, PluginRuleStore};
 use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, SlotEntry};
-use maki_agent::tools::hook::{Authority, Verdict};
+use maki_agent::tools::hook::Verdict;
 use maki_agent::tools::{
     HeaderResult, PermissionScopes, RegistryError, Tool, ToolLive, ToolRegistry, ToolSource,
 };
@@ -35,6 +36,7 @@ use maki_config::RawConfig;
 use maki_providers::plugin::DeclAuthority;
 use maki_storage::id::{MakiId, SessionRef};
 
+use crate::agent_autocmd::HostEvent;
 use crate::api::autocmd::AutocmdStore;
 use crate::api::r#fn::{JobEvent, JobOwner, JobStore, deliver_job_event};
 use crate::api::fs::publish_walks;
@@ -46,8 +48,8 @@ use crate::api::plan::{
     install_row_handlers, row_handler_opts, rows_from_table, rows_to_table,
 };
 use crate::api::slot::{
-    ChainObserver, LayeredTools, PERMISSION_PROMPT_SLOT, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT,
-    SlotStore, layer_plugins, run_host_chain, run_host_chain_with,
+    ChainObserver, LayerCost, LayeredTools, PERMISSION_PROMPT_SLOT, PLAN_FORM_ACTIONS_SLOT,
+    PLAN_FORM_SLOT, SlotStore, layer_plugins, run_host_chain, run_host_chain_with,
 };
 use crate::api::tool::{
     LuaTool, PendingRules, PendingTool, PendingTools, ToolCallReply, ToolPermission, resolve_rules,
@@ -59,7 +61,7 @@ use crate::api::util::command::{
     LuaCommandReader, LuaCommandWriter, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction,
     UiAttachment, install_ui_attachment, ui_send,
 };
-use crate::api::util::convert::{json_to_lua, lua_to_json_within};
+use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json_within};
 use crate::api::util::ctx::{LuaCtx, RestoreCtx};
 use crate::api::util::setup::ConfigStore;
 use crate::api::{Owner, create_maki_global};
@@ -69,7 +71,9 @@ use crate::error::PluginError;
 use crate::key_lint::KeyLint;
 use crate::loader::EventHandle;
 use crate::pack::Interaction;
-use crate::plugin_permissions::{PluginPermissions, load_plugin_permissions};
+use crate::plugin_permissions::{
+    Permission, PluginPermissions, grant_hint, load_plugin_permissions,
+};
 use crate::plugin_status::{PluginKind, PluginStatusStore, record_error};
 
 const INTERRUPT_SHUTDOWN_MSG: &str = "plugin interrupted: host shutting down";
@@ -142,7 +146,6 @@ const ASK_FIELD: &str = "ask";
 /// printing faster than we deliver always has another event queued, so an
 /// unbounded pass would never reach the reap.
 const FINAL_DRAIN_BUDGET: usize = 256;
-const SESSION_END_EVENT: &str = "SessionEnd";
 /// Wall clock the `ui.plan_form*` chains get, together, before the host stops
 /// waiting and opens the built-in form, generous because a layer may shell out
 /// or fetch before it decides. It rules out a parked layer stranding the user
@@ -157,7 +160,7 @@ pub const PLAN_FORM_SLOT_DEADLINE: Duration = Duration::from_secs(5);
 /// menu says and what pressing Enter on a row does, up to a build-mode turn
 /// with every tool behind it, and it can keep a built-in row's wording while
 /// swapping the outcome under it. No narrower price would be honest.
-const PLAN_FORM_AUTHORITY: Authority = Authority::Total;
+const PLAN_FORM_COST: LayerCost<'static> = LayerCost::TOTAL;
 /// Wall clock a picked plan row's handler gets. The row's built-in action
 /// waits behind it, so a handler that parks for good would cost the user the
 /// outcome the row promised as well as the one the plugin wanted.
@@ -321,7 +324,7 @@ enum PluginLoad<'a> {
 pub(crate) struct HookRun {
     /// Innermost first, run as one chain. See [`run_host_chain`].
     pub slots: Vec<String>,
-    pub authority: Authority,
+    pub cost: LayerCost<'static>,
     /// The filtered call's own cancellation and window. The chain runs on the
     /// Lua thread, so without them nothing here knows when the caller stopped
     /// waiting, and a layer that parks outlives the call it filters.
@@ -336,7 +339,7 @@ pub(crate) struct HookRun {
 
 /// One call that would have prompted, for the `permission.prompt` chain.
 pub(crate) struct PromptRun {
-    pub authority: Authority,
+    pub cost: LayerCost<'static>,
     pub cancel: CancelToken,
     pub deadline: Instant,
     pub req: Value,
@@ -725,6 +728,11 @@ pub(crate) struct TaskCell {
     /// can refuse to extend a chain that never ends. Inherited by
     /// `maki.async.run` tasks, or a cycle could hop through one and reset it.
     pub(crate) command_depth: u8,
+    /// True while running a command the user typed or a key they pressed, so
+    /// `maki.task.stop` knows a person asked for it. `maki.async` tasks start
+    /// without it, since they can run long after the keypress. So do commands
+    /// run through `maki.api.run_command`, which any plugin code can call.
+    user_action: bool,
     /// Set under a `maki.async.spawn` task and passed down to the runs it
     /// queues. [`TaskLifetime::Detached`] says why.
     detached: bool,
@@ -754,6 +762,7 @@ impl TaskCell {
             bufs_claim: Weak::new(),
             owns_jobs: true,
             command_depth: 0,
+            user_action: false,
             detached: false,
         }
     }
@@ -1161,7 +1170,7 @@ impl ModuleLoader {
             return Ok(cached);
         }
 
-        if self.loading.get::<bool>(modname).unwrap_or(false) {
+        if self.loading.opt_bool(modname).unwrap_or(false) {
             return Ok(LuaValue::Boolean(true));
         }
 
@@ -1345,6 +1354,63 @@ fn host_flash(lua: &Lua, msg: String) {
 /// For host code that has the VM but no `#[ctx]` sender of its own.
 pub(crate) fn host_ui(lua: &Lua) -> Option<flume::Sender<UiAction>> {
     lua.app_data_ref::<HostUi>()?.0.clone()
+}
+
+/// Which plugin was already told about which gap: an event it gets without
+/// content, or a slot plus the permissions its layer lacks there. Keyed by
+/// plugin first so the check every event makes needs no owned key.
+#[derive(Default)]
+struct PermissionWarnings(HashMap<String, HashSet<String>>);
+
+/// A permission gap that silently changes what a plugin sees or does, shown
+/// once per plugin per {subject}. Each of these is re-decided on every event
+/// or call, so without the dedup it would repeat for the life of the
+/// misconfiguration, and without the flash nobody would ever notice it.
+pub(crate) fn warn_plugin_once(
+    lua: &Lua,
+    plugin: &str,
+    subject: &str,
+    msg: impl FnOnce() -> String,
+) {
+    if lua.app_data_ref::<PermissionWarnings>().is_none() {
+        lua.set_app_data(PermissionWarnings::default());
+    }
+    {
+        let Some(mut warned) = lua.app_data_mut::<PermissionWarnings>() else {
+            return;
+        };
+        if warned
+            .0
+            .get(plugin)
+            .is_some_and(|seen| seen.contains(subject))
+        {
+            return;
+        }
+        warned
+            .0
+            .entry(plugin.to_owned())
+            .or_default()
+            .insert(subject.to_owned());
+    }
+    let msg = msg();
+    tracing::warn!(plugin, subject, "{msg}");
+    host_flash(lua, msg);
+}
+
+pub(crate) fn quoted_list(items: &[impl Display]) -> String {
+    items
+        .iter()
+        .map(|item| format!("'{item}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub fn layer_skipped_message(plugin: &str, slot: &str, missing: &[Permission]) -> String {
+    format!(
+        "plugin {plugin}: its layer on '{slot}' is skipped, it needs {}. {}",
+        quoted_list(missing),
+        grant_hint(missing)
+    )
 }
 
 /// Who to name for the code a watchdog interrupt caught running.
@@ -1557,11 +1623,16 @@ async fn run_abandonable<F: Future>(
     until_abandoned(run_scoped(lua, scope, fut), &handle).await
 }
 
-/// [`run_detached`] for a slash-command handler, seeding the hop count that
-/// `maki.api.run_command` checks before extending the chain.
+/// [`run_detached`] for a slash-command handler or a keybind callback, seeding
+/// the hop count that `maki.api.run_command` checks before extending the chain.
+/// Depth 0 means the user acted directly, see [`TaskCell::user_action`].
 pub(crate) async fn run_command_scoped<F: Future>(lua: &Lua, depth: u8, fut: F) -> F::Output {
     let scope = TaskScope::detached(lua);
-    lock_cell(scope.handle()).command_depth = depth;
+    {
+        let mut cell = lock_cell(scope.handle());
+        cell.command_depth = depth;
+        cell.user_action = depth == 0;
+    }
     run_scoped(lua, scope, fut).await
 }
 
@@ -1611,17 +1682,14 @@ async fn run_host_hook(lua: &Lua, hook: HostHook) {
                 .map(|(at, _)| at.saturating_duration_since(Instant::now()).as_millis() as u64);
             // Handlers may still inspect or stop the jobs, so the event fires
             // before the reap.
-            let data = json_to_lua(
-                lua,
-                &serde_json::json!({
-                    "session_id": end.session.to_string(),
-                    "reason": end.reason.to_string(),
-                    "deadline_ms": deadline_ms,
-                }),
-            )
-            .unwrap_or(LuaValue::Nil);
-            crate::api::autocmd::dispatch(lua.clone(), SESSION_END_EVENT.to_owned(), None, data)
-                .await;
+            let reason = end.reason.to_string();
+            let event = HostEvent::SessionEnd {
+                reason: &reason,
+                deadline_ms,
+            };
+            let data =
+                json_to_lua(lua, &event.payload(Some(&end.session))).unwrap_or(LuaValue::Nil);
+            crate::api::autocmd::dispatch(lua.clone(), event.name().to_owned(), None, data).await;
             with_jobs(lua, |store| store.kill_session(lua, end.session));
             BackgroundSessions::of(lua).end_session(end.session);
             // Nothing can pick from this session's plan form again.
@@ -1760,6 +1828,11 @@ pub(crate) fn active_task_cancel(lua: &Lua) -> Option<(u64, CancelToken)> {
 pub(crate) fn command_depth(lua: &Lua) -> u8 {
     lua.app_data_ref::<TaskHandle>()
         .map_or(0, |handle| lock_cell(&handle).command_depth)
+}
+
+pub(crate) fn is_user_action(lua: &Lua) -> bool {
+    lua.app_data_ref::<TaskHandle>()
+        .is_some_and(|handle| lock_cell(&handle).user_action)
 }
 
 /// Task id for job ownership; `None` under a delivery scope.
@@ -2408,7 +2481,7 @@ fn spawn_keybind_callback(
     let plugin = Arc::clone(ticket.plugin());
     ex.spawn(async move {
         let _done = done_tx;
-        if let Err(e) = run_detached(&handler_lua, func.call_async::<LuaValue>(())).await {
+        if let Err(e) = run_command_scoped(&handler_lua, 0, func.call_async::<LuaValue>(())).await {
             let error = strip_traceback(&e);
             tracing::warn!(?key, plugin = %plugin, error = %error, "keybind callback failed, key spent");
             record_error(&handler_lua, &plugin, "keybind", error);
@@ -2697,9 +2770,10 @@ impl LuaRuntime {
             });
         }
         {
+            let lua = lua.clone();
             let plugins = Rc::clone(&plugins);
-            crate::api::slot::set_layer_delegation(move |plugin, authority, slot| {
-                layer_delegation(&plugins, authority, slot)(plugin)
+            crate::api::slot::set_layer_delegation(move |plugin, cost, slot| {
+                layer_delegation(&lua, &plugins, cost)(plugin, slot)
             });
         }
         {
@@ -3315,7 +3389,7 @@ impl LuaRuntime {
         if scopes.is_empty() {
             return None;
         }
-        let force_prompt: bool = table.get("force_prompt").unwrap_or(false);
+        let force_prompt: bool = table.opt_bool("force_prompt").unwrap_or(false);
         Some(PermissionScopes {
             scopes,
             force_prompt,
@@ -3752,38 +3826,54 @@ fn run_describe(
 /// Whether a plugin may layer this slot at all.
 ///
 /// A layer on `tool.<name>.input` rewrites the call the tool then makes, so it
-/// borrows that call's [`Authority`] and has to already hold it. Without this,
-/// a plugin denied `run` could turn any bash command into its own. A layer on
-/// a slot another plugin declared arrives here as the price that slot's owner
-/// named at `declare_slot`: once per capability it listed, or as
-/// [`Authority::Total`] when it listed none.
+/// borrows that call's authority and has to already hold it. Without this, a
+/// plugin denied `run` could turn any bash command into its own. It also sees
+/// conversation content, and at the output stage rewrites it, which
+/// [`LayerCost::Host`] prices on top. A layer on a slot another plugin
+/// declared arrives here as the price that slot's owner named at
+/// `declare_slot`, or as [`LayerCost::TOTAL`] when it named none.
 ///
 /// Decided when the chain fires rather than when the layer is registered,
 /// because a layer may legitimately be set before its target tool exists, and
 /// permissions a reload narrows take effect on the very next call. Host slots
 /// reach it through [`run_host_chain`], plugin slots through the gate the
 /// runtime installs for them, so both kinds gate in one place.
+///
+/// A skipped layer is a plugin silently not doing its job, so the user hears
+/// about it once per plugin per slot and gap, naming every key to grant. A
+/// gap that changes, say after granting half of it, is news and warns again.
+///
+/// A free layer passes before the plugin is looked up. A plugin joins the map
+/// only once its load finishes, so a layer its top-level code set before an
+/// await would otherwise be dropped from every chain that fires meanwhile.
 fn layer_delegation<'a>(
+    lua: &'a Lua,
     plugins: &'a PluginMap,
-    authority: Authority,
-    slot: &'a str,
-) -> impl Fn(&str) -> bool + 'a {
-    move |plugin| {
-        let loaded = plugins.borrow();
-        let granted = loaded.get(plugin).map(|owner| &owner.permissions);
-        let held = match authority {
-            Authority::Capability(required) => granted.is_some_and(|p| p.is_allowed(required)),
-            // Steering a call whose reach nobody declared takes every
-            // capability: a meta-tool like `batch` names none and reaches all.
-            Authority::Unbounded => granted.is_some_and(PluginPermissions::holds_all_reach),
-            Authority::Total => granted.is_some_and(PluginPermissions::holds_all),
-        };
-        if !held {
-            // Every call of a layered tool re-decides this, so a warning here
-            // would repeat for the life of the misconfiguration.
-            tracing::debug!(plugin, slot, ?authority, "slot layer skipped: not granted");
+    cost: LayerCost<'a>,
+) -> impl Fn(&str, &str) -> bool + 'a {
+    let free = cost.is_free();
+    move |plugin, slot| {
+        if free {
+            return true;
         }
-        held
+        let missing: Vec<Permission> = match plugins.borrow().get(plugin) {
+            Some(owner) => {
+                let mut missing = cost.missing(&owner.permissions).peekable();
+                if missing.peek().is_none() {
+                    return true;
+                }
+                missing.collect()
+            }
+            None => {
+                tracing::debug!(plugin, slot, ?cost, "slot layer skipped: not loaded");
+                return false;
+            }
+        };
+        let gap = format!("{slot} {}", quoted_list(&missing));
+        warn_plugin_once(lua, plugin, &gap, || {
+            layer_skipped_message(plugin, slot, &missing)
+        });
+        false
     }
 }
 
@@ -3811,7 +3901,7 @@ fn plan_chain_abandoned(lua: &Lua, slot: &str, reason: &str) {
 /// for the draft that just landed. `true` means every layer deferred and the
 /// chain reached the host default.
 ///
-/// Layering costs [`PLAN_FORM_AUTHORITY`], and a layer that throws or parks
+/// Layering costs [`PLAN_FORM_COST`], and a layer that throws or parks
 /// for good leaves the built-in form, never a dead surface.
 async fn plan_form_opens(
     lua: &Lua,
@@ -3820,7 +3910,7 @@ async fn plan_form_opens(
     deadline: Instant,
     args: MultiValue,
 ) -> bool {
-    let allow_layer = layer_delegation(plugins, PLAN_FORM_AUTHORITY, PLAN_FORM_SLOT);
+    let allow_layer = layer_delegation(lua, plugins, PLAN_FORM_COST);
     let chain = run_host_chain(lua, &[PLAN_FORM_SLOT], args, &allow_layer);
     match run_awaited(lua, gate, CancelToken::none(), deadline, chain).await {
         // `None` is "nothing layered it", so there is nobody else to draw it.
@@ -3854,7 +3944,7 @@ async fn plan_form_opens(
 ///
 /// The default answers with {proposed}, the host's own rows, which is also
 /// what a layer that throws, parks for good, or answers off contract leaves
-/// behind. Layering costs [`PLAN_FORM_AUTHORITY`], since a row decides what
+/// behind. Layering costs [`PLAN_FORM_COST`], since a row decides what
 /// the agent does next.
 async fn plan_form_rows(
     lua: &Lua,
@@ -3865,7 +3955,7 @@ async fn plan_form_rows(
     args: MultiValue,
     proposed: Vec<PlanFormRow>,
 ) -> PlanMenu {
-    let allow_layer = layer_delegation(plugins, PLAN_FORM_AUTHORITY, PLAN_FORM_ACTIONS_SLOT);
+    let allow_layer = layer_delegation(lua, plugins, PLAN_FORM_COST);
     let host_rows = proposed.clone();
     // Which layer put which handler in the menu, the one thing the answered
     // table cannot say on its own.
@@ -3999,7 +4089,7 @@ async fn run_hook(
 ) -> Verdict {
     let HookRun {
         slots,
-        authority,
+        cost,
         cancel,
         deadline,
         value,
@@ -4014,7 +4104,7 @@ async fn run_hook(
         (Ok(value), Ok(call)) => MultiValue::from_vec(vec![value, call]),
         _ => return Verdict::Unchanged,
     };
-    let allow_layer = layer_delegation(plugins, authority, slot);
+    let allow_layer = layer_delegation(lua, plugins, cost);
     let chain = run_host_chain(lua, &names, args, &allow_layer);
     let returned = match run_awaited(lua, gate, cancel, deadline, chain).await {
         Ok(Ok(Some(values))) => values,
@@ -4032,7 +4122,7 @@ async fn run_hook(
     let mut returned = returned.into_iter();
     let first = returned.next();
     let ask = match returned.next() {
-        Some(LuaValue::Table(second)) => match second.get::<Option<String>>(ASK_FIELD) {
+        Some(LuaValue::Table(second)) => match second.opt::<String>(ASK_FIELD) {
             Ok(reason) => reason,
             Err(e) => {
                 tracing::warn!(slot, error = %e, "slot answered `ask` with something other than a string");
@@ -4097,7 +4187,7 @@ async fn run_prompt(
 ) -> Option<LayerAnswer> {
     let slot = PERMISSION_PROMPT_SLOT;
     let PromptRun {
-        authority,
+        cost,
         cancel,
         deadline,
         req,
@@ -4125,7 +4215,7 @@ async fn run_prompt(
             *decided = Some((table.clone(), Arc::clone(plugin)));
         }
     });
-    let allow_layer = layer_delegation(plugins, authority, slot);
+    let allow_layer = layer_delegation(lua, plugins, cost);
     let names = [slot];
     let chain = run_host_chain_with(lua, &names, default, args, &allow_layer, Some(observe));
     let table = match run_awaited(lua, gate, cancel, deadline, chain).await {
@@ -4171,7 +4261,7 @@ async fn run_prompt(
 /// own answers like `allow_session` are refused, see [`LayerVerdict`] for why.
 fn prompt_answer(table: &Table) -> mlua::Result<LayerVerdict> {
     let decision: String = table.get("decision")?;
-    let guidance: Option<String> = table.get("guidance")?;
+    let guidance: Option<String> = table.opt("guidance")?;
     match decision.as_str() {
         "allow" => Ok(LayerVerdict::Allow),
         "deny" => Ok(LayerVerdict::Deny {
@@ -6718,5 +6808,62 @@ mod tests {
             }
             panic!("gate count never reached 0 after draining");
         }));
+    }
+
+    const WARNED_PLUGIN: &str = "gapped";
+    const OTHER_PLUGIN: &str = "other";
+    const WARNED_SUBJECT: &str = "TurnStart";
+    const OTHER_SUBJECT: &str = "tool.*.input";
+
+    fn flashes(rx: &flume::Receiver<UiAction>) -> Vec<String> {
+        rx.try_iter()
+            .filter_map(|action| match action {
+                UiAction::Flash(msg) => Some(msg),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Re-decided on every event and call, so without the dedup the user would
+    /// see the same gap for as long as it lasts.
+    #[test]
+    fn a_permission_gap_is_shown_once_per_plugin_per_subject() {
+        let lua = Lua::new();
+        let (ui_tx, ui_rx) = flume::unbounded();
+        lua.set_app_data(HostUi(Some(ui_tx)));
+        let warn = |plugin: &str, subject: &str| {
+            warn_plugin_once(&lua, plugin, subject, || format!("{plugin}/{subject}"));
+        };
+
+        warn(WARNED_PLUGIN, WARNED_SUBJECT);
+        warn(WARNED_PLUGIN, WARNED_SUBJECT);
+        warn(WARNED_PLUGIN, OTHER_SUBJECT);
+        warn(OTHER_PLUGIN, WARNED_SUBJECT);
+
+        assert_eq!(
+            flashes(&ui_rx),
+            [
+                format!("{WARNED_PLUGIN}/{WARNED_SUBJECT}"),
+                format!("{WARNED_PLUGIN}/{OTHER_SUBJECT}"),
+                format!("{OTHER_PLUGIN}/{WARNED_SUBJECT}"),
+            ]
+        );
+    }
+
+    const LOADING_PLUGIN: &str = "loading";
+    const LAYERED_SLOT: &str = "loading.complete";
+
+    /// A plugin is not in the map until its load finishes, so only a layer
+    /// that costs nothing may steer a chain before then.
+    #[test_case(LayerCost::Named(&[]), true ; "a_free_layer_steers")]
+    #[test_case(LayerCost::Named(&[Permission::Net]), false ; "a_priced_layer_waits")]
+    #[test_case(LayerCost::TOTAL, false ; "a_total_price_waits")]
+    fn a_layer_from_a_plugin_still_loading(cost: LayerCost<'static>, allowed: bool) {
+        let lua = Lua::new();
+        let plugins = PluginMap::default();
+        assert_eq!(
+            layer_delegation(&lua, &plugins, cost)(LOADING_PLUGIN, LAYERED_SLOT),
+            allowed
+        );
     }
 }

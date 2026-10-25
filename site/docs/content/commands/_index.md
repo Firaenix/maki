@@ -46,7 +46,7 @@ Sessions run concurrently. `/new` starts a fresh session while the old one keeps
 ## Modes and toggles
 
 - **`/yolo`**: skip permission prompts for this session (deny rules still apply). The toggle survives a resume, and `--yolo` only sets the starting value. Config: `always_yolo = true`.
-- **`/thinking`**: extended thinking. Bare, or `Alt+T`, it opens a picker that shows what each level costs in tokens. With an argument it sets the level directly: `off`, `adaptive`, `minimal` to `max`, or a token budget. New sessions start at the last level you set, in `-p`, SDK and ACP too. Config: `always_thinking` pins a level.
+- **`/thinking`**: extended thinking. Bare, or `Alt+T`, it opens a picker that shows what each level costs in tokens. With an argument it sets the level directly: `off`, `adaptive`, `minimal` to `max`, or a token budget. A model whose API has no adaptive mode does not offer `adaptive`. A session set to it shows and sends the level the provider uses instead. New sessions start at the last level you set, in `-p`, SDK and ACP too. Config: `always_thinking` pins a level.
 - **`/fast`**: faster responses on Anthropic Opus, and on eligible Codex models when you sign in with a ChatGPT subscription. OpenAI API keys and every other model ignore it. Config: `always_fast = true`.
 - **`/workflow`**: let `code_execution` call the `task` tool (and other workflow-only tools) from inside the Python sandbox. Config: `always_workflow = true`.
 - **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only).
@@ -120,8 +120,12 @@ Aliasing adds a name, so both stay in the palette. Any command works as a target
 `run_command` only runs what the calling plugin's grants cover. Your `init.lua` counts as a plugin, and its grants come from `~/.config/maki/plugin.toml` (see [plugin permissions](/docs/lua-api/#plugin-permissions)). Commands not listed here run for any plugin.
 
 - Needs `fs_read`, `fs_write`: `/memory`.
-- Needs `fs_read`, `fs_write`, `net`, `run`, `env`: `/tasks`.
-- Needs `agent`: `/compact`, `/btw`, custom commands, MCP prompts.
+- Needs `fs_read`, `fs_write`, `net`, `run`, `env`, `agent`, `session_read`, `session_write`, `session_settings`: `/tasks`.
+- Needs `agent`: `/btw`.
+- Needs `agent`, `session_write`: `/compact`, custom commands, MCP prompts.
+- Needs `session_write`: `/new`, `/fork`.
+- Needs `session_write`, `session_settings`: `/rename`, `/sessions`.
+- Needs `session_settings`: `/model`, `/cd`, `/fast`, `/workflow`, `/thinking`.
 - Needs what its owner holds: every other plugin command, as described below.
 - Only when you type it: `/yolo`, `/trust`, `/packupdate`, `/packdel`. These change permissions, folder trust, or installed packages.
 

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use maki_agent::tools::ToolRegistry;
 use maki_config::Permission;
 use maki_lua::{LuaCommandInfo, PluginHost};
-use maki_ui::{BUILTIN_COMMANDS, PluginAccess, STARTS_TURNS};
+use maki_ui::{BUILTIN_COMMANDS, PluginAccess, SUBMITS_PROMPT};
 
 use crate::lua_util::in_registration_window;
 
@@ -71,13 +71,19 @@ fn write_plugin_access(out: &mut String, bundled: &[LuaCommandInfo]) {
     writeln!(out, "{PLUGIN_ACCESS}").unwrap();
     writeln!(out).unwrap();
     let mut by_needs: BTreeMap<Vec<Permission>, Vec<String>> = BTreeMap::new();
-    for &perm in Permission::ALL {
-        let access = PluginAccess::Needs(perm);
-        let names = by_needs.entry(vec![perm]).or_default();
-        names.extend(builtin_names(access));
-        if access == STARTS_TURNS {
-            names.extend(["custom commands".into(), "MCP prompts".into()]);
+    for cmd in BUILTIN_COMMANDS {
+        if let PluginAccess::Needs(needed) = cmd.plugin_access {
+            by_needs
+                .entry(needed.to_vec())
+                .or_default()
+                .push(format!("`{}`", cmd.name));
         }
+    }
+    if let PluginAccess::Needs(needed) = SUBMITS_PROMPT {
+        by_needs
+            .entry(needed.to_vec())
+            .or_default()
+            .extend(["custom commands".into(), "MCP prompts".into()]);
     }
     for cmd in bundled {
         let held: Vec<Permission> = Permission::ALL
@@ -167,7 +173,7 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
-        "- **`/thinking`**: extended thinking. Bare, or `Alt+T`, it opens a picker that shows what each level costs in tokens. With an argument it sets the level directly: `off`, `adaptive`, `minimal` to `max`, or a token budget. New sessions start at the last level you set, in `-p`, SDK and ACP too. Config: `always_thinking` pins a level."
+        "- **`/thinking`**: extended thinking. Bare, or `Alt+T`, it opens a picker that shows what each level costs in tokens. With an argument it sets the level directly: `off`, `adaptive`, `minimal` to `max`, or a token budget. A model whose API has no adaptive mode does not offer `adaptive`. A session set to it shows and sends the level the provider uses instead. New sessions start at the last level you set, in `-p`, SDK and ACP too. Config: `always_thinking` pins a level."
     )
     .unwrap();
     writeln!(

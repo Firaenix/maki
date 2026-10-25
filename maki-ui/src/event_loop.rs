@@ -18,14 +18,17 @@ use color_eyre::eyre::{Context, eyre};
 use crossterm::event::{
     Event, KeyEvent, KeyEventKind, MouseButton, MouseEvent as CtMouseEvent, MouseEventKind,
 };
+use maki_agent::agent::SessionExport;
 use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::session::Resumed;
 use maki_agent::{
-    AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
+    AgentConfig, AgentEvent, CancelToken, Envelope, ImageSource, McpCommand, McpConfigErrors,
+    McpHandle, Transcript, mcp,
 };
 use maki_config::project::TrustQuestion;
 use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
+use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::session_snapshot::{
     MODE_BUILD, MODE_PLAN, STATUS_IDLE, STATUS_NEEDS_INPUT, STATUS_WORKING, SessionQueueSnapshot,
     SessionSnapshot,
@@ -1001,6 +1004,13 @@ impl<'t> EventLoop<'t> {
             UiAction::Session { req, reply_tx } => {
                 self.handle_session_request(req, reply_tx);
             }
+            UiAction::ExportSession { id, reply_tx } => match self.position(id) {
+                Some(idx) => {
+                    let _ = reply_tx.send(Ok(self.sessions[idx].app.export()));
+                }
+                None => self
+                    .answer_from_disk(id, reply_tx, |session| Ok(SessionExport::stored(session))),
+            },
             UiAction::Model { req, reply_tx } => {
                 let _ = reply_tx.send(self.handle_model_request(req));
             }
@@ -1065,6 +1075,15 @@ impl<'t> EventLoop<'t> {
                     self.dispatch(idx, actions);
                 }
             }
+            UiAction::PluginTaskOpened {
+                session,
+                plugin,
+                info,
+            } => {
+                if let Some(rt) = self.sessions.iter_mut().find(|rt| rt.id() == session) {
+                    rt.app.open_plugin_task(&info, plugin);
+                }
+            }
         }
     }
 
@@ -1093,14 +1112,13 @@ impl<'t> EventLoop<'t> {
                 continue;
             }
             rt.last_status = status;
-            handle.fire_autocmd(
-                "SessionStatusChanged",
-                json!({
-                    "session_id": rt.id(),
-                    "title": rt.app.state.session.title,
-                    "status": status.as_str(),
-                    "focused": i == self.focused,
-                }),
+            handle.fire(
+                Some(&rt.id()),
+                HostEvent::SessionStatusChanged {
+                    title: &rt.app.state.session.title,
+                    status: status.as_str(),
+                    focused: i == self.focused,
+                },
             );
         }
     }
@@ -1114,13 +1132,12 @@ impl<'t> EventLoop<'t> {
                 continue;
             }
             rt.last_title = rt.app.state.session.title.clone();
-            handle.fire_autocmd(
-                "SessionTitleChanged",
-                json!({
-                    "session_id": rt.id(),
-                    "title": rt.last_title,
-                    "focused": i == self.focused,
-                }),
+            handle.fire(
+                Some(&rt.id()),
+                HostEvent::SessionTitleChanged {
+                    title: &rt.last_title,
+                    focused: i == self.focused,
+                },
             );
         }
     }
@@ -1132,18 +1149,34 @@ impl<'t> EventLoop<'t> {
         for rt in &mut self.sessions {
             let session_id = rt.app.state.session.id;
             diff_task_states(&mut rt.last_tasks, rt.app.task_states(), |task| {
-                let mut data = json!({
-                    "session_id": session_id,
-                    "id": task.id,
-                    "name": task.name,
-                    "status": task.status,
-                });
-                if let Some(plugin) = task.plugin {
-                    data["plugin"] = json!(plugin);
-                }
-                handle.fire_autocmd("TaskStatusChanged", data);
+                handle.fire(
+                    Some(&session_id),
+                    HostEvent::TaskStatusChanged {
+                        id: task.id,
+                        name: task.name,
+                        status: task.status.into(),
+                        plugin: task.plugin.map(|plugin| &**plugin),
+                    },
+                );
             });
         }
+    }
+
+    /// Called only after the cancel went out, so a handler that checks
+    /// `maki.agent.list()` already finds a stopped plugin task gone.
+    fn emit_task_stopped(&self, idx: usize, id: &str) {
+        let app = &self.sessions[idx].app;
+        let plugin = app
+            .task_states()
+            .find(|task| &**task.id == id)
+            .and_then(|task| task.plugin);
+        self.ctx.lua_event_handle.fire(
+            Some(&app.state.session.id),
+            HostEvent::TaskStopped {
+                id,
+                plugin: plugin.map(|plugin| &**plugin),
+            },
+        );
     }
 
     fn emit_notifications(&mut self) {
@@ -1187,15 +1220,16 @@ impl<'t> EventLoop<'t> {
         let switched = previous_session.is_some() && previous_session != Some(session_id);
         let eh = &self.ctx.lua_event_handle;
         if previous_session != Some(session_id) {
-            let mut data = json!({ "session_id": session_id });
-            if let Some(id) = previous_session {
-                data["previous_session_id"] = json!(id.to_string());
-            }
-            eh.fire_autocmd("SessionFocusChanged", data);
+            eh.fire(
+                Some(&session_id),
+                HostEvent::SessionFocusChanged {
+                    previous_session_id: previous_session.map(|id| id.to_string()),
+                },
+            );
         }
-        eh.fire_autocmd(
-            "TaskFocusChanged",
-            json!({ "session_id": session_id, "id": task_id }),
+        eh.fire(
+            Some(&session_id),
+            HostEvent::TaskFocusChanged { id: &task_id },
         );
         if switched {
             self.focused_app().announce_input();
@@ -1293,33 +1327,40 @@ impl<'t> EventLoop<'t> {
             SessionRequest::Current => {
                 let _ = reply_tx.send(Ok(json!(self.sessions[self.focused].id())));
             }
+            // A stored session is read from disk, off the loop like `List`.
             SessionRequest::Read { id } => {
-                let reply = match self.resolve_session_index(id.as_deref()) {
-                    Ok(idx) => Ok(self.session_snapshot_json(idx)),
-                    Err(e) => Err(e),
+                let id = match id.as_deref().map(parse_session_id).transpose() {
+                    Ok(id) => id,
+                    Err(e) => {
+                        let _ = reply_tx.send(Err(e));
+                        return;
+                    }
                 };
-                let _ = reply_tx.send(reply);
-            }
-            SessionRequest::New { prompt, focus } => {
-                let open = self.focused_app().blank_session();
-                // A blank session inherits the focused tab's model, whose slot
-                // is already built and sitting right here.
-                let slot = self.sessions[self.focused].slot.load_full();
-                let idx = self.push_runtime(self.ctx.spawn_runtime(open, slot));
-                let id = self.sessions[idx].id();
-                maki_otel::emit::session_started(
-                    maki_otel::emit::START_FRESH,
-                    Some(&id.to_string()),
-                );
-                if let Some(prompt) = prompt {
-                    let _ = self.submit_text(idx, prompt);
+                let live = match id {
+                    None => Ok(self.focused),
+                    Some(id) => self.position(id).ok_or(id),
+                };
+                match live {
+                    Ok(idx) => {
+                        let _ = reply_tx.send(Ok(self.session_snapshot_json(idx)));
+                    }
+                    Err(id) => self.answer_from_disk(id, reply_tx, |session| {
+                        serde_json::to_value(SessionSnapshot::stored(&session))
+                            .map_err(|e| e.to_string())
+                    }),
                 }
-                if focus {
-                    self.focused = idx;
-                }
-                let _ = reply_tx.send(Ok(json!(id)));
             }
-            SessionRequest::Prompt { id, text, force } => {
+            SessionRequest::New {
+                transcript,
+                prompt,
+                focus,
+            } => self.create_session(*transcript, prompt, focus, reply_tx),
+            SessionRequest::Prompt {
+                id,
+                text,
+                force,
+                images,
+            } => {
                 let idx = match id {
                     None => Ok(self.focused),
                     Some(id) => parse_session_id(&id).and_then(|id| {
@@ -1328,7 +1369,7 @@ impl<'t> EventLoop<'t> {
                     }),
                 };
                 let reply = idx.and_then(|idx| {
-                    let state = self.submit_text(idx, text)?;
+                    let state = self.submit_text(idx, text, images)?;
                     if force && state == QUEUED && self.force_queue(idx) {
                         return Ok(json!(FORCED));
                     }
@@ -1375,6 +1416,18 @@ impl<'t> EventLoop<'t> {
                 })();
                 let _ = reply_tx.send(reply);
             }
+            SessionRequest::Cancel { id } => {
+                let reply = self.resolve_session_index(id.as_deref()).map(|idx| {
+                    match self.sessions[idx].app.cancel_turn() {
+                        Some(actions) => {
+                            self.dispatch(idx, actions);
+                            json!(true)
+                        }
+                        None => json!(false),
+                    }
+                });
+                let _ = reply_tx.send(reply);
+            }
             SessionRequest::AnswerPermission {
                 handle,
                 answer,
@@ -1387,18 +1440,6 @@ impl<'t> EventLoop<'t> {
                     .iter_mut()
                     .any(|rt| rt.app.answer_permission(handle, answer.clone(), &plugin));
                 let _ = reply_tx.send(Ok(json!(won)));
-            }
-            SessionRequest::Cancel { id } => {
-                let reply = self.resolve_session_index(id.as_deref()).map(|idx| {
-                    match self.sessions[idx].app.cancel_turn() {
-                        Some(actions) => {
-                            self.dispatch(idx, actions);
-                            json!(true)
-                        }
-                        None => json!(false),
-                    }
-                });
-                let _ = reply_tx.send(reply);
             }
         }
     }
@@ -1473,14 +1514,16 @@ impl<'t> EventLoop<'t> {
             TaskRequest::List => Ok(json!(self.focused_app().tasks())),
             TaskRequest::Focus { id } => self.focused_app().focus_task(&id).map(|()| json!(true)),
             TaskRequest::Remove { id } => self.focused_app().remove_task(&id).map(|()| json!(true)),
+            TaskRequest::Stop { id, session } => {
+                let action = self.focused_app().stop_task_in_session(&id, &session)?;
+                self.dispatch(self.focused, vec![action]);
+                Ok(json!(true))
+            }
         }
     }
 
-    fn submit_text(&mut self, idx: usize, text: String) -> UiReply {
-        let msg = QueuedMessage {
-            text,
-            images: Vec::new(),
-        };
+    fn submit_text(&mut self, idx: usize, text: String, images: Vec<ImageSource>) -> UiReply {
+        let msg = QueuedMessage { text, images };
         match self.sessions[idx].app.submit_prompt(msg) {
             SubmitOutcome::Started(actions) => {
                 self.dispatch(idx, actions);
@@ -1489,6 +1532,72 @@ impl<'t> EventLoop<'t> {
             SubmitOutcome::Queued => Ok(json!(QUEUED)),
             SubmitOutcome::Rejected(e) => Err(e.into()),
         }
+    }
+
+    /// Without `prompt` or `focus` the session is only stored, and the reply
+    /// waits for the write. Otherwise it opens in a tab, which saves it on its
+    /// first checkpoint.
+    fn create_session(
+        &mut self,
+        transcript: Transcript,
+        prompt: Option<String>,
+        focus: bool,
+        reply_tx: flume::Sender<UiReply>,
+    ) {
+        let inherits_model = transcript.model.is_none();
+        let open = match self.sessions[self.focused].app.session_from(transcript) {
+            Ok(open) => open,
+            Err(e) => {
+                let _ = reply_tx.send(Err(e));
+                return;
+            }
+        };
+        if prompt.is_none() && !focus {
+            let storage = self.ctx.storage.clone();
+            smol::unblock(move || {
+                let reply = open.store(&storage).map(|id| json!(id));
+                let _ = reply_tx.send(reply.map_err(|e| e.to_string()));
+            })
+            .detach();
+            return;
+        }
+        // An inherited model's slot is already built and sitting right here.
+        let (slot, fallback) = if inherits_model {
+            (self.sessions[self.focused].slot.load_full(), None)
+        } else {
+            self.slots.get_or_fallback(&open.session.model)
+        };
+        let idx = self.push_runtime(self.ctx.spawn_runtime(open, slot));
+        let id = self.sessions[idx].id();
+        maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(&id.to_string()));
+        if let Some(reason) = fallback {
+            self.sessions[idx].app.flash(reason);
+        }
+        if let Some(prompt) = prompt {
+            let _ = self.submit_text(idx, prompt, Vec::new());
+        }
+        if focus {
+            self.focused = idx;
+        }
+        let _ = reply_tx.send(Ok(json!(id)));
+    }
+
+    /// Reads a session no tab has open off the loop, without claiming it, so
+    /// one another maki holds still answers.
+    fn answer_from_disk<T: Send + 'static>(
+        &self,
+        id: MakiId,
+        reply_tx: flume::Sender<Result<T, String>>,
+        answer: impl FnOnce(AppSession) -> Result<T, String> + Send + 'static,
+    ) {
+        let storage = self.ctx.storage.clone();
+        smol::unblock(move || {
+            let reply = AppSession::read_only(id, &storage)
+                .map_err(|e| e.to_string())
+                .and_then(answer);
+            let _ = reply_tx.send(reply);
+        })
+        .detach();
     }
 
     /// Whether the running turn of session {idx} went to the background.
@@ -1531,6 +1640,8 @@ impl<'t> EventLoop<'t> {
             } else {
                 MODE_BUILD
             },
+            thinking: Some(app.state.thinking.to_string()),
+            fast: Some(app.state.fast),
             status: SessionStatus::of(app).as_str(),
             focused: idx == self.focused,
             updated_at: app.state.session.updated_at,
@@ -1539,7 +1650,7 @@ impl<'t> EventLoop<'t> {
             }),
             usage: app.state.token_usage,
             context_size: app.state.context_size,
-            context_window: app.state.model.context_window,
+            context_window: Some(app.state.model.context_window),
             cost: app.state.cost,
         };
         json!(snapshot)
@@ -1795,10 +1906,14 @@ impl<'t> EventLoop<'t> {
                 self.sessions[idx].handles.detach_run(run_id);
             }
             Action::CancelSubagent { tool_use_id } => {
-                self.sessions[idx].handles.cancel_subagent(tool_use_id);
+                self.sessions[idx]
+                    .handles
+                    .cancel_subagent(tool_use_id.clone());
+                self.emit_task_stopped(idx, &tool_use_id);
             }
             Action::CancelPluginTask { id } => {
                 self.ctx.lua_event_handle.cancel_plugin_session(&id);
+                self.emit_task_stopped(idx, &id);
             }
             Action::RestartAgent(history) => self.respawn_agent(idx, history),
             Action::OpenFork(open) => self.open_fork(idx, *open),

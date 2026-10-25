@@ -14,6 +14,7 @@ use maki_providers::{
 use maki_storage::frame::{LiveFacts, PromptFacts};
 
 use super::compaction::{self, CompactReason, CompactSteer, Compacted};
+use super::display_order::observation_line;
 use super::frame::{
     FRAME_REBUILT, FrameFit, RunContextBuilder, context_update, fingerprint, fit_frame,
 };
@@ -79,7 +80,9 @@ pub async fn resolve_compaction_model(
         maki_providers::model_registry::spec_for_tier_any(maki_providers::ModelTier::Compaction)
         && model_policy.allows(&spec)
         && let Ok(mut m) = Model::from_spec(&spec)
-        && let Ok(p) = maki_providers::provider::from_model_async(&mut m, timeouts).await
+        && let Ok(p) = maki_providers::provider::from_model_async(&mut m, timeouts)
+            .await
+            .inspect_err(|err| warn!(provider = %m.provider, model = %m.id, error = %err, "compaction model unavailable, falling back to the session model"))
     {
         return (Arc::from(p), m);
     }
@@ -324,7 +327,7 @@ impl<'h> Agent<'h> {
                 prompt = Some(text.clone());
                 Message::user_with_images(text, images)
             });
-            self.land_input(preamble, kept)?;
+            self.land_input(preamble, kept, true)?;
         }
         let Some(message) = prompt else {
             self.emit_done(DoneReason::Dropped)?;
@@ -383,27 +386,41 @@ impl<'h> Agent<'h> {
     /// user already ran (a `!cmd` result), and that is not a layer's to judge.
     /// The mailbox waits for a kept message. Draining it for a dropped one
     /// would bury its notes in a run that ends right away, and eat the wake
-    /// they would have caused. Whatever changed goes right before the message,
-    /// so the model reads the change first and a rewind takes both.
+    /// they would have caused. A caller that draws the burst's prompts one by
+    /// one drains it only with the last, so a note's line comes after every
+    /// prompt it was saved ahead of. Whatever changed goes right before the
+    /// message, so the model reads the change first and a rewind takes both.
     fn land_input(
         &mut self,
         preamble: Vec<Message>,
         message: Option<Message>,
+        drain_mailbox: bool,
     ) -> Result<(), AgentError> {
         for message in preamble {
-            self.history.push(message);
+            self.land_observation(message)?;
         }
         let Some(message) = message else {
             return Ok(());
         };
-        if let Some(mailbox) = &self.mailbox {
+        if drain_mailbox && let Some(mailbox) = &self.mailbox {
             for message in mailbox.drain() {
-                self.history.push(message);
+                self.land_observation(message)?;
             }
         }
         self.tell_changes();
         if !message.content.is_empty() {
             self.history.push(message);
+        }
+        Ok(())
+    }
+
+    /// The line follows the observation into history, so frontends draw it
+    /// once and a restore draws it too.
+    fn land_observation(&mut self, message: Message) -> Result<(), AgentError> {
+        let line = observation_line(&message).map(str::to_owned);
+        self.history.push(message);
+        if let Some(text) = line {
+            self.event_tx.send(AgentEvent::ObservationLine { text })?;
         }
         Ok(())
     }
@@ -1089,7 +1106,8 @@ impl<'h> Agent<'h> {
             // carries all of it.
             ExtractedCommand::Interrupt(inputs) => {
                 let mut kept_any = false;
-                for input in inputs {
+                let last = inputs.len().saturating_sub(1);
+                for (index, input) in inputs.into_iter().enumerate() {
                     self.event_tx.send(AgentEvent::QueueItemConsumed {
                         text: input.message.clone(),
                         images: input.images.clone(),
@@ -1105,7 +1123,9 @@ impl<'h> Agent<'h> {
                         self.stop_continuations = 0;
                         kept_any = true;
                     }
-                    self.land_input(input.preamble, message)?;
+                    // Each prompt is drawn as it is consumed, so a note
+                    // drained earlier would show up between them.
+                    self.land_input(input.preamble, message, index == last)?;
                 }
                 Ok(kept_any)
             }
@@ -1147,7 +1167,7 @@ fn interrupt_message(message: String, images: Vec<ImageSource>) -> Message {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
@@ -1157,17 +1177,20 @@ mod tests {
         ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
         StreamResponse, ThinkingSupport, TokenUsage,
     };
+    use maki_storage::frame::{FactsUpdate, PlanChange};
     use serde_json::Value;
     use test_case::test_case;
 
     use super::compaction::FIELD_CONTINUE;
     use super::*;
+    use crate::agent::Transcript;
     use crate::agent::frame::RunContext;
     use crate::agent::hook::testing::{Seen, script};
     use crate::mcp::test_support::stub_session;
     use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
     use crate::prompt::{PromptId, Slot, SlotEntry};
+    use crate::session::StoredSession;
     use crate::template::Vars;
     use crate::tools::RequestTools;
     use crate::{EarlierInput, Envelope};
@@ -1183,6 +1206,8 @@ mod tests {
     const DEFAULT_IDENTITY_PREFIX: &str = "You are Maki, an interactive CLI coding agent.";
     const ONE_GAUGE_MSG: &str =
         "TurnComplete, Done, and the compaction trigger must read one context gauge";
+    const NOTICE_BODY: &str = "Background task find auth finished:\n\nok";
+    const NOTICE_LINE: &str = "Background agent finished: find auth";
 
     struct MockInterruptSource {
         commands: Mutex<VecDeque<ExtractedCommand>>,
@@ -1691,7 +1716,7 @@ mod tests {
         smol::block_on(async {
             let id = maki_storage::id::MakiId::generate();
             let mailbox = SessionMailbox::register(id);
-            SessionMailbox::notify(id, "mailbox".into(), false).unwrap();
+            SessionMailbox::notify(id, "mailbox".into(), None, false).unwrap();
             let mut history = History::new(Vec::new());
             let (mut agent, _event_rx) = make_agent(
                 MockProvider::new(vec![text_response(StopReason::EndTurn)]),
@@ -1715,7 +1740,7 @@ mod tests {
         smol::block_on(async {
             let id = maki_storage::id::MakiId::generate();
             let mailbox = SessionMailbox::register(id);
-            SessionMailbox::notify(id, "mailbox".into(), false).unwrap();
+            SessionMailbox::notify(id, "mailbox".into(), None, false).unwrap();
             let mut input = default_input();
             input.preamble = vec![Message::observation("preamble".into())];
             let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(vec![input])]);
@@ -1743,7 +1768,7 @@ mod tests {
         smol::block_on(async {
             let id = maki_storage::id::MakiId::generate();
             let mailbox = SessionMailbox::register(id);
-            SessionMailbox::notify(id, "failed".into(), true).unwrap();
+            SessionMailbox::notify(id, "failed".into(), None, true).unwrap();
             let mut history = History::new(Vec::new());
             let (mut agent, _event_rx) = make_agent(
                 MockProvider::new(vec![text_response(StopReason::EndTurn)]),
@@ -1759,6 +1784,157 @@ mod tests {
             assert_eq!(history.as_slice().len(), 2);
             assert!(history.as_slice()[0].is_observation());
             assert!(matches!(history.as_slice()[1].role, Role::Assistant));
+        });
+    }
+
+    /// Where an accepted notice enters the loop.
+    #[derive(Clone, Copy)]
+    enum NoticePath {
+        WakePreamble,
+        WakeBatchedWithPrompt,
+        PromptPreamble,
+        NextPrompt,
+        Interrupt,
+    }
+
+    fn notice_lines(events: &[Envelope]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|envelope| match &envelope.event {
+                AgentEvent::ObservationLine { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn observations(history: &History) -> Vec<&Message> {
+        history
+            .as_slice()
+            .iter()
+            .filter(|message| message.is_observation())
+            .collect()
+    }
+
+    #[test_case(NoticePath::WakePreamble ; "wake_preamble")]
+    #[test_case(NoticePath::WakeBatchedWithPrompt ; "wake_batched_with_prompt")]
+    #[test_case(NoticePath::PromptPreamble ; "prompt_preamble")]
+    #[test_case(NoticePath::NextPrompt ; "next_prompt")]
+    #[test_case(NoticePath::Interrupt ; "interrupt")]
+    fn an_accepted_notice_draws_its_line_once(path: NoticePath) {
+        smol::block_on(async {
+            let id = maki_storage::id::MakiId::generate();
+            let mailbox = SessionMailbox::register(id);
+            SessionMailbox::notify(id, NOTICE_BODY.into(), Some(NOTICE_LINE), true).unwrap();
+            let mut input = default_input();
+            match path {
+                NoticePath::WakePreamble => {
+                    input.message.clear();
+                    input.preamble = mailbox.claim_wake();
+                }
+                NoticePath::WakeBatchedWithPrompt => {
+                    input.earlier = vec![EarlierInput {
+                        message: String::new(),
+                        images: Vec::new(),
+                        preamble: mailbox.claim_wake(),
+                    }];
+                }
+                NoticePath::PromptPreamble => input.preamble = mailbox.drain(),
+                NoticePath::NextPrompt | NoticePath::Interrupt => {}
+            }
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.mailbox = Some(mailbox);
+
+            if let NoticePath::Interrupt = path {
+                let source =
+                    MockInterruptSource::new(vec![ExtractedCommand::Interrupt(vec![input])]);
+                let mut agent = agent.with_interrupt_source(source);
+                assert!(agent.handle_queued_command().await.unwrap());
+            } else {
+                agent.run(input).await.unwrap();
+            }
+
+            assert_eq!(notice_lines(&drain_events(&event_rx)), [NOTICE_LINE]);
+            let landed = observations(&history);
+            assert_eq!(landed.len(), 1);
+            assert_eq!(landed[0].display_text.as_deref(), Some(NOTICE_LINE));
+            assert_eq!(landed[0].first_text_content(), Some(NOTICE_BODY));
+        });
+    }
+
+    /// An interrupt burst is drawn prompt by prompt, so its notices land with
+    /// the last prompt, or wait for the next landing when that one is dropped.
+    #[test_case(false ; "last_kept")]
+    #[test_case(true ; "last_dropped")]
+    fn an_interrupt_burst_lands_notices_with_its_last_prompt(drop_last: bool) {
+        const LATER: &str = "later prompt";
+        smol::block_on(async {
+            let id = maki_storage::id::MakiId::generate();
+            let mailbox = SessionMailbox::register(id);
+            SessionMailbox::notify(id, NOTICE_BODY.into(), Some(NOTICE_LINE), false).unwrap();
+            let mut history = History::new(Vec::new());
+            let (agent, event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+            let mut agent = agent.with_interrupt_source(MockInterruptSource::new(vec![
+                ExtractedCommand::Interrupt(vec![
+                    default_input(),
+                    AgentInput {
+                        message: LATER.into(),
+                        ..default_input()
+                    },
+                ]),
+            ]));
+            agent.mailbox = Some(mailbox.clone());
+            script(&agent.registry, move |slot, value| match slot {
+                AgentSlot::UserMessage if drop_last && value[FIELD_TEXT] == LATER => {
+                    Verdict::Denied(LATER.into())
+                }
+                _ => Verdict::Unchanged,
+            });
+
+            assert!(agent.handle_queued_command().await.unwrap());
+            drop(agent);
+
+            let kinds: Vec<_> = history
+                .as_slice()
+                .iter()
+                .map(Message::is_observation)
+                .collect();
+            let events = drain_events(&event_rx);
+            let lines = notice_lines(&events);
+            if drop_last {
+                assert_eq!(kinds, [false]);
+                assert!(lines.is_empty());
+                assert_eq!(mailbox.drain().len(), 1);
+            } else {
+                assert_eq!(kinds, [false, true, false]);
+                assert_eq!(lines, [NOTICE_LINE]);
+            }
+        });
+    }
+
+    #[test]
+    fn an_unlabelled_notice_lands_without_a_line() {
+        smol::block_on(async {
+            let id = maki_storage::id::MakiId::generate();
+            let mailbox = SessionMailbox::register(id);
+            SessionMailbox::notify(id, NOTICE_BODY.into(), None, false).unwrap();
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            agent.mailbox = Some(mailbox);
+
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            assert!(notice_lines(&drain_events(&event_rx)).is_empty());
+            let landed = observations(&history);
+            assert_eq!(landed.len(), 1);
+            assert_eq!(landed[0].display_text, None);
         });
     }
 
@@ -2366,6 +2542,229 @@ mod tests {
         let last = updates.last().unwrap();
         assert!(last.contains(NEXT_DATE));
         assert!(last.contains(PLAN_ENDED));
+    }
+
+    const ORIGIN_DATE: &str = "2026-10-01";
+    const STALE_DATE: &str = "2026-09-30";
+    const ORIGIN_CWD: &str = "/origin";
+    const HERE_CWD: &str = "/here";
+    const ELSEWHERE_CWD: &str = "/elsewhere";
+    const ORIGIN_INSTRUCTIONS: &str = "\n\nProject instructions:\nbe nice";
+    const HERE_INSTRUCTIONS: &str = "\n\nProject instructions:\nbe terse";
+    const ORIGIN_HINT: &str = "tags: a";
+    const STALE_UPDATE: &str = "<context-update>Date is now 2026-10-01.</context-update>";
+    const RELOADED_TOOL: &str = "reloaded";
+    const TOLD_WHAT_MOVED_MSG: &str =
+        "a new frame must be followed by exactly what moved, never instructions or hints";
+    const MESSAGES_KEPT_MSG: &str = "a rebuilt frame must not edit earlier messages";
+
+    /// What the origin machine's prompt stated, with the model this test runs
+    /// on, so only what a case changes differs.
+    fn origin_facts() -> PromptFacts {
+        PromptFacts {
+            date: ORIGIN_DATE.into(),
+            cwd: ORIGIN_CWD.into(),
+            model: default_model().spec(),
+            instructions: ORIGIN_INSTRUCTIONS.into(),
+            hints: BTreeMap::from([(MEMORY_HINT.into(), ORIGIN_HINT.into())]),
+        }
+    }
+
+    fn cwd_moved() -> FactsUpdate {
+        FactsUpdate {
+            cwd: Some(HERE_CWD.into()),
+            ..FactsUpdate::default()
+        }
+    }
+
+    fn date_moved(date: &str) -> FactsUpdate {
+        FactsUpdate {
+            date: Some(date.into()),
+            ..FactsUpdate::default()
+        }
+    }
+
+    fn prior_turn() -> Vec<Message> {
+        vec![
+            Message::user(QUEUED_MESSAGES[0].into()),
+            text_response(StopReason::EndTurn).message,
+        ]
+    }
+
+    /// Stored by `into_session` and opened the way every resume opens one.
+    fn imported(facts: Option<PromptFacts>, messages: Vec<Message>) -> History {
+        let mut session = Transcript {
+            facts,
+            messages,
+            ..Transcript::default()
+        }
+        .into_session(StoredSession::new("", HERE_CWD))
+        .unwrap();
+        History::restored(session.drain_messages()).with_frame(session.frame().cloned())
+    }
+
+    /// The imported facts are older than the update after them, so the model
+    /// holds the update's date and every diff has to start from there.
+    fn after_import(h: &mut Harness) -> usize {
+        let stale_update = Message::context_update(STALE_UPDATE.into(), date_moved(ORIGIN_DATE));
+        let facts = PromptFacts {
+            date: STALE_DATE.into(),
+            ..origin_facts()
+        };
+        h.history = imported(Some(facts), [vec![stale_update], prior_turn()].concat());
+        h.world.change(|f| *f = origin_facts());
+        h.history.len()
+    }
+
+    fn after_rebuild_on_resume(h: &mut Harness) -> usize {
+        h.world.change(|f| *f = origin_facts());
+        h.run_in(AgentMode::Build);
+        let resumed_len = h.history.len();
+        *h.world.tool.lock().unwrap() = RELOADED_TOOL;
+        h.restart(resumed_len);
+        resumed_len
+    }
+
+    fn appended_updates(history: &History, from: usize) -> Vec<FactsUpdate> {
+        history.as_slice()[from..]
+            .iter()
+            .filter_map(Message::facts_update)
+            .cloned()
+            .collect()
+    }
+
+    fn announced_rebuild(events: &[Envelope]) -> bool {
+        events
+            .iter()
+            .any(|e| matches!(&e.event, AgentEvent::Notice { text } if text == FRAME_REBUILT))
+    }
+
+    #[test_case(|_: &mut PromptFacts| {}, vec![] ; "facts_match")]
+    #[test_case(|f: &mut PromptFacts| f.cwd = HERE_CWD.into(), vec![cwd_moved()] ; "cwd_moved")]
+    #[test_case(|f: &mut PromptFacts| f.date = NEXT_DATE.into(), vec![date_moved(NEXT_DATE)] ; "date_moved")]
+    #[test_case(|f: &mut PromptFacts| { f.instructions = HERE_INSTRUCTIONS.into(); f.hints.clear(); }, vec![] ; "instructions_and_hints_never")]
+    fn first_run_after_import_tells_what_moved(
+        change: fn(&mut PromptFacts),
+        told: Vec<FactsUpdate>,
+    ) {
+        let mut h = Harness::new(Vec::new());
+        let imported_len = after_import(&mut h);
+        h.world.change(change);
+        let events = h.run_in(AgentMode::Build);
+        h.run_in(AgentMode::Build);
+
+        h.assert_append_only();
+        assert!(!announced_rebuild(&events), "an import loses no cache");
+        assert_eq!(
+            appended_updates(&h.history, imported_len),
+            told,
+            "{TOLD_WHAT_MOVED_MSG}"
+        );
+    }
+
+    #[test]
+    fn import_without_facts_tells_nothing() {
+        let mut h = Harness::new(Vec::new());
+        h.history = imported(None, prior_turn());
+        h.world.change(|f| *f = origin_facts());
+        let events = h.run_in(AgentMode::Build);
+
+        assert!(!announced_rebuild(&events));
+        assert!(updates(&h.history).is_empty());
+    }
+
+    /// The same hole as an import: a fact only the old prompt stated used to
+    /// be dropped silently when the frame was rebuilt on resume.
+    #[test_case(|_: &mut PromptFacts| {}, vec![] ; "facts_match")]
+    #[test_case(|f: &mut PromptFacts| f.cwd = HERE_CWD.into(), vec![cwd_moved()] ; "cwd_moved")]
+    #[test_case(|f: &mut PromptFacts| f.date = NEXT_DATE.into(), vec![date_moved(NEXT_DATE)] ; "date_moved")]
+    #[test_case(|f: &mut PromptFacts| { f.instructions = HERE_INSTRUCTIONS.into(); f.hints.clear(); }, vec![] ; "instructions_and_hints_never")]
+    fn rebuilt_frame_on_resume_tells_what_moved(
+        change: fn(&mut PromptFacts),
+        told: Vec<FactsUpdate>,
+    ) {
+        let mut h = Harness::new(Vec::new());
+        let resumed_len = after_rebuild_on_resume(&mut h);
+        h.world.change(change);
+        let events = h.run_in(AgentMode::Build);
+        h.run_in(AgentMode::Build);
+
+        assert!(announced_rebuild(&events));
+        assert_eq!(
+            appended_updates(&h.history, resumed_len),
+            told,
+            "{TOLD_WHAT_MOVED_MSG}"
+        );
+        let requests = h.requests.lock().unwrap();
+        assert!(
+            requests[1].messages.starts_with(&requests[0].messages),
+            "{MESSAGES_KEPT_MSG}"
+        );
+        assert_append_only(&requests[1], &requests[2]);
+    }
+
+    /// The correction rides on the update before the first prompt, so editing
+    /// that prompt cuts it. The frame still knows what the transcript says.
+    #[test]
+    fn rewind_past_the_correction_tells_it_again() {
+        let mut h = Harness::new(Vec::new());
+        let imported_len = after_import(&mut h);
+        h.world.change(|f| f.cwd = HERE_CWD.into());
+        h.run_in(AgentMode::Build);
+        h.requests.lock().unwrap().clear();
+        h.restart(imported_len);
+        h.run_in(AgentMode::Build);
+        h.run_in(AgentMode::Build);
+
+        h.assert_append_only();
+        assert_eq!(
+            appended_updates(&h.history, imported_len),
+            vec![cwd_moved()],
+            "{TOLD_WHAT_MOVED_MSG}"
+        );
+    }
+
+    /// A frame rebuilt after an update must not keep what that update told.
+    /// Rewinding past the update leaves only the first frame's cwd in the
+    /// transcript, so moving to the updated cwd again has to be told.
+    #[test]
+    fn rewind_past_an_update_before_a_rebuild_tells_it_again() {
+        let mut h = Harness::new(Vec::new());
+        h.world.change(|f| *f = origin_facts());
+        h.run_in(AgentMode::Build);
+        let before_update = h.history.len();
+        h.world.change(|f| f.cwd = HERE_CWD.into());
+        h.run_in(AgentMode::Build);
+        *h.world.tool.lock().unwrap() = RELOADED_TOOL;
+        h.world.change(|f| f.cwd = ELSEWHERE_CWD.into());
+        h.run_in(AgentMode::Build);
+        h.restart(before_update);
+        h.world.change(|f| f.cwd = HERE_CWD.into());
+        h.run_in(AgentMode::Build);
+
+        assert_eq!(
+            appended_updates(&h.history, before_update),
+            vec![cwd_moved()],
+            "{TOLD_WHAT_MOVED_MSG}"
+        );
+    }
+
+    /// What moved and what changed since are one update, never two in a row.
+    #[test_case(after_import ; "import")]
+    #[test_case(after_rebuild_on_resume ; "rebuild_on_resume")]
+    fn new_frame_tells_one_update_per_run_start(setup: fn(&mut Harness) -> usize) {
+        let mut h = Harness::new(Vec::new());
+        let from = setup(&mut h);
+        h.world.change(|f| f.cwd = HERE_CWD.into());
+        h.run_in(AgentMode::Plan(PLAN_FILE.into()));
+
+        assert_eq!(
+            appended_updates(&h.history, from),
+            vec![FactsUpdate {
+                plan: Some(PlanChange::Entered(PLAN_FILE.into())),
+                ..cwd_moved()
+            }]
+        );
     }
 
     /// Which servers are up by now is luck, so a resumed process sends the MCP

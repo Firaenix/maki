@@ -653,7 +653,8 @@ async fn finish_detached<F: Future<Output = Box<RunOutput>>>(
         subagent: None,
         run_id: DETACHED_RUN_ID,
     });
-    if let Err(e) = SessionMailbox::notify(session, report, wake) {
+    let line = format!("Background task {task_id} {outcome}");
+    if let Err(e) = SessionMailbox::notify(session, report, Some(&line), wake) {
         tracing::warn!(error = %e, task = %task_id, "background task outlived its session");
     }
 }

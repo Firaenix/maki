@@ -199,12 +199,12 @@ impl OpenAiCompatProvider {
     /// wins, then the construction-time env / `providers.toml` override, then
     /// the static compat default.
     pub(crate) fn base_url(&self, auth: &ResolvedAuth) -> String {
-        if let Some(explicit) = auth.base_url.as_deref() {
-            return explicit.to_string();
-        }
-        self.resolved_base_url
-            .clone()
-            .unwrap_or_else(|| self.config.base_url.to_string())
+        auth.base_url
+            .as_deref()
+            .or(self.resolved_base_url.as_deref())
+            .unwrap_or(&self.config.base_url)
+            .trim_end_matches('/')
+            .to_owned()
     }
 
     fn build_request(
@@ -378,7 +378,8 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
                         }
                         ContentBlock::ToolUse { .. }
                         | ContentBlock::Thinking { .. }
-                        | ContentBlock::RedactedThinking { .. } => {}
+                        | ContentBlock::RedactedThinking { .. }
+                        | ContentBlock::Unknown(_) => {}
                     }
                 }
 
@@ -420,7 +421,8 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
                         }
                         ContentBlock::ToolResult { .. }
                         | ContentBlock::Image { .. }
-                        | ContentBlock::RedactedThinking { .. } => {}
+                        | ContentBlock::RedactedThinking { .. }
+                        | ContentBlock::Unknown(_) => {}
                     }
                 }
 
@@ -833,8 +835,19 @@ mod tests {
     use test_case::test_case;
 
     use crate::model::{Model, ModelPricing, ModelTier};
+    use crate::test_support::{Canned, serve};
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+    const FIREWORKS_BASE: &str = "https://api.fireworks.ai/inference/v1";
+    const FIREWORKS_BASE_WITH_SLASH: &str = "https://api.fireworks.ai/inference/v1/";
+    const FIREWORKS_CHAT_URL: &str = "https://api.fireworks.ai/inference/v1/chat/completions";
+    const UNUSED_BASE: &str = "https://unused.example/v2/";
+    const MODELS_URL_PATH: &str = "/v1/models";
+    const MODEL_ID: &str = "test-model";
+    const MODELS_SCRIPT: &[Canned] = &[Canned::at(
+        MODELS_URL_PATH,
+        Canned::json(200, r#"{"data":[{"id":"test-model"}]}"#),
+    )];
     const COUNTS_SURVIVE_A_BAD_COST: &str =
         "a price we cannot read must not take the token counts down with it";
     const TOOL_NAME: &str = "word_count";
@@ -1523,6 +1536,44 @@ data: [DONE]\n";
             stream_timeout: TEST_STREAM_TIMEOUT,
             resolved_base_url: None,
         }
+    }
+
+    #[test_case(FIREWORKS_BASE, None, None ; "default_without_slash")]
+    #[test_case(FIREWORKS_BASE_WITH_SLASH, None, None ; "default_with_slash")]
+    #[test_case(UNUSED_BASE, Some(FIREWORKS_BASE), None ; "configured_without_slash")]
+    #[test_case(UNUSED_BASE, Some(FIREWORKS_BASE_WITH_SLASH), None ; "configured_with_slash")]
+    #[test_case(UNUSED_BASE, Some(UNUSED_BASE), Some(FIREWORKS_BASE) ; "auth_without_slash")]
+    #[test_case(UNUSED_BASE, Some(UNUSED_BASE), Some(FIREWORKS_BASE_WITH_SLASH) ; "auth_with_slash")]
+    fn build_request_normalizes_base_url(
+        default: &str,
+        configured: Option<&str>,
+        auth: Option<&str>,
+    ) {
+        let mut provider = test_provider();
+        provider.config.to_mut().base_url = default.to_owned().into();
+        provider.resolved_base_url = configured.map(str::to_owned);
+        let auth = ResolvedAuth::for_test(auth.map(str::to_owned), Vec::new());
+
+        let request = provider
+            .build_request("POST", "/chat/completions", &auth)
+            .body(())
+            .unwrap();
+
+        assert_eq!(request.uri().to_string(), FIREWORKS_CHAT_URL);
+    }
+
+    #[test]
+    fn list_models_normalizes_base_url() {
+        let (base_url, requests) = serve(MODELS_SCRIPT);
+        let auth = ResolvedAuth::for_test(Some(format!("{base_url}/")), Vec::new());
+
+        let models = smol::block_on(test_provider().do_list_models(&auth)).unwrap();
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, MODEL_ID);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].path, MODELS_URL_PATH);
     }
 
     #[test_case("test-model", ModelFamily::Gpt, ThinkingConfig::Off, true ; "gpt_off_sends")]

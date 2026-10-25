@@ -1,4 +1,5 @@
 mod compaction;
+mod display_order;
 mod frame;
 mod history;
 pub mod hook;
@@ -6,12 +7,15 @@ mod instructions;
 mod run;
 mod streaming;
 pub mod tool_dispatch;
+mod transcript;
 
 pub use compaction::compact;
+pub use display_order::{DisplayItem, display_order, observation_line};
 pub use frame::{RunContext, RunContextBuilder, plan_mode_update};
 pub use history::{
-    History, HistorySnapshot, MirrorTap, SharedMessages, UNAVAILABLE_RESULT,
-    close_dangling_tool_calls, live_history, publish_live_history,
+    History, HistorySnapshot, MirrorTap, SharedHeader, SharedMessages, UNAVAILABLE_RESULT,
+    close_dangling_tool_calls, live_header, live_history, live_snapshot, publish_live_history,
+    publish_live_session,
 };
 pub use hook::{AgentCall, AgentHook, AgentHooks, AgentSlot};
 pub use instructions::{
@@ -19,3 +23,4 @@ pub use instructions::{
     find_subdirectory_instructions, is_instruction_file, load_instruction_text, load_instructions,
 };
 pub use run::{Agent, AgentParams, AgentRunParams, ModelSlot, resolve_compaction_model};
+pub use transcript::{NEWER_FORMAT, SessionExport, Transcript, TranscriptError};

@@ -24,9 +24,9 @@ use maki_config::{
     ThinkingLines, ToolKey, ToolOutputLines,
 };
 use maki_lua::{
-    InitFiles, Interaction, KEY_WARNING, MAX_INFLIGHT_TOOLS, NO_UI_ERR, PERMISSION_NAME_WARNING,
-    PluginError, PluginHost, PluginPermissions, SKIPPED_PLUGIN_WARNING, SessionEndReason,
-    WARM_TOOL_CAP, set_allowed_private_hosts,
+    InitFiles, Interaction, KEY_WARNING, MAX_INFLIGHT_TOOLS, Missing, NO_UI_ERR,
+    PERMISSION_NAME_WARNING, PluginError, PluginHost, PluginPermissions, SKIPPED_PLUGIN_WARNING,
+    SessionEndReason, WARM_TOOL_CAP, set_allowed_private_hosts,
 };
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -56,6 +56,7 @@ const OTHER_PERMISSION_KEYED_TOOL: &str = "write";
 const PLAIN_TOOL: &str = "plain_helper";
 const FILE_WRITE_TOOLS_DRIFT: &str = "fs_write tool declarations drifted from FILE_WRITE_TOOLS, update the const or the \
      register_tool declaration";
+const KAGI_KEY_ENV: &str = "KAGI_API_KEY";
 const MEMORY_RULES_DROPPED: &str = "memory pre-approved tools nobody had registered yet, so it must load after the plugins owning them";
 
 /// Lua tools cannot publish `ToolLive::Usage` (only the subagent relay does), so
@@ -303,6 +304,43 @@ fn register_echo_tool() {
 
     let out = exec_tool(&reg, "echo_", serde_json::json!({"msg": "hello"})).unwrap();
     assert_eq!(out, "hello");
+}
+
+const NULL_PROBE_PLUGIN: &str = r#"
+maki.api.register_tool({
+    name = "null_probe",
+    description = "reports how null arrives",
+    schema = {
+        type = "object",
+        properties = { opts = { type = "object", additionalProperties = true } },
+    },
+    audiences = { "main" },
+    handler = function(input)
+        return table.concat({
+            tostring(input.opts.depth == nil),
+            tostring(input.opts.tags[2] == nil),
+            tostring(#input.opts.tags),
+        }, ",")
+    end,
+})
+"#;
+
+/// A truthy sentinel in `if opts.limit then` would silently break every tool
+/// handler, so JSON the host hands a handler stays nil for null.
+#[test]
+fn tool_handler_receives_nil_for_json_null() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source("null_probe", NULL_PROBE_PLUGIN).unwrap();
+
+    let out = exec_tool(
+        &reg,
+        "null_probe",
+        json!({"opts": {"depth": null, "tags": ["a", null]}}),
+    )
+    .unwrap();
+
+    assert_eq!(out, "true,true,1");
 }
 
 const SESSION_PLUGIN: &str = r#"
@@ -764,6 +802,42 @@ fn get_tool_returns_normalized_header_and_restore_handles() {
     assert_eq!(
         out,
         "styled_tool|H:abc/tool|nil|userdata|true|true|true|nil"
+    );
+}
+
+/// `tool_search` and MCP tools have no registry entry, yet `get_tool`
+/// answers with the standalone call's header and format; a plain unknown
+/// name still comes back nil.
+#[test]
+fn get_tool_describes_rust_routed_tools() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"
+        maki.api.register_tool({{
+            name = "routed_probe",
+            description = "p",
+            schema = {MINIMAL_SCHEMA},
+            handler = function()
+                local search = maki.api.get_tool("tool_search")
+                local mcp = maki.api.get_tool("srv__thing")
+                local sh = search.header({{ query = "find prs" }})
+                local mh = mcp.header({{}})
+                return table.concat({{
+                    search.name, sh[1][1] .. "/" .. sh[1][2], search.format, tostring(search.restore),
+                    mcp.name, mh[1][1] .. "/" .. mh[1][2], mcp.format,
+                    tostring(maki.api.get_tool("plain_unknown")),
+                }}, "|")
+            end
+        }})
+        "#,
+    );
+    host.load_source("routed_probe_plugin", &src).unwrap();
+
+    let out = exec_tool(&reg, "routed_probe", json!({})).unwrap();
+    assert_eq!(
+        out,
+        "tool_search|find prs/tool|markdown|nil|srv__thing|mcp: srv.thing/tool|plain|nil"
     );
 }
 
@@ -3808,10 +3882,23 @@ fn websearch_config(provider: &str) -> PluginsConfig {
 /// the one thing it leaks: the description the model gets.
 #[test_case::test_case("exa", "Exa AI" ; "default_backend")]
 #[test_case::test_case("youcom", "You.com" ; "opt_in_backend")]
+#[test_case::test_case("kagi", "Kagi" ; "keyed_backend")]
+#[test_case::test_case("searxng", "SearXNG" ; "self_hosted_backend")]
 fn websearch_provider_option_selects_the_backend(provider: &str, expected: &str) {
     let (reg, _host) = builtins_host_with(&websearch_config(provider));
     let description = tool_description(&reg, &maki_config::AgentConfig::default(), "websearch");
     assert!(description.contains(expected), "got: {description}");
+}
+
+/// Kagi answers a keyless request with a bodiless 401, which would leave the
+/// model guessing, so the missing key is named before anything goes out.
+#[test]
+fn websearch_kagi_without_key_names_the_env_var() {
+    unsafe { std::env::remove_var(KAGI_KEY_ENV) };
+    let (reg, _host) = builtins_host_with(&websearch_config("kagi"));
+    let err = exec_tool(&reg, "websearch", json!({ "query": "rust" }))
+        .expect_err("a keyless kagi search must fail");
+    assert!(err.contains(KAGI_KEY_ENV), "got: {err}");
 }
 
 #[test]
@@ -3822,6 +3909,37 @@ fn websearch_unknown_provider_fails_the_load() {
         .load_builtins(&websearch_config("altavista"))
         .expect_err("unknown provider should fail");
     assert!(err.to_string().contains("unknown provider"), "got: {err}");
+}
+
+/// time_range is a GET-backend-only parameter: the MCP backends drop unknown
+/// arguments silently, so advertising it there would only spend prompt tokens.
+#[test]
+fn websearch_time_range_is_searxng_only() {
+    let (reg, _host) = builtins_host_with(&websearch_config("searxng"));
+    let entry = reg.get("websearch").expect("websearch registered");
+    assert!(
+        entry.tool.schema()["properties"]
+            .get("time_range")
+            .is_some(),
+        "searxng must advertise time_range"
+    );
+    let err = match entry
+        .tool
+        .parse(&serde_json::json!({ "query": "x", "time_range": "decade" }))
+    {
+        Ok(_) => panic!("time_range outside the enum must be rejected"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("time_range"), "got: {err}");
+
+    let (reg, _host) = builtins_host_with(&websearch_config("exa"));
+    let entry = reg.get("websearch").expect("websearch registered");
+    assert!(
+        entry.tool.schema()["properties"]
+            .get("time_range")
+            .is_none(),
+        "exa must not advertise time_range"
+    );
 }
 
 #[test_case::test_case(
@@ -5652,20 +5770,6 @@ fn perm_tool_src(name: &str, handler_body: &str) -> String {
     "agent"
     ; "agent_denied_for_session_prompt"
 )]
-#[test_case::test_case(
-    "wake_deny",
-    r#"local ok, err = pcall(function() maki.session.notify("ci red", { session = "x", wake = true }) end)
-                return tostring(err)"#,
-    "agent"
-    ; "agent_denied_for_a_waking_notify"
-)]
-#[test_case::test_case(
-    "new_prompt_deny",
-    r#"local ok, err = pcall(function() maki.session.new({ prompt = "go" }) end)
-                return tostring(err)"#,
-    "agent"
-    ; "agent_denied_for_new_with_a_prompt"
-)]
 fn denied_permission_blocks_api(tool_name: &str, handler_body: &str, expected_perm: &str) {
     let src = perm_tool_src(tool_name, handler_body);
     let result = exec_tool_with_perms(
@@ -5677,6 +5781,65 @@ fn denied_permission_blocks_api(tool_name: &str, handler_body: &str, expected_pe
     .unwrap();
     assert!(result.contains(PERMISSION_DENIED_MSG), "got: {result}");
     assert!(result.contains(expected_perm), "got: {result}");
+}
+
+const SESSION_GATE_TOOL: &str = "session_gate";
+
+/// Headless, so a call the guard wrongly lets through answers the no-UI error
+/// instead of waiting on a UI loop that is not there.
+fn run_call_with(held: &[Permission], call: &str) -> String {
+    let src = perm_tool_src(
+        SESSION_GATE_TOOL,
+        &format!(
+            r#"local ok, err = pcall(function() return {call} end)
+                return tostring(ok) .. ":" .. tostring(err)"#
+        ),
+    );
+    let reg = fresh_registry();
+    let host = PluginHost::start(Arc::clone(&reg), Interaction::None, true).unwrap();
+    let perms = PluginPermissions::from_approved(held.iter().map(|p| p.manifest_key()));
+    host.load_source_with_permissions(SESSION_GATE_TOOL, &src, perms)
+        .unwrap();
+    exec_tool(&reg, SESSION_GATE_TOOL, json!({})).unwrap()
+}
+
+/// One permission per kind of session call: reading content, changing it,
+/// changing how the session runs. Holding a neighbouring one opens nothing.
+/// A write that also starts a turn takes `agent` on top, even when the turn is
+/// only an option of the call.
+#[test_case::test_case("maki.session.messages()", &[Permission::SessionWrite, Permission::SessionSettings], Permission::SessionRead ; "messages_with_write_and_settings")]
+#[test_case::test_case("maki.session.export()", &[Permission::SessionWrite, Permission::SessionSettings], Permission::SessionRead ; "export_with_write_and_settings")]
+#[test_case::test_case("maki.ui.input()", &[Permission::SessionWrite, Permission::SessionSettings], Permission::SessionRead ; "input_with_write_and_settings")]
+#[test_case::test_case("maki.session.new()", &[Permission::SessionRead, Permission::SessionSettings], Permission::SessionWrite ; "new_with_read_and_settings")]
+#[test_case::test_case(r#"maki.session.delete("x")"#, &[Permission::SessionSettings], Permission::SessionWrite ; "delete_with_only_settings")]
+#[test_case::test_case(r#"maki.session.notify("ci red", { session = "x" })"#, &[Permission::SessionSettings], Permission::SessionWrite ; "notify_with_only_settings")]
+#[test_case::test_case(r#"maki.task.remove("x")"#, &[Permission::SessionSettings], Permission::SessionWrite ; "task_remove_with_only_settings")]
+#[test_case::test_case(r#"maki.session.prompt("go")"#, &[Permission::Agent], Permission::SessionWrite ; "prompt_with_only_agent")]
+#[test_case::test_case(r#"maki.session.prompt("go")"#, &[Permission::SessionWrite], Permission::Agent ; "prompt_with_only_session_write")]
+#[test_case::test_case(r#"maki.session.set_mode("plan")"#, &[Permission::SessionWrite], Permission::SessionSettings ; "set_mode_with_only_write")]
+#[test_case::test_case(r#"maki.session.set_title({ id = "x", title = "t" })"#, &[Permission::SessionWrite], Permission::SessionSettings ; "set_title_with_only_write")]
+#[test_case::test_case(r#"maki.model.set("x")"#, &[Permission::SessionWrite], Permission::SessionSettings ; "model_set_with_only_write")]
+#[test_case::test_case(r#"maki.session.notify("ci red", { session = "x", wake = true })"#, &[Permission::SessionWrite], Permission::Agent ; "waking_notify_with_only_write")]
+#[test_case::test_case(r#"maki.session.new({ prompt = "go" })"#, &[Permission::SessionWrite], Permission::Agent ; "new_with_a_prompt_with_only_write")]
+fn session_calls_need_their_own_permission(call: &str, held: &[Permission], missing: Permission) {
+    let result = run_call_with(held, call);
+    let refusal = Missing::Permission(missing).to_string();
+    assert!(result.contains(&refusal), "got: {result}");
+}
+
+/// Metadata: no transcript content in or out, so nothing is asked of the
+/// plugin. Without a UI they answer an error pair, never a refusal.
+#[test_case::test_case("maki.session.list()" ; "session_list")]
+#[test_case::test_case("maki.session.live()" ; "session_live")]
+#[test_case::test_case("maki.session.read()" ; "session_read")]
+#[test_case::test_case("maki.session.current()" ; "session_current")]
+#[test_case::test_case(r#"maki.session.focus("x")"# ; "session_focus")]
+#[test_case::test_case("maki.task.list()" ; "task_list")]
+#[test_case::test_case(r#"maki.task.focus("main")"# ; "task_focus")]
+#[test_case::test_case("maki.model.get()" ; "model_get")]
+fn session_metadata_needs_no_permission(call: &str) {
+    let result = run_call_with(&[], call);
+    assert!(result.starts_with("true:"), "got: {result}");
 }
 
 #[test]
@@ -7566,22 +7729,32 @@ impl Provider for TurnThenPark {
     }
 }
 
+/// What this chat session's task tabs were sent since the last drain. The
+/// notice that opens a tab carries no event, so it is skipped.
+fn task_events(
+    ui: &flume::Receiver<maki_lua::UiAction>,
+    session: MakiId,
+) -> impl Iterator<Item = AgentEvent> {
+    ui.drain().filter_map(move |action| match action {
+        maki_lua::UiAction::PluginTaskEvent {
+            session: owner,
+            envelope,
+            ..
+        } if owner == session => Some(envelope.event),
+        maki_lua::UiAction::PluginTaskOpened { session: owner, .. } if owner == session => None,
+        _ => panic!("only this chat session's task events go to the UI here"),
+    })
+}
+
 /// The paid turns the tab was told about, in order.
 fn billed_turns(
     ui: &flume::Receiver<maki_lua::UiAction>,
     session: MakiId,
 ) -> Vec<TurnCompleteEvent> {
-    ui.drain()
-        .filter_map(|action| match action {
-            maki_lua::UiAction::PluginTaskEvent {
-                session: owner,
-                envelope,
-                ..
-            } if owner == session => match envelope.event {
-                AgentEvent::TurnComplete(turn) => Some(*turn),
-                _ => None,
-            },
-            _ => panic!("only this chat session's task events go to the UI here"),
+    task_events(ui, session)
+        .filter_map(|event| match event {
+            AgentEvent::TurnComplete(turn) => Some(*turn),
+            _ => None,
         })
         .collect()
 }
@@ -7592,20 +7765,13 @@ fn handed_over_history(
     session: MakiId,
     id: &str,
 ) -> Option<Vec<Message>> {
-    ui.drain()
-        .filter_map(|action| match action {
-            maki_lua::UiAction::PluginTaskEvent {
-                session: owner,
-                envelope,
-                ..
-            } if owner == session => match envelope.event {
-                AgentEvent::SubagentHistory {
-                    tool_use_id,
-                    messages,
-                } if tool_use_id == id => Some(messages),
-                _ => None,
-            },
-            _ => panic!("only this chat session's task events go to the UI here"),
+    task_events(ui, session)
+        .filter_map(|event| match event {
+            AgentEvent::SubagentHistory {
+                tool_use_id,
+                messages,
+            } if tool_use_id == id => Some(messages),
+            _ => None,
         })
         .last()
 }
@@ -7714,6 +7880,75 @@ fn stopping_a_plugin_task_from_the_tab_ends_its_prompt_as_stopped_by_user() {
         exec_tool(&reg, "prompt_background", json!({})).unwrap(),
         STOPPED_BY_USER_ERR
     );
+}
+
+/// The tab opens with the session, so the user can find and stop a monitor
+/// that has not prompted yet.
+#[test]
+fn opening_a_background_session_shows_its_task_before_any_prompt() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = MakiId::generate();
+    let mailbox = SessionMailbox::register(session);
+    let _seed = mailbox.publish_seed(stub_seed(session));
+    let ui = host.ui_action_rx();
+    host.load_source(
+        BACKGROUND_PLUGIN,
+        &background_monitor_src(&session.to_string()),
+    )
+    .unwrap();
+    assert_eq!(
+        exec_tool(&reg, "open_background", json!({})).unwrap(),
+        "nil"
+    );
+    let id = exec_tool(&reg, "background_id", json!({})).unwrap();
+    let opened: Vec<_> = ui.drain().collect();
+    let [
+        maki_lua::UiAction::PluginTaskOpened {
+            session: owner,
+            plugin,
+            info,
+        },
+    ] = opened.as_slice()
+    else {
+        panic!("opening must announce exactly one task");
+    };
+    assert_eq!(*owner, session);
+    assert_eq!(&**plugin, BACKGROUND_PLUGIN);
+    assert_eq!(info.parent_tool_use_id, id);
+    assert_eq!(info.prompt, None);
+}
+
+/// Ending the chat session retires the monitor, but the plugin still holds
+/// its handle. A prompt on it must stop before the model or the tab hears of
+/// it, or a task queued behind it would run for a chat that is gone.
+#[test]
+fn a_retired_background_session_refuses_later_prompts() {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let session = MakiId::generate();
+    let mailbox = SessionMailbox::register(session);
+    let seed = mailbox.publish_seed(stub_seed(session));
+    let parked = TurnThenPark::install(&seed);
+    let ui = host.ui_action_rx();
+    host.load_source(
+        BACKGROUND_PLUGIN,
+        &background_monitor_src(&session.to_string()),
+    )
+    .unwrap();
+    assert_eq!(
+        exec_tool(&reg, "open_background", json!({})).unwrap(),
+        "nil"
+    );
+    host.event_handle()
+        .end_sessions_blocking([session], maki_lua::SessionEndReason::Delete);
+    let reply = call_on_thread(&reg, "prompt_background", CancelToken::none())
+        .recv_timeout(CANCEL_TEST_TIMEOUT)
+        .expect("a retired session must reject its next prompt");
+    assert_eq!(reply, Ok(CANCELLED_MSG.to_owned()));
+    assert!(parked.try_recv().is_err());
+    assert_eq!(task_events(&ui, session).count(), 0);
+    assert_eq!(exec_tool(&reg, "list_background", json!({})).unwrap(), "");
 }
 
 /// The provider parks the second turn forever, so only a cancel can end this

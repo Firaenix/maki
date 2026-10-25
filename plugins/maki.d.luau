@@ -7,6 +7,8 @@ declare maki: {
   defer_fn: @checked (callback: any, ms: number) -> (any),
   notify: @checked (msg: string, level: string?, opts: any) -> (),
   set_notify_handler: @checked (handler: any) -> (),
+  deepcopy: @checked (orig: any, noref: boolean?) -> (any),
+  NIL: any,
   agent: {
     resolve_model: @checked (ctx: any, opts: any) -> (any, string?),
     system_prompt: @checked (ctx: any, opts: any) -> (string?, string?),
@@ -70,8 +72,8 @@ declare maki: {
     winrestview: @checked (view: any) -> (boolean?, string?),
   },
   fs: {
-    read: @checked (path: string) -> (string?, string?),
-    read_bytes: @checked (path: string) -> (buffer?, string?),
+    read: @checked (path: string, opts: any) -> (string?, string?),
+    read_bytes: @checked (path: string, opts: any) -> (buffer?, string?),
     metadata: @checked (path: string) -> (any, string?),
     dirname: @checked (path: string) -> (string?),
     basename: @checked (path: string) -> (string?),
@@ -101,7 +103,7 @@ declare maki: {
   },
   json: {
     encode: @checked (value: any) -> (string?, string?),
-    decode: @checked (str: string) -> (any, string?),
+    decode: @checked (str: string, opts: any) -> (any, string?),
     schema_validator: @checked (schema: any) -> (any, string?),
   },
   keymap: {
@@ -148,6 +150,7 @@ declare maki: {
     live: @checked () -> (any, string?),
     current: @checked () -> (string?, string?),
     read: @checked (opts: any) -> (any, string?),
+    export: @checked (opts: any) -> (any, string?),
     messages: @checked (opts: any) -> (any, string?),
     focus: @checked (id: string) -> (boolean?, string?),
     delete: @checked (id: string) -> (boolean?, string?),
@@ -158,15 +161,16 @@ declare maki: {
     notify: @checked (text: string, opts: any) -> (boolean?, string?),
     set_mode: @checked (mode: string, opts: any) -> (boolean?, string?),
     set_title: @checked (opts: any) -> (boolean?, string?),
-    answer_permission: @checked (request_id: number, answer: any) -> (boolean?, string?),
     register_question: @checked (tool_id: string, win: any, opts: any) -> (),
     settle_question: @checked (tool_id: string) -> (any),
     answer_question: @checked (tool_id: string, reply: any, opts: any) -> (boolean?, string?),
+    answer_permission: @checked (request_id: number, answer: any) -> (boolean?, string?),
   },
   task: {
     list: @checked () -> (any, string?),
     focus: @checked (id: string) -> (boolean?, string?),
     remove: @checked (id: string) -> (boolean?, string?),
+    stop: @checked (id: string, opts: any) -> (boolean?, string?),
   },
   text: {
     html_to_markdown: @checked (html: string) -> (string?, string?),

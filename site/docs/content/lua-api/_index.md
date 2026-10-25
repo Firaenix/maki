@@ -64,6 +64,9 @@ permission raises `permission denied: '<name>' not granted for this plugin`.
 - `run`: starting processes
 - `env`: reading the process environment, where secrets live
 - `agent`: starting model turns: prompting a chat, or running its own sessions
+- `session_read`: reading conversation content: session history, the chat input draft, and the content fields of events
+- `session_write`: adding to, removing, or creating conversation content: new sessions, prompts, notices, and deleting sessions or task transcripts
+- `session_settings`: changing how a session runs without touching its content: mode, title, model, thinking, fast mode, working directory, and workflow
 
 Grants come from a `plugin.toml` next to the Lua file (for
 `~/.config/maki/init.lua` that is `~/.config/maki/plugin.toml`):
@@ -78,6 +81,9 @@ net = true
 run = true
 env = true
 agent = true
+session_read = true
+session_write = true
+session_settings = true
 ```
 
 The rules:
@@ -120,7 +126,7 @@ The rules:
 | [`maki.fn`](#maki-fn) | Process and environment helpers, modeled after Neovim's `vim.fn` job |
 | [`maki.fs`](#maki-fs) | File-system utilities, modelled after `vim.fs` and `vim.uv`. |
 | [`maki.image`](#maki-image) | Small building blocks for working with images: probe metadata, decode |
-| [`maki.image.Image`](#maki-image-Image) | A decoded image you can inspect, resize, and re-encode. |
+| [`maki.image.Image`](#maki-image-Image) | An image you can inspect, resize, and re-encode. |
 | [`maki.interpreter`](#maki-interpreter) | Run Python code in a memory-safe, time-limited sandbox. |
 | [`maki.json`](#maki-json) | JSON encoding, decoding, and schema validation. |
 | [`maki.json.SchemaValidator`](#maki-json-SchemaValidator) | A compiled JSON Schema validator. |
@@ -327,6 +333,58 @@ maki.set_notify_handler(function(msg, level, opts)
 end)
 ```
 
+---
+
+### `maki.deepcopy()` {#maki-deepcopy}
+
+```lua
+maki.deepcopy({orig}, {noref?})
+```
+
+Copy {orig} and every table inside it, keeping each table's metatable.
+That is what lets a copied empty array still encode as `[]` instead of
+`{}`. Use it instead of a hand-rolled copy for anything you pass back to
+maki. Table keys are copied too. Functions, userdata (including
+`maki.NIL`) and other non-table values are shared, not copied.
+
+A table reachable twice is copied once, so shared references and cycles
+survive. Pass {noref} to copy such a table every time it is reached. That
+is faster for trees, but a cycle then fails with an error.
+
+**Parameters:**
+
+- `{orig}` (`any`) Value to copy.
+- `{noref?}` (`boolean?`) Optional. When true, shared references are not tracked.
+
+**Returns:** (`any`) The copy.
+
+**Example:**
+
+```lua
+local input = maki.json.decode('{"files": []}')
+local copy = maki.deepcopy(input)
+copy.mode = "strict"
+print(maki.json.encode(copy)) -- {"files":[],"mode":"strict"}
+```
+
+---
+
+### `maki.NIL` {#maki-NIL}
+
+```lua
+maki.NIL
+```
+
+`maki.NIL` is a value that stands for JSON null, like `vim.NIL`. `maki.json.decode` returns it for every null unless `luanil` says otherwise. Every conversion to JSON turns it back into null. So a decode, change, encode pass loses no key. It is truthy and not equal to nil, so test `x == maki.NIL` for null. Tool handler arguments and event payloads use nil for null instead, never `maki.NIL`.
+
+**Example:**
+
+```lua
+local t = maki.json.decode('{"a": null}')
+assert(t.a == maki.NIL)
+print(maki.json.encode(t)) -- {"a":null}
+```
+
 
 ## maki.pack {#maki-pack}
 
@@ -432,7 +490,7 @@ only in compact mode.
     - `diff_path` (`string`) Path for a diff output block.
     - `diff_before` (`string`) Before text of the diff.
     - `diff_after` (`string`) After text of the diff.
-    - `image` (`table`) { media_type: string, data: string } base64 image.
+    - `image` (`maki.image.Image|table`) An Image, or { media_type: string, data: string } base64 image.
     - `state` (`any`) Serializable state forwarded to restore.
   - `audiences` (`string[]`) Which model audiences see the tool. Values: "main", "sub", "all". Default: all audiences.
   - `kind` (`string`) Optional grouping label (e.g. "filesystem").
@@ -732,11 +790,18 @@ tool does not exist. For Lua-registered tools the returned table also
 includes `header` and `restore` handle functions (wrapped so they never
 throw).
 
+`tool_search` and MCP tools (`server__tool` names) never enter the
+registry. For them the table holds only `name`, `header`, and the
+`format` ("plain" or "markdown") of the standalone call, enough for a
+composing tool like batch to draw a child the same way. Any
+`server__tool` shaped name resolves whether or not a server offers it,
+so this is not an existence check for MCP tools.
+
 **Parameters:**
 
 - `{name}` (`string`) Exact tool name.
 
-**Returns:** (`table|nil`) Tool entry with fields { name, schema, audiences, kind?, header?, restore? }, or nil if not found.
+**Returns:** (`table|nil`) Tool entry with fields { name, schema, audiences, kind?, header?, restore?, format? }, or nil if not found.
 
 **Example:**
 
@@ -881,7 +946,7 @@ Built-in events fired by the host: `"TurnStart"`, `"TurnEnd"`,
 `"TurnError"`, `"ToolStart"`, `"ToolDone"`, `"AutoCompacting"`,
 `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"SessionTitleChanged"`,
-`"TaskStatusChanged"`, `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
+`"SessionCwdChanged"`, `"TaskStatusChanged"`, `"TaskStopped"`, `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
 `"PermissionRequested"`, `"PermissionResolved"`, and `"FileIndexReady"`.
 Plugins can also fire their own events with
 `exec_autocmds`.
@@ -919,12 +984,20 @@ name the session now running or focused. What each event adds:
   or `"idle"`), `data.title`, and `data.focused` (boolean).
 - `"SessionTitleChanged"`: `data.title` and `data.focused` (boolean),
   when the title changes (rename or auto-generation).
+- `"SessionCwdChanged"`: `data.cwd`, the session's new working
+  directory, when `/cd` changes it.
 - `"TaskStatusChanged"`: `data.id`, `data.name`, and `data.status`
   (`"working"`, `"idle"`, `"done"`, or `"error"`), when a subagent starts
   or changes status. A task a plugin opened with `maki.agent.session`
   carries `data.plugin`, and `"idle"` is such a task between prompts. A
   task that comes back from disk already finished stays quiet, so
   reloading a session does not replay old tasks.
+- `"TaskStopped"`: `data.id`, when the user stops a task with Esc in its
+  tab or through `maki.task.stop`. A plugin task carries `data.plugin`,
+  and by then it is already gone from `maki.agent.list()`.
+  `"TaskStatusChanged"` compares tasks once per frame, so it can miss a
+  task that opened and stopped in the same frame. This event never does,
+  so an owner can rely on it to drop work it still has queued.
 - `"TaskFocusChanged"`: `data.id`, the task now on screen (`"main"` or a
   subagent's id, what `ctx:task_id()` reports inside a tool). Fires for
   the chat cycling keys, `maki.task.focus`, and a session switch that
@@ -960,6 +1033,13 @@ name the session now running or focused. What each event adds:
   the `root` of the call that asked for the walk, so a plugin matching
   the two takes an event without a root as a reason to ask again. Asking
   again only ever re-reads the root the plugin passed.
+
+Conversation content needs the `session_read` permission. Without it a
+host event still arrives, carrying only its metadata fields:
+`"TurnStart"` without `data.text`, `"ToolDone"` without `data.input`,
+`"CompactionDone"` without `data.summary`, and `"InputChanged"` without
+`data.text`. Maki warns once per plugin and event, naming what was left
+out. Events a plugin fires under its own names arrive as fired.
 
 `"TurnEnd"` fires once per turn and only for the main session, so
 subagent turns never show up. A manual `/compact` ends its run without
@@ -1156,9 +1236,8 @@ produced. Both take `function(prev, value, ctx)` and answer with a
 table to replace the value, nothing to leave it alone, or
 `nil, reason` to stop the call. An input layer can also answer
 `value, { ask = reason }` to make the user approve the call. Name the
-tool `*` (`tool.*.input`) to wrap every tool. Wrapping one costs the
-capability the tool declares, and a tool declaring none costs every
-permission.
+tool `*` (`tool.*.input`) to wrap every tool. What a layer costs is in
+the [Hooks price table](/docs/hooks/#rules).
 
 The agent loop fires `agent.user_message`, `agent.stop`,
 `agent.compact.before`, and `agent.compact.prepare`, with the same
@@ -1170,7 +1249,8 @@ the prompt as its default. A layer takes `function(prev, req, ctx)` and
 answers `{ decision = "allow" }` or `{ decision = "deny", guidance = … }`,
 or passes the call on with `prev(req, ctx)`. A verdict decides that one call
 and records no rule, and an escalated call (`ask`) is never offered to a
-layer. See [Hooks](/docs/hooks/#permission-prompt).
+layer. It costs what a layer on the same call does. See
+[Hooks](/docs/hooks/#permission-prompt).
 
 Wrapping a slot another plugin declared steers a chain that plugin's
 callers trust, so it costs whatever the owner priced it at in
@@ -1287,6 +1367,8 @@ Read the current plan state. Returns `{ mode, path, content, ready }`:
 - `ready` is `true` once the agent has written the plan file.
 - `content` is the file contents, `nil` when the plan is not ready or the
   read failed.
+
+Requires the `session_read` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -1619,8 +1701,8 @@ nobody to prompt. A tool declaring a permission (`bash` with `run`, `read`
 with `fs_read`) costs that one. A tool declaring none (`batch`,
 `code_execution`), or `mcp = true` on a chat with MCP servers, costs every
 permission except `agent`. `local_tools` cost nothing, they run as the
-plugin. The bundled `task` hands over the whole chat, so it holds all
-five.
+plugin. The bundled `task` hands over the whole chat, so it holds every
+permission.
 
 `scope` sets the lifetime. `"task"`, the default, ends the session with
 the task that opened it: an autocmd callback when it returns, a tool
@@ -1635,12 +1717,12 @@ An event-driven one opens once with `scope = "session"`, keeps the handle
 and prompts it from autocmd callbacks.
 
 Opened by chat session id, it shows up in that chat as a task owned by
-the plugin from its first prompt on: a transcript tab, a `plugin` field
-in `/tasks` and `maki.task.list()`, `"idle"` between prompts, and its
-spend in the chat's totals after each turn. Esc in its tab closes it,
-and the pending `:prompt()` returns `"stopped by user"` rather than
-`"cancelled"`, so a loop can tell the user's Esc from its own task
-ending and stop rather than reopen. Permission prompts stay denied even
+the plugin as soon as it opens: a transcript tab, a `plugin` field in
+`/tasks` and `maki.task.list()`, `"idle"` before and between prompts, and
+its spend in the chat's totals after each turn. Esc in its tab or Ctrl+S in
+`/tasks` closes it, and the pending `:prompt()` returns `"stopped by user"`
+rather than `"cancelled"`, so a loop can tell the user's stop from its own
+task ending and stop rather than reopen. Permission prompts stay denied even
 though the task has a tab: a prompt in an unfocused tab would stall a
 monitor silently, a denial reaches the plugin as an error it can handle.
 Setting `plugins.<name>.enabled = false` stops a plugin's monitors from
@@ -1800,6 +1882,20 @@ the VM sits idle, and the subagent's event relay stays alive until it does.
 Close cancels a running prompt before waiting to flush its history. That
 prompt returns a cancelled error and any partial text.
 
+---
+
+### `Session:id()` {#Session-id}
+
+```lua
+Session:id()
+```
+
+The task id of this session. A session opened by chat session id goes by
+this id in `maki.task.list()` and the `"TaskStopped"` event, so a plugin
+can tell which of those are its own.
+
+**Returns:** (`string`) Session task id.
+
 
 ## maki.async {#maki-async}
 
@@ -1894,11 +1990,11 @@ maki.async.sleep({ms})
 ```
 
 Suspend the calling task for {ms} milliseconds. Other tasks and the UI
-keep running, and a cancel still lands while you sleep.
+keep running. Cancelling the task ends the sleep early with an error.
 
 All plugins share one Lua thread. Code that runs for 5 seconds without
 yielding is stopped with an error. `sleep(0)` lets every other ready
-task run once, then returns. Call it now and then in long loops.
+task run once, then returns. Call it periodically in long loops.
 
 A repeating timer is a sleep loop inside `maki.async.spawn`. For a
 one-shot timer that outlives the tool call, such as a toast that
@@ -1906,14 +2002,16 @@ dismisses itself, use `maki.defer_fn`.
 
 **Parameters:**
 
-- `{ms}` (`integer`) Milliseconds to sleep. Zero only yields.
+- `{ms}` (`integer`) Milliseconds to wait. Negative values raise an error.
 
 **Example:**
 
 ```lua
-maki.async.run(function()
-  maki.async.sleep(4000)
-  win:close()
+maki.async.spawn(function()
+  while true do
+    poll()
+    maki.async.sleep(5000)
+  end
 end)
 
 -- A long loop that keeps the rest of maki responsive:
@@ -2709,11 +2807,13 @@ if err then return end
 ### `maki.fs.read()` {#maki-fs-read}
 
 ```lua
-maki.fs.read({path})
+maki.fs.read({path}, {opts?})
 ```
 
-Read the entire file at {path} as a UTF-8 string.
-Files over 512 MiB or not valid UTF-8 return nil plus an error message.
+Read the file at {path} as a UTF-8 string. Pass {opts} to read only some
+lines, such as the end of a log.
+Returns nil plus an error message if the text read is over 512 MiB or not
+valid UTF-8. Skipped lines do not count, so tailing a huge log works.
 Use `read_bytes` for binary files.
 
 Requires the `fs_read` [plugin permission](#plugin-permissions).
@@ -2721,6 +2821,7 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{path}` (`string`) Absolute or relative file path. `~/` is expanded to the home directory.
+- `{opts?}` (`table?`) `offset` is the 1-based line to start at (default 1). A negative value counts back from the end, so `-50` reads the last 50 lines. An offset past the end returns an empty string. `limit` is the max number of lines, `0` or omitted reads to the end.
 
 **Returns:** (`string?`, `string?`) File contents, or nil plus an error message.
 
@@ -2732,6 +2833,7 @@ if err then
   maki.log.warn("could not read config: " .. err)
   return
 end
+local tail = maki.fs.read("server.log", { offset = -50 })
 ```
 
 ---
@@ -2739,18 +2841,20 @@ end
 ### `maki.fs.read_bytes()` {#maki-fs-read_bytes}
 
 ```lua
-maki.fs.read_bytes({path})
+maki.fs.read_bytes({path}, {opts?})
 ```
 
-Read the entire file at {path} as raw bytes, returned as a Luau buffer.
-Files larger than 512 MiB return nil plus an error message.
-Useful for binary files or when you need to pass the data to `maki.base64.encode`.
+Read the file at {path} as raw bytes in a Luau buffer. Pass {opts} to read
+a byte range.
+Returns nil plus an error message if the bytes read are over 512 MiB.
+Use it for binary files or data headed for `maki.base64.encode`.
 
 Requires the `fs_read` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
 - `{path}` (`string`) Absolute or relative file path. `~/` is expanded to the home directory.
+- `{opts?}` (`table?`) `offset` is the byte to start at (default 0). A negative value counts back from the end, so `-1024` reads the last 1024 bytes. `len` is the max number of bytes, omitted reads to the end.
 
 **Returns:** (`buffer?`, `string?`) File bytes as a Luau buffer, or nil plus an error message.
 
@@ -2760,6 +2864,7 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 local buf, err = maki.fs.read_bytes("image.png")
 if err then return end
 local encoded = maki.base64.encode(buf)
+local header = maki.fs.read_bytes("image.png", { len = 8 })
 ```
 
 ---
@@ -3363,7 +3468,10 @@ maki.image.decode({data})
 ```
 
 Decode raw image bytes into an Image handle you can resize and re-encode.
-Images larger than 50 megapixels are rejected to prevent memory bombs.
+The whole image is decoded up front, so corrupt input fails here rather
+than later. Images larger than 50 megapixels are rejected to prevent
+memory bombs. Formats other than png, jpeg, gif, and webp (like bmp) are
+converted to png, so the image can go into a message.
 
 **Parameters:**
 
@@ -3382,9 +3490,12 @@ print(img:width() .. "x" .. img:height())
 
 ## maki.image.Image {#maki-image-Image}
 
-A decoded image you can inspect, resize, and re-encode.
+An image you can inspect, resize, and re-encode.
 
-Get one from `maki.image.decode()`. The image data lives in memory
+Get one from `maki.image.decode()`. It always holds encoded bytes as
+png, jpeg, gif, or webp, and decodes the pixels on first use. As a
+message image source or through `maki.json.encode` it becomes
+`{ type = "base64", media_type, data }`. The data lives in memory
 until the handle is garbage collected.
 
 ---
@@ -3395,7 +3506,8 @@ until the handle is garbage collected.
 Image:width()
 ```
 
-Get the width of the image in pixels.
+Get the width of the image in pixels. Reads only the header when the
+pixels are not decoded yet.
 
 **Returns:** (`integer`) Width in pixels.
 
@@ -3407,7 +3519,8 @@ Get the width of the image in pixels.
 Image:height()
 ```
 
-Get the height of the image in pixels.
+Get the height of the image in pixels. Reads only the header when the
+pixels are not decoded yet.
 
 **Returns:** (`integer`) Height in pixels.
 
@@ -3421,6 +3534,8 @@ Image:resize({max_w}, {max_h})
 
 Shrink the image to fit inside {max_w} x {max_h}, keeping the aspect
 ratio. If the image already fits, it is returned as-is. Never upscales.
+A resized image is JPEG if the source was JPEG and PNG otherwise, which
+decides its `media_type` when placed into a message.
 
 **Parameters:**
 
@@ -3446,7 +3561,9 @@ Image:encode({format})
 ```
 
 Encode the image into raw bytes in the given format. Use this to prepare
-images for sending over the network or writing to disk.
+images for sending over the network or writing to disk. Bytes that came
+from outside are always re-encoded, so this can shrink an oversized file.
+An image from `resize` asked for its own format comes back as is.
 
 **Parameters:**
 
@@ -3555,8 +3672,16 @@ maki.json.encode({value})
 ```
 
 Turn a Lua value into a JSON string. Tables, strings, numbers,
-booleans, and nil all work. Functions and userdata cannot be
-serialized.
+booleans, nil, and `maki.NIL` (which becomes null) all work. A
+`maki.image.Image` becomes `{ type = "base64", media_type, data }`.
+Functions, threads, other userdata, and tables that contain themselves
+cannot be encoded.
+
+A table is an array when it came from a JSON array (`maki.json.decode`,
+`maki.deepcopy` of one), or when all its keys are positive integers and
+its largest key is at most 10 or at most twice the number of keys, with
+null in the gaps like `vim.json.encode`. Any other table is an object,
+with number and boolean keys written as strings.
 
 **Parameters:**
 
@@ -3576,23 +3701,35 @@ print(s) -- {"name":"maki","version":1}
 ### `maki.json.decode()` {#maki-json-decode}
 
 ```lua
-maki.json.decode({str})
+maki.json.decode({str}, {opts?})
 ```
 
 Parse a JSON string into a Lua value. Objects become tables and
-arrays become 1-indexed sequences.
+arrays become 1-indexed sequences. Every JSON null becomes `maki.NIL`, so
+a key holding null is still there and encoding the result gives the same
+JSON back. `maki.NIL` is a special value that stands for JSON null. It is
+truthy, so test for null with `x == maki.NIL`.
+
+Pass `opts.luanil` to get plain nil instead, like `vim.json.decode`.
+`luanil.object` does so for nulls inside objects and `luanil.array` for
+nulls inside arrays. A null at the top level is always `maki.NIL`.
 
 **Parameters:**
 
 - `{str}` (`string`) JSON string to decode.
+- `{opts?}` (`table?`) Optional. `luanil` (table with boolean `object` and `array`) turns those nulls into nil.
 
 **Returns:** (`any?`, `string?`) Decoded value, or nil plus an error.
 
 **Example:**
 
 ```lua
-local t, err = maki.json.decode('{"x": 42}')
+local t, err = maki.json.decode('{"x": 42, "y": null}')
 print(t.x) -- 42
+print(t.y == maki.NIL) -- true
+
+local u = maki.json.decode('{"y": null}', { luanil = { object = true } })
+print(u.y) -- nil
 ```
 
 ---
@@ -3924,11 +4061,21 @@ Reads a session's model, thinking level, and fast mode, the focused one
 unless `opts.session` names another. `thinking` comes back in the spelling `set` accepts, so a table from here
 can go straight back in.
 
-`thinking_options` is every thinking value this model accepts, cheapest
-first: `{name, tokens?}` per row, where `tokens` is the budget maki would
-send for that row and is absent on `off` and `adaptive`. It is empty exactly
-when `supports_thinking` is false, so a picker can render the ladder from it
-without knowing the levels.
+`thinking_options` lists named thinking choices, cheapest first, as
+`{name, tokens?}` per row. Request paths that use named `thinking_fields`
+expose those levels without token counts. Toggle-only fields expose
+`adaptive` and, when allowed, `off`. Otherwise the generic budget ladder applies.
+`tokens` is absent on `off` and `adaptive` too. The list is empty exactly
+when `supports_thinking` is false.
+
+`thinking` keeps the session's intent and delegation ceiling.
+`thinking_shown` names the effective row to highlight, including snapped
+effort levels and budgets sent as native levels or toggles. With declared
+fields, a budget stays numeric only where the adapter forwards the count.
+On the generic ladder, a model whose API has no adaptive mode leaves
+`adaptive` out and shows its fixed level.
+Declared effort fields keep `adaptive` separate because their fragments can
+differ from the provider fallback.
 
 **Parameters:**
 
@@ -3936,8 +4083,8 @@ without knowing the levels.
   - `session` (`string`) id of a live session, defaults to the focused one.
 
 **Returns:** (`table|nil`, `string|nil`) `{spec, id, provider, thinking,
-  thinking_options, fast, supports_thinking, supports_fast}`, or nil and an
-  error.
+  thinking_shown, thinking_options, fast, supports_thinking,
+  supports_fast}`, or nil and an error.
 
 **Example:**
 
@@ -3985,6 +4132,8 @@ state, in the same shape `get` returns.
 A new spec also becomes the model the next `maki` starts on, like picking
 it in `/model`, unless `opts.persist` is false. Naming a session turns
 that off by default, since steering one tab is not choosing a default.
+
+Requires the `session_settings` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -4395,8 +4544,8 @@ it does for a built-in provider.
     - `dialect` (`string`) Required. One of `"standard"`, `"codex"`,
       `"codex-5-1"`, `"coding-plan"`, `"gpt-5-6"`, `"gpt-6"`,
       `"prefer-high"`, `"high-only"`, `"glm"`, `"deepseek"`,
-      `"anthropic-adaptive"`, `"tensorx"`, `"grok"` or
-      `"ollama"`.
+      `"anthropic-adaptive"`, `"gemini"`, `"tensorx"`, `"grok"`
+      or `"ollama"`.
     - `field` (`string`) Body path for the effort. Dots nest, e.g.
       `"reasoning.effort"`. Defaults to `reasoning_effort`.
     - `requires_support` (`boolean`) Send effort only to models that
@@ -4623,8 +4772,9 @@ Host session primitives. The interactive UI can run several sessions
 at once. These functions list, create, focus, rename, and delete them.
 
 Without a UI, most functions return `nil, "no interactive UI attached"`.
-`current` and `read` still work under `maki -p` and the sdk.
-`messages` and `notify` work everywhere, ACP included.
+`current`, `read`, `export`, `messages`, `notify` and `new` without
+`prompt` or `focus` still work. ACP has no focused session, so there
+`current` fails and `read`, `export` and `messages` need `session`.
 
 ---
 
@@ -4693,22 +4843,31 @@ maki.session.read({opts?})
 ```
 
 One-call snapshot of a session: queue, usage, context, cost, mode, and
-status. Reads the focused session, or the one you name in `session` when
-you act on a background tab.
+status. Reads the focused session, or the one you name in `session`: a
+background tab, or a stored session nothing has open.
+
+Metadata only, so it needs no permission. Not to be confused with the
+`session_read` permission, which guards transcript content
+(`maki.session.export`, `maki.session.messages`).
 
 The returned table:
 ```text
 {
   id, cwd, model, mode = "build" | "plan",
-  status = "idle" | "working" | "needs_input",
+  thinking, fast,    -- nil under headless drivers
+  status = "idle" | "working" | "needs_input" | "stored",
   focused, updated_at,
   usage = { input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens },
-  context_size, context_window,
-  cost,
-  queue = { count }, -- nil under headless drivers
+  context_size,
+  context_window,    -- nil for a stored session
+  cost,              -- nil for a stored session
+  queue = { count }, -- nil under headless drivers and for a stored session
   title,             -- nil under headless drivers
 }
 ```
+
+`status` is `"stored"` for a session nothing here runs. Its `model` is the
+one it was saved with, resolved only when it opens.
 
 `usage` and `cost` include subagent spend. `context_size` is the main
 session's own, since a subagent runs its own window. There is no
@@ -4717,7 +4876,7 @@ session's own, since a subagent runs its own window. There is no
 
 **Parameters:**
 
-- `{opts?}` (`table?`) `session` (string?) Session id; defaults to focused.
+- `{opts?}` (`table?`) `session` (string?) Session id, live or stored. Defaults to the focused one.
 
 **Returns:** (`table|nil`, `string|nil`) Snapshot table, or nil and an error.
 
@@ -4726,8 +4885,48 @@ session's own, since a subagent runs its own window. There is no
 ```lua
 local s = maki.session.read()
 if s.context_size > s.context_window * 0.8 then
-  maki.ui.notify("context is nearly full")
+  maki.notify("context is nearly full")
 end
+```
+
+---
+
+### `maki.session.export()` {#maki-session-export}
+
+```lua
+maki.session.export({opts?})
+```
+
+Reads a session as the document `maki session export` prints, the same
+table `maki.session.new` takes back:
+
+```text
+{ format, model, mode, thinking, fast, title, facts, messages }
+```
+
+`messages` is what `maki.session.messages` returns. `facts` is the date,
+working directory, model, instructions and hints the model was last told,
+nil when the session never ran. A live session is read from memory,
+unsaved messages included, any other from disk without claiming it, so a
+session another maki has open can be read too.
+
+JSON null comes back as `maki.NIL` and arrays are tagged, so
+`maki.session.export(...)` encodes to the same document as the CLI file.
+Copy it with `maki.deepcopy` before editing, which keeps both intact.
+
+Requires the `session_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{opts?}` (`table?`) `session` (string?) Session id, live or stored. Defaults to the focused one.
+
+**Returns:** (`table|nil`, `string|nil`) The document, or nil and an error.
+
+**Example:**
+
+```lua
+local doc = assert(maki.session.export({ session = maki.session.current() }))
+maki.fs.write("/tmp/session.json", maki.json.encode(doc))
 ```
 
 ---
@@ -4738,33 +4937,47 @@ end
 maki.session.messages({opts?})
 ```
 
-Reads a live session's transcript, oldest first: everything the model has
+Reads a session's transcript, oldest first: everything the model has
 been sent so far, tool calls and results included. Read only.
 
-Each message is `{ role, kind, hidden, content }`. `role` is `"user"` or
-`"assistant"`. `kind` is `"turn"` for something the user or the model said,
+Each message has the same shape as in the session file:
+
+```text
+{ role = "user" | "assistant", kind, facts?, display_text?, content = { blocks } }
+```
+
+`kind` is `"turn"` for something the user or the model said,
 `"observation"` for a report sent to the model as a user message, like
 `maki.session.notify`, and `"context_update"` for a change since the
-system prompt was built (date, model, plan mode, ...). `hidden` marks a
-message only the model sees, such as a nudge or a compaction note.
-`content` lists blocks:
+system prompt was built (date, model, plan mode, ...), which carries the
+changed `facts`. `display_text` is what the UI shows instead of the
+content: nil shows the content, `""` hides the message (a nudge, a
+compaction note). `content` lists blocks:
 
 ```text
 { type = "text", text }
-{ type = "thinking", text }
-{ type = "tool_use", id, name, input }
-{ type = "tool_result", tool_use_id, content, is_error }
-{ type = "image", media_type }
+{ type = "thinking", thinking, signature? }
+{ type = "redacted_thinking", data }
+{ type = "tool_use", id, name, input, thought_signature? }
+{ type = "tool_result", tool_use_id, content, is_error?, loaded_tools? }
+{ type = "image", source = maki.image.Image }
 ```
 
-Works in the TUI, `maki -p`, sdk mode, and ACP. ACP has no focused
-session, so pass `session` there. Hook and event payloads carry the
-`session_id` to pass.
+`signature`, `thought_signature`, `data` and `loaded_tools` are opaque:
+pass them through untouched. A block type this build does not know comes
+as its raw table. JSON null is `maki.NIL`.
+
+A live session is read from memory, unsaved messages included, any other
+from disk. Works in the TUI, `maki -p`, sdk mode, and ACP. ACP has no
+focused session, so pass `session` there. Hook and event payloads carry
+the `session_id` to pass.
+
+Requires the `session_read` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
 - `{opts?}` (`table?`) Options:
-  - `session` (`string?`) id of a live session, defaults to the focused one.
+  - `session` (`string?`) Session id, live or stored. Defaults to the focused one.
   - `last` (`integer?`) only the newest `last` messages.
 
 **Returns:** (`table|nil`, `string|nil`) Array of messages, or nil and an error.
@@ -4774,7 +4987,7 @@ session, so pass `session` there. Hook and event payloads carry the
 ```lua
 local msgs = maki.session.messages({ last = 1 })
 local last = msgs and msgs[1]
-if last and last.role == "assistant" then
+if last and last.role == "assistant" and last.content[1].type == "text" then
   print(last.content[1].text)
 end
 ```
@@ -4812,6 +5025,8 @@ maki.session.delete({id})
 Deletes a session and its stored history, cancelling it first if it
 is running. The focused session cannot be deleted.
 
+Requires the `session_write` [plugin permission](#plugin-permissions).
+
 **Parameters:**
 
 - `{id}` (`string`) Session id to delete.
@@ -4832,11 +5047,56 @@ local _, err = maki.session.delete(id)
 maki.session.new({opts?})
 ```
 
-Starts a new session in the current project.
+Creates a session from the document `maki.session.export` returns, or
+from nothing.
+
+Whatever the document leaves out is what a new tab would get: in the TUI
+the focused tab's project, model, mode, thinking, fast and workflow, under
+`maki -p` and sdk mode the project of the session they run, under ACP the
+directory maki runs in. Outside the TUI no model is stored, so the session
+opens on the default model. A document with messages gets no permissions
+(`yolo`, session rules) from either side. Without messages it is a new tab
+like `Ctrl-N`, which keeps the focused tab's `yolo`.
+
+Without `prompt` or `focus` the session is only stored, and
+`maki.session.focus(id)` opens it later. With either it opens in a tab.
+A session is only stored once it has messages, so storing a document
+with none left after repair fails. Pass `focus` to open a blank one
+instead.
+Headless drivers (`maki -p`, ACP) have nothing to open it in, so there
+`prompt` and `focus` answer `nil, "no interactive UI attached"` and store
+nothing.
+
+History is repaired the way a resume repairs it (orphan tool results go,
+a dangling final tool call is closed) and anything else wrong is refused
+with its location, like `messages[12].content[2]: ...` (0-based, as in
+the JSON document). A block of a known type that does not parse, or one
+without a `type`, is refused too, while one of a type this build does not
+know is kept. Thinking blocks and `thought_signature` are dropped: they
+are bound to a system prompt the new session will not have. `model` is
+stored as given and resolved when the session opens, falling back with a
+warning like any resume.
+
+Image sources may be a `maki.image.Image` or the
+`{ type = "base64", media_type, data }` table `maki.json` gives. An empty
+table where a list belongs (`messages`, a message's `content`) is refused,
+since nothing tells it from an empty object: copy with `maki.deepcopy`,
+which keeps the tag. Fields `new` does not know are ignored.
+
+Requires the `session_write` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
 - `{opts?}` (`table?`) Optional fields:
+  - `messages` (`table`) what `export` or `messages` return.
+  - `facts` (`table`) what `export` returns: the date, working directory,
+    model, instructions and hints the model was last told.
+  - `model` (`string`) model spec. Defaults to the focused tab's in the TUI,
+    else the default model when the session opens.
+  - `mode` (`string`) "build" or "plan".
+  - `thinking` (`string`) spelled like the thinking setting.
+  - `fast` (`boolean`) fast output mode, where the model supports it.
+  - `title` (`string`) else generated from the history.
   - `prompt` (`string`) first user message to submit right away. Needs the
     `agent` permission.
   - `focus` (`boolean`) switch the UI to the new session.
@@ -4846,6 +5106,11 @@ Starts a new session in the current project.
 **Example:**
 
 ```lua
+-- copy a session, keeping it in the background
+local doc = assert(maki.session.export({ session = id }))
+local copy, err = maki.session.new(doc)
+
+-- start a fresh one right away
 local id, err = maki.session.new({ prompt = "fix the tests", focus = true })
 ```
 
@@ -4862,11 +5127,14 @@ never interpreted: slash commands, `exit`, and `!` shell prefixes are
 all sent to the model verbatim. If the session is currently streaming,
 the prompt is queued and picked up when the agent reaches it.
 
-Requires the `agent` [plugin permission](#plugin-permissions).
+Requires the `agent` and `session_write` [plugin permissions](#plugin-permissions).
 
 **Parameters:**
 
-- `{text}` (`string`) The prompt to send. Must not be blank.
+- `{text}` (`string`) The prompt to send. Must not be blank unless images
+
+  are attached.
+
 - `{opts?}` (`table?`) Optional fields: session (string) id of a live
 
   session, defaults to the focused one; force (boolean) when the prompt
@@ -4875,7 +5143,16 @@ Requires the `agent` [plugin permission](#plugin-permissions).
   lands in the queue, force the queue through right away the way
 
 
-  `maki.session.detach` does.
+  `maki.session.detach` does; images (table) up to 8
+
+
+  `{ media_type, data }` entries, where media_type is "image/png",
+
+
+  "image/jpeg", "image/gif", or "image/webp" and data is base64 without
+
+
+  a `data:` prefix. Fails if the session's model has no vision support.
 
 
 **Returns:** (`string|nil`, `string|nil`) "started", "queued", or "forced" when
@@ -4886,6 +5163,7 @@ Requires the `agent` [plugin permission](#plugin-permissions).
 ```lua
 local state, err = maki.session.prompt("run the tests", { session = id })
 maki.session.prompt("stop, look at this first", { session = id, force = true })
+maki.session.prompt("", { images = { { media_type = "image/png", data = png_b64 } } })
 ```
 
 ---
@@ -4900,7 +5178,7 @@ Interrupts the running turn of a live session, the way a double Esc does
 in the TUI: the agent stops, in-flight tools are cancelled and queued
 prompts are dropped.
 
-Requires the `agent` [plugin permission](#plugin-permissions).
+Requires the `agent` and `session_write` [plugin permissions](#plugin-permissions).
 
 **Parameters:**
 
@@ -4931,7 +5209,7 @@ goes on as a background task and the queued prompts are answered next.
 Refused while the turn waits on a permission prompt or a question, since
 the answer has to reach the run that asked.
 
-Requires the `agent` [plugin permission](#plugin-permissions).
+Requires the `agent` and `session_write` [plugin permissions](#plugin-permissions).
 
 **Parameters:**
 
@@ -4962,6 +5240,8 @@ maki.session.notify({text}, {opts?})
 Reports {text} to a live session without creating a user turn. The
 observation waits for the session's next agent run.
 
+Requires the `session_write` [plugin permission](#plugin-permissions).
+
 **Parameters:**
 
 - `{text}` (`string`) What to report. Must not be blank.
@@ -4969,6 +5249,10 @@ observation waits for the session's next agent run.
   - `session` (`string`) id of a live session.
   - `wake` (`boolean`) start a TUI turn when it next becomes idle (default
     false). Needs the `agent` permission.
+  - `display` (`string?`) one-line note for the transcript, shown and saved
+    when the session's agent run accepts the report. Whitespace collapses
+    to single spaces and the note is cut to 256 bytes. Defaults to
+    nothing; the model reads only {text}.
 
 **Returns:** (`boolean|nil`, `string|nil`) true, or nil and an error.
 
@@ -4991,6 +5275,8 @@ allocates the session's plan file if it has none.
 
 A session that is mid-plan answers the next prompt with another draft of
 the plan. Set `"build"` first and that prompt implements it.
+
+Requires the `session_settings` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -5017,6 +5303,8 @@ maki.session.set_title({opts})
 
 Renames a session, live or stored.
 
+Requires the `session_settings` [plugin permission](#plugin-permissions).
+
 **Parameters:**
 
 - `{opts}` (`table`) Required fields: id (string) session to rename;
@@ -5028,41 +5316,6 @@ Renames a session, live or stored.
 
 ```lua
 local _, err = maki.session.set_title({ id = id, title = "refactor" })
-```
-
----
-
-### `maki.session.answer_permission()` {#maki-session-answer_permission}
-
-```lua
-maki.session.answer_permission({request_id}, {answer})
-```
-
-Answers an open permission prompt, racing the user at it. The prompt stays
-on screen until someone answers, and whichever answer lands first settles
-the call. A plugin may only allow or deny that one call, so nothing it
-answers records a rule. Answering for the user takes every permission in
-the plugin's `plugin.toml`.
-
-**Parameters:**
-
-- `{request_id}` (`integer`) The `request_id` of a `PermissionRequested` event.
-- `{answer}` (`table`) Required field: decision ("allow" or "deny").
-
-  Optional: guidance (string) the agent reads with a deny.
-
-
-**Returns:** (`boolean|nil`, `string|nil`) true if this answer settled the prompt,
-  false if the user or another plugin answered first, or nil and an error.
-
-**Example:**
-
-```lua
-maki.api.create_autocmd("PermissionRequested", {
-  callback = function(ev)
-    maki.session.answer_permission(ev.data.request_id, { decision = "deny" })
-  end,
-})
 ```
 
 ---
@@ -5162,6 +5415,41 @@ maki.api.create_autocmd("QuestionAsked", {
 })
 ```
 
+---
+
+### `maki.session.answer_permission()` {#maki-session-answer_permission}
+
+```lua
+maki.session.answer_permission({request_id}, {answer})
+```
+
+Answers an open permission prompt, racing the user at it. The prompt stays
+on screen until someone answers, and whichever answer lands first settles
+the call. A plugin may only allow or deny that one call, so nothing it
+answers records a rule. Answering for the user takes every permission in
+the plugin's `plugin.toml`.
+
+**Parameters:**
+
+- `{request_id}` (`integer`) The `request_id` of a `PermissionRequested` event.
+- `{answer}` (`table`) Required field: decision ("allow" or "deny").
+
+  Optional: guidance (string) the agent reads with a deny.
+
+
+**Returns:** (`boolean|nil`, `string|nil`) true if this answer settled the prompt,
+  false if the user or another plugin answered first, or nil and an error.
+
+**Example:**
+
+```lua
+maki.api.create_autocmd("PermissionRequested", {
+  callback = function(ev)
+    maki.session.answer_permission(ev.data.request_id, { decision = "deny" })
+  end,
+})
+```
+
 
 ## maki.Timer {#maki-Timer}
 
@@ -5209,9 +5497,10 @@ tool spawned has its tool call's id, one a plugin opened with
 [maki.agent.session](#maki-agent-session) has its session id and a
 `plugin` field.
 
-**Returns:** (`table|nil`, `string|nil`) Array of `{id, name, focused, status?, plugin?}`
+**Returns:** (`table|nil`, `string|nil`) Array of `{id, session, name, focused, status?, plugin?}`
   where `status` is `"working"`, `"idle"` (a plugin task between prompts),
-  `"done"`, or `"error"`, or nil and an error.
+  `"done"`, or `"error"`, and `session` is the chat session that `stop()`
+  asks for. Or nil and an error.
 
 **Example:**
 
@@ -5255,6 +5544,8 @@ maki.task.remove({id})
 Deletes a finished task and its saved transcript. Refuses the main chat and
 running tasks. Deleting the focused task moves focus to the chat before it.
 
+Requires the `session_write` [plugin permission](#plugin-permissions).
+
 **Parameters:**
 
 - `{id}` (`string`) Task id, as returned by `list()`.
@@ -5265,6 +5556,42 @@ running tasks. Deleting the focused task moves focus to the chat before it.
 
 ```lua
 local _, err = maki.task.remove("toolu_01")
+```
+
+---
+
+### `maki.task.stop()` {#maki-task-stop}
+
+```lua
+maki.task.stop({id}, {opts})
+```
+
+Stops a task in the focused session, the same way Esc in its tab does. A
+plugin task can be stopped while idle, even before its first prompt. The
+main chat, a finished task, or an unknown id returns an error.
+
+Only the user may stop a task, so this works in a command the user typed
+or a key they pressed. Tools, hooks, autocmds, `maki.async` tasks, and
+commands run through `maki.api.run_command` get an error instead, or any
+plugin could stop work that is not its own.
+
+**Parameters:**
+
+- `{id}` (`string`) Task id, as returned by `list()`.
+- `{opts}` (`table`) `session` (string), the chat session of the `list()`
+
+  row. If the user switched sessions since, this returns an error rather
+
+
+  than stopping a task with the same id in the other session.
+
+
+**Returns:** (`boolean|nil`, `string|nil`) true on success, or nil and an error.
+
+**Example:**
+
+```lua
+local _, err = maki.task.stop(task.id, { session = task.session })
 ```
 
 
@@ -6839,6 +7166,11 @@ Valid names: `"file_picker"`, `"search"`, `"help"`,
 `"plan_toggle"`, `"plan_editor"`, `"edit_input"`, `"pop_queue"`,
 `"prev_chat"`, `"next_chat"`, `"model_picker"`.
 
+Most actions are free, since they open something the user then sees and
+drives. `"pop_queue"` needs `session_write`, because it throws away a
+queued prompt. Without it the call raises the usual `permission denied`
+error.
+
 There is no action for sending the user's message. To take keys like
 `<CR>` while a popup is open, use the `keys` option of `maki.ui.open_win`.
 
@@ -7021,6 +7353,8 @@ them out: with `local before = st.text:sub(1, st.cursor)`,
 To put a window on the caret, open it with `anchor = "input_caret"`. The
 host re-places it every frame, so it follows wraps and resizes.
 
+Requires the `session_read` [plugin permission](#plugin-permissions).
+
 **Returns:** (`table|nil`, `string|nil`) The input state, or nil and an error.
 
 **Example:**
@@ -7061,6 +7395,12 @@ Read again and retry on any of them.
 
 Tabs and carriage returns in {text} become spaces and newlines, and the
 other control characters are dropped, the way a paste is rewritten.
+
+It costs what `maki.ui.input` costs. A plugin keymap sees keys before
+the input does, so with this call alone a plugin could note every key and
+type it back unseen.
+
+Requires the `session_read` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
@@ -8016,8 +8356,8 @@ function ToolView.restore_lines(lines, opts)
 function ToolView.restore(output, opts)
 
 -- Same, for tools whose live output goes through markdown (`format =
--- "markdown"`); {opts.width} is the wrap width. Errors stay plain, as they do
--- live.
+-- "markdown"`). {opts.width} is the wrap width and defaults to the body
+-- column of the current terminal. Errors stay plain, as they do live.
 function ToolView.restore_markdown(output, is_error, opts)
 ```
 
