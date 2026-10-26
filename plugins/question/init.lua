@@ -33,31 +33,19 @@ local function dense(questions, answers)
   return out
 end
 
--- Another plugin may answer the form for the user, so it hears the form open
--- and close, and whichever answer lands first is the one the model reads.
+-- A plugin may answer for a user who is away from the terminal, so the form
+-- sits behind a slot. It names no price: answering stands in for the user,
+-- which costs every permission.
+local open_form = maki.api.declare_slot("question.form", function(questions, _ev, on_open)
+  return QuestionForm.open(questions, on_open)
+end)
+
 local function ask(questions, ctx)
-  local tool_id = ctx:tool_id()
-  if not tool_id then
-    return QuestionForm.open(questions)
+  local result = open_form(questions, { session = ctx:session_id() })
+  if QuestionHelpers.is_reply(result) then
+    return result
   end
-  local session_id = ctx:session_id()
-  local result = QuestionForm.open(questions, function(win)
-    maki.session.register_question(tool_id, win, { session = session_id })
-    maki.api.exec_autocmds("QuestionAsked", {
-      data = { session_id = session_id, tool_id = tool_id, questions = questions },
-    })
-  end)
-  local by = "user"
-  local remote = maki.session.settle_question(tool_id)
-  if remote then
-    result, by = remote, "plugin"
-  elseif ctx:cancelled() then
-    by = "cancelled"
-  end
-  maki.api.exec_autocmds("QuestionResolved", {
-    data = { session_id = session_id, tool_id = tool_id, by = by },
-  })
-  return result
+  return QuestionForm.open(questions)
 end
 
 maki.api.register_tool({

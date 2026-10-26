@@ -161,9 +161,6 @@ declare maki: {
     notify: @checked (text: string, opts: any) -> (boolean?, string?),
     set_mode: @checked (mode: string, opts: any) -> (boolean?, string?),
     set_title: @checked (opts: any) -> (boolean?, string?),
-    register_question: @checked (tool_id: string, win: any, opts: any) -> (),
-    settle_question: @checked (tool_id: string) -> (any),
-    answer_question: @checked (tool_id: string, reply: any, opts: any) -> (boolean?, string?),
     answer_permission: @checked (request_id: number, answer: any) -> (boolean?, string?),
   },
   task: {
