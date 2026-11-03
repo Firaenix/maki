@@ -66,7 +66,7 @@ fn pattern_matches(patterns: Option<&[String]>, fired: Option<&str>) -> bool {
 /// One dispatch path for host-fired and plugin-fired events. Never throws.
 /// Each callback runs in its own coroutine under its own detached task
 /// scope, so it may suspend (the `maki.fs.*` helpers park on
-/// `smol::unblock`); an inline resume would die with "attempt to yield
+/// `spawn_blocking`); an inline resume would die with "attempt to yield
 /// across metamethod / C-call boundary". The per-callback scope also means
 /// task-owned jobs a handler starts die with that handler instead of
 /// outliving it to the end of the batch.
@@ -233,12 +233,13 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// `"CompactionDone"`, `"PlanReady"`, `"SessionReset"`, `"SessionEnd"`,
 /// `"SessionFocusChanged"`, `"SessionStatusChanged"`, `"SessionTitleChanged"`,
 /// `"SessionCwdChanged"`, `"TaskStatusChanged"`, `"TaskStopped"`, `"TaskFocusChanged"`, `"ModelChanged"`, `"InputChanged"`,
-/// `"PermissionRequested"`, `"PermissionResolved"`, and `"FileIndexReady"`.
-/// Plugins can also fire their own events with
+/// `"ModeChanged"`, `"PermissionRequested"`, `"PermissionResolved"` and
+/// `"FileIndexReady"`. Plugins can also fire their own events with
 /// `exec_autocmds`.
 ///
 /// Every host event carries `data.session_id` except `"FileIndexReady"`,
-/// which is about a directory rather than a session. For `"SessionReset"` and
+/// which is about a directory rather than a session, and `"ModeChanged"`,
+/// since the mode is the same in every session. For `"SessionReset"` and
 /// `"SessionEnd"` that is the session being left behind, the other events
 /// name the session now running or focused. What each event adds:
 ///
@@ -267,13 +268,14 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// - `"SessionFocusChanged"`: `data.previous_session_id`, absent on the
 ///   first focus at startup.
 /// - `"SessionStatusChanged"`: `data.status` (`"working"`, `"needs_input"`,
-///   or `"idle"`), `data.title`, and `data.focused` (boolean).
+///   or `"idle"`), `data.title`, and `data.focused` (boolean). A session
+///   stays `"working"` while a background task it waits on still runs.
 /// - `"SessionTitleChanged"`: `data.title` and `data.focused` (boolean),
 ///   when the title changes (rename or auto-generation).
 /// - `"SessionCwdChanged"`: `data.cwd`, the session's new working
 ///   directory, when `/cd` changes it.
 /// - `"TaskStatusChanged"`: `data.id`, `data.name`, and `data.status`
-///   (`"working"`, `"idle"`, `"done"`, or `"error"`), when a subagent starts
+///   (`"working"`, `"idle"`, `"done"`, `"error"`, or `"cancelled"`), when a subagent starts
 ///   or changes status. A task a plugin opened with `maki.agent.session`
 ///   carries `data.plugin`, and `"idle"` is such a task between prompts. A
 ///   task that comes back from disk already finished stays quiet, so
@@ -291,15 +293,23 @@ fn parse_string_or_seq(value: Value, what: &str) -> LuaResult<Vec<String>> {
 /// - `"ModelChanged"`: `data.model` in the shape `maki.model.get` returns,
 ///   plus `data.previous_spec`. Picking the model already in use stays
 ///   quiet, and so does startup.
-/// - `"InputChanged"`: `data.text`, `data.cursor` and `data.version`, the
-///   chat input as `maki.ui.input` reports it. `data.source` is the plugin
-///   name when that plugin's `maki.ui.input_edit` was the only writer this
-///   frame, and nil otherwise (including when the user moved the caret), so
-///   ignoring your own name never drops a change. `data.cursor_only` is true
-///   when only the caret moved. Handlers that only care about the text
-///   should return early on it. Fires at most once per frame, and only when
-///   the text or caret changed. Focusing another session republishes that
-///   session's input.
+/// - `"InputChanged"`: `data.text`, `data.cursor`, `data.anchor`,
+///   `data.version` and `data.session_id`, as
+///   [`maki.ui.input`](#maki-ui-input) reports them. `data.cursor_only` is
+///   true when only the cursor or the selection moved. `data.source` names
+///   the plugin whose `maki.ui.input_edit` made the only change since the
+///   last `"InputChanged"`, and is nil otherwise, so a handler can skip its
+///   own edits. A package goes by its
+///   [package name](/docs/packages/#install-from-git), and `init.lua` code
+///   by `"global/init.lua"` or `"project/init.lua"`. Fires at most once per
+///   screen redraw, and again for the input of a tab that takes focus.
+///   [Marks](#input-marks) alone do not fire it, so a handler can call
+///   `maki.ui.input_decorate` without looping.
+/// - `"ModeChanged"`: `data.old_mode` and `data.new_mode`, each `"n"` or
+///   `"i"`. Fires whenever `maki.fn.mode()` changes: on `maki.ui.set_mode`,
+///   and when the chat input gains or loses the keyboard, as when a picker
+///   opens. Use it to draw a mode indicator. Like `"InputChanged"`, it fires
+///   only with a UI.
 /// - `"PermissionRequested"`: `data.request_id`, the handle
 ///   `maki.session.answer_permission` takes, unique across the process, plus
 ///   `data.tool`, `data.scopes`, `data.tool_id` (empty for a call nested in

@@ -5,19 +5,21 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::app::tasks::{TaskOutcome, TaskStatus};
-use crate::components::input::Submission;
-use crate::components::messages::{MessagesPanel, PromptProgress, ScrollPos};
+use crate::app::tasks::{TaskClock, TaskOutcome, TaskParent, TaskStatus};
+use crate::components::input::Draft;
+use crate::components::messages::{ClickOutcome, MessagesPanel, PromptProgress, ScrollPos};
 use crate::components::tool_display::append_annotation;
-use crate::components::{DisplayMessage, DisplayRole, ToolRole, ToolStatus};
+use crate::components::{
+    BackgroundBadge, BackgroundOutcome, DisplayMessage, DisplayRole, ToolRole, ToolStatus,
+};
 use crate::markdown::truncate_output;
 
 use crate::selection::{DocPos, RowPos, Selection};
 use maki_agent::tools::{MAIN_TASK_ID, ToolInvocation, ToolRegistry, WRITE_TOOL_NAME};
 use maki_agent::types::ALLOWED_BY;
 use maki_agent::{
-    AgentEvent, BufferSnapshot, DisplayItem, PermissionPreview, SteerKind, SubagentInbox,
-    ToolDoneEvent, ToolOutput, ToolStartEvent, display_order,
+    AgentEvent, BufferSnapshot, DisplayItem, PermissionPreview, SharedBuf, SteerKind,
+    SubagentInbox, ToolDoneEvent, ToolOutput, ToolStartEvent, display_order, observation_detail,
 };
 use maki_config::{ToolKey, ToolOutputLines, UiConfig};
 use maki_lua::{LuaCommandInfo, WinView};
@@ -32,6 +34,7 @@ use crate::repaint::{Cadence, Dirty};
 pub(crate) const DONE_TEXT: &str = "Done!";
 pub(crate) const ERROR_TEXT: &str = "Error";
 pub(crate) const CANCELLED_TEXT: &str = "Cancelled";
+pub(crate) const LOST_TEXT: &str = "Lost";
 /// One notice per streak: a wedged model can spend twenty nudges, and twenty
 /// identical bubbles bury the conversation they are about.
 const NUDGE_TEXT: &str = "Model stalled after tool calls, nudging...";
@@ -59,14 +62,30 @@ pub enum ChatEventResult {
     AuthRequired,
 }
 
+/// A call this chat's agent started that has not reported done.
+pub(crate) struct RunningCall {
+    pub(crate) id: String,
+    pub(crate) tool: Arc<str>,
+}
+
 pub struct Chat {
     pub name: String,
     /// The plugin that opened this task with `maki.agent.session`. A tool task
     /// has none: it lives for one turn of the main chat and is swept with it,
     /// while a plugin task answers only to its plugin and to Esc in its tab.
     pub(crate) plugin: Option<Arc<str>>,
-    /// A plugin task between prompts: its run ended, its session did not.
+    /// A plugin task between runs: its run ended, its session did not. Kept
+    /// by [`Self::track_run`] from the runs' own events.
     pub(crate) idle: bool,
+    /// Its run waits on expired credentials for the user's Enter. Any later
+    /// event of the run, or the chat's end, lifts it, so it never goes stale.
+    pub(crate) auth_parked: bool,
+    /// Shows a call moved off its turn. The call is out until its final
+    /// result, whatever its runs do in between, so it never reads idle.
+    pub(crate) backs_moved_call: bool,
+    /// The moved call `/tasks` lists this task under.
+    pub(crate) parent: Option<TaskParent>,
+    pub(crate) clock: Option<TaskClock>,
     pub cost: Option<f64>,
     /// This chat's slice of the session's list-price reference cost; mirrors
     /// `cost`, but only ever set for subsidised models.
@@ -79,13 +98,20 @@ pub struct Chat {
     /// A running subagent's inbox for messages typed in its chat. Taken when
     /// the chat finishes, since nothing would drain it after that.
     pub(crate) inbox: Option<Arc<SubagentInbox>>,
+    /// Where a subagent's permission answers go. It lives until the chat
+    /// finishes, not the turn, so a subagent moved off its turn can still be
+    /// answered.
+    pub(crate) answer_tx: Option<flume::Sender<String>>,
     /// Parked while another chat is in front, see `App::set_active_chat`.
-    pub(crate) draft: Submission,
+    pub(crate) draft: Draft,
     pending_turn_usage: Option<String>,
     messages_panel: MessagesPanel,
     /// The ending and the index of the bubble announcing it, so a later, better
     /// informed outcome can fix that bubble instead of appending a second one.
     finish: Option<(TaskOutcome, usize)>,
+    /// Candidates only: a row can stop running without a `ToolDone` (a cancel,
+    /// a retry), so [`Self::running_calls`] checks each against its row.
+    running_calls: Vec<RunningCall>,
 }
 
 impl Chat {
@@ -105,16 +131,22 @@ impl Chat {
             name,
             plugin: None,
             idle: false,
+            auth_parked: false,
+            backs_moved_call: false,
+            parent: None,
+            clock: None,
             cost: None,
             list_cost: None,
             context_size: 0,
             model_id: None,
             opts: None,
             inbox: None,
-            draft: Submission::default(),
+            answer_tx: None,
+            draft: Draft::default(),
             pending_turn_usage: None,
             messages_panel,
             finish: None,
+            running_calls: Vec::new(),
         }
     }
 
@@ -135,7 +167,7 @@ impl Chat {
     pub(crate) fn task_status(&self) -> TaskStatus {
         match self.finish {
             Some((outcome, _)) => outcome.into(),
-            None if self.idle => TaskStatus::Idle,
+            None if self.idle && !self.backs_moved_call => TaskStatus::Idle,
             None => TaskStatus::Working,
         }
     }
@@ -146,6 +178,27 @@ impl Chat {
         self.plugin.is_some()
             && !self.is_finished()
             && self.messages_panel.session_id() == Some(session)
+    }
+
+    /// A run is working from any event of its own to its `Done` or `Error`.
+    /// A run woken by a moved call's result opens without a prompt, so no
+    /// single event marks the start. What trails a run, its transcript, its
+    /// close and frozen renders, says nothing either way. Only a plugin task
+    /// goes idle, but any run's own event means it no longer waits on auth.
+    pub(crate) fn track_run(&mut self, event: &AgentEvent) {
+        let idle = match event {
+            AgentEvent::Done { .. } | AgentEvent::Error { .. } => true,
+            AgentEvent::SubagentHistory { .. }
+            | AgentEvent::StreamClosed
+            | AgentEvent::ToolSnapshot { .. }
+            | AgentEvent::ToolHeaderSnapshot { .. }
+            | AgentEvent::LiveToolBuf { .. } => return,
+            _ => false,
+        };
+        self.auth_parked = false;
+        if self.plugin.is_some() {
+            self.idle = idle;
+        }
     }
 
     pub fn set_pending_turn_usage(&mut self, usage: String) {
@@ -167,13 +220,22 @@ impl Chat {
                 self.messages_panel.text_delta(&text);
             }
             AgentEvent::ToolPending { id, name } => self.messages_panel.tool_pending(id, &name),
-            AgentEvent::ToolStart(e) => self.messages_panel.tool_start(*e),
+            AgentEvent::ToolStart(e) => {
+                if !self.running_calls.iter().any(|call| call.id == e.id) {
+                    self.running_calls.push(RunningCall {
+                        id: e.id.clone(),
+                        tool: Arc::clone(&e.tool),
+                    });
+                }
+                self.messages_panel.tool_start(*e);
+            }
             AgentEvent::ToolOutput { id, content } => {
                 self.messages_panel.tool_output(&id, &content)
             }
             AgentEvent::ToolDone(e) => {
                 let plan_write = plan_path.filter(|pp| e.wrote_to(pp));
                 let is_full_write = &*e.tool == WRITE_TOOL_NAME;
+                self.running_calls.retain(|call| call.id != e.id);
                 self.messages_panel.tool_done(*e);
                 if let Some(pp) = plan_write {
                     let content = if is_full_write {
@@ -216,6 +278,11 @@ impl Chat {
                 return ChatEventResult::QueueItemConsumed { text, images };
             }
             AgentEvent::QueueDrained => {}
+            AgentEvent::ToolMovable { id, movable } => {
+                self.messages_panel.set_tool_movable(&id, movable);
+            }
+            // Parts belong to `/tasks`, which the App keeps, never to a transcript.
+            AgentEvent::ToolParts { .. } => {}
             AgentEvent::Retry { .. } => unreachable!("handled before handle_event"),
             AgentEvent::Done { .. } => {
                 self.messages_panel.flush();
@@ -282,10 +349,17 @@ impl Chat {
                     ));
                 }
             }
-            AgentEvent::Notice { text } | AgentEvent::ObservationLine { text } => {
+            AgentEvent::Notice { text } => {
                 self.messages_panel.flush();
-                self.messages_panel
-                    .push(DisplayMessage::new(DisplayRole::Notice, text));
+                self.messages_panel.push(notice(text, None));
+            }
+            AgentEvent::ObservationLine { text, detail, end } => {
+                self.messages_panel.flush();
+                self.messages_panel.push(task_notice(
+                    text,
+                    detail,
+                    end.map(BackgroundOutcome::from),
+                ));
             }
             AgentEvent::SubagentHistory { .. } | AgentEvent::StreamClosed => {}
             AgentEvent::LiveToolBuf { id, body } => {
@@ -395,8 +469,16 @@ impl Chat {
         self.messages_panel.extract_selection_text(sel, msg_area)
     }
 
-    pub fn handle_click(&mut self, row: u16, area: Rect) {
-        self.messages_panel.handle_click(row, area);
+    pub fn handle_click(&mut self, row: u16, col: u16, area: Rect) -> ClickOutcome {
+        self.messages_panel.handle_click(row, col, area)
+    }
+
+    pub fn toggle_click(&mut self, row: u16, area: Rect) -> ClickOutcome {
+        self.messages_panel.toggle_click(row, area)
+    }
+
+    pub fn has_tool(&self, tool_id: &str) -> bool {
+        self.messages_panel.has_tool(tool_id)
     }
 
     pub fn tool_snapshot(
@@ -444,6 +526,41 @@ impl Chat {
         self.messages_panel.push(msg);
     }
 
+    /// Ends the task before its work says so, after a stop or a loss. Rows
+    /// still in progress would never hear back, so they are cancelled here.
+    pub(crate) fn end_early(&mut self, outcome: TaskOutcome, text: &str) {
+        self.flush();
+        self.cancel_in_progress();
+        self.mark_finished(outcome, text);
+    }
+
+    /// Like [`Self::mark_finished`], but the latest word wins. A part's tab
+    /// only mirrors reports, and a report that lands after its call ended
+    /// knows better than the call did.
+    pub(crate) fn end_as(&mut self, outcome: TaskOutcome, text: &str) {
+        match self.finish {
+            Some((previous, _)) if previous == outcome => {}
+            Some((_, bubble)) => {
+                self.finish = Some((outcome, bubble));
+                self.messages_panel
+                    .replace(bubble, DisplayMessage::new(outcome.role(), text.into()));
+            }
+            None => self.mark_finished(outcome, text),
+        }
+    }
+
+    pub(crate) fn finish_outcome(&self) -> Option<TaskOutcome> {
+        self.finish.map(|(outcome, _)| outcome)
+    }
+
+    /// The call this tab is a part of, see [`TaskParent::Part`].
+    pub(crate) fn part_of(&self) -> Option<&Arc<str>> {
+        match &self.parent {
+            Some(TaskParent::Part(call)) => Some(call),
+            _ => None,
+        }
+    }
+
     /// Ends the transcript with the bubble [`TaskOutcome::role`] picks. A chat
     /// only ever grows one ending, but a caller who knows more than the one who
     /// got here first rewrites it in place. See [`TaskOutcome::refines`].
@@ -457,6 +574,11 @@ impl Chat {
             return;
         }
         self.messages_panel.flush();
+        self.answer_tx = None;
+        self.auth_parked = false;
+        if let Some(clock) = &mut self.clock {
+            clock.stop();
+        }
         let undelivered = self.inbox.take().map_or(0, |inbox| inbox.len());
         if undelivered > 0 {
             self.messages_panel.push(DisplayMessage::new(
@@ -470,8 +592,23 @@ impl Chat {
         self.finish = Some((outcome, bubble));
     }
 
+    /// Takes back an ending the turn wrote for a task that outlived it. Its
+    /// bubble stays as the record of that Esc. The next event naming the task
+    /// brings back the senders the ending dropped.
+    pub(crate) fn reopen(&mut self) {
+        self.finish = None;
+        if let Some(clock) = &mut self.clock {
+            clock.resume();
+        }
+    }
+
     pub fn is_finished(&self) -> bool {
         self.finish.is_some()
+    }
+
+    /// A moved call's task has no inbox, a finished one nothing to read it.
+    pub(crate) fn takes_messages(&self) -> bool {
+        self.inbox.is_some() && !self.is_finished()
     }
 
     pub fn update_tool_summary(&mut self, tool_id: &str, summary: &str) {
@@ -486,8 +623,61 @@ impl Chat {
         self.messages_panel.set_tool_turn_usage(tool_id, usage);
     }
 
+    /// The calls still running now, oldest first.
+    pub(crate) fn running_calls(&mut self) -> &[RunningCall] {
+        let panel = &self.messages_panel;
+        self.running_calls.retain(|call| {
+            panel.tool_message(&call.id).is_some_and(|msg| {
+                matches!(&msg.role, DisplayRole::Tool(t) if t.status == ToolStatus::InProgress)
+            })
+        });
+        &self.running_calls
+    }
+
+    pub(crate) fn tool_message(&self, tool_id: &str) -> Option<DisplayMessage> {
+        self.messages_panel.tool_message(tool_id)
+    }
+
+    pub(crate) fn live_buf(&self, tool_id: &str) -> Option<Arc<SharedBuf>> {
+        self.messages_panel.live_buf(tool_id)
+    }
+
+    pub(crate) fn tool_name(&self, tool_id: &str) -> Option<Arc<str>> {
+        self.messages_panel.tool_name(tool_id)
+    }
+
+    pub(crate) fn register_live_buf(&mut self, tool_id: String, buf: Arc<SharedBuf>) {
+        self.messages_panel.register_live_buf(tool_id, buf);
+    }
+
+    pub(crate) fn settle_tool(&mut self, tool_id: &str, status: ToolStatus) {
+        self.messages_panel.settle_tool(tool_id, status);
+    }
+
+    pub(crate) fn set_tool_background(&mut self, tool_id: &str, badge: BackgroundBadge) {
+        self.messages_panel.set_tool_background(tool_id, badge);
+    }
+
+    pub(crate) fn set_background_outcome(&mut self, tool_id: &str, outcome: BackgroundOutcome) {
+        self.messages_panel.set_background_outcome(tool_id, outcome);
+    }
+
+    pub(crate) fn has_background_badge(&self, tool_id: &str) -> bool {
+        self.messages_panel.has_background_badge(tool_id)
+    }
+
+    pub(crate) fn background_badges(&self) -> Vec<BackgroundBadge> {
+        self.messages_panel.background_badges()
+    }
+
     pub fn load_messages(&mut self, msgs: Vec<DisplayMessage>) {
+        self.running_calls.clear();
         self.messages_panel.load_messages(msgs);
+    }
+
+    /// Whether the transcript already shows what the subagent was asked.
+    pub(crate) fn has_user_message(&self) -> bool {
+        self.messages_panel.has_user_message()
     }
 
     pub fn push_user_message(&mut self, text: impl Into<String>) {
@@ -576,8 +766,13 @@ pub fn history_to_display(
     for item in display_order(messages) {
         let msg = match item {
             DisplayItem::Message(msg) => msg,
-            DisplayItem::ObservationLine { text, .. } => {
-                display.push(DisplayMessage::new(DisplayRole::Notice, text.to_owned()));
+            DisplayItem::ObservationLine { index, text } => {
+                let message = &messages[index];
+                display.push(task_notice(
+                    text.to_owned(),
+                    observation_detail(message).map(str::to_owned),
+                    message.settles.as_ref().map(|settled| settled.end.into()),
+                ));
                 continue;
             }
         };
@@ -699,6 +894,11 @@ pub fn history_to_display(
                                 render_header: None,
                                 snapshot_theme_gen: 0,
                                 thinking_expanded: false,
+                                movable: false,
+                                background: None,
+                                detail: None,
+                                detail_expanded: false,
+                                task_end: None,
                             });
                         }
                         _ => {}
@@ -708,6 +908,22 @@ pub fn history_to_display(
         }
     }
     (display, restore_items)
+}
+
+fn notice(text: String, detail: Option<String>) -> DisplayMessage {
+    task_notice(text, detail, None)
+}
+
+fn task_notice(
+    text: String,
+    detail: Option<String>,
+    task_end: Option<BackgroundOutcome>,
+) -> DisplayMessage {
+    DisplayMessage {
+        detail,
+        task_end,
+        ..DisplayMessage::new(DisplayRole::Notice, text)
+    }
 }
 
 /// `ToolResult` is gone after session load, so we rebuild from
@@ -824,9 +1040,11 @@ fn build_tool_results_map(messages: &[Message]) -> HashMap<&str, (bool, &str)> {
 mod tests {
     use super::*;
     use crate::components::IMAGE_PLACEHOLDER;
-    use maki_agent::{AgentEvent, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent};
+    use maki_agent::{
+        AgentEvent, RunTotals, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
+    };
     use maki_config::UiConfig;
-    use maki_providers::ImageMediaType;
+    use maki_providers::{ImageMediaType, TaskEnd, TaskSettled};
     use test_case::test_case;
 
     const IMAGE_DATA: &str = "dGVzdA==";
@@ -969,6 +1187,7 @@ mod tests {
             is_error: false,
             annotation: None,
             written_path,
+            backgrounded: false,
         }))
     }
 
@@ -999,6 +1218,7 @@ mod tests {
     const REPLY_TEXT: &str = "on it";
     const NOTICE_BODY: &str = "Background task find auth finished:\n\nok";
     const NOTICE_LINE: &str = "Background agent finished: find auth";
+    const TASK_PLUGIN: &str = "monitor";
 
     fn chat() -> Chat {
         Chat::new(
@@ -1021,11 +1241,7 @@ mod tests {
     }
 
     fn end(chat: &mut Chat, outcome: TaskOutcome) {
-        let text = match outcome {
-            TaskOutcome::Error => ERROR_TEXT,
-            TaskOutcome::Unknown | TaskOutcome::Done => DONE_TEXT,
-        };
-        chat.mark_finished(outcome, text);
+        chat.mark_finished(outcome, outcome.text());
     }
 
     fn text_delta(chat: &mut Chat, text: &str) {
@@ -1171,6 +1387,35 @@ mod tests {
             .map(|d| (d.role.clone(), d.text.as_str()))
             .collect();
         assert_eq!(shown, expected);
+    }
+
+    const NOTICE_OUTPUT: &str = "ok";
+
+    /// The line already names the task, so a background result unfolds to
+    /// its output alone, and its dot says how the task ended.
+    #[test_case(Some(TaskEnd::Failed), NOTICE_OUTPUT, Some(BackgroundOutcome::Error) ; "a_result")]
+    #[test_case(None, NOTICE_BODY, None ; "a_plain_observation")]
+    fn a_restored_notice_unfolds_to_what_it_reports(
+        end: Option<TaskEnd>,
+        detail: &str,
+        task_end: Option<BackgroundOutcome>,
+    ) {
+        let mut observation = Message::observation(NOTICE_BODY.into());
+        observation.display_text = Some(NOTICE_LINE.into());
+        observation.settles = end.map(|end| TaskSettled {
+            task: TASK_ID.into(),
+            end,
+        });
+
+        let display = history_to_display(
+            &[observation],
+            &empty_outputs(),
+            &ToolOutputLines::default(),
+        )
+        .0;
+
+        assert_eq!(display[0].detail.as_deref(), Some(detail));
+        assert_eq!(display[0].task_end, task_end);
     }
 
     fn tool_use_pair(
@@ -1593,6 +1838,27 @@ mod tests {
         assert!(sub.is_finished());
         assert_eq!(sub.task_status(), TaskStatus::Error);
         assert_eq!(sub.task_id().map(|id| &**id), Some(TASK_ID));
+    }
+
+    /// Once its run ends, only another run brings a task back. A woken run
+    /// opens with no prompt, and what trails a run says nothing of the next.
+    #[test_case(AgentEvent::TextDelta { text: USER_TEXT.into() }, TaskStatus::Working ; "a_run_streams")]
+    #[test_case(AgentEvent::ObservationLine { text: USER_TEXT.into(), detail: None, end: None }, TaskStatus::Working ; "a_woken_run_lands_its_notice")]
+    #[test_case(AgentEvent::SubagentHistory { tool_use_id: TASK_ID.into(), messages: Vec::new() }, TaskStatus::Idle ; "transcript_trails_the_run")]
+    #[test_case(AgentEvent::StreamClosed, TaskStatus::Idle ; "close_trails_the_run")]
+    fn only_a_run_event_brings_an_idle_task_back(event: AgentEvent, status: TaskStatus) {
+        let mut sub = subagent_chat();
+        sub.plugin = Some(TASK_PLUGIN.into());
+        sub.track_run(&AgentEvent::Error {
+            message: ERROR_TEXT.into(),
+            auth: false,
+            totals: RunTotals::default(),
+        });
+        assert_eq!(sub.task_status(), TaskStatus::Idle);
+
+        sub.track_run(&event);
+
+        assert_eq!(sub.task_status(), status);
     }
 
     const STEER_TEXT: &str = "keep going";

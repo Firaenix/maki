@@ -1,7 +1,5 @@
-use std::sync::atomic::Ordering;
-
 use crate::components::Overlay;
-use crate::components::input::{BORDER_ROWS, Placeholder};
+use crate::components::input::BORDER_ROWS;
 #[cfg(test)]
 use crate::components::keybindings::KeybindContext;
 use crate::components::queue_panel;
@@ -17,7 +15,13 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 
-use super::{App, Mode, Status};
+#[cfg(test)]
+use super::Status;
+use super::{App, Mode};
+
+/// A tab without an input box, a finished task's or a moved call's, has
+/// only this hint to say how to get out and where to stop it.
+pub(super) const NO_INPUT_TAB_HINT: &str = " esc back · ctrl+x tasks ";
 
 struct ViewLayout {
     msg_area: Rect,
@@ -48,8 +52,9 @@ impl App {
 
     /// Whether a plugin writing to the chat input would land in a box the
     /// user can see: nothing covering it, no form in the bottom panel, and a
-    /// {area} tall enough to leave the box a text row. An overlay counts even when it only takes the keyboard, because
-    /// the user is reading it and not the draft.
+    /// {area} tall enough to leave the box a text row. An overlay counts
+    /// even when it only takes the keyboard, because the user is reading it
+    /// and not the draft.
     ///
     /// Worked out from state on every ask rather than recorded while
     /// painting: a whole batch of wakes is handled between two frames, so a
@@ -190,10 +195,10 @@ impl App {
     }
 
     /// Returns the cell the input box drew its caret in, when it drew one at
-    /// all: a prompt, a form, a `below` split or a finished subagent's chat
-    /// all take the box off screen, and a box scrolled off its own viewport
-    /// draws without a caret. A running subagent's chat keeps the box, so a
-    /// message can be queued for that subagent while watching it.
+    /// all: a prompt, a form, a `below` split or a chat that takes no
+    /// messages all take the box off screen, and a box scrolled off its own
+    /// viewport draws without a caret. A running subagent's chat keeps the
+    /// box, so a message can be queued for that subagent while watching it.
     fn render_bottom_panel(&mut self, frame: &mut Frame, layout: &ViewLayout) -> Option<Position> {
         if self.permission_prompt.is_open() {
             self.permission_prompt.view(frame, layout.bottom_area);
@@ -217,9 +222,11 @@ impl App {
             } else {
                 layout.bottom_area
             };
+            let hint = Line::from(Span::styled(NO_INPUT_TAB_HINT, theme::current().tool_dim));
             let sep = Block::default()
                 .borders(Borders::TOP)
-                .border_style(self.separator_style());
+                .border_style(self.separator_style())
+                .title_top(hint.right_aligned());
             frame.render_widget(sep, sep_area);
         } else if self.plan_form_active() {
             self.plan_form.view(frame, layout.bottom_area);
@@ -230,15 +237,7 @@ impl App {
             for &(idx, rect) in &layout.panel_windows {
                 self.float_mgr.view_panel(frame, idx, rect);
             }
-            let placeholder = if !self.is_main_chat() {
-                Placeholder::SubagentQueue
-            } else if self.status == Status::Streaming {
-                Placeholder::Queue
-            } else if self.state.session.messages().is_empty() {
-                Placeholder::Suggestion
-            } else {
-                Placeholder::Blank
-            };
+            let placeholder = self.input_placeholder();
             let panel_hint = (self.state.mode == Mode::Plan)
                 .then(|| self.plan_form.hint_line())
                 .flatten()
@@ -308,7 +307,7 @@ impl App {
         if r.width > 0 {
             overlay_rect = r;
         }
-        let r = self.help_modal.view(frame, full);
+        let r = self.help_modal.view(frame, full, &self.keymap_reader);
         if r.width > 0 {
             overlay_rect = r;
         }
@@ -350,6 +349,7 @@ impl App {
         let (mode_label, mode_style) = self.mode_label();
         let ctx = StatusBarContext {
             status: &self.status,
+            motion: self.status_motion(),
             mode_label,
             mode_style,
             model_id: chat
@@ -367,13 +367,11 @@ impl App {
             },
             auto_scroll: chat.auto_scroll(),
             chat_name,
-            retry_info: self.retry_info.as_ref(),
             thinking_label: opts.thinking.status_label(),
             fast: opts.fast,
             workflow: self.state.workflow,
             restricted: self.trust_question.is_some(),
             yolo: self.permissions.is_yolo(),
-            restoring: self.restoring.load(Ordering::Relaxed),
         };
         self.status_bar.view(frame, status_area, &ctx);
     }
@@ -464,18 +462,14 @@ impl App {
     }
 
     fn lua_hint_line(&self) -> Option<Line<'static>> {
-        let snap = self.hints.get()?;
-        if snap.entries.is_empty() {
-            return None;
-        }
-        let mut spans = Vec::new();
-        for (_, pairs) in &snap.entries {
-            for (text, style_name) in pairs {
-                let style = theme::style_by_name(style_name);
-                spans.push(Span::styled(text.clone(), style));
-            }
-        }
-        Some(Line::from(spans))
+        let spans: Vec<_> = self
+            .hints
+            .get()?
+            .visible_in(self.state.session.id)
+            .flat_map(|entry| &entry.spans)
+            .map(|(text, style_name)| Span::styled(text.clone(), theme::style_by_name(style_name)))
+            .collect();
+        (!spans.is_empty()).then(|| Line::from(spans))
     }
 
     #[cfg(test)]

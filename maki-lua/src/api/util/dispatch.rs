@@ -166,24 +166,22 @@ mod tests {
         assert!(DepthGuard::enter(&lua, "test", SEAM, Reentry::Task).is_err());
     }
 
-    #[test]
-    fn call_swallowing_hides_errors_but_not_values() {
+    #[tokio::test]
+    async fn call_swallowing_hides_errors_but_not_values() {
         let lua = Lua::new();
         let store = crate::plugin_status::PluginStatusStore::default();
         lua.set_app_data(store.clone());
         let bad: Function = lua.load("error('boom')").into_function().unwrap();
         let ok: Function = lua.load("return 7").into_function().unwrap();
-        smol::block_on(async {
-            assert!(
-                call_swallowing::<i64>(&lua, &bad, (), SEAM, "p")
-                    .await
-                    .is_none()
-            );
-            assert_eq!(
-                call_swallowing::<i64>(&lua, &ok, (), SEAM, "p").await,
-                Some(7)
-            );
-        });
+        assert!(
+            call_swallowing::<i64>(&lua, &bad, (), SEAM, "p")
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            call_swallowing::<i64>(&lua, &ok, (), SEAM, "p").await,
+            Some(7)
+        );
         let errors = &store.snapshot()["p"].errors;
         assert_eq!(errors.len(), 1, "only the failure is kept");
         assert_eq!(errors[0].seam, SEAM);

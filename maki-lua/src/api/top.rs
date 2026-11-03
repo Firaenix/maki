@@ -15,6 +15,7 @@ use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
 use crate::api::util::command::{UiAction, ui_send};
 use crate::api::util::convert::TableExt;
 use crate::docs::FnDoc;
+use crate::plugin_permissions::Ceiling;
 use crate::plugin_status::{ErrorSeam, record_error};
 use crate::runtime::{DeferQueue, DeferredCallback, strip_traceback};
 
@@ -67,11 +68,13 @@ fn defer_fn(lua: &Lua, #[ctx] plugin: Arc<str>, callback: Function, ms: u64) -> 
         .ok_or_else(|| mlua::Error::runtime("defer queue not initialized"))?;
     let func = lua.create_registry_value(callback)?;
     let cancel = Arc::new(AtomicBool::new(false));
+    let ceiling = Ceiling::current_for(lua, &plugin);
     if let Err(rejected) = queue.push(DeferredCallback {
         func,
         delay: Duration::from_millis(ms),
         plugin,
         cancel: Arc::clone(&cancel),
+        ceiling,
     }) {
         // Reclaim the registry slot, the runtime never got the callback.
         let _ = lua.remove_registry_value(rejected.func);

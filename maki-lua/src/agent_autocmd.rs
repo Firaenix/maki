@@ -109,9 +109,15 @@ pub enum HostEvent<'a> {
     InputChanged {
         text: &'a str,
         cursor: usize,
+        anchor: Option<usize>,
         version: u64,
         source: Option<&'a str>,
         cursor_only: bool,
+    },
+    /// Not about a session: the mode is global.
+    ModeChanged {
+        old_mode: &'static str,
+        new_mode: &'static str,
     },
     FileIndexReady {
         root: Option<&'a str>,
@@ -212,7 +218,11 @@ impl HostEventKind {
             Self::TaskStopped => (&[], &["id", "plugin"]),
             Self::TaskFocusChanged => (&[], &["id"]),
             Self::ModelChanged => (&[], &["model", "previous_spec"]),
-            Self::InputChanged => (&["text"], &["cursor", "version", "source", "cursor_only"]),
+            Self::InputChanged => (
+                &["text"],
+                &["cursor", "anchor", "version", "source", "cursor_only"],
+            ),
+            Self::ModeChanged => (&[], &["old_mode", "new_mode"]),
             Self::FileIndexReady => (&[], &["root", "files", "crashed", "truncated"]),
             // Scopes name the paths or commands a tool wants, which is conversation content.
             Self::PermissionRequested => (
@@ -325,7 +335,7 @@ mod tests {
 
     use std::time::Duration;
 
-    use maki_agent::{CallRecord, ToolDoneEvent, ToolOutput, ToolStartEvent};
+    use maki_agent::{CallRecord, RunTotals, ToolDoneEvent, ToolOutput, ToolStartEvent};
     use serde_json::json;
     use test_case::test_case;
 
@@ -368,6 +378,7 @@ mod tests {
                 input: json!({ "command": TOOL_COMMAND }),
                 duration: Duration::from_millis(TOOL_MILLIS),
             })),
+            backgrounded: false,
         }))
     }
 
@@ -407,6 +418,7 @@ mod tests {
             AgentEvent::Error {
                 message: "boom".into(),
                 auth: false,
+                totals: RunTotals::default(),
             },
         ]
     }
@@ -526,9 +538,14 @@ mod tests {
             HostEventKind::InputChanged => HostEvent::InputChanged {
                 text: SAMPLE_TEXT,
                 cursor: 0,
+                anchor: Some(0),
                 version: 0,
                 source: Some(SAMPLE_TEXT),
                 cursor_only: false,
+            },
+            HostEventKind::ModeChanged => HostEvent::ModeChanged {
+                old_mode: SAMPLE_TEXT,
+                new_mode: SAMPLE_TEXT,
             },
             HostEventKind::FileIndexReady => HostEvent::FileIndexReady {
                 root: Some(SAMPLE_TEXT),

@@ -1,5 +1,5 @@
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::iter;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,6 +13,8 @@ use maki_storage::auth::{lock_credentials, plugin_auth_stamp};
 use maki_storage::id::SessionRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::task::spawn_blocking;
 use tracing::{debug, warn};
 use url::{Host, Url};
 
@@ -22,8 +24,8 @@ use crate::provider::{BoxFuture, Provider};
 use crate::spec::{BASES, ProviderRegistry, ProviderSpec};
 use crate::types::ThinkingFallback;
 use crate::{
-    AgentError, Effort, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
-    model_registry,
+    AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+    ThinkingConfig, model_registry,
 };
 
 use super::catalog;
@@ -301,6 +303,10 @@ pub enum DeclAuthority {
     /// Anything that arrived after the build: a package, a local plugin
     /// directory, `init.lua`.
     ThirdParty,
+    /// The user's own config file (`init.lua`). Runs with every permission
+    /// the user's `plugin.toml` grants, so it may register any slug maki
+    /// does not ship without a separate grant.
+    Config,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -311,10 +317,13 @@ pub enum RegisterError {
     InvalidSlug(String),
     #[error("provider slug '{0}' is already defined in providers.toml")]
     ConfiguredSlug(String),
-    #[error("provider slug '{0}' is reserved; catalog names require an explicit plugin selection")]
+    #[error("provider slug '{0}' belongs to a provider maki ships")]
     ReservedSlug(String),
-    #[error("provider '{slug}' selects plugin '{owner}' in providers.toml")]
-    SelectedOwner { slug: String, owner: String },
+    #[error(
+        "provider slug '{0}' is served by models.dev and the package was not \
+         granted it: list it under `providers` in plugin.toml and get it approved"
+    )]
+    UngrantedTakeover(String),
     #[error("provider '{slug}': {message}")]
     Credentials { slug: String, message: String },
     #[error("provider '{0}' is already registered")]
@@ -443,26 +452,8 @@ struct PluginEntry {
     auth: Arc<AuthState>,
 }
 
-#[derive(Default)]
-struct Registry {
-    entries: BTreeMap<Box<str>, Arc<PluginEntry>>,
-    selected: BTreeMap<Box<str>, String>,
-}
-
-impl Registry {
-    fn for_load() -> Self {
-        let selected = ProvidersConfig::load_or_default()
-            .providers
-            .into_iter()
-            .filter(|(slug, _)| !ProviderRegistry::is_shipped(slug))
-            .filter_map(|(slug, def)| def.plugin.map(|owner| (slug.into(), owner)))
-            .collect();
-        Registry {
-            selected,
-            ..Registry::default()
-        }
-    }
-}
+/// Ordered by slug, so every listing comes out the same each run.
+type Registry = BTreeMap<Box<str>, Arc<PluginEntry>>;
 
 type AuthCell = (Option<Arc<str>>, Arc<AuthState>);
 
@@ -474,9 +465,18 @@ static PROVIDERS: LazyLock<RwLock<Arc<Registry>>> = LazyLock::new(RwLock::defaul
 /// and open at process start so a host that loads plugins without driving the
 /// phases (tests, embedders) still registers.
 static STAGING: LazyLock<Mutex<Option<Registry>>> =
-    LazyLock::new(|| Mutex::new(Some(Registry::for_load())));
+    LazyLock::new(|| Mutex::new(Some(Registry::new())));
+/// One cell of credentials per slug, for the life of the process: see
+/// [`shared_auth`].
 /// The current owner and auth state of each slug: see [`shared_auth`].
 static AUTH: LazyLock<RwLock<HashMap<Box<str>, AuthCell>>> = LazyLock::new(RwLock::default);
+/// Slugs granted to enabled packages, kept even when their load fails so the
+/// catalog client cannot take over the slug and receive the saved key. Maps
+/// the package name to its granted slugs, so unloading the package releases
+/// exactly its own. Cleared by [`begin_load`], so a package the new load
+/// skips keeps nothing. See [`owns_slug`].
+type Granted = HashMap<Box<str>, HashSet<Box<str>>>;
+static GRANTED: LazyLock<RwLock<Granted>> = LazyLock::new(RwLock::default);
 
 /// Opens the registration window, at the top of every plugin load.
 ///
@@ -484,8 +484,34 @@ static AUTH: LazyLock<RwLock<HashMap<Box<str>, AuthCell>>> = LazyLock::new(RwLoc
 /// replacements exist would make every reader answer "unknown provider" for as
 /// long as the load takes, so [`commit_load`] swaps the whole map in one step
 /// instead.
+///
+/// Grants go with the cycle: they are cleared here and re-recorded as each
+/// package load starts, so a package this load skips (disabled or removed)
+/// keeps no slug owned past the `/reload`.
 pub fn begin_load() {
-    *STAGING.lock().unwrap() = Some(Registry::for_load());
+    *STAGING.lock().unwrap() = Some(Registry::new());
+    GRANTED.write().unwrap().clear();
+}
+
+/// Keeps the slugs of a legacy v0.6.4 `plugin =` selection in
+/// `providers.toml` owned by the named package, so the catalog client cannot
+/// take them over and receive the saved key. Returns a warning per entry
+/// telling the user to migrate: list the slug under `providers` in the
+/// package's `plugin.toml`. Call after [`begin_load`], which clears grants.
+pub fn keep_legacy_selections() -> Vec<String> {
+    let config = ProvidersConfig::load_or_default();
+    let mut warnings = Vec::new();
+    for (slug, def) in &config.providers {
+        if let Some(package) = &def.plugin {
+            keep_granted(package, std::slice::from_ref(slug));
+            warnings.push(format!(
+                "providers.toml selects package '{package}' for '{slug}'; \
+                 add '{slug}' to its `providers` list in plugin.toml and remove \
+                 the `plugin =` line"
+            ));
+        }
+    }
+    warnings
 }
 
 /// Publishes what this load registered. A load that registered nothing
@@ -498,7 +524,7 @@ pub fn commit_load() {
     let Some(staged) = STAGING.lock().unwrap().take() else {
         return;
     };
-    for entry in staged.entries.values() {
+    for entry in staged.values() {
         let slug = &entry.decl.slug;
         let api_key_env = entry.decl.api_key_env.clone().filter(|var| !var.is_empty());
         if let Err(error) = entry.auth.redeclare(
@@ -510,11 +536,7 @@ pub fn commit_load() {
             warn!(slug, %error, "provider credentials were not re-declared");
         }
     }
-    let logins = staged
-        .entries
-        .values()
-        .filter_map(|entry| entry.built.login)
-        .collect();
+    let logins = staged.values().filter_map(|e| e.built.login).collect();
     maki_config::providers::set_registered_providers(logins);
     *PROVIDERS.write().unwrap() = Arc::new(staged);
 }
@@ -528,13 +550,12 @@ pub fn discard(plugin: &str) {
         return;
     };
     let dropped: Vec<Box<str>> = staged
-        .entries
         .iter()
         .filter(|(_, entry)| entry.owner.as_deref() == Some(plugin))
         .map(|(slug, _)| slug.clone())
         .collect();
     for slug in &dropped {
-        staged.entries.remove(slug);
+        staged.remove(slug);
     }
     if !dropped.is_empty() {
         debug!(plugin, slugs = ?dropped, "discarded the declarations of a failed plugin load");
@@ -543,8 +564,15 @@ pub fn discard(plugin: &str) {
 
 /// Registers a declaration in the load in progress. A slug is registered once
 /// per load: a second declaration of it is [`RegisterError::DuplicateSlug`].
-pub fn register(reg: Registration, authority: DeclAuthority) -> Result<(), RegisterError> {
-    register_owned(reg, authority, None)
+///
+/// `takeovers` are the slugs the trust layer granted this load to register:
+/// every third-party slug must be among them; see [`register_owned`].
+pub fn register(
+    reg: Registration,
+    authority: DeclAuthority,
+    takeovers: &[String],
+) -> Result<(), RegisterError> {
+    register_owned(reg, authority, None, takeovers)
 }
 
 /// [`register`] for a Lua plugin, remembered as `plugin`'s so a load of it
@@ -553,21 +581,56 @@ pub fn register_plugin(
     plugin: Arc<str>,
     reg: Registration,
     authority: DeclAuthority,
+    takeovers: &[String],
 ) -> Result<(), RegisterError> {
-    register_owned(reg, authority, Some(plugin))
+    register_owned(reg, authority, Some(plugin), takeovers)
 }
 
 fn register_owned(
     reg: Registration,
     authority: DeclAuthority,
     owner: Option<Arc<str>>,
+    takeovers: &[String],
 ) -> Result<(), RegisterError> {
     let Registration { decl, hooks } = reg;
     let slug = decl.slug.clone();
     if !is_valid_slug(&slug) {
         return Err(RegisterError::InvalidSlug(slug));
     }
-    check_owner(&slug, authority, owner.as_deref())?;
+    // A third party on a slug maki ships would be handed the key the user
+    // saved for that provider, and would take over its models under a name
+    // the picker still labels as maki's own. A slug maki only serves from
+    // models.dev is a default the user never chose, so a plugin may replace
+    // it with the trust layer's say so, and the takeover is logged below. A
+    // bundled slug stays reserved even while its plugin is off, so turning a
+    // plugin off never frees the name.
+    let reserved = match authority {
+        DeclAuthority::Bundled => ProviderRegistry::compiled(&slug).is_some(),
+        DeclAuthority::ThirdParty | DeclAuthority::Config => ProviderRegistry::is_shipped(&slug),
+    };
+    if reserved {
+        return Err(RegisterError::ReservedSlug(slug));
+    }
+    // A granted takeover of a served name is logged.
+    if authority == DeclAuthority::ThirdParty && catalog::serves_slug(&slug) {
+        if !takeovers.contains(&slug) {
+            return Err(RegisterError::UngrantedTakeover(slug));
+        }
+        warn!(slug, "third-party plugin replaces the models.dev provider");
+    }
+    // A `providers.toml` entry only defines a provider when it sets a
+    // `protocol`, and only a third party loses the slug to it. Without one the
+    // entry just tweaks the declaration, like `[deepseek] base_url` pointing at
+    // a gateway. A bundled plugin keeps its slug either way and only gets a
+    // warning, because failing here would abort the whole bundled load and
+    // maki would not start.
+    if matches!(authority, DeclAuthority::ThirdParty | DeclAuthority::Config)
+        && ProvidersConfig::load_or_default()
+            .get(&slug)
+            .is_some_and(|def| def.protocol.is_some())
+    {
+        return Err(RegisterError::ConfiguredSlug(slug));
+    }
     if decl.net_hosts.is_empty() {
         return Err(RegisterError::NoNetHosts(slug));
     }
@@ -589,7 +652,7 @@ fn register_owned(
     // fails the plugin that registered the slug. A bundled provider only
     // fails later, in its own [`create`], since failing the bundled load would
     // stop maki from starting over a provider the user may never pick.
-    if authority == DeclAuthority::ThirdParty {
+    if matches!(authority, DeclAuthority::ThirdParty | DeclAuthority::Config) {
         ResolvedAuth::new(&slug, Vec::new()).map_err(|e| RegisterError::Credentials {
             slug: slug.clone(),
             message: e.to_string(),
@@ -600,7 +663,7 @@ fn register_owned(
     let Some(staged) = staging.as_mut() else {
         return Err(RegisterError::Closed(slug));
     };
-    let Entry::Vacant(vacant) = staged.entries.entry(slug.as_str().into()) else {
+    let Entry::Vacant(vacant) = staged.entry(slug.as_str().into()) else {
         return Err(RegisterError::DuplicateSlug(slug));
     };
     debug!(
@@ -621,45 +684,6 @@ fn register_owned(
         target,
         hooks,
     }));
-    Ok(())
-}
-
-fn check_owner(
-    slug: &str,
-    authority: DeclAuthority,
-    owner: Option<&str>,
-) -> Result<(), RegisterError> {
-    // Selecting a package is explicit consent to use this name's saved key.
-    // Catalog metadata alone cannot select that package.
-    let reserved = match authority {
-        DeclAuthority::Bundled => ProviderRegistry::compiled(slug).is_some(),
-        DeclAuthority::ThirdParty => ProviderRegistry::is_shipped(slug),
-    };
-    if reserved {
-        return Err(RegisterError::ReservedSlug(slug.into()));
-    }
-    if authority == DeclAuthority::ThirdParty {
-        let config = ProvidersConfig::load_or_default();
-        let def = config.get(slug);
-        let selected = STAGING
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|registry| registry.selected.get(slug).cloned());
-        if let Some(selected) = selected {
-            if owner != Some(selected.as_str()) {
-                return Err(RegisterError::SelectedOwner {
-                    slug: slug.into(),
-                    owner: selected,
-                });
-            }
-        } else if catalog::serves_slug(slug) {
-            return Err(RegisterError::ReservedSlug(slug.into()));
-        }
-        if def.is_some_and(|def| def.protocol.is_some()) {
-            return Err(RegisterError::ConfiguredSlug(slug.into()));
-        }
-    }
     Ok(())
 }
 
@@ -702,8 +726,11 @@ fn target_of(decl: &ProviderDecl, hooks: &ProviderHooks) -> Result<Target, Regis
     Ok(target)
 }
 
-/// Reloading the same owner keeps its token and single-flight gate. Changing
-/// owner replaces the cell, while an in-flight request keeps its old state.
+/// One cell of credentials per slug, for the life of the process. Reusing it
+/// is what carries a token across a reload, and what stops a reload from
+/// minting a second [`RefreshGate`] for a slug whose token is in flight.
+/// Reusing stops at the owner, though: a slug another package took over gets
+/// a fresh cell, so a token one of them minted never serves the other.
 fn shared_auth(slug: &str, owner: Option<Arc<str>>) -> Arc<AuthState> {
     let mut states = AUTH.write().unwrap();
     let (current_owner, state) = states
@@ -721,15 +748,12 @@ fn entries() -> Arc<Registry> {
 }
 
 fn entry(slug: &str) -> Option<Arc<PluginEntry>> {
-    entries().entries.get(slug).cloned()
+    entries().get(slug).cloned()
 }
 
 fn unknown(slug: &str) -> AgentError {
     AgentError::Config {
-        message: match entries().selected.get(slug) {
-            Some(owner) => format!("selected plugin '{owner}' for provider '{slug}' is not loaded"),
-            None => format!("unknown plugin provider '{slug}'"),
-        },
+        message: format!("unknown plugin provider '{slug}'"),
     }
 }
 
@@ -932,14 +956,14 @@ impl AuthState {
         purpose: AuthPurpose,
     ) -> Result<Recovery, AgentError> {
         let owned = slug.to_owned();
-        let (_lock, stored) = smol::unblock(move || match StateDir::resolve() {
+        let (_lock, stored) = spawn_blocking(move || match StateDir::resolve() {
             Ok(dir) => (
                 Some(lock_credentials(&dir, &owned)),
                 plugin_auth_stamp(&dir, &owned),
             ),
             Err(_) => (None, None),
         })
-        .await;
+        .await?;
         let purpose = match purpose {
             AuthPurpose::Refresh
                 if self.gate.ran() && *self.store_seen.lock().unwrap() != stored =>
@@ -970,7 +994,7 @@ impl AuthState {
             .into_resolved(slug, &self.hosts())?;
         let owned = slug.to_owned();
         let stamp =
-            smol::unblock(move || plugin_auth_stamp(&StateDir::resolve().ok()?, &owned)).await;
+            spawn_blocking(move || plugin_auth_stamp(&StateDir::resolve().ok()?, &owned)).await?;
         let mut current = self.current.lock().unwrap();
         // A hook that omits base_url keeps the resolved one. Falling back to
         // the provider's default origin would silently repoint the token.
@@ -1025,8 +1049,8 @@ impl PluginEntry {
         };
         let slug = self.decl.slug.clone();
         // A reload re-reads what is stored, so it spends no token. It waits
-        // for neither the gate nor the cross-process lock, and it runs under
-        // `block_on` on the ui thread, where either wait would freeze the ui.
+        // for neither the gate nor the cross-process lock: it runs first on a
+        // respawned agent task, and either wait would hold the first request.
         if matches!(purpose, AuthPurpose::Reload) {
             self.auth.mint(&slug, hook.as_ref(), purpose).await?;
             return Ok(Recovery::Adopted);
@@ -1037,14 +1061,13 @@ impl PluginEntry {
         // hook still holds the token nor drop what the hook minted with it.
         let auth = Arc::clone(&self.auth);
         let (done, outcome) = flume::bounded(1);
-        smol::spawn(async move {
+        tokio::spawn(async move {
             let minted = auth
                 .gate
                 .single_flight(seen, auth.locked_mint(&slug, hook.as_ref(), purpose))
                 .await;
             let _ = done.send(minted);
-        })
-        .detach();
+        });
         outcome
             .recv_async()
             .await
@@ -1064,7 +1087,7 @@ impl PluginEntry {
 /// long after that refresh finished, and it must not refresh again.
 #[derive(Default)]
 struct RefreshGate {
-    lock: smol::lock::Mutex<()>,
+    lock: AsyncMutex<()>,
     /// Bumped by every hook run that went through the gate, so not by a
     /// reload. We count instead of comparing tokens because a refresh can hand
     /// back the very same bytes.
@@ -1244,7 +1267,7 @@ impl Provider for PluginProvider {
                         }
                         forwarded
                     };
-                    let (result, forwarded) = futures_lite::future::zip(attempt, forward).await;
+                    let (result, forwarded) = tokio::join!(attempt, forward);
                     match result {
                         // The plugin mints credentials without the user, so a
                         // dead token costs a silent recovery instead of a
@@ -1325,6 +1348,10 @@ impl Provider for PluginProvider {
     /// included, still applies under a declaration that wraps it.
     fn adjust_model(&self, model: &mut Model) {
         self.inner.adjust_model(model);
+    }
+
+    fn served_context_window<'a>(&'a self, model: &'a Model) -> BoxFuture<'a, Option<u32>> {
+        self.inner.served_context_window(model)
     }
 }
 
@@ -1420,7 +1447,12 @@ pub fn effective_base_url(slug: &str) -> Option<String> {
 pub fn vouched_origin(slug: &str) -> Option<Url> {
     let entry = entry(slug)?;
     let (base_url, chosen_by) = resolve_base_url(&entry)?;
-    if chosen_by == OriginChooser::Plugin && entry.authority == DeclAuthority::ThirdParty {
+    if chosen_by == OriginChooser::Plugin
+        && matches!(
+            entry.authority,
+            DeclAuthority::ThirdParty | DeclAuthority::Config
+        )
+    {
         return None;
     }
     Url::parse(&base_url).ok()
@@ -1463,13 +1495,17 @@ pub fn effective_authority(slug: &str) -> Option<String> {
     ))
 }
 
-/// What a codec declaration sends for `adaptive`. One that names no
+/// What a codec declaration sends for `choice`. One that names no
 /// `openai.thinking` dialect leaves the mode to the model's own fields, which
 /// send nothing for a mode they do not spell.
-fn declared_adaptive_effort(model: &Model) -> Option<Effort> {
-    let entry = entry(&model.provider)?;
-    let wire = entry.decl.openai.as_ref()?.thinking.as_ref()?;
-    wire.adaptive_effort(model_registry::discovered(&model.provider, &model.id).as_ref())
+fn declared_sends_thinking(model: &Model, choice: ThinkingConfig) -> ThinkingConfig {
+    let sent = || {
+        let entry = entry(&model.provider)?;
+        let wire = entry.decl.openai.as_ref()?.thinking.as_ref()?;
+        let discovered = model_registry::discovered(&model.provider, &model.id);
+        Some(wire.sends(discovered.as_ref(), choice))
+    };
+    sent().unwrap_or(choice)
 }
 
 pub fn spec(slug: &str) -> Option<&'static ProviderSpec> {
@@ -1528,37 +1564,57 @@ pub fn build_with_auth(
 }
 
 pub fn specs() -> Vec<&'static ProviderSpec> {
-    entries()
-        .entries
-        .values()
-        .map(|entry| entry.built.spec)
-        .collect()
+    entries().values().map(|entry| entry.built.spec).collect()
 }
 
 /// The providers whose `maki auth login` runs a `login` hook.
 pub fn auth_providers() -> Vec<(String, String)> {
     entries()
-        .entries
         .values()
         .filter(|entry| entry.hooks.login.is_some())
         .map(|entry| (entry.decl.slug.clone(), entry.decl.display_name.clone()))
         .collect()
 }
 
-/// Includes selected packages that failed to register, so they cannot fall
-/// back to a catalog client until a reload removes the selection.
-pub fn owns_slug(slug: &str) -> bool {
-    let registry = entries();
-    registry.entries.contains_key(slug) || registry.selected.contains_key(slug)
-}
-
 pub fn is_registered(slug: &str) -> bool {
-    entry(slug).is_some()
+    entries().contains_key(slug)
 }
 
-/// Blocks, so it belongs to the cli thread and never to the plugin host's: the
-/// hook it drives runs on the host, and waiting for it from there deadlocks.
-pub fn login(slug: &str) -> Result<(), AgentError> {
+/// Records the slugs granted to an enabled package, so they stay owned even
+/// when the package's load fails: the catalog client must not take over the
+/// slug and receive the key the user saved for it. Called before the load
+/// attempt, so a failure does not lose the grant.
+pub fn keep_granted(package: &str, slugs: &[String]) {
+    let mut granted = GRANTED.write().unwrap();
+    let set = granted.entry(package.into()).or_default();
+    for slug in slugs {
+        set.insert(slug.as_str().into());
+    }
+}
+
+/// Drops the slugs of a package being unloaded, so a later catalog fetch may
+/// serve them again.
+pub fn release_granted(package: &str) {
+    GRANTED.write().unwrap().remove(package);
+}
+
+/// Whether a slug is owned by a plugin: registered, or granted to an enabled
+/// package whose load failed. The catalog client must not serve a slug a
+/// package owns, because it would receive the key saved for that name.
+pub fn owns_slug(slug: &str) -> bool {
+    if entries().contains_key(slug) {
+        return true;
+    }
+    GRANTED
+        .read()
+        .unwrap()
+        .values()
+        .any(|slugs| slugs.contains(slug))
+}
+
+/// The hook runs on the plugin host, so awaiting this from the host's own
+/// thread deadlocks: only the cli drives it.
+pub async fn login(slug: &str) -> Result<(), AgentError> {
     let entry = entry(slug).ok_or_else(|| unknown(slug))?;
     let hook = entry
         .hooks
@@ -1567,17 +1623,17 @@ pub fn login(slug: &str) -> Result<(), AgentError> {
         .ok_or_else(|| AgentError::Config {
             message: format!("provider '{slug}' does not support login (uses API key)"),
         })?;
-    smol::block_on(hook.call(()))
+    hook.call(()).await
 }
 
 /// Runs the `logout` hook, `false` when no registered provider defines one.
 /// Forgetting what maki stored never needs one, so the hook is only for what
 /// maki cannot do itself, like revoking a token upstream.
-pub fn logout(slug: &str) -> Result<bool, AgentError> {
+pub async fn logout(slug: &str) -> Result<bool, AgentError> {
     let Some(hook) = entry(slug).and_then(|entry| entry.hooks.logout.clone()) else {
         return Ok(false);
     };
-    smol::block_on(hook.call(()))?;
+    hook.call(()).await?;
     Ok(true)
 }
 
@@ -1586,21 +1642,21 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
-    use futures_lite::future::zip;
+    use futures::FutureExt;
     use maki_config::PROVIDER_BUILTINS;
-    use maki_config::providers::{ProviderDef, base_url_env_var};
+    use maki_config::providers::base_url_env_var;
     use maki_storage::auth::{PluginAuthData, save_plugin_auth};
     use tempfile::TempDir;
     use test_case::test_case;
 
     use super::spec::{UNKNOWN_MODEL_CONTEXT_WINDOW, UNKNOWN_MODEL_MAX_OUTPUT};
     use super::*;
-    use crate::ThinkingConfig;
     use crate::model::ModelTier;
     use crate::model_registry;
     use crate::retry::RetryKind;
     use crate::test_support::{Canned, serve};
     use crate::types::dialect;
+    use crate::{Effort, ThinkingConfig};
 
     const AUTH_HEADER: &str = "authorization";
     const CONSTANT_TOKEN: &str = "Bearer constant";
@@ -1681,16 +1737,19 @@ mod tests {
 
     /// A test registers the way a plugin load does: open the window, register,
     /// publish. Entries from the previous load go, exactly as on a `/reload`.
+    /// The slug is granted, which a takeover test overrides to cover.
     fn register_loaded(reg: Registration) -> Result<(), RegisterError> {
-        register_loaded_as(reg, DeclAuthority::ThirdParty)
+        let slug = reg.decl.slug.clone();
+        register_loaded_as(reg, DeclAuthority::ThirdParty, &[slug])
     }
 
     fn register_loaded_as(
         reg: Registration,
         authority: DeclAuthority,
+        takeovers: &[String],
     ) -> Result<(), RegisterError> {
         begin_load();
-        let result = register(reg, authority);
+        let result = register(reg, authority, takeovers);
         commit_load();
         result
     }
@@ -1735,7 +1794,7 @@ mod tests {
         /// ahead of the hook, which is the caller's business and not the gate's.
         fn call(&self, purpose: AuthPurpose) -> BoxFuture<'_, Result<PluginAuth, AgentError>> {
             Box::pin(async move {
-                smol::future::yield_now().await;
+                tokio::task::yield_now().await;
                 let run = {
                     let mut purposes = self.purposes.lock().unwrap();
                     purposes.push(purpose);
@@ -1896,7 +1955,8 @@ mod tests {
     /// the gate trusts its counter and not a diff.
     #[test_case(true, FIRST_TOKEN, ROTATED_TOKEN ; "rotating_token")]
     #[test_case(false, CONSTANT_TOKEN, CONSTANT_TOKEN ; "unchanged_token")]
-    fn refresh_gate_single_flights_concurrent_callers(
+    #[tokio::test]
+    async fn refresh_gate_single_flights_concurrent_callers(
         rotating: bool,
         after_one: &str,
         after_two: &str,
@@ -1907,24 +1967,21 @@ mod tests {
             ..ProviderHooks::default()
         });
 
-        smol::block_on(async {
-            let (a, b) = zip(
-                entry.run_auth(AuthPurpose::Refresh),
-                entry.run_auth(AuthPurpose::Refresh),
-            )
-            .await;
-            a.unwrap();
-            b.unwrap();
+        let (a, b) = tokio::join!(
+            entry.run_auth(AuthPurpose::Refresh),
+            entry.run_auth(AuthPurpose::Refresh),
+        );
+        a.unwrap();
+        b.unwrap();
 
-            assert_eq!(hook.calls(), 1, "{ONE_HOOK_CALL}");
-            assert_eq!(token(&entry), after_one);
+        assert_eq!(hook.calls(), 1, "{ONE_HOOK_CALL}");
+        assert_eq!(token(&entry), after_one);
 
-            // A 401 on the credentials from before that refresh shows up late.
-            entry.run_auth_since(AuthPurpose::Refresh, 0).await.unwrap();
-            assert_eq!(hook.calls(), 1, "{STALE_401_REFRESHED}");
+        // A 401 on the credentials from before that refresh shows up late.
+        entry.run_auth_since(AuthPurpose::Refresh, 0).await.unwrap();
+        assert_eq!(hook.calls(), 1, "{STALE_401_REFRESHED}");
 
-            entry.run_auth(AuthPurpose::Refresh).await.unwrap();
-        });
+        entry.run_auth(AuthPurpose::Refresh).await.unwrap();
 
         assert_eq!(hook.calls(), 2, "{SINGLE_FLIGHT_RERUN}");
         assert_eq!(token(&entry), after_two);
@@ -1933,8 +1990,8 @@ mod tests {
     /// Another maki process rotated the store and so killed our token. The
     /// first refresh only reloads, to pick up the new one. Once we have seen
     /// the store, the next 401 is ours to refresh.
-    #[test]
-    fn a_refresh_after_a_foreign_rotation_reloads() {
+    #[tokio::test]
+    async fn a_refresh_after_a_foreign_rotation_reloads() {
         let _home = isolated_home();
         let hook = Arc::new(CountingAuth::new(true));
         let entry = entry_with(ProviderHooks {
@@ -1942,13 +1999,11 @@ mod tests {
             ..ProviderHooks::default()
         });
 
-        smol::block_on(async {
-            entry.run_auth(AuthPurpose::Resolve).await.unwrap();
-            let dir = StateDir::resolve().unwrap();
-            save_plugin_auth(&dir, &entry.decl.slug, &PluginAuthData::default()).unwrap();
-            entry.run_auth(AuthPurpose::Refresh).await.unwrap();
-            entry.run_auth(AuthPurpose::Refresh).await.unwrap();
-        });
+        entry.run_auth(AuthPurpose::Resolve).await.unwrap();
+        let dir = StateDir::resolve().unwrap();
+        save_plugin_auth(&dir, &entry.decl.slug, &PluginAuthData::default()).unwrap();
+        entry.run_auth(AuthPurpose::Refresh).await.unwrap();
+        entry.run_auth(AuthPurpose::Refresh).await.unwrap();
 
         assert_eq!(
             hook.purposes(),
@@ -1963,18 +2018,16 @@ mod tests {
 
     /// A respawn reloads before any request, and the plugin may only do some
     /// of its work on resolve.
-    #[test]
-    fn a_reload_before_the_first_request_still_resolves() {
+    #[tokio::test]
+    async fn a_reload_before_the_first_request_still_resolves() {
         let hook = Arc::new(CountingAuth::new(true));
         let entry = entry_with(ProviderHooks {
             auth: Some(hook.clone()),
             ..ProviderHooks::default()
         });
 
-        smol::block_on(async {
-            entry.run_auth(AuthPurpose::Reload).await.unwrap();
-            entry.ensure_auth().await.unwrap();
-        });
+        entry.run_auth(AuthPurpose::Reload).await.unwrap();
+        entry.ensure_auth().await.unwrap();
 
         assert_eq!(
             hook.purposes(),
@@ -1983,8 +2036,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn owner_changes_do_not_reuse_another_packages_auth_gate() {
+    /// One package's token must not survive being replaced by another. The
+    /// same owner keeps its gate across the reload, a different one starts a
+    /// fresh cell, and returning to the first does not resurrect its token.
+    #[tokio::test]
+    async fn owner_changes_do_not_reuse_another_packages_auth_gate() {
         const SLUG: &str = "owner-auth-test";
         const FIRST_OWNER: &str = "first-owner";
         const NEXT_OWNER: &str = "next-owner";
@@ -2010,22 +2066,17 @@ mod tests {
             reg.decl.base_url = Some(base.clone());
             reg.decl.net_hosts = vec![HOST.into()];
             reg.hooks.auth = Some(hook.clone());
-            let mut config = ProvidersConfig::default();
-            config.upsert(
-                SLUG.into(),
-                ProviderDef {
-                    plugin: Some(owner.into()),
-                    ..ProviderDef::default()
-                },
-            );
-            config.save().unwrap();
             begin_load();
-            register_plugin(Arc::from(owner), reg, DeclAuthority::ThirdParty).unwrap();
+            register_plugin(
+                Arc::from(owner),
+                reg,
+                DeclAuthority::ThirdParty,
+                &[SLUG.to_owned()],
+            )
+            .unwrap();
             commit_load();
             let provider = create(SLUG, Timeouts::default()).unwrap();
-            config.providers.get_mut(SLUG).unwrap().plugin = Some(NEXT_OWNER.into());
-            config.save().unwrap();
-            smol::block_on(provider.list_models()).unwrap();
+            provider.list_models().await.unwrap();
         }
         assert_eq!(first.calls(), 1);
         assert_eq!(next.calls(), 1);
@@ -2041,8 +2092,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reload_keeps_the_auth_state() {
+    #[tokio::test]
+    async fn reload_keeps_the_auth_state() {
         const SLUG: &str = "reload-plugin";
         let hook = Arc::new(CountingAuth::new(true));
         let with_hook = || {
@@ -2060,15 +2111,12 @@ mod tests {
             Arc::ptr_eq(&before.auth, &after.auth),
             "the new entry picks up the credentials the old one was using"
         );
-        smol::block_on(async {
-            let (a, b) = zip(
-                before.run_auth(AuthPurpose::Refresh),
-                after.run_auth(AuthPurpose::Refresh),
-            )
-            .await;
-            a.unwrap();
-            b.unwrap();
-        });
+        let (a, b) = tokio::join!(
+            before.run_auth(AuthPurpose::Refresh),
+            after.run_auth(AuthPurpose::Refresh),
+        );
+        a.unwrap();
+        b.unwrap();
 
         assert_eq!(hook.calls(), 1, "{ONE_HOOK_CALL}");
     }
@@ -2285,12 +2333,14 @@ mod tests {
             Arc::from(PLUGIN),
             registration(SLUG),
             DeclAuthority::ThirdParty,
+            &[SLUG.to_owned()],
         )
         .unwrap();
         register_plugin(
             Arc::from(BYSTANDER),
             registration(BYSTANDER),
             DeclAuthority::ThirdParty,
+            &[BYSTANDER.to_owned()],
         )
         .unwrap();
         discard(PLUGIN);
@@ -2300,11 +2350,54 @@ mod tests {
         assert!(is_registered(BYSTANDER), "{BYSTANDER_LOST}");
     }
 
+    /// A granted slug stays owned when the package's load fails, so the
+    /// catalog client cannot take it over and receive the saved key.
+    /// Unloading the package releases the slug again.
+    #[test]
+    fn a_failed_load_keeps_its_granted_slugs_owned() {
+        const PACKAGE: &str = "failed-package";
+        const SLUG: &str = "granted-but-failed";
+        const OTHER: &str = "other-package-slug";
+        const OWNED_WHILE_FAILED: &str = "a granted slug must stay owned when the load fails";
+        const RELEASED_ON_UNLOAD: &str = "unloading the package must release its slugs";
+
+        keep_granted(PACKAGE, &[SLUG.to_owned()]);
+        keep_granted("other-package", &[OTHER.to_owned()]);
+
+        assert!(owns_slug(SLUG), "{OWNED_WHILE_FAILED}");
+        assert!(owns_slug(OTHER), "another package's grant is independent");
+
+        release_granted(PACKAGE);
+        assert!(!owns_slug(SLUG), "{RELEASED_ON_UNLOAD}");
+        assert!(
+            owns_slug(OTHER),
+            "unloading one package leaves another's grant"
+        );
+
+        release_granted("other-package");
+    }
+
+    /// Grants are tied to the load cycle: [`begin_load`] drops them, so a
+    /// package a `/reload` skips (disabled or removed) keeps no slug owned.
+    #[test]
+    fn a_new_load_cycle_drops_stale_grants() {
+        const STALE: &str = "stale-grant-slug";
+        const OWNED: &str = "a granted slug is owned";
+        const RESET: &str = "a new load cycle must drop the previous grants";
+
+        keep_granted("gone-package", &[STALE.to_owned()]);
+        assert!(owns_slug(STALE), "{OWNED}");
+
+        begin_load();
+        commit_load();
+        assert!(!owns_slug(STALE), "{RESET}");
+    }
+
     /// A refresh spends a single-use token, so the caller going away (an Esc,
     /// a turn that timed out) must not abandon it halfway: the hook runs to
     /// the end, what it minted lands, and the gate stays shut until it has.
-    #[test]
-    fn a_refresh_outlives_the_caller_that_started_it() {
+    #[tokio::test]
+    async fn a_refresh_outlives_the_caller_that_started_it() {
         const MINT_DROPPED: &str = "what the abandoned refresh minted never landed";
         let (entered_tx, entered) = flume::bounded(1);
         let (release, released) = flume::bounded(1);
@@ -2318,14 +2411,11 @@ mod tests {
             ..ProviderHooks::default()
         });
 
-        smol::block_on(async {
-            let abandoned =
-                futures_lite::future::poll_once(entry.run_auth(AuthPurpose::Refresh)).await;
-            assert!(abandoned.is_none());
-            entered.recv_async().await.unwrap();
-            release.send(()).unwrap();
-            let _gate = entry.auth.gate.lock.lock().await;
-        });
+        let abandoned = entry.run_auth(AuthPurpose::Refresh).now_or_never();
+        assert!(abandoned.is_none());
+        entered.recv_async().await.unwrap();
+        release.send(()).unwrap();
+        let _gate = entry.auth.gate.lock.lock().await;
 
         assert_eq!(hook.calls.load(Ordering::Acquire), 1, "{ONE_HOOK_CALL}");
         assert_eq!(token(&entry), FIRST_TOKEN, "{MINT_DROPPED}");
@@ -2338,7 +2428,12 @@ mod tests {
     /// there instead of spending another.
     #[test_case("hookless-401-plugin", false, 1 ; "hookless_does_not_replay")]
     #[test_case("hooked-401-plugin", true, 2 ; "hooked_refreshes_once")]
-    fn a_401_is_replayed_only_on_fresh_credentials(slug: &str, hooked: bool, expected: usize) {
+    #[tokio::test]
+    async fn a_401_is_replayed_only_on_fresh_credentials(
+        slug: &str,
+        hooked: bool,
+        expected: usize,
+    ) {
         const KEY_ENV: &str = "MAKI_TEST_401_KEY";
         const KEY: &str = "sk-rejected";
         const PROMPT: &str = "read a.txt";
@@ -2366,15 +2461,17 @@ mod tests {
         let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
         let messages = [Message::user(PROMPT.to_owned())];
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(provider.stream_message(
-            &model,
-            &messages,
-            "",
-            &serde_json::json!([]),
-            &tx,
-            RequestOptions::default(),
-            None,
-        ));
+        let result = provider
+            .stream_message(
+                &model,
+                &messages,
+                "",
+                &serde_json::json!([]),
+                &tx,
+                RequestOptions::default(),
+                None,
+            )
+            .await;
 
         assert!(
             result.as_ref().err().is_some_and(AgentError::is_auth_error),
@@ -2387,7 +2484,8 @@ mod tests {
     /// declared origin a key meant for a gateway went to the vendor instead.
     #[test_case(Protocol::Anthropic, "anthropic-origin-plugin" ; "anthropic")]
     #[test_case(Protocol::Google, "google-origin-plugin" ; "google")]
-    fn every_codec_posts_to_the_declared_origin(protocol: Protocol, slug: &str) {
+    #[tokio::test]
+    async fn every_codec_posts_to_the_declared_origin(protocol: Protocol, slug: &str) {
         const ENV_VAR: &str = "MAKI_TEST_CODEC_ORIGIN_KEY";
         const KEY: &str = "sk-gateway";
         const PROMPT: &str = "hi";
@@ -2411,15 +2509,17 @@ mod tests {
         let provider = create(slug, Timeouts::default()).unwrap();
         let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
         let (tx, _rx) = flume::unbounded();
-        let _ = smol::block_on(provider.stream_message(
-            &model,
-            &[Message::user(PROMPT.to_owned())],
-            "",
-            &serde_json::json!([]),
-            &tx,
-            RequestOptions::default(),
-            None,
-        ));
+        let _ = provider
+            .stream_message(
+                &model,
+                &[Message::user(PROMPT.to_owned())],
+                "",
+                &serde_json::json!([]),
+                &tx,
+                RequestOptions::default(),
+                None,
+            )
+            .await;
 
         assert_eq!(requests.lock().unwrap().len(), 1, "{MISSED_ORIGIN}");
     }
@@ -2438,7 +2538,7 @@ mod tests {
         if let Some(configured) = configured {
             unsafe { std::env::set_var(base_url_env_var(SLUG), configured) };
         }
-        register_loaded_as(registration(SLUG), authority).unwrap();
+        register_loaded_as(registration(SLUG), authority, &[SLUG.to_owned()]).unwrap();
 
         let expected = expected.map(|url| Url::parse(url).unwrap());
         assert_eq!(vouched_origin(SLUG), expected);
@@ -2451,7 +2551,12 @@ mod tests {
         if let Some(configured) = configured {
             unsafe { std::env::set_var(base_url_env_var(SLUG), configured) };
         }
-        register_loaded_as(registration(SLUG), DeclAuthority::ThirdParty).unwrap();
+        register_loaded_as(
+            registration(SLUG),
+            DeclAuthority::ThirdParty,
+            &[SLUG.to_owned()],
+        )
+        .unwrap();
 
         assert_eq!(effective_authority(SLUG).as_deref(), Some(expected));
     }
@@ -2776,8 +2881,9 @@ mod tests {
                 .unwrap(),
         );
         begin_load();
-        register(route, DeclAuthority::ThirdParty).unwrap();
-        register(gateway, DeclAuthority::ThirdParty).unwrap();
+        let takeovers = [THINKING_ROUTE.to_owned(), THINKING_GATEWAY.to_owned()];
+        register(route, DeclAuthority::ThirdParty, &takeovers).unwrap();
+        register(gateway, DeclAuthority::ThirdParty, &takeovers).unwrap();
         commit_load();
 
         let model = Model::from_spec(&format!("{THINKING_GATEWAY}/{model_id}")).unwrap();
@@ -2956,7 +3062,7 @@ mod tests {
     }
 
     fn already_registered(reg: &mut Registration) {
-        register(registration(&reg.decl.slug), DeclAuthority::Bundled).unwrap();
+        register(registration(&reg.decl.slug), DeclAuthority::Bundled, &[]).unwrap();
     }
 
     fn codec_and_base(reg: &mut Registration) {
@@ -3040,7 +3146,7 @@ mod tests {
         begin_load();
         let mut reg = registration(SLUG);
         mutate(&mut reg);
-        let error = register(reg, DeclAuthority::Bundled).unwrap_err();
+        let error = register(reg, DeclAuthority::Bundled, &[]).unwrap_err();
         assert!(expected(&error), "{error}");
         commit_load();
     }
@@ -3050,21 +3156,40 @@ mod tests {
     /// Anthropic key resolved into its own credentials and sent to the origin
     /// it declared, under a name the picker still labels "Anthropic".
     #[test_case(BUILTIN_SLUG, DeclAuthority::ThirdParty ; "third_party")]
+    #[test_case(BUILTIN_SLUG, DeclAuthority::Config ; "config")]
     #[test_case(BUILTIN_SLUG, DeclAuthority::Bundled ; "bundled")]
     #[test_case(BUNDLED_SLUG, DeclAuthority::ThirdParty ; "third_party_on_a_bundled_slug")]
+    #[test_case(BUNDLED_SLUG, DeclAuthority::Config ; "config_on_a_bundled_slug")]
     fn a_shipped_slug_is_reserved(slug: &str, authority: DeclAuthority) {
-        let error = register_loaded_as(registration(slug), authority).unwrap_err();
+        let error = register_loaded_as(registration(slug), authority, &[]).unwrap_err();
 
         assert!(matches!(error, RegisterError::ReservedSlug(_)), "{error}");
         assert!(!is_registered(slug), "{RESERVED_SLUG_TAKEN}");
     }
 
-    /// `maki auth login` saves a models.dev provider's key under its slug, so
-    /// a package declaring that slug would be handed the key and take over
-    /// the provider's models.
+    /// The user's own config file may register any slug maki does not ship
+    /// without a grant: it runs with every permission the user's `plugin.toml`
+    /// grants, so a separate approval would add no protection. A slug maki
+    /// ships stays reserved.
     #[test]
-    fn a_served_catalog_slug_is_reserved_for_third_parties() {
+    fn a_config_load_registers_any_slug_maki_does_not_ship() {
+        const SLUG: &str = "config-registered";
+        const REGISTERED: &str = "the config load must register the slug";
+        register_loaded_as(registration(SLUG), DeclAuthority::Config, &[]).expect(REGISTERED);
+        assert!(is_registered(SLUG), "{REGISTERED}");
+    }
+
+    /// Installing a plugin is an explicit act the user reviews, so a slug maki
+    /// only serves from models.dev is a third party's to replace once granted:
+    /// the plugin takes over the slug, and the catalog listing drops it. A
+    /// slug maki ships stays reserved (`a_shipped_slug_is_reserved`), and a
+    /// slug without its grant is refused
+    /// (`an_ungranted_slug_is_refused`).
+    #[test]
+    fn a_third_party_plugin_replaces_a_served_catalog_slug() {
         const CATALOG_SLUG: &str = "served-catalog";
+        const TAKEOVER_FAILED: &str = "the registration must have taken the slug";
+        const REPLACED: &str = "the catalog must stop listing the replaced slug";
         let provider = catalog::schema::CatalogProvider {
             name: DISPLAY_NAME.into(),
             env: Vec::new(),
@@ -3077,11 +3202,73 @@ mod tests {
             StateDir::from_path(Default::default()),
         );
 
-        let error =
-            register_loaded_as(registration(CATALOG_SLUG), DeclAuthority::ThirdParty).unwrap_err();
+        let granted = [CATALOG_SLUG.to_owned()];
+        register_loaded_as(
+            registration(CATALOG_SLUG),
+            DeclAuthority::ThirdParty,
+            &granted,
+        )
+        .expect("a granted catalog slug is a third party's to replace");
 
-        assert!(matches!(error, RegisterError::ReservedSlug(_)), "{error}");
-        assert!(!is_registered(CATALOG_SLUG), "{RESERVED_SLUG_TAKEN}");
+        assert!(is_registered(CATALOG_SLUG), "{TAKEOVER_FAILED}");
+        assert!(
+            !catalog::catalog_providers_if_available()
+                .expect("seeded")
+                .iter()
+                .any(|provider| provider.slug == CATALOG_SLUG),
+            "{REPLACED}"
+        );
+    }
+
+    /// A slug the catalog does not serve registers without a grant, and a
+    /// granted slug stays owned when the load fails. A bundled plugin ships
+    /// inside the binary: that is maki's own say so, no grant needed.
+    #[test]
+    fn an_ungranted_slug_is_refused() {
+        const NOT_TAKEN: &str = "a refused slug must not be serving it";
+        const STILL_LISTED: &str = "the catalog must keep listing the refused slug";
+        const BUNDLED_TAKEOVER_FAILED: &str = "a bundled plugin registers without a grant";
+
+        register_loaded_as(
+            registration("plain-ungranted"),
+            DeclAuthority::ThirdParty,
+            &[],
+        )
+        .expect("a slug the catalog does not serve registers without a grant");
+
+        // A slug the catalog serves: refused the same way, and the catalog
+        // keeps listing it.
+        const CATALOG_SLUG: &str = "ungranted-catalog";
+        let provider = catalog::schema::CatalogProvider {
+            name: DISPLAY_NAME.into(),
+            env: Vec::new(),
+            npm: catalog::ALLOWED_NPM[0].into(),
+            api: Some(EXAMPLE_BASE_URL.into()),
+            models: HashMap::new(),
+        };
+        catalog::seed_catalog_for_tests(
+            HashMap::from([(CATALOG_SLUG.into(), provider)]),
+            StateDir::from_path(Default::default()),
+        );
+
+        let error = register_loaded_as(registration(CATALOG_SLUG), DeclAuthority::ThirdParty, &[])
+            .unwrap_err();
+        assert!(
+            matches!(error, RegisterError::UngrantedTakeover(_)),
+            "{error}"
+        );
+        assert!(!is_registered(CATALOG_SLUG), "{NOT_TAKEN}");
+        assert!(
+            catalog::catalog_providers_if_available()
+                .expect("seeded")
+                .iter()
+                .any(|provider| provider.slug == CATALOG_SLUG),
+            "{STILL_LISTED}"
+        );
+
+        register_loaded_as(registration(CATALOG_SLUG), DeclAuthority::Bundled, &[])
+            .expect(BUNDLED_TAKEOVER_FAILED);
+        assert!(is_registered(CATALOG_SLUG), "{BUNDLED_TAKEOVER_FAILED}");
     }
 
     const UPSTREAM_SAID_NO: &str = "upstream said no";
@@ -3098,11 +3285,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn map_error_absent_leaves_the_error_untouched() {
+    #[tokio::test]
+    async fn map_error_absent_leaves_the_error_untouched() {
         let provider = provider_with(ProviderHooks::default());
-        let error =
-            smol::block_on(provider.mapped::<()>(Err(api_error(NOT_RETRYABLE, None)))).unwrap_err();
+        let error = provider
+            .mapped::<()>(Err(api_error(NOT_RETRYABLE, None)))
+            .await
+            .unwrap_err();
         assert!(matches!(
             error,
             AgentError::Api {
@@ -3115,8 +3304,8 @@ mod tests {
 
     /// The hook restates status and message. Retryability and `Retry-After`
     /// stay maki's to decide.
-    #[test]
-    fn map_error_remaps_the_status_only() {
+    #[tokio::test]
+    async fn map_error_remaps_the_status_only() {
         const RETRY_AFTER: Duration = Duration::from_secs(7);
         const REMAPPED: &str = "slow down";
         let provider = provider_with(ProviderHooks {
@@ -3127,9 +3316,10 @@ mod tests {
             ..ProviderHooks::default()
         });
 
-        let error =
-            smol::block_on(provider.mapped::<()>(Err(api_error(NOT_RETRYABLE, Some(RETRY_AFTER)))))
-                .unwrap_err();
+        let error = provider
+            .mapped::<()>(Err(api_error(NOT_RETRYABLE, Some(RETRY_AFTER))))
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(&error, AgentError::Api { status: RATE_LIMITED, message, .. } if message == REMAPPED)
@@ -3204,7 +3394,8 @@ mod tests {
     #[test_case(false, true, None ; "an_unminted_slug_takes_the_fresh_declaration")]
     #[test_case(true, true, Some(OTHER_BASE_URL) ; "a_leased_origin_survives_the_reload")]
     #[test_case(true, false, None ; "narrowing_the_hosts_drops_an_origin_they_no_longer_cover")]
-    fn a_reload_re_reads_the_declaration(
+    #[tokio::test]
+    async fn a_reload_re_reads_the_declaration(
         minted: bool,
         still_covered: bool,
         expected: Option<&str>,
@@ -3224,7 +3415,7 @@ mod tests {
         }
         register_loaded(first).unwrap();
         if minted {
-            smol::block_on(entry(SLUG).unwrap().ensure_auth()).unwrap();
+            entry(SLUG).unwrap().ensure_auth().await.unwrap();
             assert_eq!(
                 base_url(SLUG).as_deref(),
                 Some(OTHER_BASE_URL),

@@ -44,9 +44,13 @@ pub fn spec_for_tier(provider: &str, tier: ModelTier) -> Option<String> {
     read().spec_for_tier(provider, tier)
 }
 
-pub fn spec_for_tier_any(tier: ModelTier) -> Option<String> {
+/// The model a tier resolves to, layering user overrides on top of provider
+/// defaults: the user's pick for the tier (whatever provider it names) first,
+/// then the tier within `provider`, then the tier in any provider that
+/// `providers.toml` does not keep out with `auto_select = false`.
+pub fn resolve_tier(provider: Option<&str>, tier: ModelTier) -> Option<String> {
     let config = ProvidersConfig::load_or_default();
-    read().spec_for_tier_any(tier, |slug| config.auto_selectable(slug))
+    read().resolve_tier(provider, tier, |slug| config.auto_selectable(slug))
 }
 
 pub fn discovered(provider: &str, model_id: &str) -> Option<ModelInfo> {
@@ -73,6 +77,18 @@ pub fn tier_for(spec: &str, provider: &str, static_tier: Option<ModelTier>) -> M
 
 pub fn set_known_models(provider: &str, models: Vec<ModelInfo>) {
     write().set_known_models(provider, models);
+}
+
+/// Subagents and new sessions build their model from here, so the window a
+/// server reported belongs here too, or each of them would learn it again.
+pub fn record_context_window(provider: &str, model_id: &str, window: u32) {
+    if let Some(info) = write()
+        .known_models
+        .get_mut(provider)
+        .and_then(|models| models.iter_mut().find(|m| m.id == model_id))
+    {
+        info.context_window = Some(window);
+    }
 }
 
 /// Tiers whose override points at `spec`, in descending tier order.
@@ -231,27 +247,32 @@ impl ModelRegistry {
         self.overrides.iter().any(|(&t, s)| s == spec && t != tier)
     }
 
-    /// An override is a choice someone made by hand, so it stands whatever
-    /// `providers.toml` says about picking the provider on its own. The walk
-    /// below is the part nobody asked for, and that is where
+    /// An override, or the provider the caller is already on, is a choice
+    /// someone made, so it stands whatever `providers.toml` says. The walk over
+    /// every provider is the part nobody asked for, and that is where
     /// `auto_select = false` takes a provider out.
+    fn resolve_tier(
+        &self,
+        provider: Option<&str>,
+        tier: ModelTier,
+        auto_selectable: impl Fn(&str) -> bool,
+    ) -> Option<String> {
+        self.overrides
+            .get(&tier)
+            .cloned()
+            .or_else(|| provider.and_then(|p| self.spec_for_tier(p, tier)))
+            .or_else(|| self.spec_for_tier_any(tier, auto_selectable))
+    }
+
     fn spec_for_tier_any(
         &self,
         tier: ModelTier,
         auto_selectable: impl Fn(&str) -> bool,
     ) -> Option<String> {
-        if let Some(spec) = self.overrides.get(&tier) {
-            return Some(spec.clone());
-        }
-        for provider in self.known_models.keys() {
-            if !auto_selectable(provider) {
-                continue;
-            }
-            if let Some(spec) = self.spec_for_tier(provider, tier) {
-                return Some(spec);
-            }
-        }
-        None
+        self.known_models
+            .keys()
+            .filter(|provider| auto_selectable(provider))
+            .find_map(|provider| self.spec_for_tier(provider, tier))
     }
 
     fn override_tiers(&self, spec: &str) -> Vec<ModelTier> {
@@ -471,7 +492,26 @@ mod tests {
     }
 
     #[test]
-    fn spec_for_tier_resolution() {
+    fn resolve_tier_override_beats_the_scoped_provider() {
+        let reg = make_map(&[(ModelTier::Weak, "zai/glm-5")], &["big", "mid", "small"]);
+        assert_eq!(
+            reg.resolve_tier(Some("ollama"), ModelTier::Weak, |_| true),
+            Some("zai/glm-5".into())
+        );
+        assert_eq!(
+            reg.resolve_tier(Some("ollama"), ModelTier::Medium, |_| true),
+            Some("ollama/mid".into())
+        );
+        assert_eq!(
+            reg.resolve_tier(None, ModelTier::Weak, |_| true),
+            Some("zai/glm-5".into())
+        );
+    }
+
+    /// `spec_for_tier` is provider-scoped: an override with another provider is
+    /// invisible to a different provider's lookup.
+    #[test]
+    fn spec_for_tier_is_provider_scoped() {
         let reg = make_map(
             &[(ModelTier::Strong, "ollama/custom")],
             &["big", "mid", "small"],
@@ -490,39 +530,21 @@ mod tests {
     }
 
     #[test]
-    fn spec_for_tier_any_cross_provider() {
-        let reg = make_map(
-            &[
-                (ModelTier::Weak, "zai/glm-5"),
-                (ModelTier::Strong, "openai/gpt-foo"),
-            ],
-            &["big", "mid", "small"],
-        );
-        assert_eq!(
-            reg.spec_for_tier_any(ModelTier::Strong, |_| true),
-            Some("openai/gpt-foo".into())
-        );
-        assert_eq!(
-            reg.spec_for_tier_any(ModelTier::Weak, |_| true),
-            Some("zai/glm-5".into())
-        );
-        assert_eq!(
-            reg.spec_for_tier_any(ModelTier::Medium, |_| true),
-            Some("ollama/mid".into())
-        );
-    }
-
-    #[test]
-    fn spec_for_tier_any_walk_skips_what_is_not_auto_selectable() {
+    fn resolve_tier_walk_skips_what_is_not_auto_selectable() {
         let reg = make_map(
             &[(ModelTier::Strong, "ollama/big")],
             &["big", "mid", "small"],
         );
+        let never = |_: &str| false;
         assert_eq!(
-            reg.spec_for_tier_any(ModelTier::Strong, |_| false),
+            reg.resolve_tier(None, ModelTier::Strong, never),
             Some("ollama/big".into())
         );
-        assert_eq!(reg.spec_for_tier_any(ModelTier::Medium, |_| false), None);
+        assert_eq!(
+            reg.resolve_tier(Some("ollama"), ModelTier::Medium, never),
+            Some("ollama/mid".into())
+        );
+        assert_eq!(reg.resolve_tier(None, ModelTier::Medium, never), None);
     }
 
     #[test]

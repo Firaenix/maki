@@ -17,7 +17,6 @@ pub(crate) use crate::agent::shared_queue::QueuedMessage;
 
 pub(crate) const EMPTY_PROMPT_ERR: &str = "prompt is empty";
 pub(crate) const NO_QUEUE_ERR: &str = "session cannot queue messages";
-pub(crate) const NO_INBOX_ERR: &str = "subagent is not taking messages";
 
 pub(crate) enum SubmitOutcome {
     Started(Vec<Action>),
@@ -36,6 +35,7 @@ impl MessageQueue {
         self.shared = Some(shared);
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.shared.as_ref().is_none_or(|s| s.is_empty())
     }
@@ -160,11 +160,11 @@ impl App {
     /// A message typed in a subagent's chat is for that subagent: it waits in
     /// the subagent's inbox until its loop reaches a turn boundary, and the
     /// `QueueItemConsumed` relayed from there draws it in this chat. The
-    /// subagent runs its own settings, so the input carries them.
+    /// subagent runs its own settings, so the input carries them. A chat
+    /// without an inbox shows no input box, see `App::chat_accepts_input`.
     pub(super) fn queue_for_subagent(&mut self, msg: QueuedMessage) -> Vec<Action> {
         let chat = &self.chats[self.active_chat];
         let Some(inbox) = chat.inbox.as_ref() else {
-            self.flash(NO_INBOX_ERR.into());
             return vec![];
         };
         let (thinking, fast) = chat

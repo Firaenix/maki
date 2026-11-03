@@ -30,6 +30,10 @@ const PLUGIN_MANIFEST: &str = "plugin.toml";
 const NET_HOST_LABEL: &str = "net host";
 /// How a reach of every host is listed beside the named ones.
 const ANY_HOST: &str = "*";
+/// Sets a taken-over catalog name apart from the permission names it is
+/// listed beside when a package still needs approving, in the install prompt
+/// and in the update diff alike.
+const PROVIDER_TAKEOVER_LABEL: &str = "takes over provider";
 const APPROVALS_FILE: &str = "pack-approvals.json";
 const REVIEW_PROMPT_HEADER: &str = "Apply these package changes?";
 const REVIEW_DELETE_LINE: &str = "remove";
@@ -172,13 +176,14 @@ fn try_read_approvals() -> Option<maki_pack::approvals::Approvals> {
     }
 }
 
-/// Effective permissions for a package about to load.
+/// Effective permissions, and the slugs the package may register, for a
+/// package about to load.
 ///
 /// The whole point of `Origin`: a fetched package's own manifest is a request,
 /// and a request is not a grant.
-pub fn effective_permissions(
+pub fn effective_grant(
     pkg: &DiscoveredPackage,
-) -> crate::plugin_permissions::PluginPermissions {
+) -> (crate::plugin_permissions::PluginPermissions, Vec<String>) {
     granted(pkg, &read_approvals())
 }
 
@@ -190,20 +195,26 @@ pub fn effective_permissions(
 pub fn granted(
     pkg: &DiscoveredPackage,
     approvals: &maki_pack::approvals::Approvals,
-) -> crate::plugin_permissions::PluginPermissions {
+) -> (crate::plugin_permissions::PluginPermissions, Vec<String>) {
     match &pkg.origin {
-        Origin::Manual => pkg.requested.clone().granted(),
+        Origin::Manual => (
+            pkg.requested.clone().granted(),
+            pkg.requested.providers().to_vec(),
+        ),
         Origin::Fetched { src } => {
             let key = maki_pack::approvals::ApprovalKey::new(pkg.name.clone(), src);
-            let approved = crate::plugin_permissions::PluginPermissions::from_approved(
-                approvals
-                    .get(&key)
+            let approved = approvals.get(&key);
+            let permissions = crate::plugin_permissions::PluginPermissions::from_approved(
+                approved
                     .map(Entry::permissions)
                     .unwrap_or_default()
                     .iter()
                     .map(String::as_str),
             );
-            pkg.requested.intersect(&approved)
+            let providers = pkg
+                .requested
+                .granted_providers(approved.map(Entry::providers).unwrap_or_default());
+            (pkg.requested.intersect(&permissions), providers)
         }
     }
 }
@@ -364,7 +375,8 @@ fn approval_required(resolved: &Resolved) -> String {
 ///
 /// Hosts count the same way permissions do: an update that widens `net_hosts`,
 /// or drops the list and with it every limit, is asking for reach the user
-/// never granted.
+/// never granted. Registered slugs count the same way: a package that adds a
+/// name is asking to receive a key the user never granted it for.
 fn missing_grants(requested: &Requested, approved: Option<&Entry>) -> Vec<String> {
     let permissions = approved.map(Entry::permissions).unwrap_or_default();
     let missing_names = requested
@@ -375,7 +387,16 @@ fn missing_grants(requested: &Requested, approved: Option<&Entry>) -> Vec<String
         .beyond(Reach::granted(approved))
         .into_iter()
         .map(|host| format!("{NET_HOST_LABEL} {host}"));
-    missing_names.chain(missing_hosts).collect()
+    let approved_providers = approved.map(Entry::providers).unwrap_or_default();
+    let missing_providers = requested
+        .providers()
+        .iter()
+        .filter(|slug| !approved_providers.contains(slug))
+        .map(|slug| format!("{PROVIDER_TAKEOVER_LABEL} '{slug}'"));
+    missing_names
+        .chain(missing_hosts)
+        .chain(missing_providers)
+        .collect()
 }
 
 /// How far a package reaches over the network, on one side of an approval.
@@ -520,6 +541,7 @@ fn grant_installed(
                     .requested
                     .net_hosts()
                     .map(<[String]>::to_vec),
+                resolved.package.requested.providers().to_vec(),
             );
             approvals_changed = true;
             newly_approved.insert(name.clone());
@@ -550,7 +572,7 @@ fn grant_installed(
 /// Lua call would wait on a message that cannot be processed until it returns.
 /// One unreachable repository is reported and skipped so a network problem
 /// does not stop Maki from starting.
-pub fn install_declared(
+pub async fn install_declared(
     specs: &[crate::api::pack::Declared],
     interaction: Interaction,
 ) -> InstallReport {
@@ -653,7 +675,7 @@ pub fn install_declared(
             ));
             continue;
         }
-        let result = match smol::block_on(manager.ensure_installed(spec, &mut lock)) {
+        let result = match manager.ensure_installed(spec, &mut lock).await {
             Ok(result) => result,
             Err(e) => {
                 let message = redact_error(&e);
@@ -965,9 +987,10 @@ struct PendingApproval {
     src: String,
     names: Vec<String>,
     net_hosts: Option<Vec<String>>,
+    providers: Vec<String>,
 }
 
-pub fn prepare_pack_command(command: &PackCommand, context: &PackContext) -> PackPreparation {
+pub async fn prepare_pack_command(command: &PackCommand, context: &PackContext) -> PackPreparation {
     let operations = match plan_command(command, &context.declared, &context.installed) {
         Ok(operations) => operations,
         Err(error) => return PackPreparation::failed(error),
@@ -992,9 +1015,10 @@ pub fn prepare_pack_command(command: &PackCommand, context: &PackContext) -> Pac
         &site,
         &lock_path,
     )
+    .await
 }
 
-fn prepare_pack_ops_at(
+async fn prepare_pack_ops_at(
     ops: &[PlannedOp],
     declared: &[crate::api::pack::Declared],
     active: &BTreeSet<String>,
@@ -1072,11 +1096,10 @@ fn prepare_pack_ops_at(
                             .unwrap_or_default(),
                     )
                 };
-                let proposal = match smol::block_on(manager.prepare_update(
-                    spec,
-                    &lock,
-                    options.target == UpdateTarget::Lockfile,
-                )) {
+                let proposal = match manager
+                    .prepare_update(spec, &lock, options.target == UpdateTarget::Lockfile)
+                    .await
+                {
                     Ok(proposal) => proposal,
                     Err(error) => {
                         report
@@ -1114,6 +1137,7 @@ fn prepare_pack_ops_at(
                         src: spec.src.clone(),
                         names: requested.names(),
                         net_hosts: requested.net_hosts().map(<[String]>::to_vec),
+                        providers: requested.providers().to_vec(),
                     });
                 }
                 prepared.push(PreparedPackOp::Update {
@@ -1168,7 +1192,7 @@ fn prepare_pack_ops_at(
     }
 }
 
-pub fn apply_pack_plan(plan: PackPlan) -> PackReport {
+pub async fn apply_pack_plan(plan: PackPlan) -> PackReport {
     let PackPlan {
         operations,
         site,
@@ -1206,7 +1230,7 @@ pub fn apply_pack_plan(plan: PackPlan) -> PackReport {
                 name,
                 update,
                 approve,
-            } => match smol::block_on(manager.apply_update(&update, &mut lock)) {
+            } => match manager.apply_update(&update, &mut lock).await {
                 Ok(installed) => {
                     report.updated.push((name.clone(), installed.rev));
                     let Some(approve) = approve else { continue };
@@ -1217,6 +1241,7 @@ pub fn apply_pack_plan(plan: PackPlan) -> PackReport {
                                 &maki_pack::approvals::ApprovalKey::new(&name, &approve.src),
                                 approve.names,
                                 approve.net_hosts,
+                                approve.providers,
                             );
                             unsaved.push(failure);
                         }
@@ -1324,6 +1349,16 @@ fn update_permission_diff(requested: &Requested, approved: &Entry) -> String {
             .into_iter()
             .map(|host| format!("-{NET_HOST_LABEL} {host}")),
     );
+    for slug in requested.providers() {
+        if !approved.providers().contains(slug) {
+            additions.push(format!("+{PROVIDER_TAKEOVER_LABEL} '{slug}'"));
+        }
+    }
+    for slug in approved.providers() {
+        if !requested.providers().contains(slug) {
+            removals.push(format!("-{PROVIDER_TAKEOVER_LABEL} '{slug}'"));
+        }
+    }
     additions.extend(removals);
     if additions.is_empty() {
         "unchanged".to_owned()
@@ -1605,7 +1640,8 @@ mod tests {
         Problem, REVIEW_DELETE_LINE, REVIEW_PROMPT_HEADER, REVIEW_REVISION_LEN,
         UNAVAILABLE_OLD_REVISION, UpdateOptions, UpdateTarget, apply_pack_plan, discover, granted,
         installed_from_declared_source, missing_grants, prepare_pack_ops_at, read_approvals_file,
-        read_lockfile, resolved_on_disk, sanitize_message, write_approvals_at, write_lockfile,
+        read_lockfile, resolved_on_disk, sanitize_message, update_permission_diff,
+        write_approvals_at, write_lockfile,
     };
 
     const NET_MANIFEST: &str = "[permissions]\nnet = true\n";
@@ -1623,6 +1659,10 @@ mod tests {
     const APPROVED_PINNED_HOST: &str = "api.example.com:7777";
     /// [`NARROW_HOSTS_MANIFEST`]'s host with no port, which reaches every port.
     const MISSING_UNPINNED_HOST: &str = "net host api.example.com";
+    const APPROVED_TAKEOVER: &str = "greenpt";
+    /// What the approval prompt lists for [`APPROVED_TAKEOVER`] when the
+    /// approval never covered it.
+    const MISSING_TAKEOVER: &str = "takes over provider 'greenpt'";
     const TEST_REV: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const OTHER_REV: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -1673,15 +1713,8 @@ mod tests {
         dir
     }
 
-    /// Builds a package whose manifest asks for everything, which is the
-    /// interesting case: the question is never what it asked for, but whose
-    /// word turns the request into a grant.
-    fn greedy(name: &str, origin: Origin) -> DiscoveredPackage {
-        let asks: String = Permission::ALL
-            .iter()
-            .map(|perm| format!("{perm} = true\n"))
-            .collect();
-        let manifest = toml::from_str::<toml::Value>(&format!("[permissions]\n{asks}")).unwrap();
+    fn greedy_with(manifest: &str, name: &str, origin: Origin) -> DiscoveredPackage {
+        let manifest = toml::from_str::<toml::Value>(manifest).unwrap();
         DiscoveredPackage {
             name: name.to_owned(),
             dir: PathBuf::from("/nowhere"),
@@ -1692,12 +1725,27 @@ mod tests {
         }
     }
 
+    /// Builds a package whose manifest asks for everything, which is the
+    /// interesting case: the question is never what it asked for, but whose
+    /// word turns the request into a grant.
+    fn greedy(name: &str, origin: Origin) -> DiscoveredPackage {
+        let asks: String = Permission::ALL
+            .iter()
+            .map(|perm| format!("{perm} = true\n"))
+            .collect();
+        greedy_with(
+            &format!("providers = [\"greenpt\"]\n[permissions]\n{asks}"),
+            name,
+            origin,
+        )
+    }
+
     /// A package the user placed by hand is trusted like `init.lua`: they put
     /// the files there, so its manifest is their own statement.
     #[test]
     fn a_manual_package_is_granted_what_its_manifest_asks_for() {
         let pkg = greedy("demo", Origin::Manual);
-        let effective = granted(&pkg, &maki_pack::approvals::Approvals::default());
+        let (effective, takeovers) = granted(&pkg, &maki_pack::approvals::Approvals::default());
 
         for &perm in Permission::ALL {
             assert!(
@@ -1705,6 +1753,7 @@ mod tests {
                 "{perm} should be granted to a manually installed package"
             );
         }
+        assert_eq!(takeovers, ["greenpt".to_owned()]);
     }
 
     /// The negative half of the pair above, and the defect this exists to
@@ -1718,7 +1767,7 @@ mod tests {
                 src: "https://example.com/demo".to_owned(),
             },
         );
-        let effective = granted(&pkg, &maki_pack::approvals::Approvals::default());
+        let (effective, takeovers) = granted(&pkg, &maki_pack::approvals::Approvals::default());
 
         for &perm in Permission::ALL {
             assert!(
@@ -1726,14 +1775,25 @@ mod tests {
                 "{perm} must not be granted to fetched code with no approval"
             );
         }
+        assert!(
+            takeovers.is_empty(),
+            "a takeover must not be granted to fetched code with no approval"
+        );
     }
 
     /// An approval grants only what it names, and only where the package also
     /// asked for it. Both halves have to agree.
     #[test]
     fn a_fetched_package_is_granted_the_intersection_of_request_and_approval() {
+        const GRANTED_TAKEOVER: &str = "greenpt";
+        const UNGRANTED_TAKEOVER: &str = "rival";
+        const NO_TAKEOVER_MESSAGE: &str = "a requested takeover the approval never named";
         let src = "https://example.com/demo";
-        let pkg = greedy(
+        let manifest = format!(
+            "providers = [{GRANTED_TAKEOVER:?}, {UNGRANTED_TAKEOVER:?}]\n[permissions]\nrun = true\nnet = true\n"
+        );
+        let pkg = greedy_with(
+            manifest.as_str(),
             "demo",
             Origin::Fetched {
                 src: src.to_owned(),
@@ -1745,13 +1805,19 @@ mod tests {
             &maki_pack::approvals::ApprovalKey::new("demo", src),
             vec!["run".to_owned()],
             None,
+            vec![GRANTED_TAKEOVER.to_owned()],
         );
-        let effective = granted(&pkg, &approvals);
+        let (effective, takeovers) = granted(&pkg, &approvals);
 
         assert!(effective.is_allowed(Permission::Run), "run was approved");
         assert!(
             !effective.is_allowed(Permission::Net),
             "net was requested but never approved"
+        );
+        assert_eq!(
+            takeovers,
+            [GRANTED_TAKEOVER.to_owned()],
+            "{NO_TAKEOVER_MESSAGE}"
         );
     }
 
@@ -1765,6 +1831,7 @@ mod tests {
             &maki_pack::approvals::ApprovalKey::new("demo", "https://example.com/demo"),
             vec!["run".to_owned()],
             None,
+            Vec::new(),
         );
 
         let moved = greedy(
@@ -1774,18 +1841,19 @@ mod tests {
             },
         );
         assert!(
-            !granted(&moved, &approvals).is_allowed(Permission::Run),
+            !granted(&moved, &approvals).0.is_allowed(Permission::Run),
             "an approval for one repository must not grant another"
         );
     }
 
     /// What a package with this manifest would still have to be asked about,
-    /// given an approval for these permissions and these hosts, `None` being
-    /// every host.
+    /// given an approval for these permissions, these hosts and these
+    /// takeovers, `None` being every host.
     fn still_missing(
         manifest: &str,
         permissions: &[&str],
         net_hosts: Option<&[&str]>,
+        providers: &[&str],
     ) -> Vec<String> {
         let key = maki_pack::approvals::ApprovalKey::new("demo", APPROVAL_SRC);
         let mut store = maki_pack::approvals::Approvals::default();
@@ -1793,6 +1861,7 @@ mod tests {
             &key,
             permissions.iter().map(|name| (*name).to_owned()).collect(),
             net_hosts.map(|hosts| hosts.iter().map(|host| (*host).to_owned()).collect()),
+            providers.iter().map(|slug| (*slug).to_owned()).collect(),
         );
         let requested = Requested::from_manifest(&toml::from_str::<toml::Value>(manifest).unwrap());
         missing_grants(&requested, store.get(&key))
@@ -1804,7 +1873,8 @@ mod tests {
             still_missing(
                 "[permissions]\nfs_read = true\nnet = true\nrun = true\n",
                 &["net"],
-                None
+                None,
+                &[]
             ),
             ["fs_read".to_owned(), "run".to_owned()]
         );
@@ -1824,7 +1894,44 @@ mod tests {
         approved: Option<&[&str]>,
         expected: &[&str],
     ) {
-        assert_eq!(still_missing(manifest, &["net"], approved), expected);
+        assert_eq!(still_missing(manifest, &["net"], approved, &[]), expected);
+    }
+
+    /// `providers` is approved the same way: a name the answer never covered
+    /// asks again, because the package would be receiving a key the user
+    /// never granted it for, while an approved takeover asks nothing.
+    #[test_case(&[], &[MISSING_TAKEOVER] ; "an_unapproved_takeover_asks_again")]
+    #[test_case(&[APPROVED_TAKEOVER], &[] ; "an_approved_takeover_asks_nothing")]
+    fn taken_over_providers_are_approved_like_permissions(approved: &[&str], expected: &[&str]) {
+        assert_eq!(
+            still_missing(
+                &format!("providers = [{APPROVED_TAKEOVER:?}]\n"),
+                &[],
+                None,
+                approved
+            ),
+            expected
+        );
+    }
+
+    /// The update prompt's takeover rows: a name the update adds is asking for
+    /// a new key, and one it drops releases the old grant.
+    #[test]
+    fn an_update_lists_its_provider_takeovers() {
+        const ADDED_TAKEOVER: &str = "rival";
+        const ADDED_ROW: &str = "+takes over provider 'rival'";
+        const DROPPED_ROW: &str = "-takes over provider 'greenpt'";
+        let key = maki_pack::approvals::ApprovalKey::new("demo", APPROVAL_SRC);
+        let mut store = maki_pack::approvals::Approvals::default();
+        store.approve(&key, Vec::new(), None, vec![APPROVED_TAKEOVER.to_owned()]);
+        let requested = Requested::from_manifest(
+            &toml::from_str::<toml::Value>(&format!("providers = [{ADDED_TAKEOVER:?}]\n")).unwrap(),
+        );
+
+        let diff = update_permission_diff(&requested, store.get(&key).unwrap());
+
+        assert!(diff.contains(ADDED_ROW), "{diff}");
+        assert!(diff.contains(DROPPED_ROW), "{diff}");
     }
 
     fn declared_pack(name: &str, src: &str) -> crate::api::pack::Declared {
@@ -2086,6 +2193,8 @@ mod tests {
         }
     }
 
+    /// A declared package checked out at `old_rev` whose remote already has
+    /// `new_rev`.
     struct UpdateFixture {
         _temp: tempfile::TempDir,
         site: PathBuf,
@@ -2095,19 +2204,20 @@ mod tests {
         new_rev: String,
     }
 
-    fn run_git(repo: &Path, args: &[&str]) -> maki_pack::git::GitOutput {
-        smol::block_on(maki_pack::git::run(
+    async fn run_git(repo: &Path, args: &[&str]) -> maki_pack::git::GitOutput {
+        maki_pack::git::run(
             args.iter().map(|arg| (*arg).to_owned()).collect(),
             repo.to_path_buf(),
-        ))
+        )
+        .await
         .unwrap()
     }
 
-    fn update_fixture() -> UpdateFixture {
-        update_fixture_with_manifests(None, None)
+    async fn update_fixture() -> UpdateFixture {
+        update_fixture_with_manifests(None, None).await
     }
 
-    fn update_fixture_with_manifests(
+    async fn update_fixture_with_manifests(
         old_manifest: Option<&str>,
         new_manifest: Option<&str>,
     ) -> UpdateFixture {
@@ -2118,20 +2228,20 @@ mod tests {
         if let Some(manifest) = old_manifest {
             fs::write(origin.join(PLUGIN_MANIFEST), manifest).unwrap();
         }
-        run_git(&origin, &["init", "--quiet"]);
-        run_git(&origin, &["config", "user.email", "test@example.com"]);
-        run_git(&origin, &["config", "user.name", "test"]);
-        run_git(&origin, &["add", "."]);
-        run_git(&origin, &["commit", "--quiet", "-m", "first"]);
+        run_git(&origin, &["init", "--quiet"]).await;
+        run_git(&origin, &["config", "user.email", "test@example.com"]).await;
+        run_git(&origin, &["config", "user.name", "test"]).await;
+        run_git(&origin, &["add", "."]).await;
+        run_git(&origin, &["commit", "--quiet", "-m", "first"]).await;
 
         let site = temp.path().join("site");
         let lock_path = temp.path().join("pack-lock.json");
         let spec = maki_pack::Spec::new(origin.display().to_string()).with_name("demo");
         let mut lock = maki_pack::lockfile::Lockfile::default();
-        let installed = smol::block_on(
-            maki_pack::manager::Manager::new(&site).ensure_installed(&spec, &mut lock),
-        )
-        .unwrap();
+        let installed = maki_pack::manager::Manager::new(&site)
+            .ensure_installed(&spec, &mut lock)
+            .await
+            .unwrap();
         assert!(write_lockfile(&lock_path, &lock));
 
         fs::write(origin.join("plugin").join("later.lua"), "-- later\n").unwrap();
@@ -2142,9 +2252,10 @@ mod tests {
             }
             None => {}
         }
-        run_git(&origin, &["add", "."]);
-        run_git(&origin, &["commit", "--quiet", "-m", "later"]);
+        run_git(&origin, &["add", "."]).await;
+        run_git(&origin, &["commit", "--quiet", "-m", "later"]).await;
         let new_rev = run_git(&origin, &["rev-parse", "HEAD"])
+            .await
             .stdout
             .trim()
             .to_owned();
@@ -2207,11 +2318,13 @@ mod tests {
         }
     }
 
-    fn finish_preparation(preparation: PackPreparation) -> (super::PackReport, Option<String>) {
+    async fn finish_preparation(
+        preparation: PackPreparation,
+    ) -> (super::PackReport, Option<String>) {
         match preparation {
             PackPreparation::Complete(report) => (report, None),
-            PackPreparation::Ready(plan) => (apply_pack_plan(plan), None),
-            PackPreparation::Review { prompt, plan } => (apply_pack_plan(plan), Some(prompt)),
+            PackPreparation::Ready(plan) => (apply_pack_plan(plan).await, None),
+            PackPreparation::Review { prompt, plan } => (apply_pack_plan(plan).await, Some(prompt)),
         }
     }
 
@@ -2226,6 +2339,7 @@ mod tests {
             &maki_pack::approvals::ApprovalKey::new("demo", &fixture.declared[0].spec.src),
             names.iter().map(|name| (*name).to_owned()).collect(),
             hosts.map(|hosts| hosts.iter().map(|host| (*host).to_owned()).collect()),
+            Vec::new(),
         );
         assert!(write_approvals_at(&path, &approvals));
     }
@@ -2234,22 +2348,27 @@ mod tests {
     /// package now reaches every host rather than read like it narrowed.
     #[test_case(NARROW_HOSTS_MANIFEST, NET_MANIFEST, "+net host *" ; "a_dropped_list_widens_to_every_host")]
     #[test_case(NET_MANIFEST, NARROW_HOSTS_MANIFEST, "-net host *" ; "a_new_list_narrows_from_every_host")]
-    fn update_review_shows_the_reach_that_changed(
+    #[tokio::test]
+    async fn update_review_shows_the_reach_that_changed(
         old_manifest: &str,
         new_manifest: &str,
         expected: &str,
     ) {
-        let fixture = update_fixture_with_manifests(Some(old_manifest), Some(new_manifest));
+        let fixture = update_fixture_with_manifests(Some(old_manifest), Some(new_manifest)).await;
         let approved_hosts: &[&str] = &[APPROVED_HOST];
         let reach = (old_manifest == NARROW_HOSTS_MANIFEST).then_some(approved_hosts);
         approve_reaching(&fixture, &["net"], reach);
-        let (_, prompt) = finish_preparation(prepare_pack_ops_at(
-            &[update_operation(false)],
-            &fixture.declared,
-            &Default::default(),
-            &fixture.site,
-            &fixture.lock_path,
-        ));
+        let (_, prompt) = finish_preparation(
+            prepare_pack_ops_at(
+                &[update_operation(false)],
+                &fixture.declared,
+                &Default::default(),
+                &fixture.site,
+                &fixture.lock_path,
+            )
+            .await,
+        )
+        .await;
 
         let prompt = prompt.expect("a normal update needs review");
         assert!(
@@ -2258,16 +2377,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn accepted_update_review_applies_the_prepared_revision() {
-        let fixture = update_fixture();
-        let (report, prompt) = finish_preparation(prepare_pack_ops_at(
-            &[update_operation(false)],
-            &fixture.declared,
-            &Default::default(),
-            &fixture.site,
-            &fixture.lock_path,
-        ));
+    #[tokio::test]
+    async fn accepted_update_review_applies_the_prepared_revision() {
+        let fixture = update_fixture().await;
+        let (report, prompt) = finish_preparation(
+            prepare_pack_ops_at(
+                &[update_operation(false)],
+                &fixture.declared,
+                &Default::default(),
+                &fixture.site,
+                &fixture.lock_path,
+            )
+            .await,
+        )
+        .await;
         let prompt = prompt.expect("a normal update needs review");
 
         assert!(report.failures.is_empty(), "{:?}", report.failures);
@@ -2323,38 +2446,47 @@ mod tests {
         "+run";
         "unchanged_manifest_still_needs_missing_approval"
     )]
-    fn update_review_shows_permission_changes(
+    #[tokio::test]
+    async fn update_review_shows_permission_changes(
         approved: &[&str],
         old_manifest: Option<&str>,
         new_manifest: Option<&str>,
         expected: &str,
     ) {
-        let fixture = update_fixture_with_manifests(old_manifest, new_manifest);
+        let fixture = update_fixture_with_manifests(old_manifest, new_manifest).await;
         approve(&fixture, approved);
-        let (report, prompt) = finish_preparation(prepare_pack_ops_at(
-            &[update_operation(false)],
-            &fixture.declared,
-            &Default::default(),
-            &fixture.site,
-            &fixture.lock_path,
-        ));
+        let (report, prompt) = finish_preparation(
+            prepare_pack_ops_at(
+                &[update_operation(false)],
+                &fixture.declared,
+                &Default::default(),
+                &fixture.site,
+                &fixture.lock_path,
+            )
+            .await,
+        )
+        .await;
         let prompt = prompt.expect("a normal update needs review");
 
         assert!(report.failures.is_empty(), "{:?}", report.failures);
         assert!(prompt.contains(&format!("permissions: {expected}")));
     }
 
-    #[test]
-    fn invalid_proposed_manifest_prevents_forced_apply() {
-        let fixture = update_fixture_with_manifests(None, Some("permissions = ["));
+    #[tokio::test]
+    async fn invalid_proposed_manifest_prevents_forced_apply() {
+        let fixture = update_fixture_with_manifests(None, Some("permissions = [")).await;
 
-        let (report, prompt) = finish_preparation(prepare_pack_ops_at(
-            &[update_operation(true)],
-            &fixture.declared,
-            &Default::default(),
-            &fixture.site,
-            &fixture.lock_path,
-        ));
+        let (report, prompt) = finish_preparation(
+            prepare_pack_ops_at(
+                &[update_operation(true)],
+                &fixture.declared,
+                &Default::default(),
+                &fixture.site,
+                &fixture.lock_path,
+            )
+            .await,
+        )
+        .await;
 
         assert!(prompt.is_none());
         assert!(report.updated.is_empty());
@@ -2371,36 +2503,46 @@ mod tests {
         assert!(!maki_pack::paths::revision_dir(&fixture.site, "demo", &fixture.new_rev).exists());
     }
 
-    #[test]
-    fn invalid_previous_manifest_is_display_only() {
-        let fixture = update_fixture_with_manifests(Some("permissions = ["), Some(NET_MANIFEST));
-        let (report, prompt) = finish_preparation(prepare_pack_ops_at(
-            &[update_operation(false)],
-            &fixture.declared,
-            &Default::default(),
-            &fixture.site,
-            &fixture.lock_path,
-        ));
+    #[tokio::test]
+    async fn invalid_previous_manifest_is_display_only() {
+        let fixture =
+            update_fixture_with_manifests(Some("permissions = ["), Some(NET_MANIFEST)).await;
+        let (report, prompt) = finish_preparation(
+            prepare_pack_ops_at(
+                &[update_operation(false)],
+                &fixture.declared,
+                &Default::default(),
+                &fixture.site,
+                &fixture.lock_path,
+            )
+            .await,
+        )
+        .await;
         let prompt = prompt.expect("a normal update needs review");
 
         assert!(report.failures.is_empty(), "{:?}", report.failures);
         assert!(prompt.contains("permissions: +net"));
     }
 
-    #[test]
-    fn unavailable_previous_manifest_is_reported_in_review() {
+    #[tokio::test]
+    async fn unavailable_previous_manifest_is_reported_in_review() {
         let fixture =
-            update_fixture_with_manifests(Some("[permissions]\nrun = true\n"), Some(NET_MANIFEST));
+            update_fixture_with_manifests(Some("[permissions]\nrun = true\n"), Some(NET_MANIFEST))
+                .await;
         let mut lock = read_lockfile(Some(&fixture.lock_path)).unwrap();
         lock.record("demo", &fixture.declared[0].spec.src, TEST_REV);
         assert!(write_lockfile(&fixture.lock_path, &lock));
-        let (report, prompt) = finish_preparation(prepare_pack_ops_at(
-            &[update_operation(false)],
-            &fixture.declared,
-            &Default::default(),
-            &fixture.site,
-            &fixture.lock_path,
-        ));
+        let (report, prompt) = finish_preparation(
+            prepare_pack_ops_at(
+                &[update_operation(false)],
+                &fixture.declared,
+                &Default::default(),
+                &fixture.site,
+                &fixture.lock_path,
+            )
+            .await,
+        )
+        .await;
         let prompt = prompt.expect("a normal update needs review");
 
         assert!(report.failures.is_empty(), "{:?}", report.failures);
@@ -2408,16 +2550,17 @@ mod tests {
         assert!(prompt.contains("permissions: +net"));
     }
 
-    #[test]
-    fn declined_update_review_changes_no_managed_state() {
-        let fixture = update_fixture();
+    #[tokio::test]
+    async fn declined_update_review_changes_no_managed_state() {
+        let fixture = update_fixture().await;
         let preparation = prepare_pack_ops_at(
             &[update_operation(false)],
             &fixture.declared,
             &Default::default(),
             &fixture.site,
             &fixture.lock_path,
-        );
+        )
+        .await;
         let PackPreparation::Review { plan, .. } = preparation else {
             panic!("a normal update needs review");
         };
@@ -2433,17 +2576,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn forced_update_skips_review_and_applies_the_revision() {
-        let fixture = update_fixture();
+    #[tokio::test]
+    async fn forced_update_skips_review_and_applies_the_revision() {
+        let fixture = update_fixture().await;
         let approvals = fixture.site.join(APPROVALS_FILE);
-        let (report, prompt) = finish_preparation(prepare_pack_ops_at(
-            &[update_operation(true)],
-            &fixture.declared,
-            &Default::default(),
-            &fixture.site,
-            &fixture.lock_path,
-        ));
+        let (report, prompt) = finish_preparation(
+            prepare_pack_ops_at(
+                &[update_operation(true)],
+                &fixture.declared,
+                &Default::default(),
+                &fixture.site,
+                &fixture.lock_path,
+            )
+            .await,
+        )
+        .await;
 
         assert!(prompt.is_none());
         assert!(report.failures.is_empty(), "{:?}", report.failures);
@@ -2456,15 +2603,20 @@ mod tests {
 
     #[test_case(false, &["net"]; "accepted_review_grants_what_it_showed")]
     #[test_case(true, &[]; "force_grants_nothing")]
-    fn applied_update_records_only_reviewed_permissions(force: bool, expected: &[&str]) {
-        let fixture = update_fixture_with_manifests(None, Some(NET_MANIFEST));
-        let (report, _) = finish_preparation(prepare_pack_ops_at(
-            &[update_operation(force)],
-            &fixture.declared,
-            &Default::default(),
-            &fixture.site,
-            &fixture.lock_path,
-        ));
+    #[tokio::test]
+    async fn applied_update_records_only_reviewed_permissions(force: bool, expected: &[&str]) {
+        let fixture = update_fixture_with_manifests(None, Some(NET_MANIFEST)).await;
+        let (report, _) = finish_preparation(
+            prepare_pack_ops_at(
+                &[update_operation(force)],
+                &fixture.declared,
+                &Default::default(),
+                &fixture.site,
+                &fixture.lock_path,
+            )
+            .await,
+        )
+        .await;
 
         assert!(report.failures.is_empty(), "{:?}", report.failures);
         let approvals = read_approvals_file(&fixture.site.join(APPROVALS_FILE))
@@ -2479,39 +2631,45 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unreadable_approval_store_stops_before_git() {
-        let fixture = update_fixture();
+    #[tokio::test]
+    async fn unreadable_approval_store_stops_before_git() {
+        let fixture = update_fixture().await;
         let approval_path = fixture.site.join(APPROVALS_FILE);
         fs::create_dir_all(&fixture.site).unwrap();
         fs::write(&approval_path, "not json").unwrap();
         let work = maki_pack::paths::package_root(&fixture.site, "demo").join(".work");
         let before = run_git(&work, &["rev-parse", "refs/remotes/origin/HEAD"])
+            .await
             .stdout
             .trim()
             .to_owned();
 
-        let (report, prompt) = finish_preparation(prepare_pack_ops_at(
-            &[update_operation(false)],
-            &fixture.declared,
-            &Default::default(),
-            &fixture.site,
-            &fixture.lock_path,
-        ));
+        let (report, prompt) = finish_preparation(
+            prepare_pack_ops_at(
+                &[update_operation(false)],
+                &fixture.declared,
+                &Default::default(),
+                &fixture.site,
+                &fixture.lock_path,
+            )
+            .await,
+        )
+        .await;
 
         assert!(prompt.is_none());
         assert!(report.updated.is_empty());
         assert_eq!(report.failures.len(), 1);
         assert!(report.failures[0].contains("approval store is unreadable"));
         let after = run_git(&work, &["rev-parse", "refs/remotes/origin/HEAD"])
+            .await
             .stdout
             .trim()
             .to_owned();
         assert_eq!(before, after, "the work clone must not fetch");
     }
 
-    #[test]
-    fn delete_batch_removes_inactive_packages_and_keeps_active_ones() {
+    #[tokio::test]
+    async fn delete_batch_removes_inactive_packages_and_keeps_active_ones() {
         let fixture = managed_site(&[("inactive", TEST_REV), ("active", OTHER_REV)]);
         let active = BTreeSet::from(["active".to_owned()]);
         let operations = [
@@ -2519,13 +2677,10 @@ mod tests {
             delete_operation("active", false),
         ];
 
-        let (report, prompt) = finish_preparation(prepare_pack_ops_at(
-            &operations,
-            &[],
-            &active,
-            &fixture.site,
-            &fixture.lock_path,
-        ));
+        let (report, prompt) = finish_preparation(
+            prepare_pack_ops_at(&operations, &[], &active, &fixture.site, &fixture.lock_path).await,
+        )
+        .await;
 
         assert_eq!(
             prompt,
@@ -2547,8 +2702,8 @@ mod tests {
 
     /// The whole point of the review: a declined plan is a plan that never
     /// touched the disk.
-    #[test]
-    fn deletion_is_reviewed_before_anything_is_removed() {
+    #[tokio::test]
+    async fn deletion_is_reviewed_before_anything_is_removed() {
         let fixture = managed_site(&[("orphan", TEST_REV)]);
 
         let preparation = prepare_pack_ops_at(
@@ -2557,7 +2712,8 @@ mod tests {
             &Default::default(),
             &fixture.site,
             &fixture.lock_path,
-        );
+        )
+        .await;
 
         let PackPreparation::Review { prompt, .. } = preparation else {
             panic!("a delete needs review");
@@ -2569,17 +2725,21 @@ mod tests {
         assert!(maki_pack::paths::package_root(&fixture.site, "orphan").is_dir());
     }
 
-    #[test]
-    fn forced_deletion_skips_review_and_removes_the_package() {
+    #[tokio::test]
+    async fn forced_deletion_skips_review_and_removes_the_package() {
         let fixture = managed_site(&[("orphan", TEST_REV)]);
 
-        let (report, prompt) = finish_preparation(prepare_pack_ops_at(
-            &[delete_operation("orphan", true)],
-            &[],
-            &Default::default(),
-            &fixture.site,
-            &fixture.lock_path,
-        ));
+        let (report, prompt) = finish_preparation(
+            prepare_pack_ops_at(
+                &[delete_operation("orphan", true)],
+                &[],
+                &Default::default(),
+                &fixture.site,
+                &fixture.lock_path,
+            )
+            .await,
+        )
+        .await;
 
         assert!(prompt.is_none());
         assert!(report.failures.is_empty(), "{:?}", report.failures);
@@ -2587,22 +2747,26 @@ mod tests {
         assert!(!maki_pack::paths::package_root(&fixture.site, "orphan").exists());
     }
 
-    #[test]
-    fn updates_refuse_bundled_and_manual_package_owners() {
+    #[tokio::test]
+    async fn updates_refuse_bundled_and_manual_package_owners() {
         let fixture = managed_site(&[]);
         make_package(&fixture.site, "vendor", "start", "manual");
 
         for name in ["bash", "manual"] {
-            let (report, prompt) = finish_preparation(prepare_pack_ops_at(
-                &[PlannedOp::Update {
-                    name: name.to_owned(),
-                    options: UpdateOptions::default(),
-                }],
-                &[declaration(name)],
-                &Default::default(),
-                &fixture.site,
-                &fixture.lock_path,
-            ));
+            let (report, prompt) = finish_preparation(
+                prepare_pack_ops_at(
+                    &[PlannedOp::Update {
+                        name: name.to_owned(),
+                        options: UpdateOptions::default(),
+                    }],
+                    &[declaration(name)],
+                    &Default::default(),
+                    &fixture.site,
+                    &fixture.lock_path,
+                )
+                .await,
+            )
+            .await;
 
             assert!(prompt.is_none());
             assert_eq!(
@@ -2612,17 +2776,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn deletion_refuses_a_declared_package_before_removing_files() {
+    #[tokio::test]
+    async fn deletion_refuses_a_declared_package_before_removing_files() {
         let fixture = managed_site(&[("demo", TEST_REV)]);
 
-        let (report, prompt) = finish_preparation(prepare_pack_ops_at(
-            &[delete_operation("demo", false)],
-            &[declaration("demo")],
-            &Default::default(),
-            &fixture.site,
-            &fixture.lock_path,
-        ));
+        let (report, prompt) = finish_preparation(
+            prepare_pack_ops_at(
+                &[delete_operation("demo", false)],
+                &[declaration("demo")],
+                &Default::default(),
+                &fixture.site,
+                &fixture.lock_path,
+            )
+            .await,
+        )
+        .await;
 
         assert!(prompt.is_none());
         assert_eq!(

@@ -7,12 +7,9 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use maki_agent::cancel::CancelToken;
-use maki_config::providers::ProvidersConfig;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::AgentError;
-use maki_providers::plugin::{
-    self, DeclAuthority, Hook, ProviderDecl, ProviderHooks, Registration,
-};
+use maki_providers::plugin::{self, Hook, ProviderDecl, ProviderHooks, Registration};
 use maki_providers::provider::BoxFuture;
 use maki_storage::StateDir;
 use maki_storage::auth::{
@@ -25,7 +22,10 @@ use mlua::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tokio::task::spawn_blocking;
+use tokio::time::timeout;
 
+use crate::api::Owner;
 use crate::api::net::{self, NetError, ResponseData};
 use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json, lua_to_json_within};
 use crate::api::util::pair::{Pair, try_pair};
@@ -201,6 +201,7 @@ impl Drop for LuaHookKeys {
                 delay: Duration::ZERO,
                 plugin: Arc::clone(&self.plugin),
                 cancel: Arc::new(AtomicBool::new(true)),
+                ceiling: None,
             });
         }
     }
@@ -248,13 +249,9 @@ where
                 .map_err(|_| AgentError::Channel)?;
             let answered = async { answer.recv_async().await.map_err(|_| AgentError::Channel) };
             let value = match self.timeout {
-                Some(limit) => {
-                    futures_lite::future::or(answered, async {
-                        smol::Timer::after(limit).await;
-                        Err(self.timed_out(limit))
-                    })
-                    .await?
-                }
+                Some(limit) => timeout(limit, answered)
+                    .await
+                    .unwrap_or_else(|_| Err(self.timed_out(limit)))?,
                 None => answered.await?,
             };
             value.map_err(|failure| match failure {
@@ -494,8 +491,7 @@ async fn fetch_json(
     } = net::provider_get(url, headers, egress)
         .await
         .map_err(|error| match error {
-            NetError::Transport(error) => AgentError::Http(error),
-            NetError::Read(error) => AgentError::Io(error),
+            NetError::Transport(error) | NetError::Read(error) => AgentError::from(error),
             NetError::Refused(message) => AgentError::Config {
                 message: format!("{GET_JSON} {url}: {message}"),
             },
@@ -528,7 +524,9 @@ fn add_stdio(lua: &Lua, ctx: &Table) -> LuaResult<()> {
         lua.create_async_function(|_, opts: Table| async move {
             let label: String = opts.get("label").unwrap_or_default();
             let secret = opts.opt::<bool>("secret")?.unwrap_or(false);
-            Ok(smol::unblock(move || read_answer(&label, secret)).await)
+            spawn_blocking(move || read_answer(&label, secret))
+                .await
+                .map_err(mlua::Error::external)
         })?,
     )?;
     ctx.set(
@@ -608,17 +606,16 @@ fn owned(slugs: &OwnedSlugs, slug: &str) -> LuaResult<()> {
     )))
 }
 
-/// Whether providers.toml selects this package to implement {slug}. A package
-/// that ships several providers calls it at load time to skip the ones the user
-/// did not [select](/docs/providers/#select-a-provider-package).
+/// Whether this package was granted {slug}: the manifest lists it under
+/// `providers` and the install approval covers it. Kept from maki 0.6.3,
+/// where multi-provider packages called it to skip the ones the user did not
+/// select; it now answers from the same list.
 ///
 /// @param slug string Provider name.
 /// @return boolean
 #[lua_fn]
-fn is_selected(_lua: &Lua, #[ctx] plugin: Arc<str>, slug: String) -> LuaResult<bool> {
-    Ok(ProvidersConfig::load_or_default()
-        .get(&slug)
-        .is_some_and(|def| def.plugin.as_deref() == Some(plugin.as_ref())))
+fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> LuaResult<bool> {
+    Ok(owner.granted_providers.contains(&slug))
 }
 
 /// Register a provider this plugin implements. Its models are addressed as
@@ -628,6 +625,12 @@ fn is_selected(_lua: &Lua, #[ctx] plugin: Arc<str>, slug: String) -> LuaResult<b
 /// while the plugin loads. The plugin needs a non-empty `net_hosts` list in its
 /// `plugin.toml`. The [Providers guide](/docs/providers/#plugin-providers)
 /// walks through a full example.
+///
+/// A slug models.dev serves has to be one the package was granted: the
+/// manifest lists it under `providers`, and the install approval covers it.
+/// List every slug the package registers, so a name the catalog adds later
+/// is already approved. A slug maki ships is reserved. See
+/// [granted slugs](/docs/providers/#granted-slugs).
 ///
 /// Set exactly one of `codec` or `base`. An unknown key, or an option the
 /// chosen codec cannot honour, fails registration.
@@ -780,14 +783,18 @@ fn is_selected(_lua: &Lua, #[ctx] plugin: Arc<str>, slug: String) -> LuaResult<b
 #[lua_fn(guard = Net)]
 fn register(
     lua: &Lua,
-    #[ctx] plugin: Arc<str>,
+    #[ctx] owner: crate::api::Owner,
     #[ctx] egress: NetEgress,
-    #[ctx] authority: DeclAuthority,
-    #[ctx] reads_env: bool,
+    #[ctx] grants: PluginPermissions,
     spec: Table,
 ) -> LuaResult<()> {
+    let crate::api::Owner {
+        name: plugin,
+        authority,
+        granted_providers: granted,
+    } = owner;
     let (hook_keys, mut decl) = declaration(lua, &spec)?;
-    if decl.api_key_env.is_some() && !reads_env {
+    if decl.api_key_env.is_some() && !grants.now(lua).is_allowed(Permission::Env) {
         return Err(register_error(API_KEY_ENV_NEEDS_ENV));
     }
     decl.net_hosts = egress
@@ -822,6 +829,7 @@ fn register(
             },
         },
         authority,
+        &granted,
     )
     .map_err(|e| mlua::Error::runtime(e.to_string()))?;
     egress.owns(slug);
@@ -946,12 +954,14 @@ async fn write_credentials(
     slug: String,
     write: impl FnOnce(&StateDir, &str) -> Result<(), String> + Send + 'static,
 ) -> Result<(), String> {
-    smol::unblock(move || {
+    spawn_blocking(move || {
         let dir = StateDir::resolve().map_err(|e| e.to_string())?;
         let _lock = lock_credentials(&dir, &slug);
         write(&dir, &slug)
     })
     .await
+    .map_err(|e| e.to_string())
+    .flatten()
 }
 
 /// Store credentials for one of this plugin's providers, replacing what was
@@ -1044,9 +1054,9 @@ lua_table! {
     ///   models = { { prefixes = { "acme-large" }, tier = "strong" } },
     /// })
     /// ```
-    "maki.provider" => pub(crate) fn create_provider_table(perms: &PluginPermissions, plugin: Arc<str>, egress: NetEgress, authority: DeclAuthority, reads_env: bool), DOCS [
-        register(perms, plugin, egress, authority, reads_env),
-        is_selected(plugin),
+    "maki.provider" => pub(crate) fn create_provider_table(perms: &PluginPermissions, owner: crate::api::Owner, egress: NetEgress, grants: PluginPermissions), DOCS [
+        register(perms, owner, egress, grants),
+        is_selected(owner),
         http_error,
     ]
 }
@@ -1058,13 +1068,11 @@ lua_table! {
 pub(crate) fn create_provider_namespace(
     lua: &Lua,
     permissions: &PluginPermissions,
-    plugin: Arc<str>,
+    owner: Owner,
     egress: NetEgress,
-    authority: DeclAuthority,
 ) -> LuaResult<Table> {
     let owned = egress.owned();
-    let reads_env = permissions.is_allowed(Permission::Env);
-    let provider = create_provider_table(lua, permissions, plugin, egress, authority, reads_env)?;
+    let provider = create_provider_table(lua, permissions, owner, egress, permissions.clone())?;
     provider.set("auth", create_auth_table(lua, owned)?)?;
     Ok(provider)
 }
@@ -1072,6 +1080,7 @@ pub(crate) fn create_provider_namespace(
 #[cfg(test)]
 mod tests {
     use maki_providers::ProviderUsage;
+    use maki_providers::plugin::DeclAuthority;
     use serde_json::json;
     use test_case::test_case;
 
@@ -1183,27 +1192,30 @@ mod tests {
 
     /// A bare name would silently glue onto the origin's last segment, so it
     /// is refused as the programmer error it is.
-    #[test]
-    fn get_json_refuses_a_target_that_is_neither_a_path_nor_a_url() {
+    #[tokio::test]
+    async fn get_json_refuses_a_target_that_is_neither_a_path_nor_a_url() {
         let lua = Lua::new();
         let ctx = hook_ctx(&lua, &keys_from(&lua, []), false).unwrap();
         let get_json: Function = ctx.get(GET_JSON).unwrap();
 
-        let error = smol::block_on(get_json.call_async::<LuaValue>(RELATIVE_TARGET)).unwrap_err();
+        let error = get_json
+            .call_async::<LuaValue>(RELATIVE_TARGET)
+            .await
+            .unwrap_err();
 
         assert!(error.to_string().contains(RELATIVE_TARGET), "{error}");
     }
 
     /// A slug with no origin is a state the plugin can report, so it comes
     /// back as an error to return rather than raised.
-    #[test]
-    fn get_json_without_an_origin_answers_with_an_error() {
+    #[tokio::test]
+    async fn get_json_without_an_origin_answers_with_an_error() {
         let lua = Lua::new();
         let ctx = hook_ctx(&lua, &keys_from(&lua, []), false).unwrap();
         let get_json: Function = ctx.get(GET_JSON).unwrap();
 
         let (value, error): (LuaValue, AnyUserData) =
-            smol::block_on(get_json.call_async(PATH_TARGET)).unwrap();
+            get_json.call_async(PATH_TARGET).await.unwrap();
 
         assert!(value.is_nil());
         let ProviderError(error) = error.take().unwrap();
@@ -1218,8 +1230,8 @@ mod tests {
     /// nil key is an absent key, so without the template the fields the hook
     /// never looked at would come back deleted, silently, and only for the
     /// bodies that happen to carry a null.
-    #[test]
-    fn a_body_a_hook_handed_back_keeps_the_fields_it_never_touched() {
+    #[tokio::test]
+    async fn a_body_a_hook_handed_back_keeps_the_fields_it_never_touched() {
         const EDITED_FIELD: &str = "thinking";
         const KEPT_NULL_FIELD: &str = "tool_choice";
 
@@ -1238,7 +1250,7 @@ mod tests {
             MODEL_FIELD: "m-1",
         });
 
-        let returned = smol::block_on(run_hook(&lua, &hooks, HookSlot::BuildBody, payload));
+        let returned = run_hook(&lua, &hooks, HookSlot::BuildBody, payload).await;
         let body: Value = decode(&lua, returned.unwrap()).unwrap();
 
         assert_eq!(
@@ -1290,7 +1302,7 @@ mod tests {
     /// Runs `source`, which evaluates to a function, as a `fetch_usage` hook
     /// through the whole bridge: [`LuaHook::call`] on the caller's side, the
     /// host's [`run_hook`] on the other.
-    fn call_usage_hook(source: &str) -> Result<Option<ProviderUsage>, AgentError> {
+    async fn call_usage_hook(source: &str) -> Result<Option<ProviderUsage>, AgentError> {
         let lua = provider_lua(true);
         let func: Function = lua.load(source).eval().unwrap();
         let (requests, served) = flume::unbounded();
@@ -1315,37 +1327,38 @@ mod tests {
             };
             answer(&lua, run_hook(&lua, &hook, slot, payload).await);
         };
-        smol::block_on(futures_lite::future::zip(bridge.call(()), host)).0
+        tokio::join!(bridge.call(()), host).0
     }
 
     /// The header is spelled `Retry-After`, the way servers send it, to show
     /// that `http_error` still finds it.
     #[test_case(UNAUTHORIZED, None ; "unauthorized")]
     #[test_case(RATE_LIMITED, Some(RETRY_AFTER_SECS) ; "rate_limited_with_retry_after")]
-    fn a_returned_http_error_is_the_native_error(status: u16, retry_after: Option<&str>) {
+    #[tokio::test]
+    async fn a_returned_http_error_is_the_native_error(status: u16, retry_after: Option<&str>) {
         let source = format!(
             "return function() return nil, provider.http_error({}) end",
             lua_response(status, retry_after)
         );
 
-        let error = call_usage_hook(&source).unwrap_err();
+        let error = call_usage_hook(&source).await.unwrap_err();
 
         assert_same_error(&error, &native_error(status, retry_after));
     }
 
     /// Only our own userdata is a reported failure. A string beside a nil means
     /// what it always did: the nil is the answer, and a nil usage shows nothing.
-    #[test]
-    fn a_returned_string_error_is_not_a_reported_failure() {
+    #[tokio::test]
+    async fn a_returned_string_error_is_not_a_reported_failure() {
         let source = format!(r#"return function() return nil, "{HOOK_ERROR}" end"#);
-        assert!(call_usage_hook(&source).unwrap().is_none());
+        assert!(call_usage_hook(&source).await.unwrap().is_none());
     }
 
-    #[test]
-    fn a_raised_error_is_still_a_broken_hook() {
+    #[tokio::test]
+    async fn a_raised_error_is_still_a_broken_hook() {
         let source = format!(r#"return function() error("{HOOK_ERROR}") end"#);
 
-        let error = call_usage_hook(&source).unwrap_err();
+        let error = call_usage_hook(&source).await.unwrap_err();
 
         assert!(
             matches!(&error, AgentError::Config { message } if message.contains(HOOK_ERROR)),
@@ -1470,16 +1483,22 @@ mod tests {
     }
 
     /// A Lua state with the real `maki.provider` table as the global
-    /// `provider`.
+    /// `provider`. The slug under test is granted, which a refusal test
+    /// overrides to cover.
     fn provider_lua(reads_env: bool) -> Lua {
         let lua = Lua::new();
+        let mut grants = PluginPermissions::trusted();
+        grants.set(Permission::Env, reads_env);
         let table = create_provider_table(
             &lua,
             &PluginPermissions::trusted(),
-            Arc::from(PLUGIN),
+            crate::api::Owner {
+                name: Arc::from(PLUGIN),
+                authority: DeclAuthority::ThirdParty,
+                granted_providers: Arc::from(vec![SLUG_NAME.to_owned()]),
+            },
             NetEgress::default(),
-            DeclAuthority::ThirdParty,
-            reads_env,
+            grants,
         )
         .unwrap();
         lua.globals().set("provider", table).unwrap();

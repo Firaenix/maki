@@ -1,20 +1,22 @@
 use std::sync::{Arc, Mutex};
 
 use flume::Sender;
+use maki_storage::StateDir;
+use maki_storage::auth::load_provider_credentials;
 use maki_storage::id::SessionRef;
 use serde_json::Value;
 
 use crate::model::{Model, ModelFamily, ModelInfo};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::catalog::{
-    CatalogMeta, CatalogTransport, EndpointType, FreeTier, ProviderQuirks,
-    adaptive_effort_if_available, init_shared_catalog_if_needed,
+    CatalogMeta, CatalogTransport, EndpointType, FreeTier, ProviderQuirks, sends_if_available,
+    shared_catalog,
 };
 use crate::spec::{
     AuthDoc, Build, CatalogDoc, GENERIC_DISCOVERY_NOTE, GeneratedDocs, NO_CURATED_MODELS, Native,
     ProviderSpec,
 };
-use crate::{AgentError, Effort, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::{AgentError, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig};
 
 use super::{ResolvedAuth, Timeouts, with_prefix};
 
@@ -31,6 +33,7 @@ const GO_API_URL: &str = "https://opencode.ai/zen/go/v1";
 const ZEN_FEATURES: &str = "Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Zen API";
 const GO_FEATURES: &str = "Dynamically discovered models via [models.dev](https://models.dev/) + all the models provided by Opencode Go API";
 const GO_DISCOVERY_NOTE: &str = "No hardcoded model catalog. Use any model ID supported by this provider. An API key is required.";
+const CATALOG_UNAVAILABLE: &str = "the models.dev catalog is unavailable";
 
 const FREE_MODELS_NOTE: &str = r#"By default Maki hides free models from the Opencode catalog. To list free models (they use a public fallback, no API key needed), add this to `~/.config/maki/providers.toml`:
 
@@ -50,7 +53,7 @@ pub(crate) const ZEN_SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Generic,
     supports_thinking: true,
     supports_deferred_tools: false,
-    adaptive_effort,
+    sends_thinking,
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(128_000),
@@ -79,7 +82,7 @@ pub(crate) const GO_SPEC: ProviderSpec = ProviderSpec {
     family: ModelFamily::Generic,
     supports_thinking: false,
     supports_deferred_tools: false,
-    adaptive_effort: |_| adaptive_effort_if_available(GO_SLUG),
+    sends_thinking: |_, choice| sends_if_available(GO_SLUG, choice),
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: true,
     fallback_max_output: Some(64_000),
@@ -100,12 +103,12 @@ pub(crate) const GO_SPEC: ProviderSpec = ProviderSpec {
 
 /// Zen ids name the sub-provider that serves them, as
 /// [`Opencode::stream_message`] reads them.
-fn adaptive_effort(model: &Model) -> Option<Effort> {
+fn sends_thinking(model: &Model, choice: ThinkingConfig) -> ThinkingConfig {
     let sub_provider = model
         .id
         .split_once('/')
         .map_or(ZEN_SLUG, |(sub_provider, _)| sub_provider);
-    adaptive_effort_if_available(sub_provider)
+    sends_if_available(sub_provider, choice)
 }
 
 fn create(timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
@@ -182,13 +185,17 @@ impl Opencode {
     }
 
     async fn do_list_models(&self) -> Result<Vec<ModelInfo>, AgentError> {
-        Ok(smol::unblock(move || {
-            let guard = init_shared_catalog_if_needed().lock().unwrap();
-            guard.provider(ZEN_SLUG).map_or_else(Vec::new, |data| {
-                data.available_models(&guard.state_dir, data.free_models_enabled())
-            })
-        })
-        .await)
+        let guard = shared_catalog().await.lock().unwrap();
+        let Some(data) = guard.provider(ZEN_SLUG) else {
+            return if zen_has_key(&guard.state_dir) {
+                Err(AgentError::Config {
+                    message: CATALOG_UNAVAILABLE.into(),
+                })
+            } else {
+                Ok(Vec::new())
+            };
+        };
+        Ok(data.available_models(&guard.state_dir, data.free_models_enabled()))
     }
 
     async fn lookup(
@@ -197,34 +204,36 @@ impl Opencode {
         actual_id: &str,
         session_id: Option<&SessionRef>,
     ) -> Result<(CatalogMeta, EndpointType, ResolvedAuth), AgentError> {
-        let sub_provider = sub_provider.to_string();
-        let actual_id = actual_id.to_string();
-        let session_id = session_id.cloned();
-        let auth_override = self.auth.clone();
-        smol::unblock(move || {
-            let guard = init_shared_catalog_if_needed().lock().unwrap();
-            let (meta, provider_data) = guard.lookup(&sub_provider, &actual_id)?;
-            let override_auth = auth_override
-                .filter(|_| SLUGS.contains(&provider_data.slug.as_str()))
-                .map(|auth| {
-                    let mut auth = auth.lock().unwrap().clone();
-                    if auth.base_url.is_none() {
-                        auth.base_url = provider_data.base_url.clone();
-                    }
-                    auth
-                });
-            let auth = match override_auth {
-                Some(auth) => auth,
-                None => provider_data
-                    .catalog_auth(&guard.state_dir, provider_data.free_models_enabled())?
-                    .unlocked(&sub_provider)?
-                    .clone(),
-            };
-            let auth = provider_data.request_auth(auth, session_id.as_ref());
-            Ok((meta.clone(), provider_data.api_format, auth))
-        })
-        .await
+        let guard = shared_catalog().await.lock().unwrap();
+        let (meta, provider_data) = guard.lookup(sub_provider, actual_id)?;
+        let override_auth = self
+            .auth
+            .clone()
+            .filter(|_| SLUGS.contains(&provider_data.slug.as_str()))
+            .map(|auth| {
+                let mut auth = auth.lock().unwrap().clone();
+                if auth.base_url.is_none() {
+                    auth.base_url = provider_data.base_url.clone();
+                }
+                auth
+            });
+        let auth = match override_auth {
+            Some(auth) => auth,
+            None => provider_data
+                .catalog_auth(&guard.state_dir, provider_data.free_models_enabled())?
+                .unlocked(sub_provider)?
+                .clone(),
+        };
+        let auth = provider_data.request_auth(auth, session_id);
+        Ok((meta.clone(), provider_data.api_format, auth))
     }
+}
+
+/// Zen is listed for everyone, so a missing catalog only deserves a warning
+/// for someone who configured a key. Without one there is nothing to list and
+/// nothing to fix.
+fn zen_has_key(state_dir: &StateDir) -> bool {
+    std::env::var(ENV_VAR).is_ok() || load_provider_credentials(state_dir, ZEN_SLUG).is_some()
 }
 
 impl Provider for Opencode {

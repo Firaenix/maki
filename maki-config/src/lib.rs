@@ -4,7 +4,7 @@ use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use globset::{GlobBuilder, GlobMatcher, GlobSet, GlobSetBuilder};
 use maki_config_macro::ConfigSection;
 use maki_storage::paths;
 use maki_storage::sessions::{SessionMeta, StoredThinking, ThinkingParseError};
@@ -168,6 +168,7 @@ pub enum Permission {
     SessionRead,
     SessionWrite,
     SessionSettings,
+    Input,
 }
 
 impl Permission {
@@ -204,6 +205,7 @@ impl Permission {
             Permission::SessionRead => "session_read",
             Permission::SessionWrite => "session_write",
             Permission::SessionSettings => "session_settings",
+            Permission::Input => "input",
         }
     }
 
@@ -229,6 +231,7 @@ impl Permission {
             Permission::SessionSettings => {
                 "changing how a session runs without touching its content: mode, title, model, thinking, fast mode, working directory, and workflow"
             }
+            Permission::Input => "changing the chat input, which is what your next Enter sends",
         }
     }
 }
@@ -457,6 +460,14 @@ pub enum ConfigError {
         #[source]
         source: globset::Error,
     },
+    #[error(
+        "invalid config: instructions.overrides contains invalid glob pattern `{pattern}`: {source}"
+    )]
+    InvalidOverridePattern {
+        pattern: String,
+        #[source]
+        source: globset::Error,
+    },
 }
 
 fn check(
@@ -545,6 +556,7 @@ pub struct RawConfig {
     pub storage: StorageFileConfig,
     pub net: NetFileConfig,
     pub trust: TrustFileConfig,
+    pub instructions: InstructionsFileConfig,
     pub telemetry: TelemetryConfig,
     pub plugins: HashMap<String, PluginFileConfig>,
 }
@@ -565,6 +577,7 @@ impl RawConfig {
         self.storage.merge(overlay.storage);
         self.net.merge(overlay.net);
         self.trust.merge(overlay.trust);
+        self.instructions.merge(overlay.instructions);
         self.telemetry.merge(overlay.telemetry);
         for (name, plugin) in overlay.plugins {
             let entry = self.plugins.entry(name).or_default();
@@ -584,6 +597,8 @@ impl RawConfig {
             return Err(ConfigError::RenamedShowThinking);
         }
         self.validate_plugin_tables(packages)?;
+        let mut agent = AgentConfig::from_file(self.agent);
+        agent.instructions = InstructionsConfig::from_file(self.instructions)?;
         Ok(Config {
             always_yolo: self.always_yolo.unwrap_or(false),
             session_defaults: SessionDefaults {
@@ -595,7 +610,7 @@ impl RawConfig {
                     .transpose()?,
             },
             ui: UiConfig::from_file(self.ui),
-            agent: AgentConfig::from_file(self.agent),
+            agent,
             provider: ProviderConfig::from_file(self.provider)?,
             storage: StorageConfig::from_file(self.storage),
             net: NetConfig::from_file(self.net),
@@ -923,6 +938,51 @@ impl TrustFileConfig {
     }
 }
 
+/// Which instruction files Maki loads. Only the global `init.lua` may set
+/// this: a project file that could pick its own instructions would be
+/// trusting itself, and `maki-lua` strips the table from every other scope
+/// before it reaches here.
+#[derive(Deserialize, Default, Debug, Clone)]
+#[serde(default, deny_unknown_fields)]
+pub struct InstructionsFileConfig {
+    /// Replaces the built-in file list. An empty list loads no project
+    /// instruction files at all; `AGENTS.local.md` still loads.
+    pub files: Option<Vec<String>>,
+    /// Per-checkout overrides of `files`, matched by local `path` glob, git
+    /// `remote` glob, or both. The first matching entry wins.
+    pub overrides: Vec<ProjectOverrideFileConfig>,
+}
+
+impl InstructionsFileConfig {
+    fn merge(&mut self, overlay: InstructionsFileConfig) {
+        merge_option!(self, overlay, files);
+        if !overlay.overrides.is_empty() {
+            self.overrides = overlay.overrides;
+        }
+    }
+
+    /// Whether the file mentioned instructions at all, so the scope that is
+    /// not allowed to set them can warn about exactly the configs that tried.
+    pub fn is_set(&self) -> bool {
+        self.files.is_some() || !self.overrides.is_empty()
+    }
+}
+
+/// One entry of the `instructions.overrides` list: a per-checkout file list,
+/// matched by local `path` glob, git `remote` glob, or both.
+#[derive(Deserialize, Default, Debug, Clone)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProjectOverrideFileConfig {
+    /// Glob matched against the canonical project root, like `trust.paths`.
+    pub path: Option<String>,
+    /// Glob matched against every git remote URL of the project, normalized
+    /// to `host/path` (scheme, user, port and `.git` suffix removed).
+    pub remote: Option<String>,
+    /// The file list that applies when this entry matches. `None` keeps the
+    /// global `files`.
+    pub files: Option<Vec<String>>,
+}
+
 #[derive(Deserialize, Default, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct StorageFileConfig {
@@ -1001,18 +1061,18 @@ impl<'de> Deserialize<'de> for PermissionsFileConfig {
                         } else {
                             tracing::warn!(
                                 server = server_name.as_str(),
-                                "[mcp.{server_name}] is not a table — skipping"
+                                "[mcp.{server_name}] is not a table: skipping"
                             );
                         }
                     }
                 } else {
-                    tracing::warn!("[mcp] is not a table (got {}) — skipping", v.type_str());
+                    tracing::warn!("[mcp] is not a table (got {}): skipping", v.type_str());
                 }
             } else if let Ok(tp) = v.clone().try_into::<ToolPermissions>() {
                 if k.contains('.') {
                     tracing::warn!(
                         key = k.as_str(),
-                        "tool section [{k}] contains a dot — did you mean [mcp.{k}]? Skipping."
+                        "tool section [{k}] contains a dot: did you mean [mcp.{k}]? Skipping."
                     );
                 } else {
                     tools.insert(k.clone(), tp);
@@ -1527,6 +1587,12 @@ pub struct AgentConfig {
     /// registers its tool, so its name stays free for another plugin to claim.
     #[config(skip, default = "Vec::new()")]
     pub disabled_tools: Vec<String>,
+
+    /// Which instruction files load, and the per-project overrides. Set from
+    /// the top-level `instructions` table in `into_config`, not from the
+    /// `[agent]` section, because only the global `init.lua` may set them.
+    #[config(skip, default = "InstructionsConfig::default()")]
+    pub instructions: InstructionsConfig,
 }
 
 impl AgentConfig {
@@ -1547,6 +1613,7 @@ impl AgentConfig {
             max_turns: None,
             allowed_tools: Vec::new(),
             disabled_tools: Vec::new(),
+            instructions: InstructionsConfig::default(),
         }
     }
 }
@@ -1857,11 +1924,168 @@ fn expand_home(pattern: &str) -> String {
     }
 }
 
+/// Resolved `instructions` config. Carried on [`AgentConfig`] so every
+/// instruction load sees the same answer.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct InstructionsConfig {
+    /// `None` loads the built-in file list.
+    pub files: Option<Vec<String>>,
+    pub overrides: Vec<ProjectOverride>,
+}
+
+impl InstructionsConfig {
+    pub fn from_file(file: InstructionsFileConfig) -> Result<Self, ConfigError> {
+        let mut resolved = Vec::with_capacity(file.overrides.len());
+        for entry in file.overrides {
+            resolved.push(ProjectOverride {
+                path_matcher: compiled_matcher(entry.path.as_deref(), compile_path_glob)?,
+                remote_matcher: compiled_matcher(entry.remote.as_deref(), compile_remote_glob)?,
+                path: entry.path,
+                remote: entry.remote,
+                files: entry.files,
+            });
+        }
+        Ok(Self {
+            files: file.files,
+            overrides: resolved,
+        })
+    }
+
+    /// Whether any `overrides` entry matches on `remote`, so the caller knows
+    /// it has to read the project's git remotes before resolving.
+    pub fn needs_remotes(&self) -> bool {
+        self.overrides.iter().any(|entry| entry.remote.is_some())
+    }
+
+    /// The file list that applies to the project at `project_root`, whose git
+    /// remotes are `remotes`. The first matching `overrides` entry wins;
+    /// `default` applies when nothing configured does.
+    pub fn resolve_files(
+        &self,
+        project_root: &Path,
+        remotes: &[String],
+        default: &[&str],
+    ) -> Vec<String> {
+        let mut files = self.files.clone();
+        for entry in &self.overrides {
+            if entry.matches(project_root, remotes) {
+                if let Some(entry_files) = &entry.files {
+                    files = Some(entry_files.clone());
+                }
+                break;
+            }
+        }
+        files.unwrap_or_else(|| default.iter().map(|file| file.to_string()).collect())
+    }
+}
+
+/// One `instructions.overrides` entry, with its matchers precompiled at load.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectOverride {
+    pub path: Option<String>,
+    pub remote: Option<String>,
+    pub files: Option<Vec<String>>,
+    #[serde(skip)]
+    path_matcher: Option<GlobMatcher>,
+    #[serde(skip)]
+    remote_matcher: Option<GlobMatcher>,
+}
+
+fn compiled_matcher(
+    pattern: Option<&str>,
+    compile: fn(&str) -> Result<GlobMatcher, globset::Error>,
+) -> Result<Option<GlobMatcher>, ConfigError> {
+    let Some(pattern) = pattern else {
+        return Ok(None);
+    };
+    compile(pattern)
+        .map(Some)
+        .map_err(|source| ConfigError::InvalidOverridePattern {
+            pattern: pattern.to_owned(),
+            source,
+        })
+}
+
+/// `path` patterns name local directories, so `~` expands like
+/// `trust.paths`; `remote` patterns match the normalized URL instead.
+fn compile_path_glob(pattern: &str) -> Result<GlobMatcher, globset::Error> {
+    GlobBuilder::new(&expand_home(pattern))
+        .literal_separator(true)
+        .build()
+        .map(|glob| glob.compile_matcher())
+}
+
+fn compile_remote_glob(pattern: &str) -> Result<GlobMatcher, globset::Error> {
+    GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()
+        .map(|glob| glob.compile_matcher())
+}
+
+impl ProjectOverride {
+    /// Both matchers must match when both are set; an entry with neither
+    /// matches every project.
+    fn matches(&self, project_root: &Path, remotes: &[String]) -> bool {
+        if let Some(matcher) = &self.path_matcher
+            && !matcher.is_match(project_root)
+        {
+            return false;
+        }
+        if let Some(matcher) = &self.remote_matcher
+            && !remotes
+                .iter()
+                .any(|url| matcher.is_match(normalize_remote_url(url)))
+        {
+            return false;
+        }
+        true
+    }
+}
+
+/// A remote URL reduced to `host/path`, so a `remote` glob names the project
+/// and not the transport: `https://host/a/b.git`, `ssh://git@host/a/b.git`
+/// and `git@host:a/b.git` all become `host/a/b`.
+fn normalize_remote_url(url: &str) -> String {
+    let mut s = url.trim();
+    let has_scheme = s.contains("://");
+    if let Some((_, rest)) = s.split_once("://") {
+        s = rest;
+    }
+    // `user@` goes next: `ssh://git@host/...` and scp-like `git@host:...`
+    if let Some((user, rest)) = s.split_once('@')
+        && !user.contains('/')
+        && (has_scheme || !user.contains(':'))
+    {
+        s = rest;
+    }
+    let mut normalized = s.trim_end_matches('/').to_owned();
+    // What is left is `host/path`, `host:port/path` or scp-like `host:path`.
+    // A drive letter (`C:\...`) is a single character, an intranet host may
+    // have no dot, so only that one stays alone.
+    if let Some((host, rest)) = normalized.split_once(':')
+        && host.len() > 1
+        && !host.contains('/')
+    {
+        match rest.split_once('/') {
+            // `host:port/path`: the port is dropped
+            Some((port, path)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+                normalized = format!("{host}/{path}");
+            }
+            // scp-like `host:path`
+            _ => normalized = format!("{host}/{rest}"),
+        }
+    }
+    if let Some(stripped) = normalized.strip_suffix(".git") {
+        normalized = stripped.to_owned();
+    }
+    normalized
+}
+
 /// OpenTelemetry export settings. Every field also has an `OTEL_*` (or
 /// `MAKI_*`) environment variable, which wins over what is set here.
 ///
-/// Fields stay optional: `maki-otel` owns the defaults, resolution and
-/// validation, so the meaning of "unset" is decided in one place.
+/// Fields stay optional: `maki-otel` owns the defaults, so the meaning of
+/// "unset" is decided in one place.
 #[derive(Deserialize, Debug, Clone, ConfigSection)]
 #[serde(default, deny_unknown_fields)]
 #[config(section = "telemetry")]
@@ -1881,24 +2105,24 @@ pub struct TelemetryConfig {
              desc = "Where events go: `otlp`, `console`, `none`, or a comma-separated mix")]
     pub logs_exporter: Option<String>,
 
-    #[config(default = None, ty = "string", default_doc = "-",
+    #[config(default = None, ty = "string", default_doc = "http/json",
              env = "OTEL_EXPORTER_OTLP_PROTOCOL",
-             desc = "OTLP protocol: `grpc`, `http/protobuf`, or `http/json`. Required when an exporter is `otlp`")]
+             desc = "OTLP protocol: `grpc`, `http/protobuf`, or `http/json`")]
     pub protocol: Option<String>,
 
-    #[config(default = None, ty = "string", default_doc = "-",
+    #[config(default = None, ty = "string", default_doc = "http://localhost:4318",
              env = "OTEL_EXPORTER_OTLP_ENDPOINT",
-             desc = "Collector endpoint. HTTP appends `/v1/metrics` and `/v1/logs`")]
+             desc = "Collector endpoint. HTTP appends `/v1/metrics` and `/v1/logs`. The gRPC default is `http://localhost:4317`")]
     pub endpoint: Option<String>,
 
     #[config(default = None, ty = "table", default_doc = "{}",
              env = "OTEL_EXPORTER_OTLP_HEADERS",
-             desc = "Extra headers sent with every export")]
+             desc = "Headers sent with every export")]
     pub headers: Option<BTreeMap<String, String>>,
 
     #[config(default = None, ty = "integer", default_doc = "10000",
              env = "OTEL_EXPORTER_OTLP_TIMEOUT",
-             desc = "Per-export request timeout (ms)")]
+             desc = "Deadline for one export, retries included (ms)")]
     pub timeout_ms: Option<u64>,
 
     #[config(default = None, ty = "string", default_doc = "none",
@@ -1923,7 +2147,7 @@ pub struct TelemetryConfig {
 
     #[config(default = None, ty = "integer", default_doc = "-",
              env = "OTEL_EXPORTER_OTLP_METRICS_TIMEOUT",
-             desc = "Metrics-only request timeout (ms)")]
+             desc = "Metrics-only export deadline (ms)")]
     pub metrics_timeout_ms: Option<u64>,
 
     #[config(default = None, ty = "string", default_doc = "-",
@@ -1943,7 +2167,7 @@ pub struct TelemetryConfig {
 
     #[config(default = None, ty = "integer", default_doc = "-",
              env = "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT",
-             desc = "Logs-only request timeout (ms)")]
+             desc = "Logs-only export deadline (ms)")]
     pub logs_timeout_ms: Option<u64>,
 
     #[config(default = None, ty = "integer", default_doc = "60000",
@@ -1951,19 +2175,14 @@ pub struct TelemetryConfig {
              desc = "How often metrics are exported (ms)")]
     pub metrics_interval_ms: Option<u64>,
 
-    #[config(default = None, ty = "integer", default_doc = "30000",
-             env = "OTEL_METRIC_EXPORT_TIMEOUT",
-             desc = "Deadline for one metrics export, retries included (ms)")]
-    pub metrics_export_timeout_ms: Option<u64>,
-
-    #[config(default = None, ty = "integer", default_doc = "5000",
+    #[config(default = None, ty = "integer", default_doc = "1000",
              env = "OTEL_LOGS_EXPORT_INTERVAL, OTEL_BLRP_SCHEDULE_DELAY",
              desc = "How often queued events are flushed (ms)")]
     pub logs_interval_ms: Option<u64>,
 
     #[config(default = None, ty = "integer", default_doc = "2048",
              env = "OTEL_BLRP_MAX_QUEUE_SIZE",
-             desc = "Event queue capacity. Events are dropped and counted when it is full")]
+             desc = "Event queue capacity, at most 65536. Events are dropped when it is full")]
     pub logs_max_queue_size: Option<usize>,
 
     #[config(default = None, ty = "integer", default_doc = "512",
@@ -1971,14 +2190,9 @@ pub struct TelemetryConfig {
              desc = "Maximum events per export request")]
     pub logs_max_export_batch_size: Option<usize>,
 
-    #[config(default = None, ty = "integer", default_doc = "30000",
-             env = "OTEL_BLRP_EXPORT_TIMEOUT",
-             desc = "Deadline for one events export, retries included (ms)")]
-    pub logs_export_timeout_ms: Option<u64>,
-
     #[config(default = None, ty = "string", default_doc = "delta",
              env = "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE",
-             desc = "Metric temporality: `delta` or `cumulative`")]
+             desc = "Metric temporality: `cumulative`, `delta` or `lowmemory`")]
     pub metrics_temporality: Option<String>,
 
     #[config(default = None, ty = "string", default_doc = "maki",
@@ -2039,11 +2253,9 @@ impl TelemetryConfig {
             logs_headers,
             logs_timeout_ms,
             metrics_interval_ms,
-            metrics_export_timeout_ms,
             logs_interval_ms,
             logs_max_queue_size,
             logs_max_export_batch_size,
-            logs_export_timeout_ms,
             metrics_temporality,
             service_name,
             resource_attributes,
@@ -2243,7 +2455,7 @@ fn parse_mcp_server_table(
     if !is_valid_server_name(server_name) {
         tracing::warn!(
             server = server_name,
-            "skipping [mcp.{server_name}] — invalid server name; \
+            "skipping [mcp.{server_name}]: invalid server name; \
              must contain only alphanumeric characters and hyphens"
         );
         return;
@@ -2295,7 +2507,7 @@ fn parse_mcp_server_table(
                             tracing::info!(
                                 server = server_name,
                                 tool = tool_name,
-                                "{key} = \"{tool_name}\" coerced to {key} = [\"{tool_name}\"] — \
+                                "{key} = \"{tool_name}\" coerced to {key} = [\"{tool_name}\"]: \
                                  consider using array syntax"
                             );
                             push_mcp_tool_rule(rules, server_name, tool_name, effect);
@@ -2306,7 +2518,7 @@ fn parse_mcp_server_table(
                             server = server_name,
                             key = key.as_str(),
                             value = ?other,
-                            "unexpected value for [mcp.{server_name}].{key} — \
+                            "unexpected value for [mcp.{server_name}].{key}: \
                              expected array of tool names or default = \"allow\"/\"deny\""
                         );
                     }
@@ -2324,7 +2536,7 @@ fn parse_mcp_server_table(
                     tracing::warn!(
                         server = server_name,
                         value = ?value,
-                        "invalid [mcp.{server_name}].default value — expected \"allow\", \"deny\", or \"prompt\""
+                        "invalid [mcp.{server_name}].default value: expected \"allow\", \"deny\", or \"prompt\""
                     );
                 }
             }
@@ -2333,14 +2545,14 @@ fn parse_mcp_server_table(
                     tracing::warn!(
                         server = server_name,
                         key = other,
-                        "unknown key [mcp.{server_name}.{other}] — server names cannot \
+                        "unknown key [mcp.{server_name}.{other}]: server names cannot \
                          contain dots; use [mcp.{other}] instead if this is a server name"
                     );
                 } else {
                     tracing::warn!(
                         server = server_name,
                         key = other,
-                        "unknown key in [mcp.{server_name}] — ignored"
+                        "unknown key in [mcp.{server_name}]: ignored"
                     );
                 }
             }
@@ -2366,7 +2578,7 @@ fn build_permissions(
             if matches!(key, ToolKey::Wildcard) {
                 tracing::warn!(
                     tool = tool,
-                    "ignoring [\"*\"].default — use the top-level `default` field instead \
+                    "ignoring [\"*\"].default: use the top-level `default` field instead \
                      for global fallback behavior"
                 );
             } else {
@@ -2385,7 +2597,7 @@ fn build_permissions(
             if matches!(key, ToolKey::Wildcard) {
                 tracing::warn!(
                     tool = tool,
-                    "ignoring project [\"*\"].default — use the top-level `default` field instead"
+                    "ignoring project [\"*\"].default: use the top-level `default` field instead"
                 );
             } else {
                 tool_defaults.insert(key, d);
@@ -2587,7 +2799,7 @@ fn migrate_permissions_file(path: &Path, persist: bool) -> Option<String> {
                         key = old_key.as_str(),
                         server = server,
                         tool = tool,
-                        "SECURITY: skipping migration of malformed MCP key — \
+                        "SECURITY: skipping migration of malformed MCP key: \
                          rules for this tool will not be restored"
                     );
                     continue;
@@ -2621,7 +2833,7 @@ fn migrate_permissions_file(path: &Path, persist: bool) -> Option<String> {
             tracing::error!(
                 server = server_name.as_str(),
                 tool = &*tool_name,
-                "SECURITY: skipping migration of malformed nested MCP key — \
+                "SECURITY: skipping migration of malformed nested MCP key: \
                  rules for this tool will not be restored"
             );
             continue;
@@ -3208,6 +3420,200 @@ mod tests {
 
         assert!(policy.prompt);
         assert_eq!(policy.matched_pattern(Path::new(ABSOLUTE_PATH)), None);
+    }
+
+    fn instructions_config(
+        files: Option<Vec<String>>,
+        overrides: Vec<ProjectOverrideFileConfig>,
+    ) -> InstructionsConfig {
+        InstructionsConfig::from_file(InstructionsFileConfig { files, overrides })
+            .expect("valid patterns")
+    }
+
+    #[test_case("https://github.com/example/repo.git", "github.com/example/repo" ; "https_strips_scheme_and_git_suffix")]
+    #[test_case("git@github.com:example/repo.git", "github.com/example/repo" ; "scp_like_strips_user_and_git_suffix")]
+    #[test_case("ssh://git@github.com/example/repo.git", "github.com/example/repo" ; "ssh_strips_scheme_user_and_git_suffix")]
+    #[test_case("https://oauth2:TOKEN@github.com/example/repo.git", "github.com/example/repo" ; "token_userinfo_strips_scheme_user_and_git_suffix")]
+    #[test_case("ssh://git@github.com:2222/example/repo.git", "github.com/example/repo" ; "ssh_port_is_dropped")]
+    #[test_case("git://github.com/tontinton/maki", "github.com/tontinton/maki" ; "git_scheme_without_suffix")]
+    #[test_case("https://github.com/tontinton/maki/", "github.com/tontinton/maki" ; "trailing_slash_is_dropped")]
+    #[test_case("https://github.com/tontinton/maki.git/", "github.com/tontinton/maki" ; "trailing_slash_after_git_suffix")]
+    #[test_case("git@localhost:repo.git", "localhost/repo" ; "dotless_host_normalizes_scp_like")]
+    #[test_case("ssh://git@localhost:29418/x.git", "localhost/x" ; "dotless_host_drops_port")]
+    #[test_case("/home/user/src/repo", "/home/user/src/repo" ; "local_path_is_left_alone")]
+    #[test_case("C:\\Users\\repo", "C:\\Users\\repo" ; "drive_letter_is_left_alone")]
+    fn remote_urls_normalize_to_host_and_path(url: &str, expected: &str) {
+        assert_eq!(normalize_remote_url(url), expected);
+    }
+
+    const DEFAULT_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
+
+    #[test]
+    fn resolve_files_defaults_to_the_builtin_list() {
+        let config = instructions_config(None, Vec::new());
+        assert_eq!(
+            config.resolve_files(Path::new("/workspace"), &[], DEFAULT_FILES),
+            ["AGENTS.md", "CLAUDE.md"]
+        );
+    }
+
+    #[test]
+    fn resolve_files_global_list_replaces_the_default() {
+        let config = instructions_config(Some(vec!["CLAUDE.md".into()]), Vec::new());
+        assert_eq!(
+            config.resolve_files(Path::new("/workspace"), &[], DEFAULT_FILES),
+            ["CLAUDE.md"]
+        );
+    }
+
+    #[test]
+    fn resolve_files_empty_global_list_loads_nothing() {
+        let config = instructions_config(Some(Vec::new()), Vec::new());
+        assert!(
+            config
+                .resolve_files(Path::new("/workspace"), &[], DEFAULT_FILES)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn resolve_files_first_matching_project_entry_wins() {
+        let config = instructions_config(
+            Some(vec!["CLAUDE.md".into()]),
+            vec![
+                ProjectOverrideFileConfig {
+                    path: Some("/other/*".into()),
+                    ..Default::default()
+                },
+                ProjectOverrideFileConfig {
+                    path: Some("/workspace".into()),
+                    files: Some(Vec::new()),
+                    ..Default::default()
+                },
+                ProjectOverrideFileConfig {
+                    path: Some("/workspace".into()),
+                    files: Some(vec!["GEMINI.md".into()]),
+                    ..Default::default()
+                },
+            ],
+        );
+        assert!(
+            config
+                .resolve_files(Path::new("/workspace"), &[], DEFAULT_FILES)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn resolve_files_matching_entry_without_files_inherits_the_global_list() {
+        let config = instructions_config(
+            Some(vec!["CLAUDE.md".into()]),
+            vec![ProjectOverrideFileConfig {
+                path: Some("/workspace".into()),
+                ..Default::default()
+            }],
+        );
+        assert_eq!(
+            config.resolve_files(Path::new("/workspace"), &[], DEFAULT_FILES),
+            ["CLAUDE.md"]
+        );
+    }
+
+    #[test]
+    fn resolve_files_matches_a_project_by_remote() {
+        let config = instructions_config(
+            None,
+            vec![ProjectOverrideFileConfig {
+                remote: Some("github.com/example/*".into()),
+                files: Some(Vec::new()),
+                ..Default::default()
+            }],
+        );
+        let remotes = ["git@github.com:example/repo.git".to_owned()];
+        assert!(
+            config
+                .resolve_files(Path::new("/workspace"), &remotes, DEFAULT_FILES)
+                .is_empty()
+        );
+        let other = ["https://github.com/tontinton/maki.git".to_owned()];
+        assert_eq!(
+            config.resolve_files(Path::new("/workspace"), &other, DEFAULT_FILES),
+            ["AGENTS.md", "CLAUDE.md"]
+        );
+    }
+
+    #[test]
+    fn resolve_files_needs_remotes_only_when_a_remote_matcher_is_set() {
+        let by_path = instructions_config(
+            None,
+            vec![ProjectOverrideFileConfig {
+                path: Some("/workspace".into()),
+                ..Default::default()
+            }],
+        );
+        assert!(!by_path.needs_remotes());
+        let by_remote = instructions_config(
+            None,
+            vec![ProjectOverrideFileConfig {
+                remote: Some("github.com/*".into()),
+                ..Default::default()
+            }],
+        );
+        assert!(by_remote.needs_remotes());
+    }
+
+    #[test_case(Some(BROKEN_GLOB), None ; "path_glob_is_a_config_error")]
+    #[test_case(None, Some(BROKEN_GLOB) ; "remote_glob_is_a_config_error")]
+    fn invalid_project_pattern_is_a_config_error(path: Option<&str>, remote: Option<&str>) {
+        let result = RawConfig {
+            instructions: InstructionsFileConfig {
+                overrides: vec![ProjectOverrideFileConfig {
+                    path: path.map(str::to_owned),
+                    remote: remote.map(str::to_owned),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+        .into_config(&[]);
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidOverridePattern { pattern, .. }) if pattern == BROKEN_GLOB
+        ));
+    }
+
+    #[test]
+    fn instructions_merge_and_overrides_replace() {
+        let mut base = RawConfig {
+            instructions: InstructionsFileConfig {
+                files: Some(vec!["AGENTS.md".into()]),
+                overrides: vec![ProjectOverrideFileConfig {
+                    path: Some("/base".into()),
+                    ..Default::default()
+                }],
+            },
+            ..Default::default()
+        };
+        base.merge(RawConfig {
+            instructions: InstructionsFileConfig {
+                files: Some(vec!["CLAUDE.md".into()]),
+                overrides: vec![ProjectOverrideFileConfig {
+                    path: Some("/overlay".into()),
+                    ..Default::default()
+                }],
+            },
+            ..Default::default()
+        });
+
+        let agent = base.into_config(&[]).unwrap().agent;
+        assert_eq!(agent.instructions.files, Some(vec!["CLAUDE.md".to_owned()]));
+        assert_eq!(agent.instructions.overrides.len(), 1);
+        assert_eq!(
+            agent.instructions.overrides[0].path.as_deref(),
+            Some("/overlay")
+        );
     }
 
     #[test]
@@ -4080,6 +4486,7 @@ mod tests {
     #[test_case("agent = { bash_timeout_secs = 60 }\n" ; "moved_bash_timeout")]
     #[test_case("agent = { search_result_limit = 50 }\n" ; "moved_search_limit")]
     #[test_case("[index]\nmax_file_size_mb = 4\n" ; "removed_index_section")]
+    #[test_case("[telemetry]\nmetrics_export_timeout_ms = 5000\n" ; "removed_telemetry_timeout")]
     fn deny_unknown_fields_rejects(toml_str: &str) {
         let result: Result<RawConfig, _> = toml::from_str(toml_str);
         assert!(

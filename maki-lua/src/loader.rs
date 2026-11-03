@@ -11,31 +11,56 @@ use maki_agent::SessionEndReason;
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::{ToolRegistry, ToolSource};
 use maki_config::{GatedFile, PluginFileConfig, PluginsConfig, ProjectConfig, RawConfig};
-use maki_providers::plugin::DeclAuthority;
+use maki_providers::plugin::{DeclAuthority, keep_granted};
+#[cfg(any(test, feature = "test-support"))]
+use tokio::runtime::{Builder, EnterGuard, Handle, Runtime, RuntimeFlavor};
+use tokio::task::spawn_blocking;
 
 use crate::agent_autocmd::HostEvent;
 use crate::api::keymap::{KeybindTicket, KeymapReader};
 use crate::api::options::{PluginOptionSpecs, PluginOpts};
 use crate::api::slot::{LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT};
+use crate::api::ui::marks::InputRulesReader;
 use crate::api::util::command::{
     HintReader, LuaCommandReader, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction, UiAttachment,
 };
-use crate::background::BackgroundSessions;
+use crate::background::{BackgroundTasks, Stop};
 use crate::error::PluginError;
 use crate::pack::{DiscoveredPackage, Discovery, Interaction};
 use crate::plugin_permissions::{
     MANIFEST_FILE, PluginPermissions, Requested, check_plugin_compatibility,
-    load_plugin_permissions,
+    load_plugin_granted_providers, load_plugin_permissions,
 };
 use crate::plugin_status::PluginKind;
 use crate::runtime::{
-    self, ClickFallback, ConfigScope, EndSession, LoadChunk, LoadContext, LuaThread, Request,
-    RestoreItem,
+    self, ClickFallback, ConfigScope, EndSession, LoadChunk, LoadContext, LuaThread, MoveOutcome,
+    MoveRequest, Request, RestoreItem,
 };
 use maki_agent::prompt::ResolvedPrompts;
 use maki_storage::id::MakiId;
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+/// The runtime a host built outside `main`'s gets, which is every test.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) static HOST_RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+    Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime for plugin hosts")
+});
+/// A `#[tokio::test]` runtime is single-threaded and only advances while the
+/// test awaits, so a host on it could not wake a sleeping Lua task while the
+/// test thread blocks on the host; only a multi-thread runtime is kept.
+#[cfg(any(test, feature = "test-support"))]
+fn enter_test_runtime() -> Option<EnterGuard<'static>> {
+    let on_workers = Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == RuntimeFlavor::MultiThread);
+    (!on_workers).then(|| HOST_RUNTIME.enter())
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn enter_test_runtime() {}
+
 const PACK_STATE_UNAVAILABLE: &str = "could not read package state: plugin host stopped";
 const USER_PLUGIN: &str = "user";
 pub const SKIPPED_PLUGIN_WARNING: &str = "skipping plugin lua";
@@ -44,6 +69,8 @@ pub const PERMISSION_NAME_WARNING: &str = "inherits maki's permission rules for 
      tool of the same name, together with any \"always allow\" you saved";
 pub const TRUST_SCOPE_WARNING: &str =
     "trust is only read from the global init.lua; ignoring the trust table in";
+pub const INSTRUCTIONS_SCOPE_WARNING: &str =
+    "instructions is only read from the global init.lua; ignoring the instructions table in";
 
 /// How far user `init.lua` may reach. `--no-plugins` turns it off, and a
 /// project folder nobody vouched for stops at the global file.
@@ -323,11 +350,15 @@ impl PluginHost {
     /// `jit: false` (the `--no-jit` flag) runs plugin Lua on the O1
     /// interpreter with full debug info. Applied at VM creation, so
     /// every chunk gets it, init.lua files included.
+    ///
+    /// Runs on the current tokio runtime, which `main` enters; a test that
+    /// builds a host without one gets [`HOST_RUNTIME`].
     pub fn start(
         registry: Arc<ToolRegistry>,
         interaction: Interaction,
         jit: bool,
     ) -> Result<Self, PluginError> {
+        let _runtime = enter_test_runtime();
         let plugin_rules = Arc::new(PluginRuleStore::default());
         let lua = runtime::spawn(
             Arc::clone(&registry),
@@ -343,8 +374,9 @@ impl PluginHost {
         })
     }
 
-    /// One status bar line summing up the wrong key spellings found since the
-    /// last take. Each finding is in the log already.
+    /// One status bar line summing up the wrong key spellings and the keys
+    /// bound in normal mode only found since the last take. Each finding is in
+    /// the log already.
     pub fn take_key_warning(&self) -> Option<String> {
         self.inner.key_lint.take_summary()
     }
@@ -461,11 +493,18 @@ impl PluginHost {
             // A folder cannot vouch for itself: ACP resolves many
             // client-chosen cwds against the config it read once at startup,
             // so one trusted project's `trust.paths` would reach folders
-            // nobody ever trusted. Stripped rather than rejected, because
-            // there is no fallback config at this point and a hard error would
-            // brick the folder the user just trusted over an ignored setting.
-            if !global && std::mem::take(&mut raw.trust).is_set() {
-                warnings.push(format!("{TRUST_SCOPE_WARNING} {owner}"));
+            // nobody ever trusted. The same holds for `instructions`, which
+            // picks what a folder's checkout loads into the model. Stripped
+            // rather than rejected, because there is no fallback config at
+            // this point and a hard error would brick the folder the user
+            // just trusted over an ignored setting.
+            if !global {
+                if std::mem::take(&mut raw.trust).is_set() {
+                    warnings.push(format!("{TRUST_SCOPE_WARNING} {owner}"));
+                }
+                if std::mem::take(&mut raw.instructions).is_set() {
+                    warnings.push(format!("{INSTRUCTIONS_SCOPE_WARNING} {owner}"));
+                }
             }
             match merged {
                 Some(existing) => existing.merge(raw),
@@ -683,6 +722,20 @@ impl PluginHost {
         )
     }
 
+    /// Runs a source with a provider grant, for tests and embedders that load
+    /// a plugin registering providers outside the package system.
+    pub fn load_source_with_grant(
+        &self,
+        name: &str,
+        source: &str,
+        permissions: PluginPermissions,
+        granted_providers: Vec<String>,
+    ) -> Result<(), PluginError> {
+        let mut context = LoadContext::plain(None, permissions);
+        context.granted_providers = Arc::from(granted_providers);
+        self.send_load(Arc::from(name), vec![LoadChunk::new(name, source)], context)
+    }
+
     pub fn load_plugin_file(&self, path: &Path) -> Result<(), PluginError> {
         let source = fs::read_to_string(path).map_err(|e| PluginError::Io {
             path: path.to_path_buf(),
@@ -691,14 +744,17 @@ impl PluginHost {
         let plugin_dir = path.parent().map(Path::to_path_buf);
         check_plugin_compatibility(USER_PLUGIN, plugin_dir.as_deref())?;
         let permissions = load_plugin_permissions(plugin_dir.as_deref());
+        let granted_providers = load_plugin_granted_providers(plugin_dir.as_deref());
         // Test-only path today. Once user plugin dirs exist: derive a real
         // plugin name, since the hardcoded "user" would collide across files,
         // pass the `plugins.<name>` opts through, and teach the
         // unknown-plugin guards about user plugin names.
+        let mut context = LoadContext::plain(plugin_dir, permissions);
+        context.granted_providers = Arc::from(granted_providers);
         self.send_load(
             Arc::from(USER_PLUGIN),
             vec![LoadChunk::new(path.display().to_string(), source)],
-            LoadContext::plain(plugin_dir, permissions),
+            context,
         )
     }
 
@@ -720,6 +776,7 @@ impl PluginHost {
         declared: crate::api::pack::Declared,
         package: &DiscoveredPackage,
         permissions: PluginPermissions,
+        granted_providers: Arc<[String]>,
         opts: PluginOpts,
     ) -> Result<(), PluginError> {
         check_plugin_compatibility(&package.name, Some(&package.dir))?;
@@ -731,6 +788,7 @@ impl PluginHost {
                 context: LoadContext {
                     plugin_dir: Some(package.dir.clone()),
                     permissions,
+                    granted_providers,
                     opts,
                     revision_guard: package.revision_guard.clone(),
                     package: true,
@@ -754,7 +812,7 @@ impl PluginHost {
         permissions: PluginPermissions,
         opts: PluginOpts,
     ) -> Result<(), PluginError> {
-        self.load_package_with_guard(name, dir, permissions, opts, None)
+        self.load_package_with_guard(name, dir, permissions, Arc::from(Vec::new()), opts, None)
     }
 
     fn load_package_with_guard(
@@ -762,6 +820,7 @@ impl PluginHost {
         name: &str,
         dir: &Path,
         permissions: PluginPermissions,
+        granted_providers: Arc<[String]>,
         opts: PluginOpts,
         revision_guard: Option<Arc<maki_pack::lock::Lock>>,
     ) -> Result<(), PluginError> {
@@ -808,6 +867,7 @@ impl PluginHost {
             LoadContext {
                 plugin_dir: Some(root),
                 permissions,
+                granted_providers,
                 opts,
                 revision_guard,
                 package: true,
@@ -907,7 +967,12 @@ impl PluginHost {
                     .cloned()
                     .map(Arc::new)
                     .unwrap_or_default();
-                let permissions = crate::pack::effective_permissions(pkg);
+                let (permissions, granted_providers) = crate::pack::effective_grant(pkg);
+                let granted_providers = Arc::from(granted_providers);
+                // Keep the granted slugs owned even if the load fails, so the
+                // catalog client cannot take over the slug and receive the
+                // key the user saved for it.
+                keep_granted(&pkg.name, &granted_providers);
                 loaded.push(&pkg.name);
                 let custom = declared
                     .iter()
@@ -921,13 +986,18 @@ impl PluginHost {
                             )
                     });
                 let result = match custom {
-                    Some(declaration) => {
-                        self.run_pack_loader(declaration.clone(), pkg, permissions, opts)
-                    }
+                    Some(declaration) => self.run_pack_loader(
+                        declaration.clone(),
+                        pkg,
+                        permissions,
+                        granted_providers,
+                        opts,
+                    ),
                     None => self.load_package_with_guard(
                         &pkg.name,
                         &pkg.dir,
                         permissions,
+                        granted_providers,
                         opts,
                         pkg.revision_guard.clone(),
                     ),
@@ -1046,6 +1116,7 @@ impl PluginHost {
         EventHandle {
             tx: self.inner.tx.clone(),
             prio_tx: self.inner.prio_tx.clone(),
+            moves: self.inner.moves.clone(),
             layered: Arc::clone(&self.inner.layered),
             background: self.inner.background.clone(),
         }
@@ -1061,6 +1132,10 @@ impl PluginHost {
 
     pub fn hint_reader(&self) -> HintReader {
         self.inner.hint_reader.clone()
+    }
+
+    pub fn input_rules_reader(&self) -> InputRulesReader {
+        self.inner.input_rules_reader.clone()
     }
 
     pub fn ui_action_rx(&self) -> flume::Receiver<UiAction> {
@@ -1086,10 +1161,11 @@ pub struct EventHandle {
     tx: flume::Sender<Request>,
     /// User-initiated requests bypass queued bulk work (session restores).
     prio_tx: flume::Sender<Request>,
+    moves: flume::Sender<MoveRequest>,
     /// Published by the Lua thread and read without touching it: whether
     /// asking a chain can change the answer at all.
     layered: Arc<LayeredTools>,
-    background: BackgroundSessions,
+    background: BackgroundTasks,
 }
 
 impl EventHandle {
@@ -1097,8 +1173,9 @@ impl EventHandle {
         Self {
             tx,
             prio_tx: flume::unbounded().0,
+            moves: flume::unbounded().0,
             layered: Arc::default(),
-            background: BackgroundSessions::default(),
+            background: BackgroundTasks::default(),
         }
     }
 
@@ -1107,7 +1184,7 @@ impl EventHandle {
     /// "stopped by user". Synchronous on purpose: the registry is a mutex the
     /// Lua thread shares, so a busy Lua thread cannot delay the stop.
     pub fn cancel_plugin_session(&self, id: &str) {
-        self.background.stop(id);
+        self.background.stop(id, Stop::User);
     }
 
     #[doc(hidden)]
@@ -1188,8 +1265,9 @@ impl EventHandle {
         Self {
             tx: shared.clone(),
             prio_tx: shared,
+            moves: flume::unbounded().0,
             layered: Arc::default(),
-            background: BackgroundSessions::default(),
+            background: BackgroundTasks::default(),
         }
     }
 
@@ -1275,6 +1353,14 @@ impl EventHandle {
             row,
             fallback: Some(Box::new(ClickFallback { item, event_tx })),
         });
+    }
+
+    /// Asks the call to move to the background. The answer arrives once its
+    /// `ctx:on_background` hook ran.
+    pub fn request_background(&self, tool_use_id: String) -> flume::Receiver<MoveOutcome> {
+        let (request, rx) = MoveRequest::by_user(tool_use_id);
+        let _ = self.moves.send(request);
+        rx
     }
 
     pub fn send_restore_complete(&self, flag: Arc<AtomicBool>) {
@@ -1375,7 +1461,9 @@ impl EventHandle {
     /// whole grace period.
     pub async fn end_session_async(&self, session: MakiId, reason: SessionEndReason) {
         let handle = self.clone();
-        smol::unblock(move || handle.end_sessions_blocking([session], reason)).await;
+        spawn_blocking(move || handle.end_sessions_blocking([session], reason))
+            .await
+            .expect("end_sessions_blocking panicked");
     }
 
     fn send_end_session(
@@ -1408,13 +1496,17 @@ impl EventHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::keymap::TAKEN_ERR;
-    use crate::api::util::command::{LuaCommandInfo, LuaCommandWriter};
-    use crate::plugin_permissions::PluginReach;
+    use crate::api::keymap::{InputMode, InputSnapshot, TAKEN_ERR};
+    use crate::api::util::command::{
+        BuiltinAction, InputRequest, LuaCommandInfo, LuaCommandWriter, PLUGIN_LOADING_ERR,
+    };
+    use crate::key::{Key, PASTE};
+    use crate::key_lint::{MODE_WARNING, UPGRADE_DOCS};
+    use crate::plugin_permissions::{Permission, PluginReach, denied_error};
+    use crate::runtime::{FALLBACK_SPENT_ERR, OUTSIDE_TASK_ERR};
     use crossterm::event::KeyCode;
     use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, assemble};
     use maki_agent::tools::ToolRegistry;
-    use std::time::Instant;
     use test_case::test_case;
 
     const GLOBAL_TRUST_PATH: &str = "~/src/me/*";
@@ -1552,8 +1644,9 @@ mod tests {
         let handle = EventHandle {
             tx,
             prio_tx,
+            moves: flume::unbounded().0,
             layered: Arc::default(),
-            background: BackgroundSessions::default(),
+            background: BackgroundTasks::default(),
         };
         handle.run_command(
             Arc::from("myplugin"),
@@ -1644,23 +1737,27 @@ mod tests {
     }
 
     const FIRED_COMMAND: &str = "/fired";
-    const KEYBIND_NEVER_RAN: &str = "the keybind callback never registered its command";
-    const KEYBIND_TIMEOUT: Duration = Duration::from_secs(2);
+    const KEYBIND_NEVER_RAN: &str = "the keybind callback never ran";
+    const KEYBIND_NEVER_DONE: &str = "the keybind handler never reported done";
+    const KEYBIND_TIMEOUT: Duration = Duration::from_secs(5);
 
-    /// Waits for the command a keybind callback registers, which is how a test
-    /// on this side of the channel sees that the handler ran.
-    fn wait_for_fired_command(host: &PluginHost) {
-        let deadline = Instant::now() + KEYBIND_TIMEOUT;
-        while !host
-            .command_reader()
-            .load()
+    /// Waits for {presses} keybind handlers to report done, then checks that
+    /// one of them registered {FIRED_COMMAND}, which is how a test on this
+    /// side of the channel sees that a handler ran.
+    fn assert_fired_after(host: &PluginHost, presses: usize) {
+        let ui = host.ui_action_rx();
+        for _ in 0..presses {
+            while !matches!(
+                ui.recv_timeout(KEYBIND_TIMEOUT).expect(KEYBIND_NEVER_DONE),
+                UiAction::KeybindDone(_)
+            ) {}
+        }
+        let snapshot = host.command_reader().load();
+        let fired = snapshot
             .commands
             .iter()
-            .any(|c| c.name.as_ref() == FIRED_COMMAND)
-        {
-            assert!(Instant::now() < deadline, "{KEYBIND_NEVER_RAN}");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+            .any(|c| c.name.as_ref() == FIRED_COMMAND);
+        assert!(fired, "{KEYBIND_NEVER_RAN}");
     }
 
     /// End-to-end: a plugin registers a keymap override, the override is
@@ -1700,8 +1797,378 @@ mod tests {
         );
 
         let handle = host.event_handle();
-        assert!(reader.dispatch(key, |ticket| handle.run_keybind_callback(ticket)));
-        wait_for_fired_command(&host);
+        assert!(reader.dispatch(key, InputMode::Normal, None, |ticket| {
+            handle.run_keybind_callback(ticket)
+        }));
+        assert_fired_after(&host, 1);
+    }
+
+    const VIM_PLUGIN: &str = "vim";
+
+    /// A tiny vim plugin: `<Esc>` leaves insert mode and `i` goes back. Each
+    /// handler flashes `maki.fn.mode()` right after it switches, so the test
+    /// waits on that reply instead of polling, and it also proves the switch
+    /// is visible inside the handler that made it.
+    #[test]
+    fn a_vim_style_plugin_switches_modes() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            VIM_PLUGIN,
+            r#"
+            local function switch(mode)
+                return function()
+                    maki.ui.set_mode(mode)
+                    maki.ui.flash(maki.fn.mode())
+                end
+            end
+            maki.keymap.set("i", "<Esc>", switch("n"))
+            maki.keymap.set("n", "i", switch("i"))
+            "#,
+        )
+        .unwrap();
+        let reader = host.keymap_reader();
+        let handle = host.event_handle();
+        let ui = host.ui_action_rx();
+        let press = |lhs| {
+            let mode = reader.sync_mode(true);
+            reader.dispatch(Key::parse(lhs).unwrap(), mode, None, |t| {
+                handle.run_keybind_callback(t)
+            })
+        };
+        let flashed_mode = || {
+            let Ok(UiAction::Flash(mode)) = ui.recv_timeout(KEYBIND_TIMEOUT) else {
+                panic!("{KEYBIND_NEVER_RAN}");
+            };
+            let Ok(UiAction::KeybindDone(_)) = ui.recv_timeout(KEYBIND_TIMEOUT) else {
+                panic!("{KEYBIND_NEVER_DONE}");
+            };
+            mode
+        };
+
+        assert!(!press("i"), "typing an i reaches the input");
+        assert!(press("<Esc>"));
+        assert_eq!(flashed_mode(), InputMode::Normal.letter());
+        assert!(!press("<Esc>"), "the insert binding rests in normal mode");
+        assert!(press("i"));
+        assert_eq!(flashed_mode(), InputMode::Insert.letter());
+        assert!(!press("i"), "back in insert mode, an i types again");
+    }
+
+    const ENTER_NORMAL: &str = r#"maki.ui.set_mode("n")"#;
+    const ENTER_NORMAL_THEN_FAIL: &str = r#"maki.ui.set_mode("n") error("broken")"#;
+
+    fn unload_vim(host: &PluginHost) {
+        host.unload(VIM_PLUGIN).unwrap();
+    }
+
+    fn reload_vim(host: &PluginHost) {
+        host.load_source(VIM_PLUGIN, "").unwrap();
+    }
+
+    fn reload_vim_broken(host: &PluginHost) {
+        assert!(
+            host.load_source(VIM_PLUGIN, ENTER_NORMAL_THEN_FAIL)
+                .is_err()
+        );
+    }
+
+    /// Only the plugin that switched to normal mode can switch back, so the
+    /// mode goes with its load. Another plugin going away leaves it alone.
+    #[test_case(unload_vim ; "unloaded")]
+    #[test_case(reload_vim ; "reloaded")]
+    #[test_case(reload_vim_broken ; "reload_fails")]
+    fn normal_mode_goes_with_the_plugin_that_set_it(teardown: fn(&PluginHost)) {
+        const OTHER_PLUGIN: &str = "other";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(OTHER_PLUGIN, "").unwrap();
+        host.load_source(VIM_PLUGIN, ENTER_NORMAL).unwrap();
+        let reader = host.keymap_reader();
+        host.unload(OTHER_PLUGIN).unwrap();
+        assert_eq!(reader.sync_mode(true), InputMode::Normal);
+
+        teardown(&host);
+        assert_eq!(reader.sync_mode(true), InputMode::Insert);
+    }
+
+    const PARKED_COMMAND: &str = "/park";
+    const PARKED_DONE: &str = "parked done";
+    const PARKED_NEVER_RAN: &str = "the command never parked on the UI";
+    const PARKED_NEVER_DONE: &str = "the command never finished";
+
+    /// An unload never waits for a command handler, so one parked on the UI
+    /// wakes up with its load gone. A normal mode it switched to then would
+    /// belong to nothing that could ever switch it back, and the chat input
+    /// could not be typed in again.
+    #[test]
+    fn a_mode_switch_from_an_unloaded_plugin_is_dropped() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            VIM_PLUGIN,
+            &format!(
+                r#"
+            maki.api.register_command({{
+                name = "{PARKED_COMMAND}",
+                description = "parks on the UI",
+                handler = function()
+                    maki.ui.input()
+                    maki.ui.set_mode("n")
+                    maki.ui.flash("{PARKED_DONE}")
+                end,
+            }})
+            "#
+            ),
+        )
+        .unwrap();
+        let reader = host.keymap_reader();
+        let ui = host.ui_action_rx();
+        host.event_handle().run_command(
+            Arc::from(VIM_PLUGIN),
+            Arc::from(PARKED_COMMAND),
+            String::new(),
+            0,
+            None,
+        );
+        let parked = loop {
+            if let UiAction::Input { reply_tx, .. } =
+                ui.recv_timeout(KEYBIND_TIMEOUT).expect(PARKED_NEVER_RAN)
+            {
+                break reply_tx;
+            }
+        };
+
+        host.unload(VIM_PLUGIN).unwrap();
+        parked.send(Ok(serde_json::Value::Null)).unwrap();
+        while !matches!(
+            ui.recv_timeout(KEYBIND_TIMEOUT).expect(PARKED_NEVER_DONE),
+            UiAction::Flash(said) if said == PARKED_DONE
+        ) {}
+
+        assert_eq!(reader.sync_mode(true), InputMode::Insert);
+    }
+
+    /// The UI lets the held keys go when the done report arrives. If it came
+    /// before the handler's edit or mode switch, those keys would race them
+    /// all over again.
+    #[test]
+    fn a_keybind_handler_reports_done_after_its_edit_and_mode_switch() {
+        const SESSION: &str = "s1";
+        const VERSION: u64 = 7;
+        const TEXT: &str = "ab";
+        const TAB: &str = "<Tab>";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "accept",
+            r#"
+            maki.keymap.set("i", "<Tab>", function(ev)
+                local st = ev.input
+                maki.ui.input_edit({
+                    start = 0, stop = st.cursor, text = ev.key,
+                    version = st.version, session_id = st.session_id,
+                })
+                maki.ui.set_mode("n")
+            end)
+            "#,
+        )
+        .unwrap();
+        let reader = host.keymap_reader();
+        let handle = host.event_handle();
+        let ui = host.ui_action_rx();
+
+        let mut pressed = None;
+        assert!(reader.dispatch(
+            Key::parse(TAB).unwrap(),
+            reader.sync_mode(true),
+            None,
+            |t| {
+                let t = t.with_input(InputSnapshot {
+                    session_id: SESSION.into(),
+                    text: TEXT.into(),
+                    cursor: TEXT.len(),
+                    anchor: None,
+                    version: VERSION,
+                });
+                pressed = Some(t.id());
+                handle.run_keybind_callback(t)
+            }
+        ));
+
+        let Ok(UiAction::Input {
+            req: InputRequest::Edit(edit),
+            reply_tx,
+        }) = ui.recv_timeout(KEYBIND_TIMEOUT)
+        else {
+            panic!("{KEYBIND_NEVER_RAN}");
+        };
+        assert_eq!(
+            (edit.session_id.as_str(), edit.version, edit.edits[0].stop),
+            (SESSION, VERSION, TEXT.len()),
+            "the edit was planned against `ev.input`"
+        );
+        assert_eq!(edit.edits[0].text, TAB, "`ev.key` names the key");
+        reply_tx.send(Ok(serde_json::Value::Null)).unwrap();
+
+        let Ok(UiAction::KeybindDone(done)) = ui.recv_timeout(KEYBIND_TIMEOUT) else {
+            panic!("{KEYBIND_NEVER_DONE}");
+        };
+        assert_eq!(Some(done), pressed);
+        assert_eq!(reader.sync_mode(true), InputMode::Normal);
+    }
+
+    /// The UI runs a fallback only for the key it still holds the later keys
+    /// for, so a second call, or one made after the handler returned, would
+    /// do nothing. The plugin is told so instead of being answered `true`.
+    #[test]
+    fn fallback_asks_once_and_only_while_the_handler_runs() {
+        const PASTED: &str = "pasted";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "fallback",
+            r#"
+            local stashed
+            maki.keymap.set("i", "<Paste>", function(ev)
+                stashed = ev
+                local first = ev.fallback()
+                local _, again = ev.fallback()
+                maki.ui.flash(table.concat({ ev.text, tostring(first), again }, "|"))
+            end)
+            maki.keymap.set("i", "<Tab>", function()
+                local _, late = stashed.fallback()
+                maki.ui.flash(late)
+            end)
+            "#,
+        )
+        .unwrap();
+        let reader = host.keymap_reader();
+        let handle = host.event_handle();
+        let ui = host.ui_action_rx();
+        let press = |key: Key| {
+            let mut id = None;
+            assert!(reader.dispatch(key, reader.sync_mode(true), None, |t| {
+                let t = t.with_text(PASTED.into());
+                id = Some(t.id());
+                handle.run_keybind_callback(t)
+            }));
+            id.unwrap()
+        };
+        let next = || ui.recv_timeout(KEYBIND_TIMEOUT).expect(KEYBIND_NEVER_RAN);
+
+        let paste = press(PASTE);
+        assert!(matches!(next(), UiAction::KeybindFallback(id) if id == paste));
+        let UiAction::Flash(said) = next() else {
+            panic!("{KEYBIND_NEVER_RAN}");
+        };
+        assert_eq!(said, format!("{PASTED}|true|{FALLBACK_SPENT_ERR}"));
+        assert!(matches!(next(), UiAction::KeybindDone(id) if id == paste));
+
+        let tab = press(Key::parse("<Tab>").unwrap());
+        let UiAction::Flash(said) = next() else {
+            panic!("a late fallback must not reach the UI");
+        };
+        assert_eq!(said, FALLBACK_SPENT_ERR);
+        assert!(matches!(next(), UiAction::KeybindDone(id) if id == tab));
+    }
+
+    fn grants(names: &[&str]) -> PluginPermissions {
+        PluginPermissions::from_approved(names.iter().copied())
+    }
+
+    /// A key that types text shows the plugin every key the user types, in
+    /// normal mode too since a plugin may switch to it, so it costs what
+    /// reading the input costs.
+    #[test_case(r#""i", "a""#, &[] => false ; "a_letter_in_insert_mode")]
+    #[test_case(r#""i", "<Space>""#, &[] => false ; "space_in_insert_mode")]
+    #[test_case(r#""i", "<Paste>""#, &[] => false ; "a_paste_in_insert_mode")]
+    #[test_case(r#"{ "n", "i" }, "A""#, &[] => false ; "a_letter_in_both_modes")]
+    #[test_case(r#""i", "a""#, &["session_read"] => true ; "a_letter_with_session_read")]
+    #[test_case(r#""i", "<C-g>""#, &[] => true ; "a_shortcut_in_insert_mode")]
+    #[test_case(r#""n", "a""#, &[] => false ; "a_letter_in_normal_mode")]
+    #[test_case(r#""n", "<C-g>""#, &[] => true ; "a_shortcut_in_normal_mode")]
+    fn binding_a_typing_key_needs_session_read(mode_and_key: &str, granted: &[&str]) -> bool {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let source = format!("maki.keymap.set({mode_and_key}, function() end)");
+        match host.load_source_with_permissions("typing", &source, grants(granted)) {
+            Ok(()) => !host.keymap_reader().load().entries.is_empty(),
+            Err(err) => {
+                let denied = denied_error(Permission::SessionRead).to_string();
+                assert!(err.to_string().contains(&denied), "got: {err}");
+                false
+            }
+        }
+    }
+
+    /// A buffer binding sees the keys typed into the chat input too, while its
+    /// window sits on screen without the keyboard. So it costs the same.
+    #[test_case(&["session_read"] => "true" ; "with_session_read")]
+    #[test_case(&[] => "false" ; "without_session_read")]
+    fn a_typing_key_on_a_buffer_needs_session_read(granted: &[&str]) -> String {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source_with_permissions(
+            "popup",
+            r#"
+            maki.keymap.set("n", "<C-t>", function()
+                local buf = maki.ui.buf()
+                local bound = pcall(maki.keymap.set, "i", "a", function() end, { buffer = buf })
+                maki.ui.flash(tostring(bound))
+            end)
+            "#,
+            grants(granted),
+        )
+        .unwrap();
+        let key = Key::parse("<C-t>").unwrap();
+        let handle = host.event_handle();
+        assert!(
+            host.keymap_reader()
+                .dispatch(key, InputMode::Normal, None, |t| {
+                    handle.run_keybind_callback(t)
+                })
+        );
+        let Ok(UiAction::Flash(said)) = host.ui_action_rx().recv_timeout(KEYBIND_TIMEOUT) else {
+            panic!("{KEYBIND_NEVER_RAN}");
+        };
+        said
+    }
+
+    /// `ev.input` and `ev.text` carry the draft, so only a plugin that may
+    /// read the session gets them, even on a key that types nothing.
+    #[test_case(&["session_read"] => "true|pasted" ; "with_session_read")]
+    #[test_case(&[] => "false|nil" ; "without_session_read")]
+    fn a_key_handler_sees_the_draft_only_with_session_read(granted: &[&str]) -> String {
+        const PASTED: &str = "pasted";
+        const SHORTCUT: &str = "<C-g>";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source_with_permissions(
+            "peek",
+            r#"
+            maki.keymap.set("n", "<C-g>", function(ev)
+                maki.ui.flash(tostring(ev.input ~= nil) .. "|" .. tostring(ev.text))
+            end)
+            "#,
+            grants(granted),
+        )
+        .unwrap();
+        let reader = host.keymap_reader();
+        let handle = host.event_handle();
+        assert!(reader.dispatch(
+            Key::parse(SHORTCUT).unwrap(),
+            InputMode::Normal,
+            None,
+            |t| {
+                let t = t
+                    .with_input(InputSnapshot {
+                        session_id: String::new(),
+                        text: PASTED.into(),
+                        cursor: 0,
+                        anchor: None,
+                        version: 0,
+                    })
+                    .with_text(PASTED.into());
+                handle.run_keybind_callback(t)
+            }
+        ));
+        let Ok(UiAction::Flash(said)) = host.ui_action_rx().recv_timeout(KEYBIND_TIMEOUT) else {
+            panic!("{KEYBIND_NEVER_RAN}");
+        };
+        said
     }
 
     /// `<C-c>` never reaches a binding, so accepting one publishes a mapping
@@ -1792,10 +2259,15 @@ mod tests {
             entry.key
         };
 
-        assert!(reader.dispatch(key_of('g'), |t| handle.run_keybind_callback(t)));
-        assert!(reader.dispatch(key_of('h'), |t| handle.run_keybind_callback(t)));
+        let run = |code| {
+            reader.dispatch(key_of(code), InputMode::Normal, None, |t| {
+                handle.run_keybind_callback(t)
+            })
+        };
+        assert!(run('g'));
+        assert!(run('h'));
 
-        wait_for_fired_command(&host);
+        assert_fired_after(&host, 2);
     }
 
     /// Unloading has to take the bindings with it, or a `/reload` leaves keys
@@ -1921,6 +2393,59 @@ mod tests {
                 warning.starts_with(TRUST_SCOPE_WARNING)
                     && warning.contains(ConfigScope::Project.label())
             }),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn project_scope_cannot_set_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        fs::create_dir_all(dir.path().join(".maki")).unwrap();
+        fs::create_dir(&global).unwrap();
+        fs::write(
+            global.join("init.lua"),
+            "maki.setup({ instructions = { files = { \"CLAUDE.md\" }, \
+                 overrides = { { path = \"~/src/me/*\", files = {} } } } })",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".maki/init.lua"),
+            "maki.setup({ instructions = { files = {}, \
+                 overrides = { { remote = \"github.com/*\", files = {} } } } })",
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let merged = host
+            .load_init_files_from_dirs(
+                InitFiles::GlobalAndProject(dir.path().join(".maki/init.lua")),
+                [global],
+                &mut warnings,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            merged
+                .instructions
+                .files
+                .expect("the global instructions table survives"),
+            ["CLAUDE.md"]
+        );
+        assert_eq!(
+            merged.instructions.overrides[0]
+                .path
+                .as_deref()
+                .expect("the global overrides list survives"),
+            "~/src/me/*"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.starts_with(INSTRUCTIONS_SCOPE_WARNING)
+                    && warning.contains(ConfigScope::Project.label())),
             "{warnings:?}"
         );
     }
@@ -2531,6 +3056,103 @@ mod tests {
                 .has_replacements()
         );
     }
+
+    const UI_CALLS_AT_LOAD: &str = r#"
+    local function report(value, err)
+        maki.ui.flash(tostring(value) .. " " .. tostring(err))
+    end
+    report(maki.ui.action("help"))
+    report(maki.fn.winsaveview())
+    maki.defer_fn(function() report(maki.ui.action("help")) end, 0)
+    "#;
+    const HELP_ANSWERED: &str = "true nil";
+    const UI_NEVER_HEARD: &str = "the plugin never reached the UI";
+    const HELP_NEVER_ASKED: &str = "the deferred action never asked the UI";
+
+    /// The UI answers only after every plugin loaded, and startup waits for
+    /// the load, so a round trip from a plugin's top level would hang maki.
+    /// A callback the load scheduled runs later and gets its answer.
+    #[test]
+    fn a_ui_roundtrip_fails_fast_while_its_plugin_loads() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let ui = host.ui_action_rx();
+        host.load_source("early_ui", UI_CALLS_AT_LOAD).unwrap();
+        let next = || loop {
+            if let action @ (UiAction::Flash(_) | UiAction::Builtin { .. }) =
+                ui.recv_timeout(KEYBIND_TIMEOUT).expect(UI_NEVER_HEARD)
+            {
+                break action;
+            }
+        };
+
+        let refused = format!("nil {PLUGIN_LOADING_ERR}");
+        for _ in 0..2 {
+            assert!(matches!(next(), UiAction::Flash(msg) if msg == refused));
+        }
+        let UiAction::Builtin {
+            action: BuiltinAction::Help,
+            reply_tx,
+            ..
+        } = next()
+        else {
+            panic!("{HELP_NEVER_ASKED}");
+        };
+        reply_tx.send(true).unwrap();
+        assert!(matches!(next(), UiAction::Flash(msg) if msg == HELP_ANSWERED));
+    }
+
+    /// A buffer belongs to a task and the top level runs in none. The load
+    /// fails with a reason instead of taking the host down.
+    #[test_case("maki.ui.buf()" ; "buf")]
+    #[test_case("maki.async.on_cancel(function() end)" ; "on_cancel")]
+    fn a_task_call_at_the_top_level_fails_the_load(source: &str) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+
+        let err = host.load_source("top_level", source).unwrap_err();
+
+        assert!(err.to_string().contains(OUTSIDE_TASK_ERR), "{err}");
+        host.load_source("after", "return {}").unwrap();
+    }
+
+    const NORMAL_ONLY_PLUGIN: &str = "old_keys";
+    const NORMAL_ONLY_KEY: &str = "<M-n>";
+
+    /// Bindings in `"n"` alone used to fire while typing and no longer do.
+    /// A plugin that binds in `"i"` too, or holds normal mode, manages modes
+    /// on purpose and is left alone.
+    #[test_case(r#"maki.keymap.set("n", "<M-n>", function() end)"#, true ; "normal_only")]
+    #[test_case(r#"maki.keymap.set({ "n", "i" }, "<M-n>", function() end)"#, false ; "both_modes")]
+    #[test_case(
+        r#"maki.keymap.set("i", "<Esc>", function() maki.ui.set_mode("n") end)
+        maki.keymap.set("n", "<M-n>", function() end)"#,
+        false ;
+        "binds_insert_mode_too"
+    )]
+    #[test_case(
+        r#"maki.ui.set_mode("n")
+        maki.keymap.set("n", "<M-n>", function() end)"#,
+        false ;
+        "holds_normal_mode"
+    )]
+    fn a_normal_only_global_key_is_reported_once(source: &str, reported: bool) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(NORMAL_ONLY_PLUGIN, source).unwrap();
+
+        let warning = host.take_key_warning();
+
+        assert_eq!(warning.is_some(), reported, "{warning:?}");
+        if let Some(warning) = warning {
+            let parts = [
+                MODE_WARNING,
+                NORMAL_ONLY_PLUGIN,
+                NORMAL_ONLY_KEY,
+                UPGRADE_DOCS,
+            ];
+            assert!(parts.iter().all(|part| warning.contains(part)), "{warning}");
+        }
+        host.load_source(NORMAL_ONLY_PLUGIN, source).unwrap();
+        assert_eq!(host.take_key_warning(), None, "a reload repeats nothing");
+    }
 }
 
 /// Holds every bundled `plugin.toml` to what its plugin actually does: the
@@ -2550,8 +3172,9 @@ mod bundled_manifests {
 
     use super::{Arc, BUNDLED_PLUGINS, HashMap, PluginHost, bundled_permissions, lib_dir};
     use crate::agent_autocmd::HostEventKind;
+    use crate::api::util::command::BuiltinAction;
     use crate::docs::{DocKind, api_docs};
-    use crate::plugin_permissions::Permission;
+    use crate::plugin_permissions::{Permission, SENDS_PROMPT};
 
     const TEST_DIR: &str = "tests";
     const LUA_EXT: &str = "lua";
@@ -2561,8 +3184,11 @@ mod bundled_manifests {
     const AGENT_SESSION: &str = "maki.agent.session";
     const SESSION_NOTIFY: &str = "maki.session.notify";
     const WAKE_OPTION: &str = "wake =";
+    const UI_ACTION_CALL: &str = "maki.ui.action(";
+    const INPUT_EDIT_CALL: &str = "maki.ui.input_edit";
     const DISABLED_WAKE: &str = "false";
     const CREATE_AUTOCMD: &str = "maki.api.create_autocmd";
+    const CTX_BACKGROUND: &str = "ctx:background";
     const LUA_QUOTES: [char; 2] = ['"', '\''];
 
     /// Every guarded `maki.*` function under the dotted name lua calls it by.
@@ -2670,6 +3296,28 @@ mod bundled_manifests {
         })
     }
 
+    /// A `maki.ui.action` call naming a built-in that changes the input.
+    fn runs_an_input_action(source: &str) -> bool {
+        source.match_indices(UI_ACTION_CALL).any(|(at, _)| {
+            let rest = &source[at + UI_ACTION_CALL.len()..];
+            let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+                return false;
+            };
+            let name = &rest[1..];
+            name.find(quote)
+                .and_then(|end| name[..end].parse::<BuiltinAction>().ok())
+                .is_some_and(BuiltinAction::changes_input)
+        })
+    }
+
+    #[test_case(r#"maki.ui.action("undo")"#, true ; "undo")]
+    #[test_case("maki.ui.action('newline')", true ; "newline_in_single_quotes")]
+    #[test_case(r#"maki.ui.action("input_raw")"#, false ; "a_view_toggle")]
+    #[test_case(r#"maki.ui.action("completion.accept")"#, false ; "a_plugin_action")]
+    fn an_input_action_is_spotted(source: &str, spotted: bool) {
+        assert_eq!(runs_an_input_action(source), spotted);
+    }
+
     fn wakes_session(source: &str) -> bool {
         calls(source, SESSION_NOTIFY)
             && source.split(WAKE_OPTION).skip(1).any(|option| {
@@ -2744,6 +3392,12 @@ mod bundled_manifests {
                         .entry(Permission::Agent)
                         .or_insert_with(|| format!("{SESSION_NOTIFY} with {WAKE_OPTION}"));
                 }
+                // A ctx method, so the API metadata has no guard for it.
+                if calls(source, CTX_BACKGROUND) {
+                    needed
+                        .entry(Permission::Agent)
+                        .or_insert_with(|| CTX_BACKGROUND.to_owned());
+                }
                 // Events are never refused, they arrive without their content
                 // fields, so no guard records the need. A bundled plugin
                 // subscribing to an event that has content is reading it.
@@ -2761,11 +3415,29 @@ mod bundled_manifests {
                         }
                     }
                 }
+                // A built-in action is guarded by its name, and an edit by
+                // whether it changes the text, which the API metadata cannot
+                // see.
+                let edits_by_action = runs_an_input_action(source);
+                if edits_by_action {
+                    needed
+                        .entry(Permission::Input)
+                        .or_insert_with(|| "a built-in action that edits".to_owned());
+                }
+                if edits_by_action || calls(source, INPUT_EDIT_CALL) {
+                    for &permission in SENDS_PROMPT {
+                        needed
+                            .entry(permission)
+                            .or_insert_with(|| "changing the text of the input".to_owned());
+                    }
+                }
                 // A bundled plugin opening a session hands over whatever the
                 // chat has, and a session pays for everything it hands over.
+                // That leaves out what no tool reaches, as the session's own
+                // check does.
                 if calls(source, AGENT_SESSION) {
                     for &permission in Permission::ALL {
-                        if permission != Permission::Agent {
+                        if !matches!(permission, Permission::Agent | Permission::Input) {
                             needed
                                 .entry(permission)
                                 .or_insert_with(|| AGENT_SESSION.to_owned());

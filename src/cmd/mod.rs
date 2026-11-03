@@ -61,7 +61,7 @@ type KnownNames<'a> = dyn Fn(&PluginHost) -> Result<Vec<String>> + 'a;
 ///
 /// Warnings are returned sanitized, leaving the sink to the caller; the extra
 /// `Vec` handed to `build_config` is for warnings raised while building it.
-fn load_plugins(
+async fn load_plugins(
     host: &mut PluginHost,
     no_plugins: bool,
     on_builtin_failure: BuiltinFailure,
@@ -72,6 +72,7 @@ fn load_plugins(
     // registered: on a `/reload` this host is a new one, and an entry the old
     // one left behind answers on a channel nobody serves.
     maki_providers::plugin::begin_load();
+    let legacy_warnings = maki_providers::plugin::keep_legacy_selections();
 
     let discovery = maki_lua::discover_installed(no_plugins);
     // Includes the names discovery refused, so a package it could not read does
@@ -83,6 +84,7 @@ fn load_plugins(
         .into_iter()
         .map(|problem| format!("skipping package: {problem}"))
         .collect();
+    warnings.extend(legacy_warnings);
 
     let config = build_config(
         host,
@@ -112,7 +114,7 @@ fn load_plugins(
     // Installing here rather than inside `maki.pack.add` keeps a clone off the
     // Lua thread, and is the phase Neovim's own `load` default defers to.
     let declared = declared_packages(host)?;
-    let installed = maki_lua::install_declared(&declared, interaction);
+    let installed = maki_lua::install_declared(&declared, interaction).await;
     warnings.extend(installed.failures);
     let available: Vec<DiscoveredPackage> = discovery
         .packages
@@ -145,7 +147,7 @@ fn declared_packages(host: &PluginHost) -> Result<Vec<maki_lua::Declared>> {
 ///
 /// Plugins still load before the subscriber exists, because the config that
 /// configures it is Lua-produced. That is unchanged from `cmd::tui::run`.
-fn cli_stack(
+async fn cli_stack(
     no_plugins: bool,
     no_jit: bool,
     trust_mode: TrustMode,
@@ -190,15 +192,16 @@ fn cli_stack(
             config.permissions = load_permissions(&trust.project_config);
             Ok(config)
         },
-    )?;
-    setup::init_logging(&config.storage);
+    )
+    .await?;
+    setup::init_logging(&config.storage, trust.project_config.config_root());
     setup::init_telemetry(&config.telemetry);
     setup::install_panic_log_hook();
     report_warnings(warnings);
     Ok((host, config))
 }
 
-pub fn dispatch(cli: Cli) -> Result<()> {
+pub async fn dispatch(cli: Cli) -> Result<()> {
     // `--trust` is a grant for this process, so every entry point under it
     // reads the same shared project config the TUI would.
     let trust_mode = if cli.trust {
@@ -206,6 +209,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     } else {
         TrustMode::Consult
     };
+    let background = cli.background_wait().is_some();
     match cli.command {
         Some(Command::Auth { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
@@ -213,20 +217,20 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             // plugin load has published them, and `login`/`logout` drive a hook
             // that runs on the host's Lua thread, so `_host` stays bound for the
             // whole arm.
-            let _host = cli_stack(cli.no_plugins, cli.no_jit, trust_mode)?;
+            let _host = cli_stack(cli.no_plugins, cli.no_jit, trust_mode).await?;
             match action {
                 AuthAction::Login { provider } => {
-                    subcmd::auth_login(provider.as_deref(), &storage)?
+                    subcmd::auth_login(provider.as_deref(), &storage).await?
                 }
-                AuthAction::Logout { provider } => subcmd::auth_logout(&provider, &storage)?,
-                AuthAction::Status => subcmd::auth_status(&storage)?,
+                AuthAction::Logout { provider } => subcmd::auth_logout(&provider, &storage).await?,
+                AuthAction::Status => subcmd::auth_status(&storage).await?,
             }
         }
         Some(Command::Index { path }) => {
-            subcmd::index(&path, cli.no_plugins, cli.no_jit, trust_mode)?;
+            subcmd::index(&path, cli.no_plugins, cli.no_jit, trust_mode).await?;
         }
         Some(Command::Models { refresh }) => {
-            subcmd::models(cli.no_plugins, cli.no_jit, refresh, trust_mode)?
+            subcmd::models(cli.no_plugins, cli.no_jit, refresh, trust_mode).await?
         }
         Some(Command::Session { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
@@ -242,24 +246,36 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Some(Command::Mcp { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
             match action {
-                McpAction::Auth { server } => subcmd::mcp_auth(&server, &storage, trust_mode)?,
+                McpAction::Auth { server } => {
+                    subcmd::mcp_auth(&server, &storage, trust_mode).await?
+                }
                 McpAction::Logout { server } => subcmd::mcp_logout(&server, &storage)?,
             }
         }
         Some(Command::Update { yes, no_color }) => {
-            update::update(yes, no_color).map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
+            update::update(yes, no_color)
+                .await
+                .map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
         }
         Some(Command::Rollback) => {
             update::rollback().map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
         }
         Some(Command::Acp { model, yolo }) => {
-            acp::run(model, yolo, cli.no_plugins, cli.no_jit, trust_mode)?;
+            acp::run(
+                model,
+                yolo,
+                cli.no_plugins,
+                cli.no_jit,
+                trust_mode,
+                background,
+            )
+            .await?;
         }
         Some(Command::Migrate { action }) => match action {
             MigrateAction::Xdg => migrate::xdg()?,
             MigrateAction::Providers => {
                 // A script counts as ported once a plugin registers its slug.
-                let _host = cli_stack(cli.no_plugins, cli.no_jit, trust_mode)?;
+                let _host = cli_stack(cli.no_plugins, cli.no_jit, trust_mode).await?;
                 migrate::providers()?
             }
         },
@@ -291,10 +307,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 cli.no_plugins,
                 cli.no_jit,
                 trust_mode,
-            )?;
+            )
+            .await?;
         }
         None => {
-            tui::run(cli)?;
+            tui::run(cli).await?;
         }
     }
     Ok(())

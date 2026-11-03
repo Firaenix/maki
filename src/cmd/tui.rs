@@ -143,7 +143,7 @@ struct Launch<'a> {
 /// The one construction path for a generation: first startup passes
 /// `fallback: None` (fail-fast); `/reload` passes the last-good config and
 /// model so a broken config reopens the UI with a warning instead of exiting.
-fn build_stack(
+async fn build_stack(
     launch: &Launch<'_>,
     trust: &ProjectDecision,
     fallback: Option<(Config, Model)>,
@@ -178,12 +178,14 @@ fn build_stack(
             );
             config_or_fallback(loaded, fallback_config, warnings)
         },
-    )?;
+    )
+    .await?;
 
     let commands = discover_commands(cli.no_commands, launch.cwd);
 
     setup::remember_thinking(&mut config.session_defaults, launch.storage);
-    let model_result = setup::resolve_model(cli.model.as_deref(), &config.provider, launch.storage);
+    let model_result =
+        setup::resolve_model(cli.model.as_deref(), &config.provider, launch.storage).await;
     let (model, needs_login) = match (model_result, fallback_model) {
         (Ok((m, warning)), _) => {
             warnings.extend(warning);
@@ -246,7 +248,7 @@ fn should_load_project_env(was_trusted: bool, now_trusted: bool) -> bool {
 /// project environment, because the ordering is the whole safety argument: the
 /// old plugin host's thread must be joined before `load_env_files` touches the
 /// process env, and the env must be in place before the new host reads config.
-fn rebuild(
+async fn rebuild(
     launch: &Launch<'_>,
     mut stack: Stack,
     teardown: &mut Teardown,
@@ -271,22 +273,25 @@ fn rebuild(
     } else {
         teardown.defer(move || drop(stack));
     }
-    let pack_report = pack.map(maki_lua::apply_pack_plan);
+    let pack_report = match pack {
+        Some(plan) => Some(maki_lua::apply_pack_plan(plan).await),
+        None => None,
+    };
 
     if load_env {
         // This calls `std::env::set_var`. On the startup grant path nothing
         // long-lived exists yet, so the join above is the whole story. The only
         // site that reaches it with threads alive is `/trust`, a rare explicit
-        // action, and only after the join: smol's worker pool and any telemetry
-        // exporter may still be parked.
+        // action, and only after the join: tokio's worker threads and any
+        // telemetry exporter may still be parked.
         load_env_files(&trust.project_config);
     }
 
-    let (stack, warnings) = build_stack(launch, trust, fallback)?;
+    let (stack, warnings) = build_stack(launch, trust, fallback).await?;
     Ok((stack, warnings, pack_report))
 }
 
-pub fn run(mut cli: Cli) -> Result<()> {
+pub async fn run(mut cli: Cli) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
     maki_providers::model_registry::load_from_storage(&storage);
 
@@ -317,7 +322,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         storage: &storage,
         interaction,
     };
-    let (mut stack, mut startup_warnings) = build_stack(&launch, &trust, None)?;
+    let (mut stack, mut startup_warnings) = build_stack(&launch, &trust, None).await?;
 
     // The card owns the terminal, so it is drawn before logging, telemetry and
     // the panic hook claim it, and while the process is still single-threaded.
@@ -357,7 +362,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     was_trusted,
                     None,
                     None,
-                )?;
+                )
+                .await?;
             } else {
                 startup_warnings.extend(trust.warning.clone());
             }
@@ -366,7 +372,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         None => startup_warnings.extend(trust.state.restricted_warning()),
     }
 
-    setup::init_logging(&stack.config.storage);
+    setup::init_logging(&stack.config.storage, trust.project_config.config_root());
     setup::init_telemetry(&stack.config.telemetry);
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
@@ -395,7 +401,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         let (resumed, claim) = resolved.into_resumed();
         let prompt_slots = stack.plugin_host.event_handle().collect_prompt_slots();
         let timeouts = stack.timeouts();
-        crate::sdk_mode::run(crate::sdk_mode::SdkParams {
+        let interrupt = crate::sdk_mode::run(crate::sdk_mode::SdkParams {
             cli,
             resumed,
             claim,
@@ -411,14 +417,19 @@ pub fn run(mut cli: Cli) -> Result<()> {
             lua_handle: stack.plugin_host.event_handle(),
             project_config: trust.project_config.clone(),
         })
+        .await
         .context("run sdk mode")?;
+        drop(stack.plugin_host);
+        teardown.join();
+        interrupt.exit_if_caught();
         return Ok(());
     }
 
     if cli.print {
         let (resumed, claim) = resolved.into_resumed();
         let timeouts = stack.timeouts();
-        crate::print::run(crate::print::PrintParams {
+        let background_wait = cli.background_wait();
+        let interrupt = crate::print::run(crate::print::PrintParams {
             model: stack.model,
             prompt: cli.initial_prompt,
             image_paths: cli.images,
@@ -435,8 +446,13 @@ pub fn run(mut cli: Cli) -> Result<()> {
             resumed,
             claim,
             storage: storage.clone(),
+            background_wait,
         })
+        .await
         .context("run print mode")?;
+        drop(stack.plugin_host);
+        teardown.join();
+        interrupt.exit_if_caught();
         return Ok(());
     }
 
@@ -447,6 +463,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         &cwd_str,
     )];
     let mut focused = 0;
+    let mut handed_over = Vec::new();
     let mut warnings = startup_warnings;
     let mut initial_prompt = read_initial_prompt(cli.initial_prompt.take())?;
     let launch = Launch {
@@ -491,9 +508,11 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 )),
                 timeouts: stack.timeouts(),
                 exit_on_done: cli.exit_on_done,
+                background_wait: cli.background_wait(),
                 lua_command_reader: stack.plugin_host.command_reader(),
                 keymap_reader: stack.plugin_host.keymap_reader(),
                 hint_reader: stack.plugin_host.hint_reader(),
+                input_rules_reader: stack.plugin_host.input_rules_reader(),
                 ui_action_rx: stack.plugin_host.ui_action_rx(),
                 ui_wake_rx: stack.plugin_host.ui_wake_rx(),
                 ui_attachment: stack.plugin_host.ui_attachment(),
@@ -501,9 +520,11 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 model_policy: Arc::new(stack.config.provider.model_policy.clone()),
                 project_config: trust.project_config.clone(),
                 trust_question: trust.state.question().cloned(),
+                handed_over: std::mem::take(&mut handed_over),
             },
             initial_prompt.take(),
         )
+        .await
         .context("run UI")?;
 
         match outcome {
@@ -534,7 +555,11 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 tabs: reloaded,
                 focused: f,
                 pack,
+                mailboxes,
             } => {
+                // Held across the rebuild: a result no run drained yet lives
+                // only there.
+                handed_over = mailboxes;
                 let started = Instant::now();
                 let last_good = (stack.config.clone(), stack.model.clone());
                 let was_trusted = trust.project_config.is_trusted();
@@ -549,7 +574,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     was_trusted,
                     pack,
                     Some(last_good),
-                )?;
+                )
+                .await?;
                 tabs = reloaded;
                 if tabs.is_empty() {
                     let replacement = Resolved::fresh(&storage);

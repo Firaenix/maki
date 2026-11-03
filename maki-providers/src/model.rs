@@ -21,7 +21,9 @@ use crate::model_registry;
 use crate::providers::catalog::{self, CatalogMeta};
 use crate::providers::{anthropic, custom, plugin};
 use crate::spec::{ProviderRegistry, ProviderSpec};
-use crate::types::{EffortDialect, FALLBACK_MAX_THINKING_BUDGET, ThinkingFallback, dialect};
+use crate::types::{
+    EffortDialect, FALLBACK_MAX_THINKING_BUDGET, ThinkingFallback, dialect, thinks_by_default,
+};
 pub use maki_config::providers::ModelTier;
 use maki_config::providers::{
     ProviderDef, ProvidersConfig, ThinkingFields, base_url_override, builtin_provider,
@@ -138,7 +140,7 @@ impl ModelEffort {
     }
 
     /// What [`Self::supported`] keeps of the names a provider listed.
-    fn known_levels(listed: &[Value]) -> Vec<Effort> {
+    pub(crate) fn known_levels(listed: &[Value]) -> Vec<Effort> {
         let mut efforts: Vec<Effort> = listed
             .iter()
             .filter_map(|raw| {
@@ -286,6 +288,7 @@ pub struct ModelEntry {
 }
 
 impl ModelEntry {
+    #[cfg(test)]
     pub(crate) fn canonical_id(&self) -> Option<&str> {
         self.prefixes.first().map(String::as_str)
     }
@@ -517,6 +520,9 @@ pub struct ThinkingOption {
     /// Absent on rows that are not a token budget.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens: Option<u32>,
+    /// The row this one goes out as. A level the model does not take is
+    /// sent as its nearest neighbour, and the picker shows which.
+    pub sends: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -676,21 +682,39 @@ impl Model {
             .unwrap_or(spec.supports_thinking)
     }
 
+    /// A model that spells its own `off` keeps it: the id rule only covers an
+    /// `off` that would go out as nothing.
     pub fn requires_thinking(&self) -> bool {
         self.thinking_override == Some(ThinkingSupport::Required)
+            || (thinks_by_default(&self.id)
+                && self
+                    .effective_thinking_fields()
+                    .is_none_or(|(fields, _)| fields.off.is_none()))
+    }
+
+    /// Discovery files its rows under the builtin slug, so a slug that
+    /// borrows a native row still finds them.
+    pub(crate) fn discovered_effort(&self) -> Option<ModelEffort> {
+        let spec = ProviderRegistry::for_slug(&self.provider)?;
+        model_registry::discovered(spec.slug, &self.id)?.effort
     }
 
     /// The level `adaptive` is sent as for this model, or `None` where the
     /// API picks the depth itself. Such a level is all `adaptive` is here, so
-    /// the ladder leaves the row out. Every provider answers on its spec row.
-    /// A `providers.toml` slug borrows a native row for its protocol but not
-    /// its dialect: its codec sends nothing for a mode the model does not
-    /// spell. An id only models.dev knows goes by the wire it is served on.
+    /// the ladder leaves the row out.
     pub fn adaptive_effort(&self) -> Option<Effort> {
+        self.thinking_sent(ThinkingConfig::Adaptive).level()
+    }
+
+    /// What the request carries for `choice`. Every provider answers on its
+    /// spec row. A `providers.toml` slug borrows a native row for its
+    /// protocol but not its dialect, so its codec sends the choice as it is.
+    /// An id only models.dev knows goes by the wire it is served on.
+    pub(crate) fn thinking_sent(&self, choice: ThinkingConfig) -> ThinkingConfig {
         match ProviderRegistry::get(&self.provider) {
-            Some(spec) => (spec.adaptive_effort)(self),
-            None if custom::is_declared(&self.provider) => None,
-            None => catalog::adaptive_effort_if_available(&self.provider),
+            Some(spec) => (spec.sends_thinking)(self, choice),
+            None if custom::is_declared(&self.provider) => choice,
+            None => catalog::sends_if_available(&self.provider, choice),
         }
     }
 
@@ -748,7 +772,9 @@ impl Model {
 
     /// Named thinking choices, cheapest first. Explicit wire-level names take
     /// precedence over the generic budget ladder and carry no invented token
-    /// counts. Empty exactly when the model has no thinking support.
+    /// counts. Empty exactly when the model has no thinking support. A level
+    /// the model does not take stays listed, because the session keeps it as
+    /// a ceiling for subagents, which may run on a model that does take it.
     pub fn thinking_options(&self) -> Vec<ThinkingOption> {
         if !self.supports_thinking() {
             return Vec::new();
@@ -767,7 +793,11 @@ impl Model {
                 (ThinkingConfig::Adaptive.shown(self) == ThinkingConfig::Adaptive)
                     .then_some(THINKING_ADAPTIVE),
             )
-            .map(|name| ThinkingOption { name, tokens: None })
+            .map(|name| ThinkingOption {
+                name,
+                tokens: None,
+                sends: name,
+            })
             .chain(
                 Effort::ALL
                     .into_iter()
@@ -775,6 +805,11 @@ impl Model {
                     .map(|level| ThinkingOption {
                         name: level.as_str(),
                         tokens: declared.is_none().then(|| level.budget(max)),
+                        sends: ThinkingConfig::Effort(level)
+                            .shown(self)
+                            .level()
+                            .unwrap_or(level)
+                            .as_str(),
                     }),
             )
             .collect()
@@ -910,6 +945,9 @@ impl Model {
         ProviderRegistry::for_slug(&self.provider).map_or("Unknown", |m| m.display_name)
     }
 
+    /// The model for a tier within given provider. This function only picks a
+    /// model within the given provider. Use `resolve_tier()` when needed to
+    /// resolve a model tier to model spec from any provider.
     pub fn from_tier(slug: &str, tier: ModelTier) -> Result<Self, ModelError> {
         if let Some(spec) = model_registry::spec_for_tier(slug, tier) {
             return Self::from_spec(&spec);
@@ -1043,14 +1081,16 @@ impl Model {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {
     /// Non-cached input tokens. Total input = `input + cache_read + cache_creation`.
+    /// u64 because a session accumulates these for its whole life; a u32
+    /// running total saturates around 4.3 billion tokens.
     #[serde(rename = "input_tokens")]
-    pub input: u32,
+    pub input: u64,
     #[serde(rename = "output_tokens")]
-    pub output: u32,
+    pub output: u64,
     #[serde(rename = "cache_creation_input_tokens")]
-    pub cache_creation: u32,
+    pub cache_creation: u64,
     #[serde(rename = "cache_read_input_tokens")]
-    pub cache_read: u32,
+    pub cache_read: u64,
     /// What this one response cost, straight from the provider, when it bothers
     /// to say (OpenRouter's `usage.cost`). Worth preferring on a router, where
     /// our table prices the model we asked for and the router bills for
@@ -1102,13 +1142,13 @@ impl TokenUsage {
         }
     }
 
-    pub fn total_input(&self) -> u32 {
+    pub fn total_input(&self) -> u64 {
         self.input
             .saturating_add(self.cache_read)
             .saturating_add(self.cache_creation)
     }
 
-    pub fn context_tokens(&self) -> u32 {
+    pub fn context_tokens(&self) -> u64 {
         self.total_input().saturating_add(self.output)
     }
 
@@ -1207,7 +1247,7 @@ mod tests {
     const UNPRICED_SCHEDULED_SPEC: &str = "scheduled-plugin/my-custom-model";
     const SCHEDULED_HOST: &str = "scheduled.example";
     const SURCHARGE: f64 = 2.0;
-    const MILLION: u32 = 1_000_000;
+    const MILLION: u64 = 1_000_000;
     const INPUT_ONLY: TokenUsage = TokenUsage {
         input: MILLION,
         output: 0,
@@ -1317,13 +1357,13 @@ mod tests {
     #[test_case(1_000, "1.0k"      ; "thousand")]
     #[test_case(999_999, "1000.0k" ; "just_under_million")]
     #[test_case(1_000_000, "1.0m"  ; "million")]
-    fn format_tokens_display(tokens: u32, expected: &str) {
+    fn format_tokens_display(tokens: u64, expected: &str) {
         assert_eq!(format_tokens(tokens), expected);
     }
 
     #[test_case(TokenUsage { input: 12_000, output: 456, cache_creation: 200, cache_read: 100, cost: None }, None, "12.3k↑ 456↓" ; "without_cost")]
     #[test_case(TokenUsage { input: 1_000_000, output: 100_000, cache_creation: 200_000, cache_read: 500_000, cost: None }, Some(5.4), "1.7m↑ 100.0k↓ $5.400" ; "with_cost")]
-    #[test_case(TokenUsage { input: u32::MAX, output: 1, cache_creation: 1, cache_read: 1, cost: None }, None, "4295.0m↑ 1↓" ; "input_saturates")]
+    #[test_case(TokenUsage { input: u64::from(u32::MAX) + 1, output: 1, cache_creation: 1, cache_read: 1, cost: None }, None, "4295.0m↑ 1↓" ; "past_u32_max")]
     fn usage_formatting(usage: TokenUsage, cost: Option<f64>, expected: &str) {
         assert_eq!(usage.format(cost), expected);
     }
@@ -1488,6 +1528,20 @@ mod tests {
         };
         assert_eq!(total.input, COUNTERS.input * 2);
         assert_eq!(total.cost, None);
+    }
+
+    #[test]
+    fn running_total_past_u32_max_keeps_counting() {
+        let mut total = TokenUsage {
+            input: u32::MAX as u64,
+            ..Default::default()
+        };
+        total += TokenUsage {
+            input: 1_000,
+            ..Default::default()
+        };
+        assert_eq!(total.input, u32::MAX as u64 + 1_000);
+        assert_eq!(format_tokens(total.input), "4295.0m");
     }
 
     #[test]
@@ -1802,6 +1856,26 @@ mod tests {
     }
 
     #[test]
+    fn discovered_thinking_flows_into_ollama_model() {
+        use crate::model::ModelInfo;
+
+        model_registry::set_known_models(
+            "ollama",
+            vec![
+                ModelInfo {
+                    supports_thinking: Some(true),
+                    ..ModelInfo::id_only("test-thinker".into())
+                },
+                ModelInfo::id_only("test-thinkless".into()),
+            ],
+        );
+
+        let thinking = |id| Model::from_spec(id).unwrap().supports_thinking();
+        assert!(thinking("ollama/test-thinker"));
+        assert!(!thinking("ollama/test-thinkless"));
+    }
+
+    #[test]
     fn discovered_context_window_flows_into_from_base_for_unknown_model() {
         use crate::model::ModelInfo;
 
@@ -1887,7 +1961,7 @@ mod tests {
         let model = Model::from_spec(SCHEDULED_SPEC).unwrap();
 
         let list = model.list_cost(&INPUT_ONLY, false).unwrap();
-        let table_price = f64::from(INPUT_ONLY.input) * model.pricing.input / PER_MILLION;
+        let table_price = INPUT_ONLY.input as f64 * model.pricing.input / PER_MILLION;
         assert!(
             (list - table_price).abs() < EPSILON,
             "list_cost {list} must be the table price {table_price}, surcharge free"
@@ -1978,6 +2052,18 @@ mod tests {
         assert_eq!(names, expected);
     }
 
+    #[test]
+    fn thinking_options_drop_off_where_the_model_thinks_by_default() {
+        let model = Model {
+            id: "claude-opus-5.5".into(),
+            ..ladder_model(ThinkingSupport::Yes, Some(ROOMY_OUTPUT))
+        };
+
+        let options = model.thinking_options();
+        let names: Vec<&str> = options.iter().map(|option| option.name).collect();
+        assert_eq!(names, &LADDER[1..]);
+    }
+
     /// `adaptive` promises that the API picks the depth, so a provider that
     /// sends one fixed level for it must not offer the row. A slug nothing
     /// describes keeps it, since nobody said otherwise.
@@ -2033,6 +2119,49 @@ mod tests {
         let names: Vec<&str> = options.iter().map(|option| option.name).collect();
         assert_eq!(names, expected);
         assert!(options.iter().all(|option| option.tokens.is_none()));
+    }
+
+    #[test]
+    fn thinking_options_name_the_row_each_level_sends() {
+        model_registry::set_known_models(
+            "ollama",
+            vec![ModelInfo {
+                supports_thinking: Some(true),
+                effort: Some(ModelEffort {
+                    supported: vec![Effort::Low, Effort::Medium],
+                    send_off: Some(true),
+                }),
+                ..ModelInfo::id_only("two-levels".into())
+            }],
+        );
+        let options = Model::from_spec("ollama/two-levels")
+            .unwrap()
+            .thinking_options();
+        let rows: Vec<(&str, &str)> = options.iter().map(|o| (o.name, o.sends)).collect();
+        assert_eq!(
+            rows,
+            [
+                ("off", "off"),
+                ("minimal", "low"),
+                ("low", "low"),
+                ("medium", "medium"),
+                ("high", "medium"),
+                ("xhigh", "medium"),
+                ("max", "medium"),
+            ]
+        );
+    }
+
+    /// The badge follows a provider's fixed dialect too, not only discovery.
+    #[test_case("zai/glm-5.3", Effort::Low, Effort::High ; "below_the_lowest_takes_the_lowest")]
+    #[test_case("zai/glm-5.3", Effort::Max, Effort::XHigh ; "above_the_top_takes_the_top")]
+    #[test_case("anthropic/claude-sonnet-4-5", Effort::Low, Effort::Low ; "an_api_that_takes_it_keeps_it")]
+    fn shown_is_the_level_the_provider_sends(spec: &str, picked: Effort, sent: Effort) {
+        let model = Model::from_spec(spec).unwrap();
+        assert_eq!(
+            ThinkingConfig::Effort(picked).shown(&model),
+            ThinkingConfig::Effort(sent)
+        );
     }
 
     #[test_case(json!({}) ; "empty_fields")]

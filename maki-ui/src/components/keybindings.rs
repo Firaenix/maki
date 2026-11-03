@@ -130,6 +130,7 @@ pub mod key {
     pub const HELP: Bind = ctrl_bind!('h');
     pub const SESSIONS: Bind = ctrl_bind!('p');
     pub const TASKS: Bind = ctrl_bind!('x');
+    pub const BACKGROUND: Bind = ctrl_bind!('b');
     pub const SCROLL_HALF_UP: Bind = ctrl_bind!('u');
     pub const SCROLL_HALF_DOWN: Bind = ctrl_bind!('d');
     pub const SCROLL_PAGE_UP: Bind = Bind {
@@ -173,11 +174,6 @@ pub mod key {
         code: KeyCode::Char('z'),
         modifiers: KeyModifiers::ALT,
         label: "Alt+Z",
-    };
-    pub const DETACH_RUN: Bind = Bind {
-        code: KeyCode::Enter,
-        modifiers: KeyModifiers::CONTROL,
-        label: "Ctrl+Enter",
     };
 }
 
@@ -326,7 +322,7 @@ pub struct Keybind {
 pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(key::QUIT.label),
-        description: "Quit / clear input",
+        description: "Quit / clear input / copy selection",
         context: KeybindContext::General,
         platform: Platform::All,
     },
@@ -389,7 +385,7 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single("Tab"),
-        description: "Toggle mode",
+        description: "Switch between plan and build",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },
@@ -408,6 +404,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::MacMulti(&["Alt+←", "Alt+→"], &["⌥←", "⌥→"]),
         description: "Move word left / right",
+        context: KeybindContext::Editing,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("Shift+motion"),
+        description: "Select text",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },
@@ -502,8 +504,8 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Single(key::DETACH_RUN.label),
-        description: "Send now, running turn goes to background",
+        label: KeyLabel::Single(key::BACKGROUND.label),
+        description: "Move running calls to the background (tmux: press twice)",
         context: KeybindContext::Streaming,
         platform: Platform::All,
     },

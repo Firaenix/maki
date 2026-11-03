@@ -13,6 +13,7 @@ use maki_agent::tools::{
 };
 use maki_config::{PluginFileConfig, PluginsConfig};
 use maki_lua::PluginHost;
+use maki_lua::test_support::runtime;
 
 const CODE_EXECUTION_SRC: &str = include_str!("../../plugins/code_execution/init.lua");
 
@@ -63,6 +64,10 @@ const REWRITING_READ_HOOK: &str = concat!(
 const WILDCARD_INPUT_HOOK: &str =
     r#"maki.api.set_slot("tool.*.input", function(prev, input) return input end)"#;
 const NO_POLICY: &str = "";
+const LIST_HOOK: &str =
+    r#"maki.api.set_slot("tool.list.input", function(prev, input) return input end)"#;
+const RUNTIME_ERROR: &str = "RuntimeError";
+const MADE_DIR: &str = "made/deep";
 const OPEN_APPEND_REFUSED: &str = "write tool has no append option";
 const WRITE_WITHOUT_APPEND: &str = r#"maki.api.register_tool({
     name = "write",
@@ -188,7 +193,8 @@ fn run_tool(
 ) -> Result<String, String> {
     let entry = reg.get(name).unwrap_or_else(|| panic!("{name} registered"));
     let inv = entry.tool.parse(&input).expect("parse failed");
-    smol::block_on(async { inv.execute(ctx).await })
+    runtime()
+        .block_on(inv.execute(ctx))
         .output
         .map(|out| match out {
             maki_agent::ToolOutput::Plain(s) => s.text,
@@ -398,6 +404,30 @@ fn open_for_writing_is_refused_where_the_write_tool_is(shape: fn(&mut ToolContex
     assert_eq!(content, OPEN_ORIGINAL);
 }
 
+/// Loud on purpose, since `os.path.exists` would turn an `OSError` into False.
+/// mkdir looks before it creates, so it needs the list tool too.
+#[test_case::test_case("os.path.exists(path)", LIST_HOOK, &[] ; "list_tool_hooked")]
+#[test_case::test_case("os.path.exists(path)", NO_POLICY, &["list"] ; "list_tool_disabled")]
+#[test_case::test_case("os.makedirs(path + '.d', exist_ok=True)", NO_POLICY, &["list"] ; "mkdir_with_list_tool_disabled")]
+fn os_metadata_is_refused_where_the_list_tool_is(code: &str, policy: &str, disabled: &[&str]) {
+    let (out, _) = run_on_file(code, policy, |_| {}, disabled);
+    let err = out.expect_err("the query must be refused");
+    assert!(err.contains(RUNTIME_ERROR), "got: {err}");
+}
+
+/// `build_mode` also proves metadata is served, as a refused `isdir` would raise.
+#[test_case::test_case(|_| {}, true ; "build_mode")]
+#[test_case::test_case(|ctx| ctx.mode = AgentMode::Plan(PLAN_FILE.into()), false ; "plan_mode_blocks_the_write_tool")]
+#[test_case::test_case(|ctx| ctx.audience = ToolAudience::RESEARCH_SUB, false ; "write_tool_not_callable")]
+fn os_makedirs_goes_where_the_write_tool_would(shape: fn(&mut ToolContext), made: bool) {
+    let code = format!(
+        "target = os.path.join(os.path.dirname(path), '{MADE_DIR}')\ntry:\n    os.makedirs(target)\nexcept OSError:\n    pass\nos.path.isdir(target)"
+    );
+    let (out, _) = run_on_file(&code, NO_POLICY, shape, &[]);
+    let out = out.expect("a refused mkdir raises OSError, which the script catches");
+    assert!(out.contains(&format!("return: {made}")), "got: {out}");
+}
+
 /// Only a failed tool call belongs in the results. The script's own mistake
 /// must stop the run instead of hiding as an `[ERROR]` entry.
 #[test]
@@ -541,7 +571,7 @@ fn start_preview_text(code: &str) -> String {
     let (reg, _host) = setup();
     let inv = parse_code(&reg, code);
     let (ctx, rx) = event_ctx(&reg);
-    smol::block_on(inv.start(&ctx));
+    runtime().block_on(inv.start(&ctx));
     let body = rx
         .drain()
         .find_map(|env| match env.event {
@@ -607,7 +637,8 @@ fn handler_renders_script_when_start_never_ran() {
     let (reg, _host) = setup();
     let inv = parse_code(&reg, "print('hi')");
     let (ctx, rx) = event_ctx(&reg);
-    smol::block_on(inv.execute(&ctx))
+    runtime()
+        .block_on(inv.execute(&ctx))
         .output
         .expect("execute ok");
     let text = final_body_text(&rx);
@@ -634,7 +665,8 @@ fn handler_error_keeps_script_and_drops_waiting_notice() {
     let (reg, _host) = setup();
     let inv = parse_code(&reg, "print(boom_undefined)");
     let (ctx, rx) = event_ctx(&reg);
-    let err = smol::block_on(inv.execute(&ctx))
+    let err = runtime()
+        .block_on(inv.execute(&ctx))
         .output
         .expect_err("undefined name must error");
     let text = final_body_text(&rx);

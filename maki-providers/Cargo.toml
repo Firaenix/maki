@@ -2,6 +2,7 @@
 name = "maki-providers"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [features]
 # The recorded loopback server in `test_support`, for suites in other crates.
@@ -10,20 +11,23 @@ test-support = []
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
+serde-saphyr = { workspace = true, features = ["deserialize"] }
+indexmap = { workspace = true }
 maki-storage = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 strum = { workspace = true }
-smol = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
 flume = { workspace = true }
-futures-lite = { workspace = true }
 futures = { workspace = true }
-isahc = { workspace = true }
+reqwest = { workspace = true, features = ["socks", "gzip", "deflate", "stream"] }
+aws-config = { workspace = true }
+aws-credential-types = { workspace = true }
+aws-sigv4 = { workspace = true }
 base64 = { workspace = true }
 image = { workspace = true, features = ["jpeg", "gif", "webp"] }
 sha2 = { workspace = true }
-hmac = { workspace = true }
 fastrand = { workspace = true }
 maki-config = { workspace = true }
 inventory = { workspace = true }

@@ -26,6 +26,7 @@ const MAX_HEIGHT_PERCENT: u16 = 80;
 const CLICK_EXPANDED: bool = false;
 const CLICKABLE: bool = false;
 
+#[derive(Debug, PartialEq)]
 pub enum BtwEvent {
     TextDelta(String),
     ThinkingDelta(String),
@@ -233,6 +234,10 @@ impl BtwModal {
 }
 
 impl Overlay for BtwModal {
+    fn is_prompting(&self) -> bool {
+        self.is_open()
+    }
+
     fn is_open(&self) -> bool {
         self.is_open()
     }

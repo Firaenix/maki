@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 
-use arc_swap::{ArcSwap, ArcSwapOption};
-use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Role};
+use arc_swap::ArcSwap;
+use maki_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Model, Role};
 use maki_storage::frame::{LiveFacts, StoredFrame};
 use maki_storage::id::MakiId;
-use maki_storage::sessions::next_epoch;
+use maki_storage::sessions::{SessionTools, next_epoch};
 use serde_json::Value;
 use tracing::warn;
 
@@ -80,23 +80,11 @@ pub fn live_header(session: MakiId) -> Option<Arc<SessionHeader>> {
     live_entries().get(&session)?.header()
 }
 
-/// Where a [`History`] publishes. A run owns its history for as long as it
-/// lasts, so a host that hands the run off elsewhere needs this to stop it
-/// writing over the transcript the host carries on with.
-#[derive(Clone, Default)]
-pub struct MirrorTap(Arc<ArcSwapOption<ArcSwap<HistorySnapshot>>>);
-
-impl MirrorTap {
-    pub fn cut(&self) {
-        self.0.store(None);
-    }
-}
-
 pub struct History {
     /// The value the mirror publishes, held whole so the two can never
     /// disagree and so a new run can never inherit the last one's epoch.
     snapshot: HistorySnapshot,
-    mirror: MirrorTap,
+    mirror: Option<SharedMessages>,
     /// Set by every change and cleared only once a save lands, so a failed
     /// write is retried by the next turn instead of lost. [`Self::restored`]
     /// leaves it clear: its repair alone is not worth rewriting the file for.
@@ -111,18 +99,7 @@ impl History {
     pub fn new(messages: Vec<Message>) -> Self {
         Self {
             snapshot: HistorySnapshot::new(messages),
-            mirror: MirrorTap::default(),
-            unsaved: false,
-            live: None,
-        }
-    }
-
-    /// Picks a transcript up where a mirror left it. The epoch carries over,
-    /// so a consumer reading the mirror sees what comes next as an append.
-    pub fn from_snapshot(snapshot: HistorySnapshot) -> Self {
-        Self {
-            snapshot,
-            mirror: MirrorTap::default(),
+            mirror: None,
             unsaved: false,
             live: None,
         }
@@ -172,12 +149,24 @@ impl History {
     pub(crate) fn request_prefix(&self) -> Option<(&str, &Value)> {
         Some((
             self.snapshot.frame.as_ref()?.prefix()?,
-            &self.live.as_ref()?.wire,
+            self.live.as_ref()?.wire.as_ref(),
         ))
     }
 
     pub(crate) fn adopt_frame(&mut self, live: LiveFrame) {
         self.live = Some(live);
+        self.publish();
+    }
+
+    /// The fingerprint skips the model, so a kept frame follows a switch here.
+    pub(crate) fn refit_live(&mut self, model: &Model) {
+        let spec = model.spec();
+        if let Some(live) = &mut self.live
+            && live.model != spec
+        {
+            live.model = spec;
+            self.publish();
+        }
     }
 
     pub(crate) fn set_frame(&mut self, stored: StoredFrame, live: LiveFrame) {
@@ -213,13 +202,9 @@ impl History {
     }
 
     pub fn with_mirror(mut self, mirror: SharedMessages) -> Self {
-        self.mirror = MirrorTap(Arc::new(ArcSwapOption::new(Some(mirror))));
+        self.mirror = Some(mirror);
         self.publish();
         self
-    }
-
-    pub fn mirror_tap(&self) -> MirrorTap {
-        self.mirror.clone()
     }
 
     pub fn as_slice(&self) -> &[Message] {
@@ -322,10 +307,15 @@ impl History {
     /// here used to make the snapshot as long as the real results that came
     /// next, so the log never saw them. Callers that need an API-valid list
     /// close the dangling calls on their own copy.
-    fn publish(&self) {
-        let Some(mirror) = &*self.mirror.0.load() else {
-            return;
-        };
+    ///
+    /// Tools come from `live` only here, so a reader always sees the array
+    /// the next request sends.
+    fn publish(&mut self) {
+        self.snapshot.tools = self.live.as_ref().map(|live| SessionTools {
+            model: live.model.clone(),
+            wire: Arc::clone(&live.wire),
+        });
+        let Some(mirror) = &self.mirror else { return };
         mirror.store(Arc::new(self.snapshot.clone()));
     }
 }
@@ -959,31 +949,6 @@ mod tests {
         assert_eq!(snap.messages.len(), 2);
         assert_eq!(snap.messages[0].user_text(), Some(SECOND));
         assert_ne!(snap.epoch, run1_epoch, "run 2 is not an append onto run 1");
-    }
-
-    #[test]
-    fn a_cut_tap_leaves_the_mirror_to_whoever_picks_the_transcript_up() {
-        let mirror = make_mirror();
-        let mut handed_off =
-            History::new(vec![Message::user(FIRST.into())]).with_mirror(Arc::clone(&mirror));
-        handed_off.mirror_tap().cut();
-        let epoch = mirror.load().epoch;
-
-        let mut kept = History::from_snapshot(HistorySnapshot::clone(&mirror.load()))
-            .with_mirror(Arc::clone(&mirror));
-        handed_off.push(Message::user(GO.into()));
-        kept.push(Message::user(SECOND.into()));
-
-        let snap = mirror.load();
-        assert_eq!(
-            snap.messages
-                .iter()
-                .filter_map(Message::user_text)
-                .collect::<Vec<_>>(),
-            [FIRST, SECOND],
-            "the handed-off run must not write into the kept transcript"
-        );
-        assert_eq!(snap.epoch, epoch, "picking up is an append, not a rewrite");
     }
 
     #[test]
