@@ -9238,7 +9238,7 @@ fn question_host(layer: &str, granted: PluginPermissions) -> (Arc<ToolRegistry>,
     let mut host = PluginHost::start(Arc::clone(&reg), Interaction::None, true).unwrap();
     host.load_builtins(&PluginsConfig {
         enabled: true,
-        names: vec!["question".to_owned()],
+        names: vec!["question".to_owned(), "batch".to_owned()],
         packages: Vec::new(),
         opts: HashMap::new(),
     })
@@ -9272,6 +9272,25 @@ fn a_trusted_question_form_layer_answers_for_the_user(reply: &str, expected: &st
     let (reg, _host) = question_host(&question_layer(reply), PluginPermissions::trusted());
     let out = ask_question(&reg).expect("an answered question succeeds");
     assert!(out.contains(expected), "got: {out}");
+}
+
+/// The slot needs no tool id, so a question nested in `batch`, whose call has
+/// none, reaches the layer like a top-level one.
+#[test]
+fn a_question_form_layer_answers_a_question_nested_in_batch() {
+    let (reg, _host) = question_host(
+        &question_layer(r#"{ type = "submit", answers = { { "Yes" } } }"#),
+        PluginPermissions::trusted(),
+    );
+    let question = json!({ "questions": [{ "question": QUESTION_INPUT_LABEL, "options": [{ "label": REMOTE_PICK }] }] });
+    let out = exec_tool_in(
+        &reg,
+        "batch",
+        json!({ "tool_calls": [{ "tool": "question", "parameters": question }] }),
+        Some(Arc::clone(&reg)),
+    )
+    .expect("the batch succeeds");
+    assert!(out.contains("Q1: Yes"), "got: {out}");
 }
 
 /// Answering stands in for the user, so a layer short of every permission is
