@@ -125,17 +125,8 @@ pub fn remember_thinking(defaults: &mut SessionDefaults, storage: &StateDir) {
     }
 }
 
-/// An unknown slug may just mean the models.dev catalog has not been loaded
-/// yet, so retry once with a warm catalog. `Model::from_spec` itself must stay
-/// non-blocking: the UI draws with it.
 async fn from_spec_or_warm_catalog(spec: &str) -> Result<Model> {
-    let result = match Model::from_spec(spec) {
-        Err(ModelError::UnsupportedProvider(_)) => {
-            maki_providers::warm_catalog().await;
-            Model::from_spec(spec)
-        }
-        result => result,
-    };
+    let result = Model::from_spec_or_warm_catalog(spec).await;
     if let Err(ModelError::UnsupportedProvider(slug)) = &result
         && let Some(hint) = provider_scripts::unknown_provider_hint(slug)
     {
@@ -179,7 +170,7 @@ fn user_provider_models() -> impl Iterator<Item = Model> {
 
 /// Built-in slugs keep their compiled protocol, model catalog and auth wiring,
 /// so a `providers.toml` entry setting those fields is only partly honored
-/// (#597). A bundled plugin's slug counts once its declaration registered,
+/// (#597). Local endpoints read some of them, see `ignored_builtin_fields`. A bundled plugin's slug counts once its declaration registered,
 /// since it keeps the slug over a `protocol` the same way. Call this after
 /// `init_logging` and the bundled load, or the warning has nowhere to go and
 /// no declaration to check.

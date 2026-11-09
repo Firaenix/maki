@@ -52,7 +52,7 @@ pub struct RunContext {
 }
 
 impl RunContext {
-    pub fn render(
+    pub(crate) fn render(
         vars: &Vars,
         instructions: &str,
         slots: &ResolvedPrompts,
@@ -96,6 +96,60 @@ impl RunContext {
             self.authored = json!([self.authored, policy]).to_string();
         }
         self
+    }
+}
+
+/// The text from `--system-prompt` and `--append-system-prompt`. Every
+/// frontend builds its main agent's [`RunContext`] through here, because back
+/// when each built its own, all but one forgot the flags. Subagents never see it.
+#[derive(Clone, Default, Debug)]
+pub struct HostPrompt {
+    replace: Option<String>,
+    append: Option<String>,
+}
+
+impl HostPrompt {
+    /// Empty text counts as unset, because the claude-agent-sdk sends
+    /// `--system-prompt ""` when its caller gave none.
+    pub fn new(replace: Option<&str>, append: Option<&str>) -> Self {
+        let set = |text: Option<&str>| text.filter(|text| !text.is_empty()).map(String::from);
+        Self {
+            replace: set(replace),
+            append: set(append),
+        }
+    }
+
+    pub fn replaces(&self) -> bool {
+        self.replace.is_some()
+    }
+
+    pub fn appends(&self) -> bool {
+        self.append.is_some()
+    }
+
+    /// The appended text also goes into `authored`, which feeds the frame
+    /// fingerprint, so resuming with other text gets a new frame. Saved
+    /// sessions were fingerprinted with this `\n` join, so changing it
+    /// rebuilds every resumed frame.
+    pub fn context(
+        &self,
+        vars: &Vars,
+        instructions: &str,
+        slots: &ResolvedPrompts,
+        model: &Model,
+        tools: RequestTools,
+    ) -> RunContext {
+        let mut context = match &self.replace {
+            Some(system) => RunContext::fixed(system.clone(), tools).with_prompt_policy(slots),
+            None => RunContext::render(vars, instructions, slots, model, tools),
+        };
+        if let Some(append) = &self.append {
+            for text in [&mut context.system, &mut context.authored] {
+                text.push('\n');
+                text.push_str(append);
+            }
+        }
+        context
     }
 }
 
@@ -226,6 +280,13 @@ pub(crate) enum FrameFit {
 /// [`History::told`] replays every update in the transcript on top anyway,
 /// so this tells the same thing today. A later rewind can cut those updates,
 /// and then the frame must not claim the model still heard them.
+///
+/// Thinking is signed against the prefix it was written under, so a new frame
+/// makes every signature in history invalid. An enforcing account answers
+/// with a 400, and a lenient one flags each block again on every request. The
+/// cache is gone anyway, so the signatures go here and the text stays for the
+/// transcript. Only lenient accounts lose anything: the old reasoning they
+/// still showed the model.
 pub(crate) fn fit_frame(
     history: &mut History,
     context: RunContext,
@@ -259,6 +320,7 @@ pub(crate) fn fit_frame(
                 live.mcp_tools().to_vec(),
             );
             frame.inherited = inherited;
+            history.unbind_thinking();
             history.set_frame(frame, live);
             if stored.is_some() {
                 FrameFit::Rebuilt
@@ -346,6 +408,8 @@ pub(crate) fn context_update(
 mod tests {
     use std::path::PathBuf;
 
+    use maki_providers::test_support::isolated_home;
+
     use super::super::history::{HistorySnapshot, SharedMessages};
     use super::*;
     use crate::AgentConfig;
@@ -360,6 +424,11 @@ mod tests {
     const NATIVE_MODEL: &str = "anthropic/claude-opus-5";
     const OTHER_NATIVE_MODEL: &str = "anthropic/claude-sonnet-5";
     const CLIENT_MODEL: &str = "anthropic/claude-sonnet-4-20250514";
+    const INSTRUCTIONS: &str = "\n\nProject instructions:\nbe nice";
+    const APPEND: &str = "You review the auth module only.";
+    const APPENDED: &str = "\nYou review the auth module only.";
+    const OTHER_APPEND: &str = "You review the billing module only.";
+    const REPLACE: &str = "You are a reviewer.";
 
     fn facts() -> LiveFacts {
         LiveFacts {
@@ -458,6 +527,7 @@ mod tests {
 
     #[test]
     fn fingerprint_tracks_tools_authored_text_and_deferral() {
+        let _home = isolated_home();
         let native = model(NATIVE_MODEL);
         let base = fingerprint(&context("a", ""), None, &native);
         assert_eq!(base, fingerprint(&context("a", ""), None, &native));
@@ -472,5 +542,47 @@ mod tests {
             fingerprint(&context("a", ""), Some(&mcp), &model(CLIENT_MODEL)),
             "a model without tool search shapes the MCP entries another way"
         );
+    }
+
+    fn host_context(host: &HostPrompt) -> RunContext {
+        host.context(
+            &Vars::new(),
+            INSTRUCTIONS,
+            &ResolvedPrompts::default(),
+            &model(NATIVE_MODEL),
+            RequestTools::default(),
+        )
+    }
+
+    #[test_case(None, Some(APPEND), None, APPENDED ; "append_follows_rendered")]
+    #[test_case(Some(REPLACE), None, Some(REPLACE), "" ; "replace")]
+    #[test_case(Some(REPLACE), Some(APPEND), Some(REPLACE), APPENDED ; "replace_then_append")]
+    #[test_case(Some(""), Some(""), None, "" ; "empty_is_unset")]
+    fn host_prompt_composes_system(
+        replace: Option<&str>,
+        append: Option<&str>,
+        base: Option<&str>,
+        tail: &str,
+    ) {
+        let context = host_context(&HostPrompt::new(replace, append));
+        let rendered = host_context(&HostPrompt::default());
+        let base = base.unwrap_or(&rendered.system);
+        assert_eq!(context.system, format!("{base}{tail}"));
+    }
+
+    /// The text is not stored with the session, so a resume with other text
+    /// has to miss the stored frame and get an announced new one.
+    #[test_case(Some(APPEND), true ; "same_text")]
+    #[test_case(Some(OTHER_APPEND), false ; "other_text")]
+    #[test_case(None, false ; "no_text")]
+    fn host_prompt_shapes_fingerprint(append: Option<&str>, same: bool) {
+        let native = model(NATIVE_MODEL);
+        let started = fingerprint(
+            &host_context(&HostPrompt::new(None, Some(APPEND))),
+            None,
+            &native,
+        );
+        let resumed = fingerprint(&host_context(&HostPrompt::new(None, append)), None, &native);
+        assert_eq!(started == resumed, same);
     }
 }

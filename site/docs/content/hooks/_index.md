@@ -187,12 +187,17 @@ call, and the first skip shows a warning naming every missing key.
 | Tool | A layer needs |
 | --- | --- |
 | declares a permission, like `bash` | that permission, `session_read` and `session_write` |
-| declares none: `read`, `batch`, MCP tools, ACP client tools, `tool_search` | every permission |
+| declares `permission = {}`, like `todo_write` | `session_read` and `session_write` |
+| leaves `permission` out, like `batch`, or is an MCP tool, ACP client tool or `tool_search` | every permission |
 
-Declaring no capability does not mean a tool uses none. `batch`,
+The [Tools](/docs/tools/) page lists what each built-in declares.
+
+Leaving `permission` out does not mean a tool uses none. `batch`,
 `code_execution` and `task` declare nothing while invoking any other tool, so
 reading undeclared as free would hand a plugin everything. Undeclared costs the
-maximum instead. See [plugin permissions](/docs/lua-api/#plugin-permissions).
+maximum instead. Only a tool that declares `permission = {}` is cheap, and its
+owner promises it reaches nothing past the conversation it runs in. See
+[plugin permissions](/docs/lua-api/#plugin-permissions).
 
 **A layer may wait, within a window.** Chains are async, so a layer can read a
 file or run a job before it decides. It runs inside the call it is filtering, so
@@ -274,6 +279,15 @@ inside a subagent), `model`, `context_size`, `context_window`, and
 A layer on any of them needs every permission, because it steers what the agent
 does next. The chain gets 30 seconds, then the loop carries on without it.
 
+The verdict strings the host reads off the final value, `continue` and
+`instructions`, are one string shared by every layer, and only the last write
+survives. A layer that has something to say appends its own text to whatever is
+already there, and tolerates the field being absent:
+
+```lua
+value.continue = (value.continue and value.continue .. "\n" or "") .. "Re-read PLAN.md."
+```
+
 ### agent.user_message
 
 `images` is the number of attached images. `source` is `"tui"`, `"acp"`,
@@ -297,14 +311,15 @@ end)
 ### agent.stop
 
 `reason` is `"finished"` or `"max_tokens"`, and `last_message` is the text of
-the final answer. Return `{ continue = text }` to send `text` as the next
-message and keep going:
+the final answer. Append to `continue` to send the text as the next message
+and keep going:
 
 ```lua
 maki.api.set_slot("agent.stop", function(prev, stop, ctx)
   local todo = maki.fs.read("TODO.md")
   if todo and todo:find("%- %[ %]") then
-    return { continue = "TODO.md still has open items. Keep going." }
+    stop.continue = (stop.continue and stop.continue .. "\n" or "")
+      .. "TODO.md still has open items. Keep going."
   end
   return prev(stop, ctx)
 end)
@@ -326,7 +341,7 @@ Return a table with any of:
   cannot be skipped, because the run cannot go on without compacting.
 - `instructions`: appended to the summary prompt, after the configured and
   requested ones.
-- `continue`: appended to the message the agent resumes with.
+- `continue`: text appended to the message the agent resumes with.
 
 ### agent.compact.prepare
 
@@ -526,7 +541,8 @@ end)
 once. An empty list is free for anyone. Leaving `capability` out charges every
 permission, which is what a tool declaring no capability charges: a slot that
 named no price has not promised its default exercises none, only that nobody
-asked. You can only name permissions your own plugin holds.
+asked. You can only name permissions your own plugin holds. `permission = {}` on
+a tool is the same declaration as `capability = {}` on a slot.
 
 The rule is the one the `tool.*` slots use, and it is read the same way: every
 call re-reads what each layer's plugin holds, so a layer registered by a plugin

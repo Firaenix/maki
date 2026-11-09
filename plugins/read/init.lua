@@ -25,7 +25,7 @@ local opts = maki.api.register_options({
 
 local function read_view_opts(ctx)
   local tol = ctx:tool_output_lines()
-  return { max_lines = (tol and tol.read) or 10, keep = "head" }
+  return { max_lines = (tol and tol.read) or 0, keep = "head" }
 end
 
 local function apply_highlights(view, lines, ext, prefix)
@@ -127,6 +127,10 @@ local function read_file(path, offset, limit, ctx)
     parts[#parts + 1] = string.format(nr_fmt, start + i - 1, line)
   end
   local llm_output = table.concat(parts, "\n")
+  if #lines == 0 then
+    llm_output = total_lines == 0 and "(empty file)"
+      or ("offset %d is past the end of the file (%d lines)"):format(start, total_lines)
+  end
 
   local trunc_start = start + #lines
   if trunc_start <= total_lines then
@@ -204,7 +208,10 @@ maki.api.register_tool({
     return buf
   end,
 
-  restore = function(input, output, _is_error, ctx)
+  restore = function(input, output, is_error, ctx)
+    if is_error then
+      return nil
+    end
     local lines, start_line, total_lines = {}, nil, nil
     for _, raw in ipairs(maki.split(output, "\n")) do
       local nr, text = raw:match("^%s*(%d+): (.*)$")

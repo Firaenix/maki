@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use maki_agent::tools::{ToolRegistry, ToolSource};
+use maki_agent::tools::ToolRegistry;
 use mlua::{Function, Lua};
 use serde::Serialize;
 use strum::{IntoStaticStr, VariantNames};
@@ -254,12 +254,10 @@ pub(crate) fn plugin_listing(lua: &Lua) -> Vec<PluginListing> {
     let mut tools: BTreeMap<String, Vec<String>> = BTreeMap::new();
     if let Some(registry) = lua.app_data_ref::<Arc<ToolRegistry>>() {
         for entry in registry.iter().iter() {
-            if let ToolSource::Lua { plugin } = &entry.source {
-                tools
-                    .entry(plugin.to_string())
-                    .or_default()
-                    .push(entry.name().to_owned());
-            }
+            tools
+                .entry(entry.source.plugin.to_string())
+                .or_default()
+                .push(entry.name().to_owned());
         }
     }
     let mut autocmds: BTreeMap<String, usize> = BTreeMap::new();

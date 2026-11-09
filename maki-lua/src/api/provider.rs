@@ -16,12 +16,13 @@ use maki_storage::auth::{
     delete_plugin_auth, load_plugin_auth, lock_credentials, save_plugin_auth,
 };
 use mlua::{
-    Function, Lua, LuaSerdeExt, MetaMethod, MultiValue, RegistryKey, Result as LuaResult, Table,
-    UserData, UserDataMethods, Value as LuaValue,
+    Function, Lua, LuaSerdeExt, LuaString, MetaMethod, MultiValue, RegistryKey,
+    Result as LuaResult, Table, UserData, UserDataMethods, Value as LuaValue,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tokio::sync::oneshot;
 use tokio::task::spawn_blocking;
 use tokio::time::timeout;
 
@@ -226,7 +227,7 @@ where
     fn call(&self, input: In) -> BoxFuture<'_, Result<Out, AgentError>> {
         Box::pin(async move {
             let payload = serde_json::to_value(input)?;
-            let (reply, answer) = flume::bounded(1);
+            let (reply, answer) = oneshot::channel();
             // Fires when this future goes, answered or not: a caller that timed
             // out or was cancelled takes the hook down with it.
             let (_abandon, cancel) = CancelToken::new();
@@ -247,7 +248,7 @@ where
                     }),
                 })
                 .map_err(|_| AgentError::Channel)?;
-            let answered = async { answer.recv_async().await.map_err(|_| AgentError::Channel) };
+            let answered = async { answer.await.map_err(|_| AgentError::Channel) };
             let value = match self.timeout {
                 Some(limit) => timeout(limit, answered)
                     .await
@@ -377,12 +378,10 @@ pub(crate) async fn run_hook(
     let spec = slot.spec();
     let template = spec.refines.and_then(|field| payload.get(field).cloned());
     let args = call_args(lua, keys, spec, payload).map_err(|e| e.to_string())?;
-    let call = async {
-        lua.create_thread(func)?
-            .into_async::<(LuaValue, LuaValue)>(args)?
-            .await
-    };
-    let (value, second) = call.await.map_err(|e| e.to_string())?;
+    let (value, second) = func
+        .call_async::<(LuaValue, LuaValue)>(args)
+        .await
+        .map_err(|e| e.to_string())?;
     if let LuaValue::UserData(reported) = second
         && let Ok(ProviderError(error)) = reported.take::<ProviderError>()
     {
@@ -503,9 +502,13 @@ async fn fetch_json(
                 .find(|(key, _)| key.eq_ignore_ascii_case(name))
                 .map(|(_, value)| value.as_str())
         };
-        return Err(AgentError::from_parts(status, header, body));
+        return Err(AgentError::from_parts(
+            status,
+            header,
+            String::from_utf8_lossy(&body).into_owned(),
+        ));
     }
-    Ok(serde_json::from_str(&body)?)
+    Ok(serde_json::from_slice(&body)?)
 }
 
 /// What a login or logout adds to `ctx`. Stdio, because the one caller is the
@@ -704,6 +707,8 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
 ///             Defaults to `max_tokens`.
 ///     `include_stream_usage` (boolean) Ask for usage on the stream.
 ///             Defaults to `true`.
+///     `usage_cost` (boolean) Price turns from `usage.cost` on the stream
+///             (in USD). Defaults to `false`.
 ///     `thinking` (table) How the API spells reasoning effort. Without it,
 ///             each model's `thinking_fields` decides.
 ///       `dialect` (string) Required. One of `"standard"`, `"codex"`,
@@ -719,11 +724,13 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
 ///             set wins. `host`, `content-length`, `transfer-encoding` and
 ///             `connection` are refused.
 ///     `extra_body` (table) Merged into every request body.
-///     `session_id` (table) Sends the session id, as
-///             `{ header = "x-affinity" }`, `{ body_field = "prompt_cache_key" }`,
-///             or both at once.
 ///     `thinking_overrides` (table) Model id prefix to `"no"`, `"yes"` or
 ///             `"required"`, overriding the model table. Longest prefix wins.
+///   `session_id` (table) Sends the session id with every request, as
+///           `{ headers = { "x-affinity" } }`,
+///           `{ body_field = "prompt_cache_key" }`, or both at once. A
+///           listed header replaces one the credentials set. The `google`
+///           codec refuses it.
 ///   `models` (table) Static model rows, read once at registration. They
 ///            describe models and add to the runtime list. See
 ///            [model rows](/docs/providers/#model-rows).
@@ -906,7 +913,7 @@ fn hook_slot(name: &str) -> Option<HookSlot> {
 fn http_error(_lua: &Lua, res: Table) -> LuaResult<ProviderError> {
     let malformed = |e: mlua::Error| mlua::Error::runtime(format!("{HTTP_ERROR}: {e}"));
     let status: u16 = res.get(STATUS_FIELD).map_err(malformed)?;
-    let body: String = res.get(BODY_FIELD).map_err(malformed)?;
+    let body: LuaString = res.get(BODY_FIELD).map_err(malformed)?;
     let headers: HashMap<String, String> = res
         .opt::<HashMap<String, String>>(HEADERS)
         .map_err(malformed)?
@@ -917,7 +924,7 @@ fn http_error(_lua: &Lua, res: Table) -> LuaResult<ProviderError> {
     Ok(ProviderError(AgentError::from_parts(
         status,
         |name| headers.get(name).map(String::as_str),
-        body,
+        body.to_string_lossy(),
     )))
 }
 
@@ -1103,6 +1110,8 @@ mod tests {
     const TRANSPORT_HEADER: &str = "Host";
     const BAD_HEADER: &str = "bad header";
     const FAILED_BODY: &str = r#"{"error":{"message":"slow down"}}"#;
+    const BINARY_ERROR_BODY: &[u8] = b"bad\xff\0response";
+    const BINARY_ERROR_TEXT: &str = "bad\u{fffd}\0response";
     const RETRY_AFTER: &str = "Retry-After";
     const RETRY_AFTER_SECS: &str = "7";
     const UNAUTHORIZED: u16 = 401;
@@ -1344,6 +1353,19 @@ mod tests {
         let error = call_usage_hook(&source).await.unwrap_err();
 
         assert_same_error(&error, &native_error(status, retry_after));
+    }
+
+    #[test]
+    fn binary_http_error_body_is_decoded_lossily() {
+        let lua = Lua::new();
+        let response = lua.create_table().unwrap();
+        response.set(STATUS_FIELD, RATE_LIMITED).unwrap();
+        response
+            .set(BODY_FIELD, lua.create_string(BINARY_ERROR_BODY).unwrap())
+            .unwrap();
+        let ProviderError(error) = http_error(&lua, response).unwrap();
+        let expected = AgentError::from_parts(RATE_LIMITED, |_| None, BINARY_ERROR_TEXT.into());
+        assert_same_error(&error, &expected);
     }
 
     /// Only our own userdata is a reported failure. A string beside a nil means

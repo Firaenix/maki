@@ -39,6 +39,7 @@ static CONFIG_STANDARD: OpenAiCompatConfig = OpenAiCompatConfig {
     base_url: Cow::Borrowed(BASE_URL),
     max_tokens_field: Cow::Borrowed(MAX_TOKENS_FIELD),
     include_stream_usage: false,
+    usage_cost: false,
     provider_name: Cow::Borrowed(DISPLAY_NAME),
 };
 
@@ -76,6 +77,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     sends_thinking: |_, choice| dialect::GLM.sends(choice),
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: false,
+    catalog_is_authoritative: false,
     fallback_max_output: Some(16_000),
     fallback_context_window: 128_000,
     models_toml: include_str!("../../../models/zai.toml"),
@@ -273,11 +275,7 @@ impl Provider for Zai {
     }
 
     fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Bearer,
-        ))
+        KeyRotation::over(&self.key_pool, &self.auth, KeyHeader::Bearer)
     }
 
     fn adjust_model(&self, model: &mut Model) {

@@ -30,7 +30,7 @@ Type `/` in the input box to open the command palette.
 | `/workflow` | Toggle workflow mode (task callable inside code_execution) |
 | `/exit` | Exit the application |
 | `/reload` | Reload plugins and config (! stops background tasks) |
-| `/trust` | Trust this folder and load its shared project config |
+| `/trust` | Trust this folder: load its project config and save project answers |
 | `/packupdate` | Update packages (++lockfile, ! skips review) |
 | `/packdel` | Remove undeclared packages (++all, or a name) |
 | `/memory` | View, edit, and delete memory files |
@@ -62,7 +62,7 @@ You can define your own slash commands as Markdown files. Empty files are skippe
 
 Later sources override earlier ones when the command **name** matches (the stem of the file, or `name` in frontmatter):
 
-1. User config: `~/.config/maki/commands/` (and legacy `~/.maki/commands/` if present)
+1. User config: `~/.config/maki/commands/`
 2. User third-party: `~/.claude/commands/`
 3. Project dirs, walking from the current working directory up to the nearest `.git` root. At each level: `.maki/commands/`, then `.claude/commands/`
 

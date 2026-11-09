@@ -3,14 +3,19 @@ use std::sync::Arc;
 
 use maki_agent::tools::ToolRegistry;
 use maki_config::{
-    AgentConfig, ConfigField, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
-    DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, NetConfig, ProviderConfig, StorageConfig,
-    TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
+    AgentConfig, ConfigField, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES, NetConfig,
+    ProviderConfig, StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
 };
 use maki_lua::{PluginHost, PluginOptionSpecs};
 
 use crate::gen_folder_trust::POLICY_EXAMPLE;
+use crate::gen_tools::SECTIONS as TOOL_SECTIONS;
 use crate::lua_util::in_registration_window;
+
+const OTHER_FIELD: &str = "other";
+const OTHER_TOOLS: &str = "Every other tool, MCP tools included";
+/// Fixed so the generated docs don't depend on the build machine's OS.
+const EXAMPLE_MOUSE_SCROLL_LINES: u32 = 5;
 
 type ExtraColumn = (&'static str, fn(&ConfigField) -> String);
 
@@ -111,6 +116,17 @@ fn write_theme_section(out: &mut String) {
          last picked interactively. If unset, Maki keeps your last selection \
          (the built-in default on first run). An unknown name is ignored with \
          a warning.\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "To match a light or dark terminal, give a theme for each:\n\n\
+         ```lua\n\
+         theme = {{ light = \"catppuccin_latte\", dark = \"catppuccin_macchiato\" }}\n\
+         ```\n\n\
+         Maki asks the terminal for its background color once at startup, and \
+         uses `dark` if it gets no answer. Restart Maki after your terminal \
+         switches between light and dark.\n"
     )
     .unwrap();
     let names = maki_ui::BUNDLED_THEMES
@@ -298,14 +314,33 @@ fn write_tool_output_section(out: &mut String) {
     writeln!(out, "### `ui.tool_output_lines`\n").unwrap();
     writeln!(
         out,
-        "How many lines of output to show per tool in the UI. \
-         All values are `usize` with a minimum of {MIN_TOOL_OUTPUT_LINES}.\n"
+        "Lines of output a tool call shows before it collapses. Click the call \
+         to see all of it.\n\n\
+         With 0 you see only the header. The read, index and list tools default \
+         to 0, because their header already says how many lines or entries came \
+         back. Errors and MCP tools still show their first line.\n"
     )
     .unwrap();
-    writeln!(out, "| Field | Default |").unwrap();
-    writeln!(out, "|-------|---------|").unwrap();
-    for (name, default) in ToolOutputLines::FIELD_DEFAULTS {
-        writeln!(out, "| `{name}` | {default} |",).unwrap();
+    let mut tools: Vec<&str> = TOOL_SECTIONS
+        .iter()
+        .flat_map(|(_, names)| *names)
+        .copied()
+        .collect();
+    tools.sort_unstable();
+    writeln!(out, "| Field | Default | Tools |").unwrap();
+    writeln!(out, "|-------|---------|-------|").unwrap();
+    for (field, default) in ToolOutputLines::FIELD_DEFAULTS {
+        let covered = if *field == OTHER_FIELD {
+            OTHER_TOOLS.to_owned()
+        } else {
+            tools
+                .iter()
+                .filter(|t| ToolOutputLines::field_for(t) == *field)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        writeln!(out, "| `{field}` | {default} | {covered} |").unwrap();
     }
     writeln!(out).unwrap();
 }
@@ -377,7 +412,7 @@ All fields are optional. Typos in field names cause an error right away.
 
 ## Full Reference
 ",
-        mouse_scroll = DEFAULT_MOUSE_SCROLL_LINES + 2,
+        mouse_scroll = EXAMPLE_MOUSE_SCROLL_LINES,
         tol_bash = ToolOutputLines::DEFAULT.bash + 3,
         tol_read = ToolOutputLines::DEFAULT.read + 2,
         max_output_lines = DEFAULT_MAX_OUTPUT_LINES + 1000,
@@ -464,17 +499,19 @@ Maki follows platform directory conventions. On Linux and macOS that is XDG. On 
 
 Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, folder trust, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\\maki` on Windows; that is separate from these runtime dirs.
 
-`~/.maki/` (or `%USERPROFILE%\\.maki\\`) is checked as a legacy fallback. If that directory still exists, maki uses it for everything until you migrate.
+`~/.maki/` (or `%USERPROFILE%\\.maki\\`) is the layout older versions used. Maki does not read it anymore.
 
-### Migrating from ~/.maki/
+### Moving from ~/.maki/
+
+Maki moves `~/.maki/` into the locations above on the first start that finds it, before it reads or writes anything else, and shows where the files went. Files maki writes go to state. Your own files (`init.lua`, `lua/`, `permissions.toml`, `mcp.toml`, `providers.toml`, `.env`, `AGENTS.md`, `pack-lock.json`, `commands/`, `skills/`, `themes/` and `providers/`) go to config. Logs go to logs. Caches are rebuilt.
+
+When both places hold the same file, folder trust and recent models are merged. For any other file maki keeps the copy written last and moves the other one to `~/.maki.bak/`. The exception is `permissions.toml`: older versions applied the one in `~/.config/maki/`, so that one stays.
+
+Maki does not move a `~/.maki/` that is a symlink, because it most likely points into a dotfiles repository. Run the move yourself, or retry one that failed, with:
 
 ```
 maki migrate xdg
 ```
-
-This safely moves sessions, auth, plans, memories, logs, and preferences to the platform locations above. Where both old and new files exist, they are merged (input history, model tiers, etc.). Nothing is deleted until it has been copied. At the end you get a summary of where everything lives now.
-
-Safe to run more than once.
 
 ## Personal Instructions
 

@@ -28,8 +28,8 @@ maki.setup({
         mouse_scroll_lines = 5,
         theme = "tokyonight",
         tool_output_lines = {
-            bash = 8,
-            read = 5,
+            bash = 6,
+            read = 2,
         },
     },
     agent = {
@@ -76,9 +76,10 @@ All fields are optional. Typos in field names cause an error right away.
 | `scrollbar` | bool | `true` | - | Show vertical scrollbar in scrollable areas |
 | `inline_images` | bool | `true` | - | Render inline images in terminals with graphics support, falling back to an [image] line where nothing else names the image |
 | `notifications` | string | `auto` | - | Notification method: auto, osc9, bell, notify, or off |
+| `program_status` | bool | `true` | - | Report session state (idle, working, blocked, done, error) to the terminal with OSC 7501 |
 | `flash_duration_ms` | u64 | `1500` | - | Duration of flash messages (ms) |
 | `typewriter_ms_per_char` | u64 | `4` | - | Typewriter effect speed (ms/char) |
-| `mouse_scroll_lines` | u32 | `3` | 1 | Lines per mouse wheel scroll |
+| `mouse_scroll_lines` | u32 | `1 on macOS, 3 elsewhere` | 1 | Lines per mouse wheel scroll. Set it to 1 if your terminal runs on a Mac and maki runs remotely (e.g. over SSH) |
 | `max_input_lines` | u32 | `20` | 1 | Maximum visible input lines |
 | `thinking_lines` | integer | `3` | - | Collapse model reasoning to its header and last N lines. Click to toggle. 0 shows only the header, -1 never collapses |
 | `clock_format` | String | `system` | - | Clock format for timestamps: "12h", "24h", or "system" (follow the OS preference, 24h when unknown) |
@@ -87,6 +88,14 @@ All fields are optional. Typos in field names cause an error right away.
 ### `ui.theme`
 
 Name of the color theme to load at startup, overriding the theme you last picked interactively. If unset, Maki keeps your last selection (the built-in default on first run). An unknown name is ignored with a warning.
+
+To match a light or dark terminal, give a theme for each:
+
+```lua
+theme = { light = "catppuccin_latte", dark = "catppuccin_macchiato" }
+```
+
+Maki asks the terminal for its background color once at startup, and uses `dark` if it gets no answer. Restart Maki after your terminal switches between light and dark.
 
 Available themes: `ayu_dark`, `ayu_light`, `ayu_mirage`, `carbonfox`, `catppuccin_frappe`, `catppuccin_latte`, `catppuccin_macchiato`, `catppuccin_mocha`, `dark_daltonized`, `dracula`, `everforest_dark`, `fleet_dark`, `github_dark`, `gruvbox`, `gruvbox_light`, `kanagawa`, `kanagawa_ink`, `kanagawa_plum`, `material_darker`, `monokai_pro`, `night_owl`, `nightfox`, `nord`, `onedark`, `rose_pine`, `rose_pine_dawn`, `rose_pine_midnight`, `rose_pine_moon`, `solarized_dark`, `solarized_light`, `system`, `tokyonight`, `vscode_dark_plus`, `zenburn`.
 
@@ -104,19 +113,21 @@ These work everywhere a hex value does, including syntax highlighting scopes, so
 
 ### `ui.tool_output_lines`
 
-How many lines of output to show per tool in the UI. All values are `usize` with a minimum of 1.
+Lines of output a tool call shows before it collapses. Click the call to see all of it.
 
-| Field | Default |
-|-------|---------|
-| `bash` | 5 |
-| `code_execution` | 5 |
-| `task` | 5 |
-| `index` | 3 |
-| `grep` | 3 |
-| `read` | 3 |
-| `write` | 7 |
-| `web` | 3 |
-| `other` | 3 |
+With 0 you see only the header. The read, index and list tools default to 0, because their header already says how many lines or entries came back. Errors and MCP tools still show their first line.
+
+| Field | Default | Tools |
+|-------|---------|-------|
+| `bash` | 3 | bash |
+| `code_execution` | 3 | code_execution |
+| `task` | 3 | task |
+| `index` | 0 | index |
+| `grep` | 3 | glob, grep |
+| `read` | 0 | list, read |
+| `write` | 5 | edit, edit_lines, insert_lines, memory, multiedit, write |
+| `web` | 3 | webfetch, websearch |
+| `other` | 3 | Every other tool, MCP tools included |
 
 ### `agent`
 
@@ -353,7 +364,7 @@ maki.setup({
 |-------|------|---------|-----|-------------|
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
-| `max_response_bytes` | integer | `5242880` | 1024 | Stop reading a response after this many bytes. |
+| `max_response_bytes` | integer | `5242880` | 1024 | Stop reading a response after this many bytes, at most 64 MiB. |
 
 ### `plugins.websearch`
 
@@ -361,7 +372,7 @@ maki.setup({
 |-------|------|---------|-----|-------------|
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
-| `max_response_bytes` | integer | `5242880` | 1024 | Stop reading a response after this many bytes. |
+| `max_response_bytes` | integer | `5242880` | 1024 | Stop reading a response after this many bytes, at most 64 MiB. |
 | `provider` | string | `"exa"` | - | Search backend: "exa" (default), "youcom" (You.com MCP), "kagi" (Kagi MCP, needs KAGI_API_KEY), or "searxng" (self-hosted). |
 | `searxng_base_url` | string | `""` | - | SearXNG instance URL; falls back to the `SEARXNG_BASE_URL` env var. A LAN instance also needs its host in `net.allowed_private_hosts`. Only this backend accepts websearch's `time_range` (day, week, month, or year); its `num_results` is capped by the instance page size. |
 
@@ -383,17 +394,19 @@ Maki follows platform directory conventions. On Linux and macOS that is XDG. On 
 
 Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, folder trust, and model-tier overrides. The install script puts the binary under `%LOCALAPPDATA%\maki` on Windows; that is separate from these runtime dirs.
 
-`~/.maki/` (or `%USERPROFILE%\.maki\`) is checked as a legacy fallback. If that directory still exists, maki uses it for everything until you migrate.
+`~/.maki/` (or `%USERPROFILE%\.maki\`) is the layout older versions used. Maki does not read it anymore.
 
-### Migrating from ~/.maki/
+### Moving from ~/.maki/
+
+Maki moves `~/.maki/` into the locations above on the first start that finds it, before it reads or writes anything else, and shows where the files went. Files maki writes go to state. Your own files (`init.lua`, `lua/`, `permissions.toml`, `mcp.toml`, `providers.toml`, `.env`, `AGENTS.md`, `pack-lock.json`, `commands/`, `skills/`, `themes/` and `providers/`) go to config. Logs go to logs. Caches are rebuilt.
+
+When both places hold the same file, folder trust and recent models are merged. For any other file maki keeps the copy written last and moves the other one to `~/.maki.bak/`. The exception is `permissions.toml`: older versions applied the one in `~/.config/maki/`, so that one stays.
+
+Maki does not move a `~/.maki/` that is a symlink, because it most likely points into a dotfiles repository. Run the move yourself, or retry one that failed, with:
 
 ```
 maki migrate xdg
 ```
-
-This safely moves sessions, auth, plans, memories, logs, and preferences to the platform locations above. Where both old and new files exist, they are merged (input history, model tiers, etc.). Nothing is deleted until it has been copied. At the end you get a summary of where everything lives now.
-
-Safe to run more than once.
 
 ## Personal Instructions
 

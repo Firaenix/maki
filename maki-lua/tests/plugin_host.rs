@@ -7,7 +7,7 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::poll_until;
 use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
@@ -26,11 +26,12 @@ use maki_config::{
     AlwaysThinking, EDIT_SUB_TOOLS, Effect, FILE_WRITE_TOOLS, Permission, PluginsConfig,
     ThinkingLines, ToolKey, ToolOutputLines,
 };
-use maki_lua::test_support::runtime;
+use maki_lua::test_support::{fire_autocmd, runtime};
 use maki_lua::{
-    InitFiles, Interaction, KEY_WARNING, MAX_INFLIGHT_TOOLS, NO_UI_ERR, PERMISSION_NAME_WARNING,
+    INERT_WITH_MUTABLE_PATH_ERR, INERT_WITH_SCOPES_ERR, InitFiles, Interaction, KEY_WARNING,
+    MAX_INFLIGHT_TOOLS, MCP_HINT, NO_UI_ERR, PERMISSION_NAME_WARNING, PERMISSION_SHAPE_ERR,
     PluginError, PluginHost, PluginPermissions, SKIPPED_PLUGIN_WARNING, SessionEndReason,
-    WARM_TOOL_CAP, set_allowed_private_hosts,
+    UNDECLARED_REACH, UNPAID_REACH_ERR, WARM_TOOL_CAP, set_allowed_private_hosts,
 };
 use maki_providers::provider::{BoxFuture, Provider};
 use maki_providers::{
@@ -234,6 +235,29 @@ const SCOPES_WITHOUT_PERMISSION_SRC: &str =
     r#"name = "no_perm", description = "test", permission_scopes = "url""#;
 const UNKNOWN_PERMISSION_SRC: &str = r#"name = "bad_perm", description = "test", permission = "filesystem", permission_scopes = "url""#;
 const FS_WRITE_WITHOUT_MUTABLE_PATH_SRC: &str = r#"name = "no_mpath", description = "test", permission = "fs_write", permission_scopes = "url""#;
+const INERT_WITH_SCOPES_SRC: &str =
+    r#"name = "inert_scoped", description = "test", permission = {}, permission_scopes = "url""#;
+const INERT_WITH_MUTABLE_PATH_SRC: &str =
+    r#"name = "inert_writer", description = "test", permission = {}, mutable_path = "url""#;
+const PERMISSION_LIST_SRC: &str =
+    r#"name = "perm_list", description = "test", permission = { "fs_read" }"#;
+const PERMISSION_MAP_SRC: &str =
+    r#"name = "perm_map", description = "test", permission = { fs_read = true }"#;
+const INERT_TOOL: &str = "inert_";
+const SECOND_UNDECLARED_TOOL: &str = "echo2_";
+const INERT_TOOL_SRC: &str = r#"maki.api.register_tool({
+    name = "inert_",
+    description = "reaches nothing",
+    schema = { type = "object", properties = {} },
+    permission = {},
+    handler = function() return "" end,
+})"#;
+const SECOND_UNDECLARED_SRC: &str = r#"maki.api.register_tool({
+    name = "echo2_",
+    description = "declares nothing either",
+    schema = { type = "object", properties = {} },
+    handler = function() return "" end,
+})"#;
 const NON_STRING_FIELD_SCHEMA: &str = r#"{
     type = "object",
     properties = { count = { type = "integer" } },
@@ -315,9 +339,7 @@ fn register_echo_tool() {
 
     let entry = reg.get("echo_").expect("echo_ tool not registered");
     assert_eq!(entry.tool.name(), "echo_");
-    assert!(
-        matches!(entry.source, ToolSource::Lua { ref plugin } if plugin.as_ref() == "echo_plugin"),
-    );
+    assert_eq!(entry.source.plugin.as_ref(), "echo_plugin");
     assert_eq!(entry.tool.tool_kind(), None);
 
     let out = exec_tool(&reg, "echo_", serde_json::json!({"msg": "hello"})).unwrap();
@@ -682,6 +704,10 @@ fn permission_rule_validation_rejects(spec: &str, expected_err: &str) {
 #[test_case::test_case(SCOPES_WITHOUT_PERMISSION_SRC, STRING_FIELD_SCHEMA, "must declare 'permission'" ; "scopes_without_permission")]
 #[test_case::test_case(UNKNOWN_PERMISSION_SRC, STRING_FIELD_SCHEMA, "unknown permission 'filesystem'" ; "unknown_permission")]
 #[test_case::test_case(FS_WRITE_WITHOUT_MUTABLE_PATH_SRC, STRING_FIELD_SCHEMA, "no 'mutable_path'" ; "fs_write_without_mutable_path")]
+#[test_case::test_case(INERT_WITH_SCOPES_SRC, STRING_FIELD_SCHEMA, INERT_WITH_SCOPES_ERR ; "inert_with_scopes")]
+#[test_case::test_case(INERT_WITH_MUTABLE_PATH_SRC, STRING_FIELD_SCHEMA, INERT_WITH_MUTABLE_PATH_ERR ; "inert_with_mutable_path")]
+#[test_case::test_case(PERMISSION_LIST_SRC, MINIMAL_SCHEMA, PERMISSION_SHAPE_ERR ; "permission_list")]
+#[test_case::test_case(PERMISSION_MAP_SRC, MINIMAL_SCHEMA, PERMISSION_SHAPE_ERR ; "permission_map")]
 fn registration_validation_rejects(fields: &str, schema: &str, expected_err: &str) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
@@ -713,11 +739,37 @@ fn permission_without_scopes_declares_reach_and_never_prompts() {
 
     assert_eq!(
         tool.reach(),
-        Some(ToolReach {
+        Some(ToolReach::Capability {
             permission: Permission::FsRead,
             prompted: false,
         })
     );
+    assert!(runtime().block_on(inv.permission_scopes()).is_none());
+}
+
+/// `{}` needs no grant, so a plugin holding nothing can declare it.
+/// `maki.NIL` reads as absent, which keeps the undeclared price.
+#[test_case::test_case("{}", Some(ToolReach::Inert) ; "empty_permission_table_declares_inert_reach")]
+#[test_case::test_case("maki.NIL", None ; "nil_permission_stays_undeclared")]
+fn a_permission_declaration_sets_the_tool_reach(permission: &str, expected: Option<ToolReach>) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "{INERT_TOOL}",
+            description = "test",
+            schema = {MINIMAL_SCHEMA},
+            permission = {permission},
+            handler = function() return "" end,
+        }})"#,
+    );
+    host.load_source_with_permissions("tool_owner", &src, PluginPermissions::denied())
+        .unwrap();
+
+    let tool = &reg.get(INERT_TOOL).unwrap().tool;
+    let inv = tool.parse(&json!({})).unwrap();
+
+    assert_eq!(tool.reach(), expected);
     assert!(runtime().block_on(inv.permission_scopes()).is_none());
 }
 
@@ -858,6 +910,35 @@ fn get_tool_describes_rust_routed_tools() {
         out,
         "tool_search|find prs/tool|markdown|nil|srv__thing|mcp: srv.thing/tool|plain|nil"
     );
+}
+
+/// The list is what a plugin compares against what it holds, so a declared
+/// key reads back as a one-entry list rather than the string it registered.
+#[test_case::test_case("edit", "fs_write" ; "a_declared_key")]
+#[test_case::test_case(INERT_TOOL, "" ; "reaches_nothing")]
+#[test_case::test_case("echo_", "nil" ; "undeclared")]
+fn get_tool_reports_permission_as_a_list(tool: &str, expected: &str) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(
+        "tool_owner",
+        &format!("{EDIT_TOOL_SRC}\n{INERT_TOOL_SRC}\n{ECHO_PLUGIN}"),
+    )
+    .unwrap();
+    let src = format!(
+        r#"maki.api.register_tool({{
+            name = "probe_tool",
+            description = "p",
+            schema = {MINIMAL_SCHEMA},
+            handler = function()
+                local p = maki.api.get_tool("{tool}").permission
+                return p and table.concat(p, ",") or "nil"
+            end,
+        }})"#,
+    );
+    host.load_source("probe", &src).unwrap();
+
+    assert_eq!(exec_tool(&reg, "probe_tool", json!({})).unwrap(), expected);
 }
 
 #[test]
@@ -1157,6 +1238,29 @@ fn examples_table_flows_to_trait() {
     assert_eq!(
         entry.tool.examples(),
         Some(serde_json::json!([{"url": "https://example.com"}]))
+    );
+}
+
+#[test]
+fn memory_command_guidance_rejects_shell_style_input() {
+    let (reg, _host) = builtins_host();
+    let entry = reg.get("memory").expect("memory tool not registered");
+    let schema = entry.tool.schema();
+    let description = schema["properties"]["command"]["description"]
+        .as_str()
+        .expect("command guidance missing");
+    for command in schema["properties"]["command"]["enum"].as_array().unwrap() {
+        let command = command.as_str().unwrap();
+        assert!(description.contains(&format!("- `{command}`:")));
+    }
+
+    let input = json!({"command": "write notes.md tags: [a]"});
+    let Err(err) = entry.tool.parse(&input) else {
+        panic!("shell-style memory command must be rejected");
+    };
+    assert!(
+        err.to_string().contains(r#"Use "write" alone."#),
+        "missing command hint: {err}"
     );
 }
 
@@ -1765,7 +1869,7 @@ fn conflict_from_different_plugin_preserves_original() {
     assert!(matches!(err, PluginError::NameConflict { .. }));
 
     let entry = reg.get("evolving").unwrap();
-    assert!(matches!(entry.source, ToolSource::Lua { ref plugin } if plugin.as_ref() == "keeper"),);
+    assert_eq!(entry.source.plugin.as_ref(), "keeper");
 }
 
 #[test]
@@ -2504,14 +2608,14 @@ fn warm_click_survives_post_completion_cancel() {
     assert_eq!(body.read()[0].spans[0].text, WARM_CLICK_LINE);
 }
 
-/// `maki.agent.call_tool` returns `(text, err)` and delivers live bufs,
+/// `maki.agent.call_tool` returns `(text, err, format)` and delivers live bufs,
 /// annotations (live and completion alike) and usage through the callbacks.
 #[test]
 fn call_tool_streams_live_buf_and_annotations() {
     let reg = fresh_registry();
     reg.register(
         Arc::new(UsageTool),
-        ToolSource::Lua {
+        ToolSource {
             plugin: Arc::from("usage_fixture"),
         },
     )
@@ -2525,7 +2629,7 @@ maki.api.register_tool({{
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function(input, ctx)
-        return {{ llm_output = "child_done", annotation = "5 items" }}
+        return {{ llm_output = "child_done", annotation = "5 items", format = "markdown" }}
     end
 }})
 maki.api.register_tool({{
@@ -2556,12 +2660,12 @@ maki.api.register_tool({{
     audiences = {{ "main" }},
     handler = function(input, ctx)
         local ann = "nil"
-        local text, err = maki.agent.call_tool(ctx, "annotated_child", {{}}, {{
+        local text, err, format = maki.agent.call_tool(ctx, "annotated_child", {{}}, {{
             on_annotation = function(a) ann = a end,
         }})
         local live_text = "none"
         local ann2 = "nil"
-        local text2 = maki.agent.call_tool(ctx, "streaming_child", {{}}, {{
+        local text2, _, format2 = maki.agent.call_tool(ctx, "streaming_child", {{}}, {{
             on_live_buf = function(b)
                 local lines = b:get_lines()
                 live_text = lines[1] and lines[1][1] and lines[1][1][1] or "empty"
@@ -2573,13 +2677,13 @@ maki.api.register_tool({{
             on_usage = function(value) usage = value end,
         }})
         local ann3 = "nil"
-        local _, err3 = maki.agent.call_tool(ctx, "failing_child", {{}}, {{
+        local _, err3, format3 = maki.agent.call_tool(ctx, "failing_child", {{}}, {{
             on_annotation = function(a) ann3 = a end,
         }})
-        return tostring(text) .. "/" .. ann
-            .. " " .. tostring(text2) .. "/" .. live_text .. "/" .. ann2
+        return tostring(text) .. "/" .. ann .. "/" .. format
+            .. " " .. tostring(text2) .. "/" .. live_text .. "/" .. ann2 .. "/" .. format2
             .. " " .. tostring(text3) .. "/" .. usage
-            .. " " .. tostring(err3) .. "/" .. ann3
+            .. " " .. tostring(err3) .. "/" .. ann3 .. "/" .. tostring(format3)
     end
 }})
 "#,
@@ -2595,8 +2699,8 @@ maki.api.register_tool({{
     assert_eq!(
         out,
         format!(
-            "child_done/5 items stream_done/streamed line/1 line \
-             {USAGE_OUTPUT}/{USAGE_VALUE} boom/nil"
+            "child_done/5 items/markdown stream_done/streamed line/1 line/plain \
+             {USAGE_OUTPUT}/{USAGE_VALUE} boom/nil/nil"
         )
     );
 }
@@ -2692,10 +2796,15 @@ fn jobstop_kills_running_job() {
     assert_eq!(out, "killed=true");
 }
 
+/// The job exits only once the test opens its gate. A `sleep` raced the
+/// 1ms `jobwait` against the clock: a Lua thread stalled past the job's exit
+/// let `jobwait` collect the result and the handler report "did not time out".
 #[test]
 fn plugin_owned_job_outlives_its_starting_tool() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let gate = dir.path().join("gate");
     let src = format!(
         r#"
 local output = "pending"
@@ -2706,7 +2815,7 @@ maki.api.register_tool({{
     schema = {MINIMAL_SCHEMA},
     audiences = {{ "main" }},
     handler = function()
-        local id = maki.fn.jobstart("sleep 0.1; printf plugin-output; exit 7", {{
+        local id = maki.fn.jobstart("while [ ! -e '{gate}' ]; do sleep 0.01; done; printf plugin-output; exit 7", {{
             scope = "plugin",
             on_stdout = function(_, line) output = line end,
             on_exit = function(_, code) exit_code = tostring(code) end,
@@ -2723,13 +2832,15 @@ maki.api.register_tool({{
         return output .. "/" .. exit_code
     end,
 }})
-"#
+"#,
+        gate = gate.display(),
     );
     host.load_source("plugin_job", &src).unwrap();
     assert_eq!(
         exec_tool(&reg, "start_plugin_job", json!({})).unwrap(),
         "started"
     );
+    std::fs::write(&gate, "").unwrap();
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -3460,8 +3571,7 @@ maki.api.register_tool({{
     );
     host.load_source("isolation_probe", &src).unwrap();
 
-    host.event_handle()
-        .fire_autocmd("ProbeIsolation", json!({}));
+    fire_autocmd(&host.event_handle(), "ProbeIsolation", json!({}));
 
     // FireAutocmd and CallTool queue on the same channel and dispatch is
     // awaited in order, so the second handler has already run here. A shared
@@ -3502,8 +3612,11 @@ maki.api.register_tool({{
     );
     host.load_source("sessionend_suspend", &src).unwrap();
 
-    host.event_handle()
-        .fire_autocmd("SessionEnd", json!({ "dir": dir.display().to_string() }));
+    fire_autocmd(
+        &host.event_handle(),
+        "SessionEnd",
+        json!({ "dir": dir.display().to_string() }),
+    );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let seen = loop {
@@ -4177,7 +4290,7 @@ fn fs_write_tools_match_file_write_tools() {
     let snapshot = reg.iter();
     let mut declared: Vec<&str> = snapshot
         .iter()
-        .filter(|t| t.tool.reach().map(|r| r.permission) == Some(Permission::FsWrite))
+        .filter(|t| t.tool.reach().and_then(ToolReach::permission) == Some(Permission::FsWrite))
         .map(|t| t.name())
         .collect();
     declared.sort_unstable();
@@ -4550,83 +4663,6 @@ fn list_commands_round_trips_through_ui() {
         .unwrap();
     let action = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(matches!(action, maki_lua::UiAction::Flash(msg) if msg == "/model|builtin|true"));
-}
-
-/// A handler learns which chat it runs in, and can aim the next command at
-/// that same chat even when it is not the focused one.
-#[test]
-fn run_command_forwards_session_both_ways() {
-    let host = PluginHost::new(fresh_registry()).unwrap();
-    host.load_source(
-        "p",
-        r#"
-        maki.api.register_command({
-            name = "/here",
-            handler = function(opts)
-                maki.api.run_command("/new", { session = opts.session })
-            end,
-        })
-        "#,
-    )
-    .unwrap();
-    let rx = host.ui_action_rx();
-    host.event_handle().run_command(
-        Arc::from("p"),
-        Arc::from("/here"),
-        String::new(),
-        0,
-        Some("s-bg".into()),
-    );
-
-    let maki_lua::UiAction::RunCommand {
-        cmdline, session, ..
-    } = rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect(RUN_COMMAND_NO_ACTION)
-    else {
-        panic!("{RUN_COMMAND_NO_ACTION}");
-    };
-    assert_eq!(cmdline, "/new");
-    assert_eq!(session.as_deref(), Some("s-bg"));
-}
-
-/// An alias like `/clear` calls `run_command` with no session. Run in a
-/// background tab, it must stay there instead of resetting the focused one.
-#[test]
-fn run_command_without_session_inherits_the_handlers() {
-    let host = PluginHost::new(fresh_registry()).unwrap();
-    host.load_source(
-        "p",
-        r#"
-        maki.api.register_command({
-            name = "/clear",
-            handler = function()
-                maki.api.run_command("/new")
-            end,
-        })
-        "#,
-    )
-    .unwrap();
-    let rx = host.ui_action_rx();
-    let background = MakiId::generate().to_string();
-    host.event_handle().run_command(
-        Arc::from("p"),
-        Arc::from("/clear"),
-        String::new(),
-        0,
-        Some(background.clone()),
-    );
-
-    let maki_lua::UiAction::RunCommand {
-        cmdline, session, ..
-    } = rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect(RUN_COMMAND_NO_ACTION)
-    else {
-        panic!("{RUN_COMMAND_NO_ACTION}");
-    };
-    assert_eq!(cmdline, "/new");
-    assert_eq!(session, Some(background));
 }
 
 #[test_case::test_case(
@@ -7287,11 +7323,16 @@ mod read_tool_required_params {
     }
 
     #[test]
-    fn offset_beyond_file_returns_empty() {
+    fn offset_beyond_file_says_past_end_instead_of_empty() {
+        const NOTE: &str = "offset 100 is past the end of the file (10 lines)";
         let (reg, _host) = builtins_host();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("small.txt");
-        std::fs::write(&path, "just one line\n").unwrap();
+        let content = (1..=10i32)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, &content).unwrap();
 
         let out = exec_tool(
             &reg,
@@ -7303,10 +7344,28 @@ mod read_tool_required_params {
             }),
         );
         let out = out.expect("read should succeed");
-        assert!(
-            out.is_empty(),
-            "offset beyond file should return empty, got: {out}"
-        );
+        assert!(out.contains(NOTE), "got: {out}");
+    }
+
+    #[test]
+    fn empty_file_says_so_instead_of_empty() {
+        const NOTE: &str = "(empty file)";
+        let (reg, _host) = builtins_host();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+        std::fs::write(&path, "").unwrap();
+
+        let out = exec_tool(
+            &reg,
+            "read",
+            serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 1,
+                "limit": 0
+            }),
+        )
+        .expect("read should succeed");
+        assert_eq!(out, NOTE);
     }
 }
 
@@ -8175,6 +8234,34 @@ fn billed_turns(
         .collect()
 }
 
+/// Waits for the relay to hand the tab a paid turn. The relay is its own task,
+/// so the provider being asked for the next turn says nothing about whether
+/// the tab heard of the last one yet.
+fn await_billed_turn(
+    ui: &flume::Receiver<maki_lua::UiAction>,
+    session: MakiId,
+) -> TurnCompleteEvent {
+    let deadline = Instant::now() + CANCEL_TEST_TIMEOUT;
+    loop {
+        let action = ui
+            .recv_deadline(deadline)
+            .expect("the paid turn must reach the tab while the prompt still runs");
+        match action {
+            maki_lua::UiAction::PluginTaskEvent {
+                session: owner,
+                envelope,
+                ..
+            } if owner == session => {
+                if let AgentEvent::TurnComplete(turn) = envelope.event {
+                    return *turn;
+                }
+            }
+            maki_lua::UiAction::PluginTaskOpened { session: owner, .. } if owner == session => {}
+            _ => panic!("only this chat session's task events go to the UI here"),
+        }
+    }
+}
+
 /// The transcript the tab was last handed for task `id`.
 fn handed_over_history(
     ui: &flume::Receiver<maki_lua::UiAction>,
@@ -8221,10 +8308,11 @@ fn cancelled_background_prompt_goes_idle_and_bills_its_paid_turn() {
     parked
         .recv_timeout(CANCEL_TEST_TIMEOUT)
         .expect("the prompt must reach its second turn");
-    let turns = billed_turns(&ui, session);
-    let [turn] = turns.as_slice() else {
-        panic!("the paid turn must reach the tab while the prompt still runs");
-    };
+    let turn = await_billed_turn(&ui, session);
+    assert!(
+        billed_turns(&ui, session).is_empty(),
+        "one paid turn must reach the tab once"
+    );
     assert_eq!(turn.usage.input, PAID_TURN_INPUT);
     let billed_cost = turn.cost.expect("the paid turn must have a price");
     let listed_cost = format!("{billed_cost:.COST_DECIMALS$}");
@@ -8367,9 +8455,9 @@ fn a_retired_background_session_refuses_later_prompts() {
     assert_eq!(exec_tool(&reg, "list_background", json!({})).unwrap(), "");
 }
 
-/// The provider parks the second turn forever, so only a cancel can end this
-/// prompt. If `close` waited for it instead, a `SessionEnd` callback that
-/// closes its own session would hang.
+/// The provider parks the second turn forever, so only the close can end
+/// this prompt, which then says the session closed. If `close` waited for it
+/// instead, a `SessionEnd` callback that closes its own session would hang.
 #[test]
 fn closing_a_background_session_cancels_its_running_prompt() {
     let reg = fresh_registry();
@@ -8395,7 +8483,7 @@ fn closing_a_background_session_cancels_its_running_prompt() {
     let closed = call_on_thread(&reg, "close_background", CancelToken::none())
         .recv_timeout(CANCEL_TEST_TIMEOUT)
         .expect("close must not wait for the parked prompt");
-    assert_eq!(closed, Ok(CANCELLED_MSG.to_owned()));
+    assert_eq!(closed, Ok(SESSION_CLOSED_ERR.to_owned()));
     assert_eq!(exec_tool(&reg, "list_background", json!({})).unwrap(), "");
 }
 
@@ -8861,15 +8949,19 @@ fn background_session_scope_decides_what_ends_it(scope: &str, outlives_handler: 
     assert_eq!(exec_tool(&reg, "list_background", json!({})).unwrap(), "");
 }
 
-/// A host where `edit` (declares `fs_write`) and `echo_` (declares nothing)
-/// are registered, plus a plugin holding only `agent` whose `open_reaching`
-/// tool calls `maki.agent.session({session_args})` and returns the error, or
-/// "nil" when the session opened.
+/// A host where `edit` (declares `fs_write`), the inert tool (declares `{}`),
+/// `echo_` and a second tool declaring nothing are registered, plus a plugin
+/// holding only `agent` whose `open_reaching` tool calls
+/// `maki.agent.session({session_args})` and returns the error, or "nil" when
+/// the session opened.
 fn reach_probe_host(session_args: &str) -> (Arc<ToolRegistry>, PluginHost) {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
-    host.load_source("tool_owner", &format!("{EDIT_TOOL_SRC}\n{ECHO_PLUGIN}"))
-        .unwrap();
+    host.load_source(
+        "tool_owner",
+        &format!("{EDIT_TOOL_SRC}\n{ECHO_PLUGIN}\n{INERT_TOOL_SRC}\n{SECOND_UNDECLARED_SRC}"),
+    )
+    .unwrap();
     let mut perms = maki_lua::PluginPermissions::denied();
     perms.set(maki_lua::Permission::Agent, true);
     let src = format!(
@@ -8892,17 +8984,26 @@ fn reach_probe_host(session_args: &str) -> (Arc<ToolRegistry>, PluginHost) {
 /// Nobody answers a prompt in a session of the plugin's own, so what it can
 /// reach is priced like a hook on the same tool. MCP reaches whatever its
 /// servers do, which is nothing on a chat without any.
-#[test_case::test_case(r#"{ { name = "edit" } }"#, false, false, "fs_write" ; "a_declared_capability_costs_itself")]
-#[test_case::test_case(r#"{ { name = "echo_" } }"#, false, false, "every permission" ; "undeclared_reach_costs_everything")]
-#[test_case::test_case("nil", true, true, "mcp" ; "mcp_costs_everything")]
+#[test_case::test_case(r#"{ { name = "edit" } }"#, false, false, "edit (fs_write)" ; "a_declared_capability_costs_itself")]
+#[test_case::test_case(r#"{ { name = "echo_" } }"#, false, false, UNDECLARED_REACH ; "undeclared_reach_costs_everything")]
+#[test_case::test_case("nil", true, true, MCP_HINT ; "mcp_costs_everything")]
 #[test_case::test_case("nil", true, false, "nil" ; "mcp_without_servers_costs_nothing")]
 #[test_case::test_case(r#"{ { name = "nobody_registered_this" } }"#, false, false, "nil" ; "an_unknown_name_never_dispatches")]
+#[test_case::test_case(r#"{ { name = "inert_" } }"#, false, false, "nil" ; "an_inert_tool_costs_nothing")]
 fn a_plugin_session_can_only_reach_what_its_plugin_holds(
     tools: &str,
     mcp: bool,
     servers: bool,
     expected: &str,
 ) {
+    let result = open_reaching(tools, mcp, servers);
+
+    assert!(result.contains(expected), "got: {result}");
+}
+
+/// Opens a session with {tools} from the `agent`-only plugin of
+/// [`reach_probe_host`], and returns its error or "nil".
+fn open_reaching(tools: &str, mcp: bool, servers: bool) -> String {
     let session = MakiId::generate();
     let mailbox = SessionMailbox::register(session);
     let mut seed = stub_seed(session);
@@ -8913,10 +9014,35 @@ fn a_plugin_session_can_only_reach_what_its_plugin_holds(
     let (reg, _host) = reach_probe_host(&format!(
         r#"{{ session = "{session}", tools = {tools}, mcp = {mcp} }}"#
     ));
+    exec_tool(&reg, "open_reaching", json!({})).unwrap()
+}
 
-    let result = exec_tool(&reg, "open_reaching", json!({})).unwrap();
+/// One error names every tool the plugin cannot pay for, with undeclared
+/// tools sharing one clause, so the author fixes them in one edit. MCP was
+/// not asked for, so its hint stays out.
+#[test]
+fn every_unpaid_tool_is_named_at_once() {
+    let tools = format!(
+        r#"{{ {{ name = "edit" }}, {{ name = "echo_" }}, {{ name = "{INERT_TOOL}" }}, {{ name = "{SECOND_UNDECLARED_TOOL}" }} }}"#
+    );
 
-    assert!(result.contains(expected), "got: {result}");
+    let result = open_reaching(&tools, false, false);
+
+    assert!(result.contains(UNPAID_REACH_ERR), "got: {result}");
+    assert!(!result.contains(MCP_HINT), "got: {result}");
+    assert!(result.contains("edit (fs_write)"), "got: {result}");
+    assert!(
+        result.contains(&format!(
+            "echo_, {SECOND_UNDECLARED_TOOL} {UNDECLARED_REACH}"
+        )),
+        "got: {result}"
+    );
+    assert!(
+        result.contains(&format!(
+            r#"except = {{ "edit", "echo_", "{SECOND_UNDECLARED_TOOL}" }}"#
+        )),
+        "got: {result}"
+    );
 }
 
 /// The ctx form pays the same price whether or not a user could answer: a
@@ -9325,7 +9451,15 @@ fn a_malformed_question_form_reply_falls_back_to_the_form() {
 
 #[test]
 fn list_plugins_reports_registrations_load_failures_and_runtime_errors() {
-    let (reg, host) = builtins_host();
+    let disabled = maki_config::NON_TOOL_BUILTINS[0];
+    let plugins = HashMap::from([(
+        disabled.to_owned(),
+        maki_config::PluginFileConfig {
+            enabled: Some(false),
+            ..Default::default()
+        },
+    )]);
+    let (reg, host) = builtins_host_with(&PluginsConfig::from_plugins(plugins));
     let src = format!(
         r#"
 maki.api.create_autocmd("ProbeFailure", {{
@@ -9346,7 +9480,7 @@ maki.api.register_tool({{
     host.load_source("probe", &src).unwrap();
     host.load_source("broken", "error('nope')")
         .expect_err("load must fail");
-    host.event_handle().fire_autocmd("ProbeFailure", json!({}));
+    maki_lua::test_support::fire_autocmd(&host.event_handle(), "ProbeFailure", json!({}));
 
     let out = exec_tool(&reg, "list_plugins_probe", json!({})).unwrap();
     let list: Vec<Value> = serde_json::from_str(&out).unwrap();
@@ -9370,8 +9504,85 @@ maki.api.register_tool({{
     assert_eq!(broken["loaded"], false);
     assert!(broken["load_error"].as_str().unwrap().contains("nope"));
 
-    let optional = find(maki_config::OPTIONAL_BUILTINS[0]);
-    assert_eq!(optional["source"], "bundled");
-    assert_eq!(optional["enabled"], false);
-    assert_eq!(optional["loaded"], false);
+    let disabled = find(disabled);
+    assert_eq!(disabled["source"], "bundled");
+    assert_eq!(disabled["enabled"], false);
+    assert_eq!(disabled["loaded"], false);
+}
+
+/// A handler learns which chat it runs in, and can aim the next command at
+/// that same chat even when it is not the focused one.
+#[test]
+fn run_command_forwards_session_both_ways() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "p",
+        r#"
+        maki.api.register_command({
+            name = "/here",
+            handler = function(opts)
+                maki.api.run_command("/new", { session = opts.session })
+            end,
+        })
+        "#,
+    )
+    .unwrap();
+    let rx = host.ui_action_rx();
+    host.event_handle().run_command(
+        Arc::from("p"),
+        Arc::from("/here"),
+        String::new(),
+        0,
+        Some("s-bg".into()),
+    );
+
+    let maki_lua::UiAction::RunCommand {
+        cmdline, session, ..
+    } = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect(RUN_COMMAND_NO_ACTION)
+    else {
+        panic!("{RUN_COMMAND_NO_ACTION}");
+    };
+    assert_eq!(cmdline, "/new");
+    assert_eq!(session.as_deref(), Some("s-bg"));
+}
+
+/// An alias like `/clear` calls `run_command` with no session. Run in a
+/// background tab, it must stay there instead of resetting the focused one.
+#[test]
+fn run_command_without_session_inherits_the_handlers() {
+    let host = PluginHost::new(fresh_registry()).unwrap();
+    host.load_source(
+        "p",
+        r#"
+        maki.api.register_command({
+            name = "/clear",
+            handler = function()
+                maki.api.run_command("/new")
+            end,
+        })
+        "#,
+    )
+    .unwrap();
+    let rx = host.ui_action_rx();
+    let background = MakiId::generate().to_string();
+    host.event_handle().run_command(
+        Arc::from("p"),
+        Arc::from("/clear"),
+        String::new(),
+        0,
+        Some(background.clone()),
+    );
+
+    let maki_lua::UiAction::RunCommand {
+        cmdline, session, ..
+    } = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect(RUN_COMMAND_NO_ACTION)
+    else {
+        panic!("{RUN_COMMAND_NO_ACTION}");
+    };
+    assert_eq!(cmdline, "/new");
+    assert_eq!(session, Some(background));
 }

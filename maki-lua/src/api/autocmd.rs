@@ -139,12 +139,7 @@ pub(crate) async fn dispatch(lua: Lua, event: String, pattern: Option<String>, d
                 return;
             }
         };
-        if let Err(e) = run_detached(&lua, async {
-            let thread = lua.create_thread(callback)?;
-            thread.into_async::<()>(ev)?.await
-        })
-        .await
-        {
+        if let Err(e) = run_detached(&lua, callback.call_async::<()>(ev)).await {
             let error = format!("{event}: {}", strip_traceback(&e));
             record_error(&lua, &plugin, ErrorSeam::Autocmd, error);
         }

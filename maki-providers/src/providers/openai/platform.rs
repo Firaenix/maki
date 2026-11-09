@@ -19,6 +19,7 @@ use crate::{
 
 use super::auth;
 use crate::providers::ResolvedAuth;
+use crate::providers::codec::SessionCarrier;
 use crate::providers::managed_auth::ManagedAuth;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 
@@ -28,6 +29,7 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     base_url: Cow::Borrowed("https://api.openai.com/v1"),
     max_tokens_field: Cow::Borrowed("max_completion_tokens"),
     include_stream_usage: true,
+    usage_cost: false,
     provider_name: Cow::Borrowed("OpenAI"),
 };
 
@@ -36,6 +38,7 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
 // `coding_plan_context_window`, so they are not listed here.
 pub(crate) const PLAN_MODELS: &[&str] = &[
     "gpt-6.1-sol",
+    "gpt-6.1-terra",
     "gpt-6-sol",
     "gpt-6-luna",
     "gpt-6-astra",
@@ -56,14 +59,23 @@ const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 // The backend hides models newer than this Codex CLI version, so bump it when
 // a fresh model is missing from the list. 0.156.1 is the first line that
 // surfaces GPT-6 Sol / Luna in the picker, 0.159.x the first with GPT-6.1 Sol;
-// 0.159.1 is latest as of 2026-09-29.
-const CODEX_CLIENT_VERSION: &str = "0.159.1";
+// 0.167.0 is latest as of 2026-10-07
+const CODEX_CLIENT_VERSION: &str = "0.167.0";
 const PLAN_MODELS_PATH: &str = "/models?client_version=";
 const LISTED_VISIBILITY: &str = "list";
 const ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
 const FAST_SERVICE_TIER: &str = "priority";
 const PROMPT_CACHE_KEY_FIELD: &str = "prompt_cache_key";
-const SESSION_AFFINITY_HEADERS: [&str; 2] = ["session-id", "x-client-request-id"];
+const SESSION_AFFINITY_HEADERS: &[Cow<'static, str>] = &[
+    Cow::Borrowed("session-id"),
+    Cow::Borrowed("x-client-request-id"),
+];
+/// Without a stable key the backend spreads a session's requests over cache
+/// shards, so an unchanged prefix still misses most of the time.
+const SESSION_AFFINITY: SessionCarrier = SessionCarrier {
+    headers: Cow::Borrowed(SESSION_AFFINITY_HEADERS),
+    body_field: Some(Cow::Borrowed(PROMPT_CACHE_KEY_FIELD)),
+};
 const IMAGE_MODALITY: &str = "image";
 const EMPTY_USAGE_ERROR: &str =
     "OpenAI usage response contained no plan or rate limits; the endpoint schema likely changed";
@@ -258,15 +270,9 @@ fn apply_plan_fast(
     }
 }
 
-/// Without a stable key the backend spreads a session's requests over cache
-/// shards, so an unchanged prefix still misses most of the time.
 fn apply_session_affinity(body: &mut Value, auth: &mut ResolvedAuth, session: &SessionRef) {
-    if !is_coding_plan(auth) {
-        return;
-    }
-    body[PROMPT_CACHE_KEY_FIELD] = session.as_str().into();
-    for header in SESSION_AFFINITY_HEADERS {
-        auth.set_header(header, session.to_string());
+    if is_coding_plan(auth) {
+        SESSION_AFFINITY.apply(session, body, auth);
     }
 }
 
@@ -624,6 +630,7 @@ mod tests {
     }
 
     #[test_case("gpt-6.1-sol", Some(272_000))]
+    #[test_case("gpt-6.1-terra", Some(272_000))]
     #[test_case("gpt-6-sol", Some(272_000))]
     #[test_case("gpt-6-luna", Some(272_000))]
     #[test_case("gpt-6-astra", Some(272_000))]
@@ -682,6 +689,7 @@ mod tests {
             ("gpt-6-luna", &dialect::GPT_6),
             ("gpt-6-astra", &dialect::GPT_6),
             ("gpt-6.1-sol", &dialect::GPT_6),
+            ("gpt-6.1-terra", &dialect::GPT_6),
             ("gpt-5.6-luna", &dialect::GPT_5_6),
             ("gpt-5.6-terra", &dialect::GPT_5_6),
             ("gpt-5.6-sol", &dialect::GPT_5_6),

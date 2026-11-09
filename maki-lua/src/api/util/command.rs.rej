@@ -1,0 +1,8 @@
+@@ -8,6 +8,7 @@
+ 
+ use arc_swap::ArcSwap;
+ use maki_agent::agent::SessionExport;
++use maki_agent::permissions::PermissionAnswer;
+ use maki_agent::{Envelope, SharedBuf, SubagentInfo, TaskEnd, Transcript};
+ use maki_storage::id::MakiId;
+ use mlua::{Lua, RegistryKey, Result as LuaResult, Value};

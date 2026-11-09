@@ -7,7 +7,7 @@ group = "Reference"
 
 # Providers
 
-Maki talks to LLM providers over their HTTP APIs. Models are split into three tiers: **weak** (cheap and fast), **medium** (balanced), and **strong** (highest capability, highest cost). There is also a **compaction** tier for choosing a dedicated model to summarize context when the conversation grows long.
+Maki talks to LLM providers over their HTTP APIs. Models are split into three tiers: **weak** (cheap and fast), **medium** (balanced), and **strong** (highest capability, highest cost). There is also a **compaction** tier for choosing a dedicated model to summarize context when the conversation grows long. The summary comes from the first of: your `/model` compaction pick, a `tier = "compaction"` model of the session's provider, one from any other provider in slug order, then the session model.
 
 Open the model picker with `/model` and press `!`, `@`, `#`, or `$` on any row to assign it to strong, medium, weak, or compaction. Press the same key again to remove the assignment. Your overrides are saved to `~/.local/state/maki/model-tiers` and apply across sessions.
 
@@ -41,7 +41,7 @@ You can also set `base_url` for a built-in provider in `~/.config/maki/providers
 base_url = "http://xxxx:1234/v1"
 ```
 
-The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discover_models` and `models` are ignored with a warning. Use a custom slug if you need those.
+The built-in provider still owns the slug, so `api_key_env`, `discover_models`, `models` and `protocol` are ignored with a warning. Use a custom slug if you need those. `ollama` and `llama-cpp` read `protocol` values `openai` and `openai-responses` to pick the chat or Responses API.
 
 ## Built-in Providers
 
@@ -103,6 +103,7 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 | Medium | **gpt-5.6-terra** (default) | $2.50 / $15.00 | 372K ctx / 128K out |
 | Medium | gpt-6-sol | $2.00 / $10.00 | 1050K ctx / 128K out |
 | Medium | gpt-6.1-sol | $2.00 / $10.00 | 1050K ctx / 128K out |
+| Medium | gpt-6.1-terra | $1.00 / $5.00 | 1050K ctx / 128K out |
 | Medium | gpt-4.1-mini | $0.40 / $1.60 | 1047K ctx / 32K out |
 | Medium | gpt-4.1 | $2.00 / $8.00 | 1047K ctx / 32K out |
 | Medium | o4-mini | $1.10 / $4.40 | 200K ctx / 100K out |
@@ -291,6 +292,7 @@ Defaults: deepseek-flash (medium), deepseek-v4-pro (strong)
 
 - **Env var**: `MISTRAL_API_KEY`
 - **API**: `https://api.mistral.ai/v1`
+- **Features**: `/usage` reads the plan and monthly Vibe Code allowance from `/v1/billing/subscription` and `/v1/billing/budget` (the budget needs the `see_org_inference_usage` permission)
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
@@ -451,7 +453,7 @@ supports_vision = false
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
 | `id` | string | required | Model id. Spec becomes `{slug}/{id}` |
-| `tier` | string | `medium` | `weak`, `medium`, `strong`, or `compaction` |
+| `tier` | string | `medium` | `weak`, `medium`, `strong`, or `compaction`. With `discover_models = true`, a declared tier counts only for models the server lists |
 | `context_window` | u32 | protocol default | Tokens of context |
 | `max_output_tokens` | u32 | protocol default | Max completion tokens |
 | `supports_tool_examples` | bool | protocol default | |
@@ -713,7 +715,7 @@ local function credentials()
   if stored then
     return stored
   end
-  local text = maki.fs.read(maki.fs.normalize("~/.maki/auth/acme.json"))
+  local text = maki.fs.read(maki.fs.normalize("~/.local/state/maki/auth/acme.json"))
   if not text then
     return nil
   end

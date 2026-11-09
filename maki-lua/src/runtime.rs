@@ -6,7 +6,7 @@ use std::fmt::Display;
 use std::future::{Future, pending};
 use std::panic::catch_unwind;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::ptr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
@@ -26,7 +26,7 @@ use maki_agent::tools::{
     ToolSource,
 };
 use maki_agent::{
-    AgentSeed, BufferSnapshot, CallScope, SessionEndReason, SessionMailbox, SharedBuf,
+    AgentSeed, BufferSnapshot, CallScope, Cutter, SessionEndReason, SessionMailbox, SharedBuf,
     SnapshotLine, SnapshotSpan, SpanStyle, TaskHome, UiWaker, receipt_tag,
 };
 use mlua::chunk::{Chunk, ChunkMode, Compiler};
@@ -35,6 +35,8 @@ use serde_json::Value;
 use strum::{EnumString, IntoStaticStr};
 use tokio::runtime::Handle;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::oneshot;
+use tokio::sync::oneshot::error::TryRecvError;
 use tokio::task::{LocalSet, spawn_local, yield_now};
 use tokio::time::{sleep, sleep_until, timeout, timeout_at};
 
@@ -47,7 +49,6 @@ use crate::agent_autocmd::HostEvent;
 use crate::api::action::{ActionStore, clear_plugin_actions};
 use crate::api::agent::adopt_session;
 use crate::api::autocmd::AutocmdStore;
-use crate::api::r#fn::{JobEvent, JobOwner, JobStore, deliver_job_event};
 use crate::api::fs::publish_walks;
 use crate::api::keymap::KeymapReader;
 use crate::api::keymap::{KeybindTicket, KeymapStore, KeymapWriter, release_mode};
@@ -61,7 +62,7 @@ use crate::api::slot::{
     PLAN_FORM_SLOT, SlotLayer, SlotStore, layer_plugins, run_host_chain, run_host_chain_with,
 };
 use crate::api::tool::{
-    LuaTool, PendingRules, PendingTool, PendingTools, ToolCallReply, ToolPermission, resolve_rules,
+    DeclaredReach, LuaTool, PendingRules, PendingTool, PendingTools, ToolCallReply, resolve_rules,
 };
 use crate::api::ui::buf::{BufHandle, BufferStore};
 use crate::api::ui::marks::{InputRuleStore, InputRulesReader};
@@ -77,10 +78,11 @@ use crate::api::util::pair::{Pair, err_pair};
 use crate::api::util::setup::ConfigStore;
 use crate::api::{Owner, create_maki_global};
 use crate::background::{
-    BackgroundInfo, BackgroundTask, BackgroundTasks, Fire, Kind, Lifetime, MovedEnd, Stop, StopMark,
+    BackgroundInfo, BackgroundTask, BackgroundTasks, Fire, Kind, Lifetime, MovedEnd,
 };
 use crate::docs_render;
 use crate::error::PluginError;
+use crate::jobs::{JobEvent, JobOwner, JobReaper, JobStore, deliver_job_event};
 use crate::key_lint::KeyLint;
 use crate::loader::EventHandle;
 use crate::pack::Interaction;
@@ -484,7 +486,7 @@ pub enum Request {
         input: Value,
         ctx: Box<LuaCtx>,
         deadline: Option<Instant>,
-        reply: flume::Sender<ToolCallReply>,
+        reply: oneshot::Sender<ToolCallReply>,
         live: Option<LiveCtx>,
         /// Runs on the caller's slot instead of taking one of its own.
         /// See [`under_inflight_slot`].
@@ -521,25 +523,25 @@ pub enum Request {
         plugin: Arc<str>,
         tool: Arc<str>,
         input: Value,
-        reply: flume::Sender<HeaderResult>,
+        reply: oneshot::Sender<HeaderResult>,
     },
     ComputePermissionScopes {
         plugin: Arc<str>,
         tool: Arc<str>,
         input: Value,
-        reply: flume::Sender<Option<PermissionScopes>>,
+        reply: oneshot::Sender<Option<PermissionScopes>>,
     },
     /// A host-owned slot chain (`tool.<name>.input`, `tool.<name>.output`,
     /// `agent.*`). Only sent when the slot has layers, so the idle case never
     /// reaches the request loop at all.
     RunHook {
         run: HookRun,
-        reply: flume::Sender<Verdict>,
+        reply: oneshot::Sender<Verdict>,
     },
     /// The `permission.prompt` chain, sent only when it has layers.
     RunPrompt {
         run: PromptRun,
-        reply: flume::Sender<Option<LayerAnswer>>,
+        reply: oneshot::Sender<Option<LayerAnswer>>,
     },
     ClearPlugin {
         plugin: Arc<str>,
@@ -621,7 +623,7 @@ pub enum Request {
         input: Value,
         live: LiveCtx,
         ctx: Box<LuaCtx>,
-        reply: flume::Sender<()>,
+        reply: oneshot::Sender<()>,
         /// See [`Request::CallTool::nested`].
         nested: bool,
     },
@@ -787,8 +789,9 @@ pub(crate) struct TaskCell {
     /// The model call this task serves, shared with the calls it nests. Once
     /// the call moved to the background no deadline ends any of them.
     pub(crate) call: Option<Arc<CallScope>>,
-    /// `ctx:on_background`, at most one per call.
-    pub(crate) background_hook: Option<RegistryKey>,
+    /// `ctx:on_background`, at most one per call. Shared, so
+    /// [`LiveTask::try_move`] can resolve it outside the cell lock.
+    pub(crate) background_hook: Option<Arc<RegistryKey>>,
     /// Notified by `ctx:set_deadline`, so [`until_abandoned`] re-arms on the
     /// new deadline instead of staying parked on the one it started with.
     pub(crate) deadline_changed: Event,
@@ -968,14 +971,6 @@ impl TaskCell {
     fn renew_kill_grace(&self) {
         self.kill_at.set(None);
     }
-
-    /// Hooks of a task that ended without a cancel never fire, so this is
-    /// the only thing that unpins their closures and captures.
-    fn clear_cancel_hooks(&mut self, lua: &Lua) {
-        for key in self.cancel_hooks.drain(..) {
-            lua.remove_registry_value(key).ok();
-        }
-    }
 }
 
 pub(crate) type TaskHandle = Arc<Mutex<TaskCell>>;
@@ -1020,14 +1015,14 @@ fn not_movable(reason: &str) -> MoveOutcome {
 /// comes first answers and the other finds it gone. A move leaves its tail's
 /// sender behind, so the final reply of a moved call takes `reply` too.
 struct CallAnswer {
-    reply: RefCell<Option<flume::Sender<ToolCallReply>>>,
+    reply: RefCell<Option<oneshot::Sender<ToolCallReply>>>,
     /// The call's [`MAX_INFLIGHT_TOOLS`] slot. A move gives it back, so long
     /// background work never starves foreground calls.
     slot: RefCell<Option<GateGuard>>,
 }
 
 impl CallAnswer {
-    fn new(reply: flume::Sender<ToolCallReply>, slot: Option<GateGuard>) -> Self {
+    fn new(reply: oneshot::Sender<ToolCallReply>, slot: Option<GateGuard>) -> Self {
         Self {
             reply: RefCell::new(Some(reply)),
             slot: RefCell::new(slot),
@@ -1038,7 +1033,7 @@ impl CallAnswer {
         self.reply
             .borrow()
             .as_ref()
-            .is_some_and(|tx| !tx.is_disconnected())
+            .is_some_and(|tx| !tx.is_closed())
     }
 
     /// The final reply goes to the dispatcher, or once the call moved, to
@@ -1082,14 +1077,13 @@ impl LiveTask {
             return refusal;
         }
         let _moving = self.move_lock.lock().await;
-        let (hook, call) = {
+        // Resolved outside the lock: allocating can run the GC, and a
+        // finalizer may want this very cell.
+        let (hook_key, call) = {
             let cell = lock_cell(&self.handle);
-            let hook = cell
-                .background_hook
-                .as_ref()
-                .and_then(|key| lua.registry_value::<Function>(key).ok());
-            (hook, cell.call.clone())
+            (cell.background_hook.clone(), cell.call.clone())
         };
+        let hook = hook_key.and_then(|key| lua.registry_value::<Function>(&key).ok());
         let (Some(hook), Some(call)) = (hook, call) else {
             return MoveOutcome::NoHook;
         };
@@ -1244,10 +1238,7 @@ impl LiveTask {
         };
         // An Esc that fired the run while the call was moving reaches it
         // through the claim. The user stopped it, so its end is quiet.
-        let stop = StopMark::default();
-        if call.cancel().is_cancelled() {
-            stop.mark(Stop::User);
-        }
+        let stopped = call.cancel().is_cancelled().then_some(Cutter::User);
         let entry = BackgroundTask {
             info: BackgroundInfo {
                 id: self.id.clone(),
@@ -1256,15 +1247,16 @@ impl LiveTask {
                 kind: Kind::Call {
                     tool: Arc::clone(&self.tool),
                 },
-                running: true,
                 started_at: now_epoch(),
                 cost: None,
             },
             session: chat,
             task: None,
             lifetime: Lifetime::Call,
-            stop,
-            cancel: Fire::Owned(cancel),
+            stopped,
+            control: None,
+            replied: false,
+            cancel: Fire::Call(cancel),
             mailbox: Some(mailbox.clone()),
         };
         let registry = BackgroundTasks::of(lua);
@@ -1274,7 +1266,7 @@ impl LiveTask {
             return MoveOutcome::NotMovable(e);
         }
         let ui = host_ui(lua);
-        let (tail_tx, tail_rx) = flume::bounded(1);
+        let (tail_tx, tail_rx) = oneshot::channel();
         receipt.result = receipt.result.map(|text| {
             format!(
                 "{text}\n\n{}",
@@ -1283,7 +1275,7 @@ impl LiveTask {
         });
         receipt.moved = Some(MovedCall {
             result: Box::pin(async move {
-                let reply: ToolCallReply = tail_rx.recv_async().await.ok()?;
+                let reply: ToolCallReply = tail_rx.await.ok()?;
                 Some(reply.into_exec_result())
             }),
             land: {
@@ -1476,7 +1468,7 @@ fn cut_reason(lua: &Lua, handle: &TaskHandle, reason: KillReason) -> &'static st
     let call = lock_cell(handle).call.clone();
     let by_model = call.is_some_and(|call| {
         lua.app_data_ref::<BackgroundTasks>()
-            .is_some_and(|registry| registry.stopped_by(call.id()) == Stop::Model)
+            .is_some_and(|registry| registry.stopped_by(call.id()) == Some(Cutter::Parent))
     });
     if by_model { STOPPED_MSG } else { CANCELLED_MSG }
 }
@@ -2095,10 +2087,20 @@ impl Blame {
 /// [`Self::enter`] for Lua called synchronously.
 pub(crate) struct TaskScope {
     lua: Lua,
-    handle: TaskHandle,
-    /// Dropped after `Drop::drop` runs, so jobs die before bufs can clear.
+    /// Before `bufs_claim`, so the task ends before its bufs can clear.
+    end: ScopeEnd,
     /// Warm entries clone it to keep buf handlers alive past completion.
     bufs_claim: Arc<BufsClaim>,
+}
+
+/// Ends the task when its scope drops. A scope parked in a coroutine dies
+/// with it inside a GC sweep, where any VM call aborts, so this holds no
+/// `Lua`. It grabs the job reaper and `BackgroundTasks` up front instead,
+/// and neither gets replaced once scopes run.
+struct ScopeEnd {
+    handle: TaskHandle,
+    jobs: JobReaper,
+    background: BackgroundTasks,
 }
 
 impl TaskScope {
@@ -2108,7 +2110,11 @@ impl TaskScope {
         lock_cell(&handle).bufs_claim = Arc::downgrade(&claim);
         Self {
             lua: lua.clone(),
-            handle,
+            end: ScopeEnd {
+                handle,
+                jobs: with_jobs(lua, |store| store.reaper()),
+                background: BackgroundTasks::of(lua),
+            },
             bufs_claim: claim,
         }
     }
@@ -2126,12 +2132,12 @@ impl TaskScope {
     /// silent kill into a loud `jobstart` error.
     pub(crate) fn delivery(lua: &Lua) -> Self {
         let scope = Self::detached(lua);
-        lock_cell(&scope.handle).owns_jobs = false;
+        lock_cell(scope.handle()).owns_jobs = false;
         scope
     }
 
     pub(crate) fn handle(&self) -> &TaskHandle {
-        &self.handle
+        &self.end.handle
     }
 
     pub(crate) fn bufs_claim(&self) -> Arc<BufsClaim> {
@@ -2139,14 +2145,14 @@ impl TaskScope {
     }
 
     pub(crate) fn scope_future<F>(&self, inner: F) -> ScopedFuture<F> {
-        ScopedFuture::new(self.lua.clone(), Arc::clone(&self.handle), inner)
+        ScopedFuture::new(self.lua.clone(), Arc::clone(self.handle()), inner)
     }
 
     /// Makes this the active task until the guard drops. Only for Lua called
     /// without yielding: a guard held across an await would leak the task
     /// into whatever the executor runs meanwhile.
     pub(crate) fn enter(&self) -> AppDataGuard<'_, TaskHandle> {
-        AppDataGuard::publish(&self.lua, Some(Arc::clone(&self.handle)))
+        AppDataGuard::publish(&self.lua, Some(Arc::clone(self.handle())))
     }
 }
 
@@ -2320,37 +2326,62 @@ pub(crate) async fn run_command_scoped<F: Future>(
 
 async fn run_scoped<F: Future>(lua: &Lua, scope: TaskScope, fut: F) -> F::Output {
     let handle = Arc::clone(scope.handle());
-    let owner = JobOwner::Task(lock_cell(&handle).id);
+    let (owner, cancel) = {
+        let cell = lock_cell(&handle);
+        (JobOwner::Task(cell.id), cell.cancel.clone())
+    };
     let mut jobs_changed = with_jobs(lua, |store| store.subscribe());
+    let (stop_pump, pump_stopping) = CancelToken::new();
+    let next_event = || with_jobs(lua, |store| store.next_event(&owner));
     let pump = async {
-        while jobs_changed.changed().await.is_ok() {
+        let mut stopping = pin!(pump_stopping.cancelled());
+        loop {
+            tokio::select! {
+                biased;
+                () = &mut stopping => break,
+                Ok(()) = jobs_changed.changed() => {}
+            }
             deliver_pending(lua, usize::MAX, || {
-                with_jobs(lua, |store| store.next_event(&owner))
+                (!pump_stopping.is_cancelled()).then(next_event).flatten()
             })
             .await;
         }
+        deliver_pending(lua, FINAL_DRAIN_BUDGET, next_event).await;
     };
     let out = scope
         .scope_future(async {
-            tokio::select! {
+            let mut pump = pin!(pump);
+            let out = tokio::select! {
                 biased;
                 out = fut => out,
-                () = pump => unreachable!("the job pump never ends"),
+                () = &mut pump => unreachable!("only the body ending stops the job pump"),
+            };
+            // The pump already popped the event in hand, so dropping it here
+            // would kill that callback halfway. Stopped instead, it finishes the
+            // callback and delivers a bounded tail before the scope reaps the
+            // jobs. A cancelled or expired task skips all that, so its {out}
+            // still beats the outer `until_abandoned`.
+            stop_pump.cancel();
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {}
+                () = deadline_lapsed(&handle) => {}
+                () = pump => {}
             }
+            out
         })
-        .await;
-    // `select!` drops the pump the moment {fut} wins, so one last pass under the
-    // same scope delivers whatever arrived in between; the scope teardown
-    // right after reaps any task job. Only a callback caught mid-suspend at
-    // that instant is lost, never a whole event: `deliver_pending` leaves
-    // events in the channel until the delivery that records them starts.
-    scope
-        .scope_future(deliver_pending(lua, FINAL_DRAIN_BUDGET, || {
-            with_jobs(lua, |store| store.next_event(&owner))
-        }))
         .await;
     drop(scope);
     out
+}
+
+/// A `Drop` that may run inside a GC sweep can't call
+/// `remove_registry_value`, so it just drops its `RegistryKey`. mlua keeps
+/// that value pinned until a later `create_registry_value` reuses the slot,
+/// or until this expires it at turn end.
+fn collect_turn_garbage(lua: &Lua) {
+    lua.expire_registry_values();
+    lua.gc_collect().ok();
 }
 
 async fn run_host_hook(lua: &Lua, hook: HostHook) {
@@ -2360,7 +2391,7 @@ async fn run_host_hook(lua: &Lua, hook: HostHook) {
             let is_turn_end = event == TURN_END_EVENT;
             crate::api::autocmd::dispatch(lua.clone(), event, None, data).await;
             if is_turn_end {
-                lua.gc_collect().ok();
+                collect_turn_garbage(lua);
             }
         }
         HostHook::EndSession(end) => {
@@ -2427,27 +2458,23 @@ async fn deliver_job(lua: Lua, job_id: u32, delivering: Rc<RefCell<HashSet<u32>>
     delivering.borrow_mut().remove(&job_id);
 }
 
-impl Drop for TaskScope {
+impl Drop for ScopeEnd {
     fn drop(&mut self) {
-        let task_id = {
+        let (task_id, owns_jobs) = {
             let mut cell = lock_cell(&self.handle);
-            cell.clear_cancel_hooks(&self.lua);
-            if let Some(key) = cell.background_hook.take() {
-                self.lua.remove_registry_value(key).ok();
-            }
-            cell.id
+            // Hooks of a task that ended without a cancel never fire.
+            // Dropping their keys here is what lets `collect_turn_garbage`
+            // unpin their closures and captures.
+            cell.cancel_hooks.clear();
+            cell.background_hook = None;
+            (cell.id, cell.owns_jobs)
         };
-        with_jobs(&self.lua, |store| {
-            let leftovers = store.kill_owner(&self.lua, &JobOwner::Task(task_id));
-            if !leftovers.is_empty() {
-                tracing::warn!(
-                    task = task_id,
-                    jobs = ?leftovers,
-                    "scope finished with live jobs; they were killed"
-                );
-            }
-        });
-        BackgroundTasks::of(&self.lua).end_task(task_id);
+        // The pump makes a delivery scope for every batch, and it owns no
+        // jobs, so waking the pump for it would only spin it again.
+        if owns_jobs {
+            self.jobs.task_ended(task_id);
+        }
+        self.background.end_task(task_id);
     }
 }
 
@@ -2522,6 +2549,7 @@ pub(crate) fn with_jobs<R>(lua: &Lua, f: impl FnOnce(&mut JobStore) -> R) -> R {
     let mut store = lua
         .app_data_mut::<JobStore>()
         .expect("job store was just installed");
+    store.reap_ended(lua);
     f(&mut store)
 }
 
@@ -3267,8 +3295,7 @@ fn spawn_deferred_callback(lua: &Lua, gate: &Rc<InflightGate>, cb: DeferredCallb
         }
         let run = async {
             let func: Function = lua.registry_value(&cb.func)?;
-            let thread = lua.create_thread(func)?;
-            thread.into_async::<()>(())?.await
+            func.call_async::<()>(()).await
         };
         let run = Narrowed::under(&lua, cb.ceiling.clone(), run);
         if let Err(e) = run_detached(&lua, run).await {
@@ -3326,7 +3353,7 @@ fn spawn_keybind_callback(lua: &Lua, gate: &Rc<InflightGate>, mut ticket: Keybin
     };
     // Dropped when the handler returns, which is how the task below learns it
     // may hand the slot back before the hold lapses.
-    let (done_tx, done_rx) = flume::bounded::<()>(1);
+    let (done_tx, done_rx) = oneshot::channel::<()>();
     let handler_lua = lua.clone();
     let handler_plugin = Arc::clone(&plugin);
     spawn_local(async move {
@@ -3343,10 +3370,7 @@ fn spawn_keybind_callback(lua: &Lua, gate: &Rc<InflightGate>, mut ticket: Keybin
     let gate = Rc::clone(gate);
     spawn_local(async move {
         let _guard = GateGuard::new(&gate);
-        if timeout(KEYBIND_GATE_HOLD, done_rx.recv_async())
-            .await
-            .is_err()
-        {
+        if timeout(KEYBIND_GATE_HOLD, done_rx).await.is_err() {
             tracing::warn!(key = %key.notation(), ticket = id, plugin = %plugin, "keybind handler outlived its drain-barrier slot");
         }
     });
@@ -3549,6 +3573,34 @@ struct ToolKeys {
     describe: Option<RegistryKey>,
 }
 
+impl ToolKeys {
+    fn release(self, lua: &Lua, plugin: &str) {
+        let Self {
+            handler,
+            header,
+            restore,
+            start,
+            permission_scopes,
+            describe,
+        } = self;
+        let keys = [
+            ("handler", Some(handler)),
+            ("header", header),
+            ("restore", restore),
+            ("start", start),
+            ("permission_scopes", permission_scopes),
+            ("describe", describe),
+        ];
+        for (slot, key) in keys {
+            if let Some(key) = key
+                && let Err(e) = lua.remove_registry_value(key)
+            {
+                tracing::warn!(plugin, slot, error = %e, "failed to drop lua tool key");
+            }
+        }
+    }
+}
+
 struct PluginOwner {
     tools: HashMap<Arc<str>, ToolKeys>,
     revision_guard: Option<Arc<maki_pack::lock::Lock>>,
@@ -3619,7 +3671,6 @@ impl LuaRuntime {
         })?;
 
         lua.set_app_data(CommandHandlerMap::new());
-        lua.set_app_data(JobStore::new());
         lua.set_app_data(SpawnQueue::new());
         lua.set_app_data(DeferQueue::new());
         lua.set_app_data(SpawnedTasks::default());
@@ -3743,30 +3794,8 @@ impl LuaRuntime {
         if let Some(owner) = self.plugins.borrow_mut().remove(name) {
             unload_ui(&self.lua, name);
             revision_guard = owner.revision_guard;
-            for (_, tk) in owner.tools {
-                if let Err(e) = self.lua.remove_registry_value(tk.handler) {
-                    tracing::warn!(plugin = name, error = %e, "failed to drop lua handler key");
-                }
-                if let Some(sk) = tk.header
-                    && let Err(e) = self.lua.remove_registry_value(sk)
-                {
-                    tracing::warn!(plugin = name, error = %e, "failed to drop lua header key");
-                }
-                if let Some(sk) = tk.permission_scopes
-                    && let Err(e) = self.lua.remove_registry_value(sk)
-                {
-                    tracing::warn!(plugin = name, error = %e, "failed to drop lua permission_scopes key");
-                }
-                if let Some(sk) = tk.start
-                    && let Err(e) = self.lua.remove_registry_value(sk)
-                {
-                    tracing::warn!(plugin = name, error = %e, "failed to drop lua start key");
-                }
-                if let Some(sk) = tk.describe
-                    && let Err(e) = self.lua.remove_registry_value(sk)
-                {
-                    tracing::warn!(plugin = name, error = %e, "failed to drop lua describe key");
-                }
+            for tk in owner.tools.into_values() {
+                tk.release(&self.lua, name);
             }
         }
         if let Some(mut cmd_map) = self.lua.app_data_mut::<CommandHandlerMap>()
@@ -3800,11 +3829,8 @@ impl LuaRuntime {
     }
 
     async fn run_hint_callback(&self, plugin: &str, func: Function) -> Option<String> {
-        let result: mlua::Result<LuaValue> = run_detached(&self.lua, async {
-            let thread = self.lua.create_thread(func)?;
-            thread.into_async::<LuaValue>(())?.await
-        })
-        .await;
+        let result: mlua::Result<LuaValue> =
+            run_detached(&self.lua, func.call_async::<LuaValue>(())).await;
         match result {
             Ok(LuaValue::String(s)) => Some(s.to_string_lossy()),
             Ok(LuaValue::Nil) => None,
@@ -4118,26 +4144,17 @@ impl LuaRuntime {
             .iter()
             .map(|t| {
                 let tool: Arc<dyn Tool> = Arc::new(LuaTool {
-                    name: Arc::clone(&t.name),
-                    description: t.description.clone(),
-                    schema: t.schema,
-                    audience: t.audience,
-                    kind: t.kind.clone(),
+                    meta: t.meta.clone(),
                     tx: self.tx.clone(),
                     plugin: Arc::clone(&name),
                     has_header_fn: t.header_key.is_some(),
                     has_start_fn: t.start_key.is_some(),
-                    permission: t.permission.as_ref().map(ToolPermission::kind),
-                    mutable_path_field: t.mutable_path_field.clone(),
-                    timeout: t.timeout,
-                    start_annotation: t.start_annotation.clone(),
-                    examples: t.examples.clone(),
+                    permission: t.permission.as_ref().map(DeclaredReach::kind),
                     has_describe_fn: t.describe_key.is_some(),
-                    background_only: t.background_only.clone(),
                 });
                 (
                     tool,
-                    ToolSource::Lua {
+                    ToolSource {
                         plugin: Arc::clone(&name),
                     },
                 )
@@ -4164,13 +4181,15 @@ impl LuaRuntime {
             .into_iter()
             .map(|t| {
                 (
-                    t.name,
+                    t.meta.name,
                     ToolKeys {
                         handler: t.handler_key,
                         header: t.header_key,
                         restore: t.restore_key,
                         start: t.start_key,
-                        permission_scopes: t.permission.and_then(|p| p.scopes?.callback_key()),
+                        permission_scopes: t
+                            .permission
+                            .and_then(|p| p.into_scopes()?.callback_key()),
                         describe: t.describe_key,
                     },
                 )
@@ -4331,6 +4350,167 @@ impl LuaRuntime {
         .await?;
         Ok(config_store.lock().unwrap().take())
     }
+
+    async fn run_pack_loader(
+        &mut self,
+        declared: crate::api::pack::Declared,
+        context: LoadContext,
+    ) -> LoadResult {
+        let name = declared.spec.name.clone();
+        let (function, argument) = (|| {
+            let crate::api::pack::LoadMode::Custom(loader) = &declared.load else {
+                return Err(mlua::Error::runtime("run_pack_loader: not a custom load"));
+            };
+            let function = self.lua.registry_value::<Function>(loader.as_ref())?;
+            let argument = self.lua.create_table()?;
+            argument.set(
+                "spec",
+                crate::api::pack::spec_to_lua(&self.lua, &declared.spec, declared.data.as_ref())?,
+            )?;
+            // The same directory the chunks would load from, read back rather
+            // than passed twice.
+            argument.set(
+                "path",
+                context
+                    .plugin_dir
+                    .as_ref()
+                    .map(|dir| dir.display().to_string()),
+            )?;
+            Ok::<_, mlua::Error>((function, argument))
+        })()
+        .map_err(|source| PluginError::Lua {
+            plugin: name.clone(),
+            source,
+        })?;
+        self.load_source(
+            Arc::from(name.as_str()),
+            PluginLoad::Function { function, argument },
+            context,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_plan_action(
+        &self,
+        gate: &Rc<InflightGate>,
+        session: String,
+        generation: u64,
+        row: usize,
+        path: String,
+        parallel: bool,
+        reply: flume::Sender<PlanActionOutcome>,
+    ) {
+        let found = self
+            .lua
+            .app_data_ref::<PlanRowHandlers>()
+            .ok_or(PLAN_HANDLERS_MISSING_ERR)
+            .and_then(|handlers| {
+                let handler = handlers.handler(&session, generation, row)?;
+                let func = self
+                    .lua
+                    .registry_value::<Function>(&handler.key)
+                    .map_err(|_| PLAN_HANDLER_GONE_ERR)?;
+                Ok((Arc::clone(&handler.plugin), func))
+            });
+        let (plugin, func) = match found {
+            Ok(found) => found,
+            Err(reason) => {
+                tracing::warn!(
+                    session,
+                    generation,
+                    row,
+                    reason,
+                    "plan form row pick reached no handler"
+                );
+                let _ = reply.send(PlanActionOutcome::Failed);
+                return;
+            }
+        };
+        let lua = self.lua.clone();
+        let gate = Rc::clone(gate);
+        spawn_local(async move {
+            let run = async {
+                let opts = row_handler_opts(&lua, &session, &path, parallel)?;
+                func.call_async::<LuaValue>(opts).await
+            };
+            // Handler-then-action: the row's built-in outcome follows unless
+            // the handler answered `false` or failed.
+            let deadline = Instant::now() + PLAN_ROW_HANDLER_DEADLINE;
+            let outcome = match run_awaited(&lua, &gate, CancelToken::none(), deadline, run).await {
+                Ok(Ok(LuaValue::Boolean(false))) => PlanActionOutcome::Vetoed,
+                Ok(Ok(_)) => PlanActionOutcome::Proceed,
+                Ok(Err(e)) => {
+                    let error = format!("row {row}: {}", strip_traceback(&e));
+                    record_error(&lua, &plugin, ErrorSeam::PlanRow, error);
+                    PlanActionOutcome::Failed
+                }
+                Err(reason) => {
+                    tracing::warn!(plugin = %plugin, row, reason, "plan form row handler abandoned");
+                    PlanActionOutcome::Failed
+                }
+            };
+            let _ = reply.send(outcome);
+        });
+    }
+
+    fn click_tool(
+        &self,
+        gate: &Rc<InflightGate>,
+        restores: &Rc<RestoreTracker>,
+        tool_use_id: String,
+        row: usize,
+        fallback: Option<Box<ClickFallback>>,
+    ) {
+        let handle = self
+            .live_tasks
+            .borrow()
+            .get(&tool_use_id)
+            .map(|task| Arc::clone(&task.handle))
+            .or_else(|| {
+                self.warm_tools
+                    .borrow()
+                    .iter()
+                    .find(|w| w.id == tool_use_id)
+                    .map(|w| Arc::clone(&w.handle))
+            });
+        let func = handle
+            .as_ref()
+            .and_then(resolve_root_buf)
+            .and_then(|root| crate::api::ui::buf::click_fn(&root));
+        let (Some(handle), Some(func)) = (handle, func) else {
+            // No handle, or a buf without a click handler (some plugins wire
+            // clicks only in restore): either way the fallback restore serves
+            // it.
+            if let Some(fb) = fallback {
+                spawn_restore(gate, restores, self, fb.item, fb.event_tx);
+            } else {
+                tracing::debug!(tool_use_id, "unhandled click ignored");
+            }
+            return;
+        };
+        let lua = self.lua.clone();
+        let gate = Rc::clone(gate);
+        let arg = match self.lua.create_table() {
+            Ok(t) => {
+                let _ = t.set("row", row);
+                LuaValue::Table(t)
+            }
+            Err(_) => LuaValue::Nil,
+        };
+        spawn_local(async move {
+            let slot = Some(gate.acquire().await);
+            let call = covered(
+                slot,
+                ScopedFuture::new(lua.clone(), handle, func.call_async::<()>(arg)),
+            );
+            if let Err(e) = call.await {
+                let error = format!("{tool_use_id}: {}", strip_traceback(&e));
+                record_callback_error(&lua, &func, ErrorSeam::Click, error);
+            }
+        });
+    }
 }
 
 /// Resolves a plugin callback and converts its json input, warning on
@@ -4417,7 +4597,6 @@ async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Opti
         (lua.registry_value::<Function>(key).ok()?, pname)
     };
     let input_lua = json_to_lua(lua, &item.input).ok()?;
-    let thread = lua.create_thread(func).ok()?;
 
     let (dummy_tx, _) = flume::unbounded();
     let cell = TaskCell::new(
@@ -4438,9 +4617,7 @@ async fn restore_item(lua: &Lua, plugins: &PluginMap, item: RestoreItem) -> Opti
             reason: item.reason,
         }))
         .ok()?;
-    let inner = thread
-        .into_async::<LuaValue>((input_lua, &*item.output, item.is_error, ctx))
-        .ok()?;
+    let inner = func.call_async::<LuaValue>((input_lua, &*item.output, item.is_error, ctx));
     let scope = TaskScope::new(lua, cell);
     lock_cell(scope.handle()).inline_spawn = Some(Vec::new());
     let ret = scope
@@ -4589,6 +4766,10 @@ fn extract_restore_reply(ret: &LuaValue) -> Option<RestoreReply> {
             });
             (body, header)
         }
+        // A nil restore leaves the output to the host, as a live call with no
+        // body does. Returning None here would also lose the header that
+        // restore_item builds from the tool's `header` fn.
+        LuaValue::Nil => (None, None),
         _ => return None,
     };
     Some(RestoreReply { body, header })
@@ -4600,7 +4781,7 @@ fn extract_restore_reply(ret: &LuaValue) -> Option<RestoreReply> {
 fn cancel_hook_reply(
     lua: &Lua,
     handle: &TaskHandle,
-    finish_rx: &flume::Receiver<ToolCallReply>,
+    finish_rx: &mut oneshot::Receiver<ToolCallReply>,
     reason: KillReason,
 ) -> Option<ToolCallReply> {
     fire_cancel_hooks(lua, handle, reason);
@@ -4609,8 +4790,8 @@ fn cancel_hook_reply(
 
 /// The jobs are gone, so all that can still answer is a `ctx:finish()` already
 /// on its way. A dropped `ctx` ends the wait early: nothing can finish any more.
-async fn late_finish(finish_rx: &flume::Receiver<ToolCallReply>) -> ToolCallReply {
-    timeout(FINISH_GRACE, finish_rx.recv_async())
+async fn late_finish(finish_rx: &mut oneshot::Receiver<ToolCallReply>) -> ToolCallReply {
+    timeout(FINISH_GRACE, finish_rx)
         .await
         .ok()
         .and_then(Result::ok)
@@ -4624,7 +4805,7 @@ async fn dispatch_async(
     handle: TaskHandle,
     plugin: &str,
     tool: &str,
-    finish_rx: flume::Receiver<ToolCallReply>,
+    mut finish_rx: oneshot::Receiver<ToolCallReply>,
 ) -> ToolCallReply {
     let (owner, cancel) = {
         let cell = lock_cell(&handle);
@@ -4633,7 +4814,7 @@ async fn dispatch_async(
     let mut jobs_changed = with_jobs(lua, |store| store.subscribe());
     if with_jobs(lua, |store| store.is_empty(&owner)) {
         lua.gc_collect().ok();
-        return late_finish(&finish_rx).await;
+        return late_finish(&mut finish_rx).await;
     }
 
     loop {
@@ -4642,7 +4823,7 @@ async fn dispatch_async(
         // before `timeout_reply`, which locks the same cell.
         let kill = lock_cell(&handle).doomed(Instant::now());
         if let Some(reason) = kill {
-            if let Some(reply) = cancel_hook_reply(lua, &handle, &finish_rx, reason) {
+            if let Some(reply) = cancel_hook_reply(lua, &handle, &mut finish_rx, reason) {
                 return reply;
             }
             return match reason {
@@ -4653,10 +4834,10 @@ async fn dispatch_async(
 
         match finish_rx.try_recv() {
             Ok(reply) => return reply,
-            Err(flume::TryRecvError::Disconnected) => {
+            Err(TryRecvError::Closed) => {
                 return ToolCallReply::err(NIL_WITHOUT_FINISH_MSG);
             }
-            Err(flume::TryRecvError::Empty) => {}
+            Err(TryRecvError::Empty) => {}
         }
 
         if let Some((job_id, event)) = with_jobs(lua, |store| store.next_event(&owner)) {
@@ -4668,7 +4849,7 @@ async fn dispatch_async(
         }
 
         if with_jobs(lua, |store| store.is_empty(&owner)) {
-            return late_finish(&finish_rx).await;
+            return late_finish(&mut finish_rx).await;
         }
 
         // A doomed task goes first, so its cancel hooks still get the last word
@@ -4677,7 +4858,7 @@ async fn dispatch_async(
             biased;
             () = cancel.cancelled() => {}
             () = deadline_lapsed(&handle) => {}
-            reply = finish_rx.recv_async() => {
+            reply = &mut finish_rx => {
                 return reply.unwrap_or_else(|_| ToolCallReply::err(NIL_WITHOUT_FINISH_MSG));
             }
             Ok(()) = jobs_changed.changed() => {}
@@ -5252,8 +5433,7 @@ async fn run_tool_start(
     let run = async {
         let input_lua = json_to_lua(lua, &input)?;
         let ctx_ud = lua.create_userdata(*ctx)?;
-        let thread = lua.create_thread(func)?;
-        thread.into_async::<LuaValue>((input_lua, ctx_ud))?.await
+        func.call_async::<LuaValue>((input_lua, ctx_ud)).await
     };
     if let Err(e) = scope.scope_future(run).await {
         record_error(lua, plugin, ErrorSeam::Start, tool_error(tool, &e));
@@ -5294,7 +5474,7 @@ async fn run_tool_call(
         return ToolCallReply::err("plugin host shutting down");
     }
 
-    let (finish_tx, finish_rx) = flume::bounded::<ToolCallReply>(1);
+    let (finish_tx, mut finish_rx) = oneshot::channel::<ToolCallReply>();
     ctx.finish_tx = Some(finish_tx);
     let cancel = ctx.cancel.clone();
 
@@ -5378,7 +5558,7 @@ async fn run_tool_call(
             // hooks run: they lock the same cell.
             Err(e) => {
                 let kill = lock_cell(&handle).doomed(Instant::now());
-                match kill.and_then(|reason| cancel_hook_reply(&lua, &handle, &finish_rx, reason)) {
+                match kill.and_then(|reason| cancel_hook_reply(&lua, &handle, &mut finish_rx, reason)) {
                     // The reply wins, but a doom-window error is still the
                     // only trace of a plugin bug that raised on its way out.
                     Some(reply) => {
@@ -5763,9 +5943,8 @@ pub fn spawn(
                             });
                         }
                         Request::TakePackOps { reply } => {
-                            let ops = with_packs(&rt.lua, |packs| {
-                                std::mem::take(&mut packs.pending)
-                            });
+                            let ops =
+                                with_packs(&rt.lua, |packs| std::mem::take(&mut packs.pending));
                             let _ = reply.send(ops);
                         }
                         Request::SealPackOps { reply } => {
@@ -5793,73 +5972,9 @@ pub fn spawn(
                             path,
                             parallel,
                             reply,
-                        } => {
-                            let found = rt
-                                .lua
-                                .app_data_ref::<PlanRowHandlers>()
-                                .ok_or(PLAN_HANDLERS_MISSING_ERR)
-                                .and_then(|handlers| {
-                                    let handler = handlers.handler(&session, generation, row)?;
-                                    let func = rt
-                                        .lua
-                                        .registry_value::<Function>(&handler.key)
-                                        .map_err(|_| PLAN_HANDLER_GONE_ERR)?;
-                                    Ok((Arc::clone(&handler.plugin), func))
-                                });
-                            match found {
-                                Ok((plugin, func)) => {
-                                    let lua = rt.lua.clone();
-                                    let gate = Rc::clone(&gate);
-                                    spawn_local(async move {
-                                        let run = async {
-                                            let opts =
-                                                row_handler_opts(&lua, &session, &path, parallel)?;
-                                            let thread = lua.create_thread(func)?;
-                                            thread.into_async::<LuaValue>(opts)?.await
-                                        };
-                                        // Handler-then-action: the row's
-                                        // built-in outcome follows unless the
-                                        // handler answered `false` or failed.
-                                        let deadline =
-                                            Instant::now() + PLAN_ROW_HANDLER_DEADLINE;
-                                        let outcome = match run_awaited(
-                                            &lua,
-                                            &gate,
-                                            CancelToken::none(),
-                                            deadline,
-                                            run,
-                                        )
-                                        .await
-                                        {
-                                            Ok(Ok(LuaValue::Boolean(false))) => {
-                                                PlanActionOutcome::Vetoed
-                                            }
-                                            Ok(Ok(_)) => PlanActionOutcome::Proceed,
-                                            Ok(Err(e)) => {
-                                                let error = format!("row {row}: {}", strip_traceback(&e));
-                                                record_error(&lua, &plugin, ErrorSeam::PlanRow, error);
-                                                PlanActionOutcome::Failed
-                                            }
-                                            Err(reason) => {
-                                                tracing::warn!(plugin = %plugin, row, reason, "plan form row handler abandoned");
-                                                PlanActionOutcome::Failed
-                                            }
-                                        };
-                                        let _ = reply.send(outcome);
-                                    });
-                                }
-                                Err(reason) => {
-                                    tracing::warn!(
-                                        session,
-                                        generation,
-                                        row,
-                                        reason,
-                                        "plan form row pick reached no handler"
-                                    );
-                                    let _ = reply.send(PlanActionOutcome::Failed);
-                                }
-                            }
-                        }
+                        } => rt.run_plan_action(
+                            &gate, session, generation, row, path, parallel, reply,
+                        ),
                         Request::OpenPlanForm {
                             path,
                             session,
@@ -5911,8 +6026,7 @@ pub fn spawn(
                                         )?;
                                         opts.set("args", args)?;
                                         opts.set("session", session)?;
-                                        let thread = lua.create_thread(func)?;
-                                        thread.into_async::<()>(opts)?.await
+                                        func.call_async::<()>(opts).await
                                     };
                                     if let Err(e) =
                                         run_command_scoped(&lua, depth, target, run).await
@@ -5973,13 +6087,7 @@ pub fn spawn(
                             let label = scope.label().to_owned();
                             let path = plugin_dir.clone();
                             let res = rt.run_init_lua(&source, scope, plugin_dir).await;
-                            record_load(
-                                &rt.lua,
-                                &label,
-                                PluginKind::Init,
-                                path,
-                                &res,
-                            );
+                            record_load(&rt.lua, &label, PluginKind::Init, path, &res);
                             let _ = reply.send(res);
                         }
                         Request::CollectPromptSlots { reply } => {
@@ -6007,51 +6115,7 @@ pub fn spawn(
                             drain_barrier(&rt.lua, &gate, &spawn_rx).await;
                             let name = declared.spec.name.clone();
                             let path = context.plugin_dir.clone();
-                            let input = (|| {
-                                let crate::api::pack::LoadMode::Custom(loader) = &declared.load
-                                else {
-                                    return Err(mlua::Error::runtime(
-                                        "run_pack_loader: not a custom load",
-                                    ));
-                                };
-                                let function =
-                                    rt.lua.registry_value::<Function>(loader.as_ref())?;
-                                let argument = rt.lua.create_table()?;
-                                argument.set(
-                                    "spec",
-                                    crate::api::pack::spec_to_lua(
-                                        &rt.lua,
-                                        &declared.spec,
-                                        declared.data.as_ref(),
-                                    )?,
-                                )?;
-                                // The same directory the chunks would load
-                                // from, read back rather than passed twice.
-                                argument.set(
-                                    "path",
-                                    context
-                                        .plugin_dir
-                                        .as_ref()
-                                        .map(|dir| dir.display().to_string()),
-                                )?;
-                                Ok::<_, mlua::Error>((function, argument))
-                            })()
-                            .map_err(|source| PluginError::Lua {
-                                plugin: name.clone(),
-                                source,
-                            });
-                            let result = match input {
-                                Ok((function, argument)) => {
-                                    rt.load_source(
-                                        Arc::from(name.as_str()),
-                                        PluginLoad::Function { function, argument },
-                                        context,
-                                        None,
-                                    )
-                                    .await
-                                }
-                                Err(error) => Err(error),
-                            };
+                            let result = rt.run_pack_loader(declared, context).await;
                             record_load(&rt.lua, &name, PluginKind::Package, path, &result);
                             let _ = reply.send(result);
                         }
@@ -6065,55 +6129,7 @@ pub fn spawn(
                             tool_use_id,
                             row,
                             fallback,
-                        } => {
-                            let handle = rt
-                                .live_tasks
-                                .borrow()
-                                .get(&tool_use_id)
-                                .map(|task| Arc::clone(&task.handle))
-                                .or_else(|| {
-                                    rt.warm_tools
-                                        .borrow()
-                                        .iter()
-                                        .find(|w| w.id == tool_use_id)
-                                        .map(|w| Arc::clone(&w.handle))
-                                });
-                            let func = handle
-                                .as_ref()
-                                .and_then(resolve_root_buf)
-                                .and_then(|root| crate::api::ui::buf::click_fn(&root));
-                            let (Some(handle), Some(func)) = (handle, func) else {
-                                // No handle, or a buf without a click handler
-                                // (some plugins wire clicks only in restore):
-                                // either way the fallback restore serves it.
-                                if let Some(fb) = fallback {
-                                    spawn_restore(&gate, &restores, &rt, fb.item, fb.event_tx);
-                                } else {
-                                    tracing::debug!(tool_use_id, "unhandled click ignored");
-                                }
-                                continue;
-                            };
-                            let lua = rt.lua.clone();
-                            let g = Rc::clone(&gate);
-                            let arg = match rt.lua.create_table() {
-                                Ok(t) => {
-                                    let _ = t.set("row", row);
-                                    LuaValue::Table(t)
-                                }
-                                Err(_) => LuaValue::Nil,
-                            };
-                            spawn_local(async move {
-                                let slot = Some(g.acquire().await);
-                                let call = covered(
-                                    slot,
-                                    ScopedFuture::new(lua.clone(), handle, func.call_async::<()>(arg)),
-                                );
-                                if let Err(e) = call.await {
-                                    let error = format!("{tool_use_id}: {}", strip_traceback(&e));
-                                    record_callback_error(&lua, &func, ErrorSeam::Click, error);
-                                }
-                            });
-                        }
+                        } => rt.click_tool(&gate, &restores, tool_use_id, row, fallback),
                         Request::FireAutocmd { event, data } => {
                             let _ = hook_tx.send(HostHook::Autocmd { event, data });
                         }
@@ -6126,8 +6142,13 @@ pub fn spawn(
                             dctx,
                             reply,
                         } => {
-                            let _ = reply
-                                .send(run_describe(&rt.lua, &rt.plugins, &plugin, &tool, &dctx));
+                            let _ = reply.send(run_describe(
+                                &rt.lua,
+                                &rt.plugins,
+                                &plugin,
+                                &tool,
+                                &dctx,
+                            ));
                         }
                         Request::StartTool {
                             plugin,
@@ -6217,6 +6238,7 @@ pub fn spawn(
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    use maki_agent::MovedTrigger;
     use maki_agent::cancel::CancelTrigger;
 
     use super::*;
@@ -6234,9 +6256,7 @@ pub(crate) mod test_support {
 
     /// A model call, moved or not. Hold on to the triggers it hands back:
     /// dropping one fires it, and the call would read as cancelled.
-    pub(crate) fn call_scope(
-        moved: bool,
-    ) -> (Arc<CallScope>, CancelTrigger, Option<CancelTrigger>) {
+    pub(crate) fn call_scope(moved: bool) -> (Arc<CallScope>, CancelTrigger, Option<MovedTrigger>) {
         let (run_trigger, run) = CancelToken::new();
         let call = Arc::new(CallScope::new(MOVED_CALL_ID.to_owned(), &run));
         let task_trigger = moved.then(|| call.move_to(moved_home()).expect("first move"));
@@ -6248,15 +6268,16 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::{MOVED_CALL_ID, call_scope, moved_home};
     use super::*;
-    use crate::api::r#fn::JobSpec;
     use crate::api::tool::ToolCallReply;
+    use crate::api::util::dispatch::{DepthGuard, MAX_HOOK_DEPTH, Reentry};
+    use crate::jobs::JobSpec;
     use crate::loader::HOST_RUNTIME;
     use futures::FutureExt;
     use maki_agent::cancel::CancelTrigger;
     use std::future::poll_fn;
-    use std::pin::pin;
     use std::task::{Context, Poll, Wake, Waker};
     use test_case::test_case;
+    use tokio::sync::Notify;
 
     fn make_buf_handle(text: &str) -> BufHandle {
         let buf = Arc::new(maki_agent::SharedBuf::new());
@@ -6358,6 +6379,81 @@ mod tests {
             assert!(!store.is_empty(&plugin_owner));
             store.kill_owner(&lua, &plugin_owner);
         });
+    }
+
+    /// Can't exit while a test runs, so only the code under test ends it.
+    const SLEEPING_JOB: &str = "sleep 600";
+    const TEST_PLUGIN: &str = "test-plugin";
+    const DEPTH_SEAM: &str = "seam";
+
+    /// Every type Lua can own whose `Drop` gives something back.
+    enum LuaOwned {
+        WaitLease,
+        DepthGuard,
+        TaskScope,
+    }
+
+    /// Frees `value` the way the collector frees a coroutine parked on it:
+    /// inside `collect_userdata`, where any VM call aborts the process.
+    fn drop_in_collector<T: MaybeSend + 'static>(lua: &Lua, value: T) {
+        let owner = lua
+            .create_function(move |_, ()| {
+                let _held = &value;
+                Ok(())
+            })
+            .unwrap();
+        drop(owner);
+        lua.gc_collect().unwrap();
+        lua.gc_collect().unwrap();
+    }
+
+    #[test_case(LuaOwned::WaitLease ; "wait_lease")]
+    #[test_case(LuaOwned::DepthGuard ; "depth_guard")]
+    #[test_case(LuaOwned::TaskScope ; "task_scope")]
+    fn dropped_by_collector_releases_its_hold(owned: LuaOwned) {
+        let lua = Lua::new();
+        match owned {
+            LuaOwned::WaitLease => {
+                let owner = JobOwner::Plugin(Arc::from(TEST_PLUGIN));
+                let id = with_jobs(&lua, |store| store.start(JobSpec::new(owner, SLEEPING_JOB)))
+                    .unwrap();
+                let lease = || with_jobs(&lua, |store| store.lease_events(id, None, TEST_PLUGIN));
+
+                drop_in_collector(&lua, lease().unwrap());
+
+                assert!(lease().is_some(), "the job must be free to wait on again");
+            }
+            LuaOwned::DepthGuard => {
+                let enter = || DepthGuard::enter(&lua, DEPTH_SEAM, DEPTH_SEAM, Reentry::Vm);
+
+                drop_in_collector(&lua, enter().unwrap());
+
+                let reentered: Result<Vec<_>, _> = (0..MAX_HOOK_DEPTH).map(|_| enter()).collect();
+                assert!(reentered.is_ok(), "the depth must be given back");
+            }
+            LuaOwned::TaskScope => {
+                let scope = TaskScope::new(&lua, task_cell(None));
+                let handle = Arc::clone(scope.handle());
+                let owner = JobOwner::Task(lock_cell(&handle).id);
+                with_jobs(&lua, |store| {
+                    store.start(JobSpec::new(owner.clone(), SLEEPING_JOB))
+                })
+                .unwrap();
+                let hook = lua.create_function(|_, ()| Ok(())).unwrap();
+                let key = lua.create_registry_value(hook).unwrap();
+                lock_cell(&handle).cancel_hooks.push(key);
+                let changed = with_jobs(&lua, |store| store.subscribe());
+
+                drop_in_collector(&lua, scope);
+
+                assert!(changed.has_changed().unwrap(), "the job pump must wake");
+                assert!(lock_cell(&handle).cancel_hooks.is_empty());
+                assert!(
+                    with_jobs(&lua, |store| store.is_empty(&owner)),
+                    "the next store access must reap the task's jobs"
+                );
+            }
+        }
     }
 
     #[test]
@@ -7532,8 +7628,9 @@ mod tests {
 
     /// The `RegistryKey` is the last reference to a hook, so holding it pins
     /// the closure and its captures for the VM's whole life. Both endings must
-    /// let go: fired, or dropped with a task that was never cancelled, which
-    /// mlua only reclaims on some later registry op.
+    /// let go by turn end: fired, or dropped with a task that was never
+    /// cancelled. `_warm` keeps the cell alive the way a warm entry does, so
+    /// only the scope's end can let go of the key.
     #[test_case(true ; "after firing")]
     #[test_case(false ; "when an uncancelled scope ends")]
     fn cancel_hook_registry_value_is_released(cancel: bool) {
@@ -7551,6 +7648,7 @@ mod tests {
             let _active = scope.enter();
             register_cancel_hook(&lua, hook).unwrap();
         }
+        let _warm = Arc::clone(scope.handle());
 
         if cancel {
             trigger.cancel();
@@ -7558,6 +7656,36 @@ mod tests {
         } else {
             drop(scope);
         }
+        collect_turn_garbage(&lua);
+        lua.gc_collect().unwrap();
+
+        assert_eq!(Arc::strong_count(&captured), 1);
+    }
+
+    #[test]
+    fn tool_keys_release_drops_every_key() {
+        let lua = Lua::new();
+        let captured = Arc::new(());
+        let key = || {
+            let held = Arc::clone(&captured);
+            let func = lua
+                .create_function(move |_, ()| {
+                    let _ = &held;
+                    Ok(())
+                })
+                .unwrap();
+            lua.create_registry_value(func).unwrap()
+        };
+        let keys = ToolKeys {
+            handler: key(),
+            header: Some(key()),
+            restore: Some(key()),
+            start: Some(key()),
+            permission_scopes: Some(key()),
+            describe: Some(key()),
+        };
+
+        keys.release(&lua, "plugin");
         lua.gc_collect().unwrap();
         lua.gc_collect().unwrap();
 
@@ -7798,7 +7926,7 @@ mod tests {
     /// armed cancel hooks.
     fn drive_dispatch_with(
         cell: TaskCell,
-        setup: impl FnOnce(&Lua, flume::Sender<ToolCallReply>) + Send + 'static,
+        setup: impl FnOnce(&Lua, oneshot::Sender<ToolCallReply>) + Send + 'static,
     ) -> (Result<String, String>, Duration) {
         let (tx, rx) = flume::bounded(1);
         thread::spawn(move || {
@@ -7809,7 +7937,7 @@ mod tests {
                 store.start(JobSpec::new(owner, DISPATCH_TEST_JOB))
             })
             .unwrap();
-            let (finish_tx, finish_rx) = flume::bounded(1);
+            let (finish_tx, finish_rx) = oneshot::channel();
             {
                 let _active = scope.enter();
                 setup(&lua, finish_tx);
@@ -7908,7 +8036,7 @@ mod tests {
                 store.start(JobSpec::new(owner.clone(), PARKED_DISPATCH_JOB))
             })
             .unwrap();
-            let (finish_tx, finish_rx) = flume::bounded(1);
+            let (finish_tx, finish_rx) = oneshot::channel();
             let reply = HOST_RUNTIME.block_on(async {
                 let mut dispatch = pin!(dispatch_async(
                     &lua,
@@ -7928,9 +8056,11 @@ mod tests {
                         cell.deadline.set(Some(Instant::now()));
                         cell.deadline_changed.notify(usize::MAX);
                     }
-                    ParkedWake::Finish => finish_tx
-                        .send(ToolCallReply::plain(Ok(PARKED_DISPATCH_REPLY.to_owned())))
-                        .unwrap(),
+                    ParkedWake::Finish => assert!(
+                        finish_tx
+                            .send(ToolCallReply::plain(Ok(PARKED_DISPATCH_REPLY.to_owned())))
+                            .is_ok()
+                    ),
                     ParkedWake::ContextDropped => drop(finish_tx),
                     ParkedWake::JobsGone => {
                         with_jobs(&lua, |store| store.kill_owner(&lua, &owner));
@@ -7946,6 +8076,131 @@ mod tests {
             .recv_timeout(WATCHDOG_TEST_TIMEOUT)
             .expect("dispatch_async stayed parked");
         assert_eq!(result, expected);
+    }
+
+    const MID_WAIT_DELAY: Duration = Duration::from_millis(10);
+    const ALREADY_LAPSED_BY: Duration = Duration::from_secs(1);
+    const PARKED_DELIVERY_JOB: &str = "echo a; echo b";
+    const CHATTY_JOB: &str = "while :; do echo x; done";
+
+    /// Parks only the first delivery, so the later ones queue up behind it.
+    #[derive(Default)]
+    struct ParkOnce {
+        parked: AtomicBool,
+        entered: Notify,
+        release: Notify,
+        finished: AtomicBool,
+    }
+
+    #[test]
+    fn run_scoped_with_no_callback_in_hand_returns_on_the_first_poll() {
+        HOST_RUNTIME.block_on(async {
+            let lua = Lua::new();
+            let scope = TaskScope::new(&lua, TaskCell::new(CancelToken::none(), None, None));
+            assert!(run_scoped(&lua, scope, async {}).now_or_never().is_some());
+        });
+    }
+
+    enum BodyEnd {
+        ReleasingCallback,
+        Cancelled,
+        PastDeadline,
+    }
+
+    // The deadline lapses before the wait, never during it: the outer
+    // `until_abandoned` reads the clock right after the inner wait does, so a
+    // lapse between the two reads would turn the result into a timeout.
+    #[test_case(BodyEnd::ReleasingCallback, true ; "callback_finishes")]
+    #[test_case(BodyEnd::Cancelled, false ; "cancel_cuts_the_callback")]
+    #[test_case(BodyEnd::PastDeadline, false ; "deadline_cuts_the_callback")]
+    fn finished_body_keeps_its_result_over_a_callback_in_hand(
+        end: BodyEnd,
+        expected_finished: bool,
+    ) {
+        let (trigger, token) = CancelToken::new();
+        let mut trigger = Some(trigger);
+        let lua = Lua::new();
+        let park = Arc::new(ParkOnce::default());
+        let callback = lua
+            .create_async_function({
+                let park = Arc::clone(&park);
+                move |_, _: MultiValue| {
+                    let park = Arc::clone(&park);
+                    async move {
+                        if !park.parked.swap(true, Ordering::Relaxed) {
+                            park.entered.notify_one();
+                            park.release.notified().await;
+                            park.finished.store(true, Ordering::Relaxed);
+                        }
+                        Ok(())
+                    }
+                }
+            })
+            .unwrap();
+        let body = async {
+            let handle = try_active_task(&lua).unwrap();
+            let owner = JobOwner::Task(lock_cell(&handle).id);
+            let mut spec = JobSpec::new(owner, PARKED_DELIVERY_JOB);
+            spec.on_stdout = Some(lua.create_registry_value(callback.clone()).unwrap());
+            spec.on_exit = Some(lua.create_registry_value(callback).unwrap());
+            with_jobs(&lua, |store| store.start(spec)).unwrap();
+            park.entered.notified().await;
+            match end {
+                BodyEnd::ReleasingCallback => park.release.notify_one(),
+                BodyEnd::Cancelled => {
+                    let (trigger, park) = (trigger.take().unwrap(), Arc::clone(&park));
+                    HOST_RUNTIME.spawn(async move {
+                        sleep(MID_WAIT_DELAY).await;
+                        trigger.cancel();
+                        park.release.notify_one();
+                    });
+                }
+                BodyEnd::PastDeadline => {
+                    let expired = Instant::now() - ALREADY_LAPSED_BY;
+                    lock_cell(&handle).deadline.set(Some(expired));
+                    park.release.notify_one();
+                }
+            }
+        };
+        let result = HOST_RUNTIME
+            .block_on(async {
+                timeout(
+                    WATCHDOG_TEST_TIMEOUT,
+                    run_abandonable(&lua, token, None, body),
+                )
+                .await
+            })
+            .expect("run_scoped never returned");
+        assert_eq!(result, Ok(()));
+        assert_eq!(park.finished.load(Ordering::Relaxed), expected_finished);
+    }
+
+    #[test]
+    fn chatty_job_does_not_hold_back_a_finished_body() {
+        let lua = Lua::new();
+        let entered = Arc::new(Notify::new());
+        let callback = lua
+            .create_async_function({
+                let entered = Arc::clone(&entered);
+                move |_, _: MultiValue| {
+                    let entered = Arc::clone(&entered);
+                    async move {
+                        entered.notify_one();
+                        Ok(())
+                    }
+                }
+            })
+            .unwrap();
+        let body = async {
+            let handle = try_active_task(&lua).unwrap();
+            let mut spec = JobSpec::new(JobOwner::Task(lock_cell(&handle).id), CHATTY_JOB);
+            spec.on_stdout = Some(lua.create_registry_value(callback).unwrap());
+            with_jobs(&lua, |store| store.start(spec)).unwrap();
+            entered.notified().await;
+        };
+        HOST_RUNTIME
+            .block_on(async { timeout(WATCHDOG_TEST_TIMEOUT, run_detached(&lua, body)).await })
+            .expect("run_scoped never returned");
     }
 
     const PARTIAL_REPLY_OUTPUT: &str = "partial output";
@@ -7969,13 +8224,16 @@ mod tests {
         };
 
         let (result, _) = drive_dispatch_with(cell, |lua, finish_tx| {
+            let finish_tx = Mutex::new(Some(finish_tx));
             let hook = lua
                 .create_function(move |_, reason: String| {
-                    finish_tx
-                        .send(ToolCallReply::err(format!(
-                            "{PARTIAL_REPLY_OUTPUT}:{reason}"
-                        )))
-                        .ok();
+                    if let Some(finish_tx) = finish_tx.lock().unwrap().take() {
+                        finish_tx
+                            .send(ToolCallReply::err(format!(
+                                "{PARTIAL_REPLY_OUTPUT}:{reason}"
+                            )))
+                            .ok();
+                    }
                     Ok(())
                 })
                 .unwrap();

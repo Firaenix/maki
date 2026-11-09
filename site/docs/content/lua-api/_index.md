@@ -138,14 +138,15 @@ The rules:
 | [`maki.keymap`](#maki-keymap) | Key mappings, modeled after `vim.keymap`. |
 | [`maki.log`](#maki-log) | Structured logging for plugins. |
 | [`maki.model`](#maki-model) | The model behind the focused session. |
-| [`maki.net`](#maki-net) | HTTP and plain TCP for plugins. |
-| [`maki.net.Conn`](#maki-net-Conn) | A TCP connection opened by `maki.net.connect`. |
+| [`maki.net`](#maki-net) | HTTP, plain TCP, and Unix sockets for plugins. |
+| [`maki.net.Conn`](#maki-net-Conn) | A TCP or Unix socket connection. |
+| [`maki.net.Listener`](#maki-net-Listener) | A Unix socket listener opened by `maki.net.listen_unix`. |
 | [`maki.provider`](#maki-provider) | Providers implemented in Lua. |
 | [`maki.provider.auth`](#maki-provider-auth) | Credential storage for the providers this plugin registered. |
 | [`maki.session`](#maki-session) | Host session primitives. |
 | [`maki.Timer`](#maki-Timer) | Handle returned by `maki.defer_fn`. |
 | [`maki.task`](#maki-task) | The subagents of the focused session and their transcripts. |
-| [`maki.text`](#maki-text) | Text utilities: format conversion and the fuzzy matcher the built-in |
+| [`maki.text`](#maki-text) | Text utilities: format conversion, UTF-8 decoding and the fuzzy matcher |
 | [`maki.treesitter`](#maki-treesitter) | Tree-sitter parsing and query API. |
 | [`maki.treesitter.language`](#maki-treesitter-language) | Language registry for tree-sitter grammars. |
 | [`maki.treesitter.query`](#maki-treesitter-query) | Query compilation and lookup. |
@@ -470,6 +471,7 @@ Your {spec} table must include a name, a description (the model reads it
 to decide when to use the tool), a JSON Schema for the input, and a handler
 function. The handler receives `(input, ctx)` and returns either a plain
 string or a table with richer output fields.
+Invalid UTF-8 in the returned text becomes U+FFFD.
 
 `ctx:output_mode()` returns "compact" when the result goes to the model and
 "full" when code such as `code_execution` made the call. Apply output limits
@@ -504,7 +506,7 @@ only in compact mode.
   - `describe` (`function`) Optional. Returns a custom description string for the current context.
   - `examples` (`table`) Optional. Array of example input objects for documentation.
   - `permission_scopes` (`string|function`) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission. Declaring it is what puts the tool in front of the permission prompt, and it requires `permission`.
-  - `permission` (`string`) The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. A tool declaring neither costs those plugins every permission.
+  - `permission` (`string|table`) The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. Pass `{}` when the tool reaches nothing past the conversation it runs in: its handler calls no guarded `maki` function and no other tool. `{}` is the tool form of `capability = {}` on slots and actions, needs no grant, makes the tool free to hand to a session, and cannot go with `permission_scopes` or `mutable_path`. Older maki versions refuse `{}`, so set `min_maki_version`. Leaving `permission` out costs those plugins every permission except `agent` and `input`.
   - `mutable_path` (`string`) Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
   - `start_annotation` (`string|table`) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
   - `needs_background` (`boolean`) Offer the tool only to a model that can move a call to the background itself: the main agent of a session where background tasks are on. Default: false. A schema property can set the same key to hide just that (optional) parameter. The choice is made when the session's tool list is built, and a call that names a hidden parameter still validates.
@@ -770,12 +772,17 @@ available tools or for checking which tools are enabled.
 Each entry has the tool's name, schema, audiences, and an `enabled` flag.
 Describe callbacks are not invoked (the static description is used).
 
+`permission` is what the tool reaches, as a list like `get_slots`
+`capability`: `{ "fs_read" }`, `{}` when it reaches nothing, or nil when
+it declared none, which costs every permission. A tool registered with
+`permission = "fs_read"` reads back as `{ "fs_read" }`.
+
 **Parameters:**
 
 - `{opts?}` (`table?`) Options:
   - `config` (`table`) Optional config table with a `disabled_tools` string[] field used to compute the `enabled` flag on each entry.
 
-**Returns:** (`table[]`) Array of tool entries: { name, schema, audiences, kind?, enabled }.
+**Returns:** (`table[]`) Array of tool entries: { name, schema, audiences, kind?, permission?, enabled }.
 
 **Example:**
 
@@ -809,11 +816,16 @@ so this is not an existence check for MCP tools.
 `background_params` lists the parameters marked `needs_background`,
 which only a session that can move calls to the background sees.
 
+`permission` is what the tool reaches, as a list like `get_slots`
+`capability`: `{ "fs_read" }`, `{}` when it reaches nothing, or nil when
+it declared none, which costs every permission. MCP tools and
+`tool_search` declare none.
+
 **Parameters:**
 
 - `{name}` (`string`) Exact tool name.
 
-**Returns:** (`table|nil`) Tool entry with fields { name, schema, audiences, kind?, background_params?, header?, restore?, format? }, or nil if not found.
+**Returns:** (`table|nil`) Tool entry with fields { name, schema, audiences, kind?, permission?, background_params?, header?, restore?, format? }, or nil if not found.
 
 **Example:**
 
@@ -1567,7 +1579,11 @@ You might want a cheaper model for simple subtasks (summaries, classification)
 without hard-coding a model name.
 
 The returned table has fields: `id` (string), `tier` (string),
-`provider` (string), `spec` (string).
+`provider` (string), `spec` (string), `assigned_tier` (string?).
+`assigned_tier` is set when the user assigned this model to that tier, and
+nil for an explicit `spec`, the inherited model or a curated default. Mention
+it in your errors, since the user may have forgotten the assignment. If an
+assigned model no longer resolves, you get an error instead of another model.
 
 **Parameters:**
 
@@ -1644,6 +1660,10 @@ Get the list of tool definitions for a given audience. Pass the result
 straight into `maki.agent.session()` or use it to inspect what tools are
 available.
 
+A session costs what its tools reach (see `maki.agent.session`). To hand
+over only what the plugin can pay for, check each tool's `permission`
+from `maki.api.get_tool`, as the second example does.
+
 Without a `ctx`, pass `session = id` in `opts` to get the tools a
 background session of that chat would have.
 
@@ -1676,6 +1696,19 @@ local defs, err = maki.agent.tools(ctx, {
 })
 if err then error(err) end
 print(#defs .. " tools available")
+
+-- Keep only tools this plugin can hand to a session. `held` is the
+-- set of permission keys the plugin was granted.
+local held = { fs_read = true, net = true }
+local affordable = {}
+for _, def in ipairs(defs) do
+  local perms = maki.api.get_tool(def.name).permission
+  local ok = perms ~= nil
+  for _, p in ipairs(perms or {}) do
+    ok = ok and held[p] == true
+  end
+  if ok then table.insert(affordable, def) end
+end
 ```
 
 ---
@@ -1760,8 +1793,9 @@ through optional callbacks while the tool runs.
     a subagent, which `/tasks` then lists as a task of its own. Must not
     yield.
 
-**Returns:** (`string?`, `string?`) Tool output text, or `(nil, err)` on failure.
-  Instruction files the child picks up (a subdirectory `AGENTS.md`) are
+**Returns:** (`string?`, `string?`, `string?`) Tool output text and its format
+  (`"markdown"` or `"plain"`, as a tool handler sets it), or `(nil, err)`
+  on failure. Instruction files the child picks up (a subdirectory `AGENTS.md`) are
   not in the text: they land on the calling tool's own result.
 
 **Example:**
@@ -1806,11 +1840,18 @@ goes above the chat's current setting.
 With or without a ctx, the plugin must hold what its tools reach. A prompt
 is no gate under YOLO or an allow rule, and a background session has
 nobody to prompt. A tool declaring a permission (`bash` with `run`, `read`
-with `fs_read`) costs that one. A tool declaring none (`batch`,
-`code_execution`), or `mcp = true` on a chat with MCP servers, costs every
-permission except `agent`. `local_tools` cost nothing, they run as the
+with `fs_read`) costs that one. A tool registered with `permission = {}`
+costs nothing. A tool declaring none, or `mcp = true` on a chat with MCP
+servers, costs every permission except `agent` and `input`. See each
+tool's `permission` in `maki.api.get_tool` and on the
+[Tools](/docs/tools/) page. `local_tools` cost nothing, they run as the
 plugin. The bundled `task` hands over the whole chat, so it holds every
-permission.
+permission. If the plugin cannot pay, the error lists every tool it cannot
+pay for and the `except` list that leaves them out.
+
+The `general_sub` set in the example includes tools that declare no
+permission (`batch`, `code_execution`), so a plugin without every
+permission leaves those out.
 
 `scope` sets the lifetime. `"task"`, the default, ends the session with
 the task that opened it: an autocmd callback when it returns, a tool
@@ -1902,7 +1943,8 @@ Each entry has these fields:
 - `session` (`string`) Chat session it belongs to.
 - `plugin` (`string`) Plugin that opened it.
 - `name` (`string`) Name given at open.
-- `status` (`string`) `"working"` during a `:prompt()`, otherwise `"idle"`.
+- `status` (`string`) `"working"` while a `:prompt()` runs a turn or waits
+  on calls moved to the background, otherwise `"idle"`.
 - `started_at` (`integer`) Unix seconds.
 - `cost` (`number?`) Dollars billed so far, updated after each turn. nil until
   a priced turn ends.
@@ -1965,9 +2007,10 @@ session, or the end of the task that opened it, stops such calls.
 **Returns:** (`table?`, `string?`) Result table on success, or `(nil, err)` on
 failure. A run cut short after streaming some text hands you both: the
 error and a `{ text = <what it streamed> }` table. `"cancelled"` means the
-task that opened or prompted the session ended. `"stopped by user"` means
-Esc in its tab closed a session opened by chat session id, and every
-later prompt answers the same.
+task that opened or prompted the session ended. `"session closed"` means
+`:close()` ended it. `"stopped by user"` means Esc in its tab stopped it,
+and `"stopped by parent agent"` that the model stopped the background task
+it runs in. Every later prompt answers the same.
 
 **Example:**
 
@@ -1983,22 +2026,32 @@ print(r.input_tokens .. " input, " .. r.output_tokens .. " output tokens")
 ### `Session:send()` {#Session-send}
 
 ```lua
-Session:send({message})
+Session:send({message}, {opts?})
 ```
 
 Hand the subagent a message without waiting, delivered the same way as a
-message typed in its tab. A running `:prompt()` picks it up at its next turn boundary, once
-the current reply and its tool calls finish, and the model reads it as an
-interrupt from its parent, not the user. The tab draws it when it lands.
-Messages sent in a burst land together.
+message typed in its tab. A running `:prompt()` picks it up at its next
+turn boundary, once the current reply and its tool calls finish, and the
+model reads it as an interrupt from its parent, not the user. The tab
+draws it when it lands. Messages sent in a burst land together.
 
 With no prompt running, or one already past its last turn, the message
 waits. The next `:prompt()` sends it in the same request as its own
 message, just before it, so the first reply already reads it.
 
+With `interrupt`, a running `:prompt()` does not wait for the turn to end,
+nor for moved calls. The reply stops and running tools are cancelled (bash
+returns what it printed so far). The subagent then reads the message and
+carries on with its history intact, and `:prompt()` returns its answer as
+usual. If an `agent.user_message` layer drops the message, the subagent
+picks up the cut work instead. With no prompt running, the message waits
+like any other.
+
 **Parameters:**
 
 - `{message}` (`string`) Message to deliver.
+- `{opts?}` (`table?`) Optional fields:
+  - `interrupt` (`boolean?`) cut the running turn short. Default: `false`.
 
 **Returns:** (`boolean?`, `string?`) `true`, or `(nil, err)` when the session takes
 no more messages. The errors are the ones `:prompt()` refuses with. `true`
@@ -2011,6 +2064,8 @@ closes is dropped.
 -- From another task, while `sess:prompt()` is still running.
 local ok, err = sess:send("New finding: the bug is in parser.rs, focus there.")
 if not ok then maki.log.warn(err) end
+-- Stop a subagent heading the wrong way, mid tool call.
+sess:send("Stop, the bug is in lexer.rs, not parser.rs.", { interrupt = true })
 ```
 
 ---
@@ -2029,7 +2084,7 @@ leaves the work to the Lua garbage collector, which may never run while
 the VM sits idle, and the subagent's event relay stays alive until it does.
 
 Close cancels a running prompt before waiting to flush its history. That
-prompt returns a cancelled error and any partial text.
+prompt returns `"session closed"` and any partial text.
 
 ---
 
@@ -2071,10 +2126,10 @@ maki.async.run({fn}, {on_finish?})
 ```
 
 Start {fn} as a background task without waiting for it. Pass
-{on_finish} to get the result. The task is cancelled with its caller
-and stopped after 60 seconds. Started from a tool handler, it may outlive
-the reply: it ends with the turn, or with the background task once the
-call moved. For work that outlives the caller, use `maki.async.spawn`.
+{on_finish} to get the result. The task stops when its caller ends, or
+after 60 seconds. A tool handler's task can outlive the reply: it runs
+until the turn ends, or until the call is stopped if it was moved to the
+background. For work that outlives the caller, use `maki.async.spawn`.
 
 **Parameters:**
 
@@ -2656,8 +2711,8 @@ Requires the `run` [plugin permission](#plugin-permissions).
     `jobwait` (default 20, 0 disables, max 1024).
   - `max_line_bytes` (`integer?`) longest line delivered, in bytes. A longer
     line is cut at a UTF-8 boundary and ends in `...`, and its rest is
-    skipped without being read into memory (default and `0`: 64 MiB, the
-    `maki.fs` read limit).
+    skipped without being read into memory (default, `0`, and max: 64 MiB,
+    the `maki.fs` read limit).
   - `name` (`string?`) handle for `jobfind`, unique among the live jobs this
     plugin can see. Starting a second job under a live name is an error.
 
@@ -3096,7 +3151,7 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{path}` (`string`) Absolute or relative file path. `~/` is expanded to the home directory.
-- `{opts?}` (`table?`) `offset` is the 1-based line to start at (default 1). `limit` is the max number of lines, `0` or omitted reads to the end. `max_line_bytes` cuts longer lines at a UTF-8 boundary and appends `...`, omitted or `0` keeps lines whole. `count = false` stops reading after the page and leaves `total` nil.
+- `{opts?}` (`table?`) `offset` is the 1-based line to start at (default 1). `limit` is the max number of lines, `0` or omitted reads to the end. `max_line_bytes` cuts longer lines (at most 64 MiB) at a UTF-8 boundary and appends `...`, omitted or `0` keeps lines whole. `count = false` stops reading after the page and leaves `total` nil.
 
 **Returns:** (`table?`, `string?`) `{ lines = string[], total = integer? }`, or nil plus an error message.
 
@@ -3360,6 +3415,8 @@ maki.fs.dir({path}, {opts?})
 List the contents of the directory at {path}.
 Each entry is a two-element array `{name, type}` where type is one of
 `"file"`, `"directory"`, `"link"`, or `"unknown"`. Follows symlinks.
+`name` is relative to {path}, so with `depth` > 1 nested entries keep
+their directory: "d/nested.txt", unambiguous and joinable onto {path}.
 
 Requires the `fs_read` [plugin permission](#plugin-permissions).
 
@@ -3376,7 +3433,7 @@ Requires the `fs_read` [plugin permission](#plugin-permissions).
 local entries, err = maki.fs.dir("src", { depth = 2 })
 if err then return end
 for _, e in ipairs(entries) do
-  print(e[1], e[2]) -- "main.rs"  "file"
+  print(e[1], e[2]) -- "main.rs" "file", "tests/lib.rs" "file"
 end
 ```
 
@@ -3396,7 +3453,7 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{path}` (`string`) Destination file path. `~/` is expanded.
-- `{content}` (`string`) Text to write.
+- `{content}` (`string|buffer`) Bytes to write.
 
 **Returns:** (`true?`, `string?`) `true` on success, or nil plus an error message.
 
@@ -3423,7 +3480,7 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{path}` (`string`) Destination file path. `~/` is expanded.
-- `{content}` (`string`) Text to append.
+- `{content}` (`string|buffer`) Bytes to append.
 
 **Returns:** (`true?`, `string?`) `true` on success, or nil plus an error message.
 
@@ -3451,7 +3508,7 @@ Requires the `fs_write` [plugin permission](#plugin-permissions).
 **Parameters:**
 
 - `{path}` (`string`) Destination file path. `~/` is expanded.
-- `{content}` (`string`) Text to write.
+- `{content}` (`string|buffer`) Bytes to write.
 
 **Returns:** (`true?`, `string?`) `true` on success, or nil plus an error message.
 
@@ -4588,9 +4645,13 @@ maki.model.tier({name}, {provider?})
 
 The model maki uses for a tier, the same one a subagent asking for that
 tier gets: user's pick from the `/model` picker for that tier (whatever
-provider it names), else the curated default within `provider`, else any
-provider. `assigned` tells a pick apart from a default. Pass `provider` to
-prefer its models, the way subagents prefer the session's provider.
+provider it names), else the curated or `providers.toml`-declared default
+within `provider`, else any provider. `assigned` tells a pick apart from a
+default. Pass `provider` to prefer its models, the way subagents prefer the
+session's provider.
+
+Resolving a models.dev model can wait for that catalog to download, so
+like `get`, this can't run in a callback that must not yield.
 
 **Parameters:**
 
@@ -4654,7 +4715,7 @@ if m and m.subsidised_by then print(m.subsidised_by, m.pricing.input) end
 
 ## maki.net {#maki-net}
 
-HTTP and plain TCP for plugins.
+HTTP, plain TCP, and Unix sockets for plugins.
 
 `request` traffic goes over HTTPS (plain HTTP is upgraded). Private
 and metadata IP addresses are blocked to prevent SSRF, including
@@ -4666,7 +4727,8 @@ Requests reuse a pool of clients, so calls to the same host share one
 keep-alive connection rather than pay a fresh handshake each time.
 
 `connect` follows the same rules, but only reaches hosts the plugin
-lists in `net_hosts`.
+lists in `net_hosts`. On Unix, `connect_unix` and `listen_unix` reach
+local sockets, and need the `run` permission instead.
 
 ```lua
 local res, err = maki.net.request("https://example.com")
@@ -4695,10 +4757,12 @@ one. This holds only for an origin the user set (`<SLUG>_BASE_URL`,
 {opts} fields:
 - `method` (`string`) HTTP verb, in any case (default `"GET"`).
 - `headers` (`table`) Header name/value pairs.
-- `body` (`string`) Request body.
+- `body` (`string|buffer`) Request body, sent as is.
 - `timeout` (`integer`) Total timeout in seconds, max 120 (default 30,
   none on a provider's origin). 0 means the default.
-- `max_bytes` (`integer`) Max response size in bytes (default 5 MB).
+- `max_bytes` (`integer`) Max response size in bytes, max 64 MiB (default
+  5 MiB). 0 means the default. The whole body is held in memory, so a
+  bigger download belongs in a job such as `curl -o`.
 - `retry` (`integer`) Retries on 5xx errors (default 3).
 - `line_match` (`string`) Regex. Keep only the response lines it
   matches. Filtering happens after the body is read, so `max_bytes`
@@ -4711,6 +4775,9 @@ response's headers under lowercase names, as in
 which breaks `set-cookie`. A compressed response arrives decoded, without
 its `content-encoding` and `content-length`. A failed response can go
 straight to `maki.provider.http_error`.
+`body` holds the raw bytes, so a binary download can go straight to
+`maki.fs.write`. Tool results and `maki.text.html_to_markdown` turn
+invalid UTF-8 into U+FFFD.
 
 Requires the `net` [plugin permission](#plugin-permissions).
 
@@ -4754,6 +4821,7 @@ garbage collected, and when the plugin unloads.
 
 {opts} fields:
 - `timeout` (`integer`) Connect timeout in seconds, max 60 (default 10).
+  0 means the default.
 
 Requires the `net` [plugin permission](#plugin-permissions).
 
@@ -4781,10 +4849,89 @@ maki.async.spawn(function()
 end)
 ```
 
+---
+
+### `maki.net.connect_unix()` {#maki-net-connect_unix}
+
+```lua
+maki.net.connect_unix({path}, {opts?})
+```
+
+Connect to the Unix socket at {path}. The connection is a
+`maki.net.Conn`, the same as a TCP one.
+
+{opts} fields:
+- `timeout` (`integer`) Connect timeout in seconds, max 60 (default 10).
+  0 means the default.
+
+Requires the `run` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{path}` (`string`) Absolute path of the socket, or one starting with `~/`.
+- `{opts?}` (`table?`) Options (see above).
+
+**Returns:** ([`maki.net.Conn?`](#maki-net-Conn), `string?`) The connection, or nil plus an error string.
+
+**Example:**
+
+```lua
+maki.async.spawn(function()
+  local conn, err = maki.net.connect_unix("/run/user/1000/app/control.sock")
+  if not conn then return maki.log.error(err) end
+  conn:write("status\n")
+  print(conn:read())
+  conn:close()
+end)
+```
+
+---
+
+### `maki.net.listen_unix()` {#maki-net-listen_unix}
+
+```lua
+maki.net.listen_unix({path})
+```
+
+Listen on the Unix socket at {path} and answer a `maki.net.Listener`.
+
+A path this plugin already listens on is taken over, so it can listen on
+its usual path again after `/reload`. Anything else at
+{path} is an error: removing a stale socket is up to the plugin, which
+knows whether its name is still in use, and so is a private directory
+for it. The listener closes, and removes the socket file it
+bound, on `:close()`, when it is garbage collected, and when the plugin
+unloads.
+
+Requires the `run` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{path}` (`string`) Absolute path of the socket, or one starting with `~/`.
+
+**Returns:** ([`maki.net.Listener?`](#maki-net-Listener), `string?`) The listener, or nil plus an error string.
+
+**Example:**
+
+```lua
+maki.async.spawn(function()
+  local listener = assert(maki.net.listen_unix("/run/user/1000/app/inbox.sock"))
+  while true do
+    local conn = listener:accept()
+    if not conn then break end
+    print(conn:read())
+    conn:close()
+  end
+end)
+```
+
 
 ## maki.net.Conn {#maki-net-Conn}
 
-A TCP connection opened by `maki.net.connect`.
+A TCP or Unix socket connection.
+
+`maki.net.connect` opens a TCP one and `maki.net.connect_unix` a Unix
+socket one.
 
 `read` and `write` yield until done and can run at the same time.
 The connection closes on `:close()`, when the handle is garbage
@@ -4850,6 +4997,44 @@ Conn:close()
 
 Close the connection. A read or write in flight ends with an error.
 Extra calls do nothing.
+
+
+## maki.net.Listener {#maki-net-Listener}
+
+A Unix socket listener opened by `maki.net.listen_unix`.
+
+---
+
+### `Listener:accept()` {#Listener-accept}
+
+```lua
+Listener:accept()
+```
+
+Wait for the next client and answer its connection. Answers `nil, nil`
+once the listener is closed, including when it closes while waiting.
+Only one `accept` at a time: a second one while one waits is an error.
+
+**Returns:** ([`maki.net.Conn?`](#maki-net-Conn), `string?`) The connection, nil plus an error string, or nil, nil once closed.
+
+**Example:**
+
+```lua
+local conn, err = listener:accept()
+if err then return maki.log.error(err) end
+if not conn then print("listener closed") end
+```
+
+---
+
+### `Listener:close()` {#Listener-close}
+
+```lua
+Listener:close()
+```
+
+Stop listening and remove the socket file. A pending `accept` answers
+`nil, nil`. Extra calls do nothing.
 
 
 ## maki.provider {#maki-provider}
@@ -4966,6 +5151,8 @@ it does for a built-in provider.
     Defaults to `max_tokens`.
   - `include_stream_usage` (`boolean`) Ask for usage on the stream.
     Defaults to `true`.
+  - `usage_cost` (`boolean`) Price turns from `usage.cost` on the stream
+    (in USD). Defaults to `false`.
   - `thinking` (`table`) How the API spells reasoning effort. Without it,
     each model's `thinking_fields` decides.
     - `dialect` (`string`) Required. One of `"standard"`, `"codex"`,
@@ -4981,11 +5168,13 @@ it does for a built-in provider.
     set wins. `host`, `content-length`, `transfer-encoding` and
     `connection` are refused.
   - `extra_body` (`table`) Merged into every request body.
-  - `session_id` (`table`) Sends the session id, as
-    `{ header = "x-affinity" }`, `{ body_field = "prompt_cache_key" }`,
-    or both at once.
   - `thinking_overrides` (`table`) Model id prefix to `"no"`, `"yes"` or
     `"required"`, overriding the model table. Longest prefix wins.
+- `session_id` (`table`) Sends the session id with every request, as
+  `{ headers = { "x-affinity" } }`,
+  `{ body_field = "prompt_cache_key" }`, or both at once. A
+  listed header replaces one the credentials set. The `google`
+  codec refuses it.
 - `models` (`table`) Static model rows, read once at registration. They
   describe models and add to the runtime list. See
   [model rows](/docs/providers/#model-rows).
@@ -5371,7 +5560,7 @@ been sent so far, tool calls and results included. Read only.
 Each message has the same shape as in the session file:
 
 ```text
-{ role = "user" | "assistant", kind, facts?, display_text?, receipts?, settles?, content = { blocks } }
+{ role = "user" | "assistant", kind, facts?, display_text?, receipts?, settles?, partial?, content = { blocks } }
 ```
 
 `kind` is `"turn"` for something the user or the model said,
@@ -5383,7 +5572,9 @@ content: nil shows the content, `""` hides the message (a nudge, a
 compaction note). `receipts` lists the calls whose results in this
 message moved to the background, and `settles` = `{ task, end }` marks the
 notice that answered one, with `end` one of `"finished"`, `"failed"`,
-`"cancelled"` or `"lost"`. `content` lists blocks:
+`"cancelled"` or `"lost"`. `partial` has the same shape and marks a notice
+that answered one piece early, like one call of a moved batch, and left
+the receipt open. `content` lists blocks:
 
 ```text
 { type = "text", text }
@@ -5702,6 +5893,40 @@ local _, err = maki.session.set_title({ id = id, title = "refactor" })
 
 ---
 
+### `maki.session.data_dir()` {#maki-session-data_dir}
+
+```lua
+maki.session.data_dir({opts?})
+```
+
+This plugin's directory for this session's data, as
+`state/sessions/data/<session>/<plugin>/`. Core owns it: the delete that
+takes the session takes everything written under it. Not created; make it
+with `maki.fs.mkdir` before the first write. A plugin's grants cover it
+like any other path.
+
+The session defaults to the one the calling agent serves, so a tool of
+a background tab gets that tab's dir rather than the one on screen, and
+to the focused session otherwise.
+
+**Parameters:**
+
+- `{opts?}` (`table?`) `session` names another session.
+
+**Returns:** (`string|nil`, `string|nil`) The directory path, or nil and an error.
+
+**Example:**
+
+```lua
+local dir, err = maki.session.data_dir()
+if dir then
+  maki.fs.mkdir(dir, { parents = true })
+  maki.fs.write(maki.fs.joinpath(dir, "scratch.md"), text)
+end
+```
+
+---
+
 ### `maki.session.answer_permission()` {#maki-session-answer_permission}
 
 ```lua
@@ -5763,7 +5988,8 @@ h:stop()
 The subagents of the focused session and their transcripts. Tasks are
 spawned by the `task` tool and addressed by an id that survives a reload.
 Without an interactive UI every function returns
-`nil, "no interactive UI attached"`.
+`nil, "no interactive UI attached"`, except the ones that take a tool
+handler's ctx: they reach the background tasks its agent moved.
 
 ---
 
@@ -5781,20 +6007,19 @@ tool spawned has its tool call's id, one a plugin opened with
 `plugin` field.
 
 **Returns:** (`table|nil`, `string|nil`) Array of `{id, session, name, focused, status?, plugin?,
-  tool?, parent?, part?, started_at?, ended_at?, cost?}` where `status` is `"working"`,
-  `"idle"` (a plugin task between prompts), `"done"`, `"error"`, or
-  `"cancelled"` (stopped by the user or the model), and `session` is the
-  chat session that `stop()` asks for. `tool` is the tool whose call the
-  task runs, `"task"` for a subagent or `"bash"` for a moved command,
-  absent on a session a plugin opened on its own. `parent` is the id of
-  the call the task runs under, like a `batch` that started it. That
-  call is listed only once it moved. `part` is true for a piece listed
-  with `ctx:set_parts()`. Stopping a part stops its whole call, while a
-  subagent the call started stops alone. `started_at` and `ended_at` are
-  Unix seconds: when the task started, or moved to the background, and
-  when it finished. A task saved before they were recorded has neither.
-  `cost` is what a subagent billed so far, in dollars. The main chat has
-  none of the three. Or nil and an error.
+  tool?, parent?, part?, wrapper?, started_at?, ended_at?, cost?}`, or nil and an error.
+  `status` is `"working"`, `"idle"` (a plugin task between prompts), `"done"`,
+  `"error"` or `"cancelled"`. `session` is the chat session that `stop()` asks for.
+  `tool` is the tool whose call the task runs, like `"task"` or `"bash"`, and is
+  absent on a session a plugin opened on its own. `parent` is the id of the call
+  the task runs under, like a `batch`, which is listed only once it moved. `part`
+  is true for a piece listed with `ctx:set_parts()`: stopping it stops its whole
+  call, while a subagent the call started stops alone. `wrapper` is true for a
+  call that `/tasks` replaces with the tasks under it, so it gets no row and does
+  not count as running. `started_at` and `ended_at` are Unix seconds: when the
+  task started or moved, and when it finished. Tasks saved before they were
+  recorded lack them. `cost` is what a subagent billed so far, in dollars. The
+  main chat has none of the three.
 
 **Example:**
 
@@ -5872,11 +6097,12 @@ plugin could stop work that is not its own.
 From a tool handler, `stop(ctx, id)` is the model's stop. It stops a
 background task (a command or subagent) that the calling agent moved,
 which is allowed because the tool call belongs to a turn the user started.
-It waits up to 5 seconds for the final reply and returns it, and the agent
-gets no notice of the end. A late reply returns no `output`, and the
-result reaches the agent later as a quiet notice. A task another agent
-moved, a finished task or an unknown id returns an error that names the
-agent's running task ids.
+A subagent stopped this way ends its pending `:prompt()` with
+`"stopped by parent agent"`. It waits up to 5 seconds for the final reply
+and returns it, and the agent gets no notice of the end. A late reply
+returns no `output`, and the result reaches the agent later as a quiet
+notice. A task another agent moved, a finished task or an unknown id
+returns an error that names the agent's running task ids.
 
 **Parameters:**
 
@@ -5900,14 +6126,91 @@ local _, err = maki.task.stop(task.id, { session = task.session })
 local stopped, err = maki.task.stop(ctx, input.id)
 ```
 
+---
+
+### `maki.task.send()` {#maki-task-send}
+
+```lua
+maki.task.send({ctx}, {id}, {text}, {opts?})
+```
+
+Messages a background subagent that the calling agent moved, the way the
+`task_message` tool does. The subagent reads it as an interrupt from its
+parent once its current turn ends, and one still waiting for a slot reads
+it with its first prompt.
+
+With `interrupt` it does not wait for the turn to end, nor for the calls
+the subagent moved. The reply stops and running tools are cancelled (bash
+returns what it printed so far), then the subagent reads the message and
+carries on with its history intact. With no turn running the message
+waits like any other.
+
+An agent reaches the subagents it moved, and those nested in a call it
+moved, until they end. Like `stop(ctx, id)`, it never reaches what
+another agent moved.
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) The tool handler's ctx.
+- `{id}` (`string`) Task id, from its receipt.
+- `{text}` (`string`) The message.
+- `{opts?}` (`table?`) Optional fields:
+  - `interrupt` (`boolean?`) cut its current turn short. Default: `false`.
+
+**Returns:** (`table|nil`, `string|nil`) `{name}`, the task's name in `/tasks`, or
+  nil and `"no running background subagent with id <id>"`.
+
+**Example:**
+
+```lua
+local sent, err = maki.task.send(ctx, input.id, input.message)
+if not sent then return { llm_output = err, is_error = true } end
+return "Message queued for " .. sent.name .. "."
+```
+
+---
+
+### `maki.task.messages()` {#maki-task-messages}
+
+```lua
+maki.task.messages({ctx}, {id}, {opts?})
+```
+
+Reads the transcript of a background subagent that the calling agent
+moved, oldest first, while it works. The messages have the shape
+`maki.session.messages` returns. It reaches what `send(ctx, id)` does.
+Works without an interactive UI.
+
+Requires the `session_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{ctx}` (`LuaCtx`) The tool handler's ctx.
+- `{id}` (`string`) Task id, from its receipt.
+- `{opts?}` (`table?`) `last` (integer?) only the newest `last` messages.
+
+**Returns:** (`table|nil`, `string|nil`) Array of messages, or nil and
+  `"no running background subagent with id <id>"`.
+
+**Example:**
+
+```lua
+local msgs = maki.task.messages(ctx, input.id, { last = 1 })
+local last = msgs and msgs[1]
+if last and last.content[1].type == "text" then
+  print(last.content[1].text)
+end
+```
+
 
 ## maki.text {#maki-text}
 
-Text utilities: format conversion and the fuzzy matcher the built-in
-pickers use.
+Text utilities: format conversion, UTF-8 decoding and the fuzzy matcher
+the built-in pickers use.
 
 ```lua
 local md = maki.text.html_to_markdown(html)
+local text = maki.text.to_utf8(bytes)
 local hits = maki.text.fuzzy_list("mrs", names, { limit = 10 })
 ```
 
@@ -5921,6 +6224,7 @@ maki.text.html_to_markdown({html})
 
 Convert an HTML string to Markdown.
 Useful for cleaning up web content fetched with `maki.webfetch`.
+Invalid UTF-8 becomes U+FFFD.
 
 **Parameters:**
 
@@ -5934,6 +6238,34 @@ Useful for cleaning up web content fetched with `maki.webfetch`.
 local md, err = maki.text.html_to_markdown("<h1>Hello</h1><p>world</p>")
 if err then return end
 print(md) -- "# Hello\n\nworld"
+```
+
+---
+
+### `maki.text.to_utf8()` {#maki-text-to_utf8}
+
+```lua
+maki.text.to_utf8({s})
+```
+
+Return {s} as valid UTF-8, with every invalid byte sequence replaced by
+U+FFFD. Lua strings are bytes, and `maki.net` and `maki.fs` hand them over
+as-is, so decode before measuring or cutting a body as text. An invalid
+byte can grow to 3 bytes, so a cut made before decoding can triple in size.
+
+Needs no plugin permission.
+
+**Parameters:**
+
+- `{s}` (`string`) Bytes to decode.
+
+**Returns:** (`string`) Valid UTF-8 text, `s` itself when it already is.
+
+**Example:**
+
+```lua
+local resp = maki.net.request(url)
+local text = maki.text.to_utf8(resp.body)
 ```
 
 ---
@@ -7417,7 +7749,8 @@ Looks up a named style from the current theme. The names are the ones a span
 already takes as a string ("dim", "item_selected", "keybind_section",
 "diff_old", ...), so `{ text, "dim" }` and `theme_style("dim")` paint the
 same. Reach for the table when you need the parts, say to keep a style's
-foreground over a background of your own.
+foreground over a background of your own. A span styled "cursor" also marks
+the caret of a focused window, see the `focus` option of `maki.ui.open_win`.
 
 **Parameters:**
 
@@ -7459,7 +7792,7 @@ every case.
 - `{lang}` (`string`) Language identifier, e.g. "rust", "python".
 - `{opts?}` (`table?`) Options. Fields:
   - `independent` (`boolean`) highlight each line without cross-line context. Default false.
-  - `prefix` (`string`) preceding source used as token context. Only the nearest lines fitting within 16 KiB are parsed, so earlier comments or strings may affect coloring. Default "".
+  - `prefix` (`string`) the lines before `code`, used as token context. A trailing newline is optional. Only the nearest lines fitting within 16 KiB are parsed, so a comment or string opened before them is missed. Default "".
 
 **Returns:** (`table`) Lines: `{ { {text, style}, ... }, ... }`. Each style is `{fg, bold?, italic?, underline?}`.
 
@@ -7785,7 +8118,7 @@ session, closing the tab), or right away if the session is not in any tab.
   - `reserved_bottom` (`integer`) rows reserved at the bottom of the content area. Default 0.
   - `split` (`string`) dock the window to an edge instead of floating. One of "above", "below", "left", "right", "panel", or "" (floating, default).
   - `order` (`integer`) paint order among split windows at the same edge. Default 50.
-  - `focus` (`boolean`) whether the window takes keyboard focus on open. Default true.
+  - `focus` (`boolean`) whether the window takes keyboard focus on open. Default true. A focused window parks the terminal cursor on its first span styled `cursor`, which is where an input method (IME) shows the text being composed. With no such span on screen, the cursor is not parked.
   - `keys` (`table`) keys this window takes while it is on screen, in `maki.keymap` notation, e.g. `{ "<Tab>", "<CR>" }`. `maki.keymap.set` with `{ buffer = buf }` is the newer way to give a popup keys, with a handler per key, a mode, and `ev.fallback()`. Requires `focus = false`, since a focused window already gets every key. A claimed key goes to this window's `recv` and never reaches the chat input or global `maki.keymap.set` bindings. The window's buffer bindings are asked first. Claims are released automatically when the window closes, and a hidden or zero-size window claims nothing. Host pickers and the slash command palette take keys first while open over the window. `<C-c>` and `<C-z>` are refused.
   - `visible` (`boolean`) whether the window is initially visible. Default true. See `win:hide()` for what hiding does.
   - `needs_input` (`boolean`) whether the window means the session needs user input. Default false.
@@ -8420,6 +8753,8 @@ or a palette index as a string like "4". Names must be spelled exactly,
 hyphens included. Named and indexed colors are left for the terminal to
 resolve, so they follow the user's palette. To mix a named style with colors
 of your own, `maki.ui.theme_style` hands back its parts.
+
+Invalid UTF-8 shows as U+FFFD.
 
 **Parameters:**
 
@@ -9132,6 +9467,9 @@ function ToolView.line_nr_fmt(max_line_nr)
 -- (default "tail"), max_expand_lines (default 2000) kept for expansion,
 -- max_line_bytes (optional) per-line byte cap. Lines are stored already cut,
 -- so a run of huge lines costs no more than short ones while kept for expansion.
+-- With max_lines 0 only the set_header lines show until a click expands the
+-- view. The UI puts the line count in the tool header, so the row still says
+-- how much is hidden.
 function ToolView.new(buf, opts)
 function ToolView:set_header(lines)
 function ToolView:clear()

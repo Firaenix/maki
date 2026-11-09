@@ -29,6 +29,7 @@ use crate::{
     AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse, UsageLimit,
 };
 
+use super::codec::SessionCarrier;
 use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, Timeouts};
 
 const API_VERSION: &str = "2023-06-01";
@@ -83,6 +84,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     sends_thinking: sends_as_chosen,
     thinking_fields_fallback: |_| None,
     accepts_arbitrary_models: false,
+    catalog_is_authoritative: false,
     fallback_max_output: Some(128_000),
     fallback_context_window: 200_000,
     models_toml: include_str!("../../../models/anthropic.toml"),
@@ -360,6 +362,7 @@ pub struct Anthropic {
     auth: Arc<Mutex<super::ResolvedAuth>>,
     key_pool: Option<KeyPool>,
     system_prefix: Option<String>,
+    session_id: SessionCarrier,
     stream_timeout: Duration,
     /// Env / `providers.toml` / inventory default, resolved once at construction.
     /// Reused by key rotation / reload so they do not re-parse providers.toml.
@@ -380,6 +383,7 @@ impl Anthropic {
             auth: Arc::new(Mutex::new(resolved)),
             key_pool: Some(pool),
             system_prefix: None,
+            session_id: SessionCarrier::default(),
             stream_timeout: timeouts.stream,
             resolved_base_url,
             fallback_base_url: None,
@@ -395,6 +399,7 @@ impl Anthropic {
             auth,
             key_pool: None,
             system_prefix: None,
+            session_id: SessionCarrier::default(),
             stream_timeout: timeouts.stream,
             // Custom / dynamic callers own their base URL; treating it as the
             // anthropic override would make every third-party endpoint look
@@ -406,6 +411,11 @@ impl Anthropic {
 
     pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
         self.system_prefix = prefix;
+        self
+    }
+
+    pub(crate) fn with_session_id(mut self, session_id: SessionCarrier) -> Self {
+        self.session_id = session_id;
         self
     }
 
@@ -424,8 +434,16 @@ impl Anthropic {
     }
 
     fn build_request(&self, method: Method, path: &str) -> RequestBuilder {
-        let auth = self.auth.lock().unwrap();
-        let url = format!("{}{path}", origin(self.base_url(&auth)));
+        self.build_request_with(&self.auth.lock().unwrap(), method, path)
+    }
+
+    fn build_request_with(
+        &self,
+        auth: &ResolvedAuth,
+        method: Method,
+        path: &str,
+    ) -> RequestBuilder {
+        let url = format!("{}{path}", origin(self.base_url(auth)));
         auth.configure_request(
             self.client
                 .request(method, url)
@@ -436,24 +454,21 @@ impl Anthropic {
 
     async fn do_stream_request(
         &self,
+        auth: &ResolvedAuth,
         body: &Value,
         event_tx: &Sender<ProviderEvent>,
         betas: &[&str],
     ) -> Result<StreamResponse, AgentError> {
         let json_body = serde_json::to_vec(body)?;
         let mut builder = self
-            .build_request(Method::POST, MESSAGES_PATH)
+            .build_request_with(auth, Method::POST, MESSAGES_PATH)
             .header("content-type", "application/json");
         if !betas.is_empty() {
             builder = builder.header("anthropic-beta", betas.join(","));
         }
         let request = builder.body(json_body).build()?;
-        super::send_request(&self.client, request, |response| async move {
-            if response.status().as_u16() == 200 {
-                parse_sse(super::body_reader(response), event_tx, self.stream_timeout).await
-            } else {
-                Err(AgentError::from_response(response).await)
-            }
+        super::ok_sse(&self.client, request, |body| {
+            parse_sse(body, event_tx, self.stream_timeout)
         })
         .await
     }
@@ -498,7 +513,7 @@ impl Provider for Anthropic {
         tools: &'a Value,
         event_tx: &'a Sender<ProviderEvent>,
         opts: RequestOptions,
-        _session_id: Option<&'a SessionRef>,
+        session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let system_blocks = if let Some(prefix) = &self.system_prefix {
@@ -522,17 +537,15 @@ impl Provider for Anthropic {
                 }]
             };
 
-            let (top_p, anthropic_api) = {
-                let auth = self.auth.lock().unwrap();
-                (auth.top_p, is_anthropic_api(self.base_url(&auth)))
-            };
+            let mut auth = self.auth.lock().unwrap().clone();
+            let anthropic_api = is_anthropic_api(self.base_url(&auth));
             let mut body = shared::build_request_body_with_system(
                 model,
                 messages,
                 &system_blocks,
                 tools,
                 opts.thinking,
-                top_p,
+                auth.top_p,
             );
             body["model"] = json!(shared::strip_long_context(&model.id));
             body["stream"] = json!(true);
@@ -549,9 +562,12 @@ impl Provider for Anthropic {
             if reports_block_binding(&body, anthropic_api) {
                 betas.push(BLOCK_BINDING_BETA);
             }
+            if let Some(session) = session_id {
+                self.session_id.apply(session, &mut body, &mut auth);
+            }
 
             debug!(model = %model.id, num_messages = messages.len(), thinking = ?opts.thinking, ?betas, "sending API request");
-            self.do_stream_request(&body, event_tx, &betas).await
+            self.do_stream_request(&auth, &body, event_tx, &betas).await
         })
     }
 
@@ -575,11 +591,7 @@ impl Provider for Anthropic {
     }
 
     fn keys(&self) -> Option<KeyRotation<'_>> {
-        Some(KeyRotation::new(
-            self.key_pool.as_ref()?,
-            &self.auth,
-            KeyHeader::Raw(API_KEY_HEADER),
-        ))
+        KeyRotation::over(&self.key_pool, &self.auth, KeyHeader::Raw(API_KEY_HEADER))
     }
 
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {

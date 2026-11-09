@@ -19,7 +19,7 @@ use crate::providers::catalog::{
     available_if_warm, catalog_providers, catalog_providers_if_available, try_create,
 };
 use crate::providers::{KeyRotation, Timeouts, custom, plugin};
-use crate::spec::{Owner, ProviderRegistry};
+use crate::spec::{Owner, ProviderRegistry, ProviderSpec};
 use crate::{AgentError, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse};
 
 /// A headless run waits for its listing, so a hung endpoint must not hold up
@@ -204,6 +204,7 @@ fn providers_of(specs: &[String]) -> Vec<String> {
 pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
     let mut specs: Vec<String> = ProviderRegistry::all()
         .into_iter()
+        .filter(|m| !m.catalog_is_authoritative)
         .filter(|m| provider_available_offline(m.slug))
         .flat_map(|m| {
             m.models()
@@ -258,43 +259,13 @@ pub async fn fetch_all_models(
             warn!(provider = slug, "failed to create provider, skipping");
             continue;
         };
-        let display_name = spec.display_name;
         let tx = tx.clone();
         tokio::spawn(async move {
-            let batch = match provider.list_models().await {
-                Ok(models) => {
-                    let mut specs: Vec<String> =
-                        models.iter().map(|m| format!("{slug}/{}", m.id)).collect();
-                    set_known_models(slug, models);
-                    for entry in spec.models() {
-                        for prefix in &entry.prefixes {
-                            let spec = format!("{slug}/{prefix}");
-                            if !specs.contains(&spec) {
-                                specs.push(spec);
-                            }
-                        }
-                    }
-                    ModelBatch {
-                        models: specs,
-                        providers: vec![slug.to_string()],
-                        warnings: Vec::new(),
-                    }
-                }
-                Err(e) => {
-                    warn!(provider = slug, error = %e, "failed to list models, using static fallback");
-                    let fallback: Vec<String> = spec
-                        .models()
-                        .iter()
-                        .flat_map(|entry| entry.prefixes.iter())
-                        .map(|p| format!("{slug}/{p}"))
-                        .collect();
-                    ModelBatch {
-                        models: fallback,
-                        providers: vec![slug.to_string()],
-                        warnings: vec![format!("{display_name}: {e} (using static fallback)")],
-                    }
-                }
-            };
+            let listed = provider.list_models().await;
+            let batch = listing_batch(spec, &listed);
+            if let Ok(models) = listed {
+                set_known_models(slug, models);
+            }
             let _ = tx.send_async(batch).await;
         });
     }
@@ -359,31 +330,81 @@ pub async fn fetch_all_models(
     }
 }
 
+fn listing_batch(spec: &ProviderSpec, listed: &Result<Vec<ModelInfo>, AgentError>) -> ModelBatch {
+    let slug = spec.slug;
+    let curated = || {
+        spec.models()
+            .iter()
+            .flat_map(|entry| &entry.prefixes)
+            .map(move |prefix| format!("{slug}/{prefix}"))
+    };
+    let (models, warnings) = match listed {
+        Ok(models) => {
+            let mut specs: Vec<String> =
+                models.iter().map(|m| format!("{slug}/{}", m.id)).collect();
+            if !spec.catalog_is_authoritative {
+                for row in curated() {
+                    if !specs.contains(&row) {
+                        specs.push(row);
+                    }
+                }
+            }
+            (specs, Vec::new())
+        }
+        Err(
+            e @ AgentError::Api {
+                status: 401 | 403, ..
+            },
+        ) if spec.catalog_is_authoritative => {
+            warn!(provider = slug, error = %e, "failed to list models");
+            (Vec::new(), vec![format!("{}: {e}", spec.display_name)])
+        }
+        Err(e) => {
+            warn!(provider = slug, error = %e, "failed to list models, using static fallback");
+            let warning = format!("{}: {e} (using static fallback)", spec.display_name);
+            (curated().collect(), vec![warning])
+        }
+    };
+    ModelBatch {
+        models,
+        providers: vec![slug.to_string()],
+        warnings,
+    }
+}
+
 /// One provider's share of [`fetch_all_models`], for a provider whose rows can't
-/// describe everything it serves. The UI re-resolves its models whenever a batch
-/// lands, a headless session resolves before a turn and has to wait for the
-/// answer, unless the provider already gave one. A failed listing leaves `model`
-/// on what is already known, which another discovery can have added in the
-/// meantime.
-pub async fn rediscover_model(
-    model: &mut Model,
-    provider: &dyn Provider,
-) -> Result<(), AgentError> {
-    let Some(spec) =
-        ProviderRegistry::get(&model.provider).filter(|spec| spec.accepts_arbitrary_models)
+/// describe everything it serves. Once anyone has discovered it, nobody asks
+/// again. It waits at most [`DISCOVERY_WAIT`] and only fills the registry, it is
+/// [`refresh_model`] that reads it back into a model.
+pub async fn discover_provider(model: &Model, provider: &dyn Provider) -> Result<(), AgentError> {
+    let Some(spec) = ProviderRegistry::get(&model.provider)
+        .filter(|spec| spec.accepts_arbitrary_models && !discovery_complete(spec.slug))
     else {
         return Ok(());
     };
-    let listed = if discovery_complete(spec.slug) {
-        Ok(())
-    } else {
-        remember_models(spec.slug, provider, DISCOVERY_WAIT).await
+    remember_models(spec.slug, provider, DISCOVERY_WAIT).await
+}
+
+/// A `Model` is a snapshot of the registry, and discovery can land long after it
+/// was built, so a headless session calls this before every turn. If the spec no
+/// longer resolves, the old model is still better than none.
+pub fn refresh_model(model: &mut Model, provider: &dyn Provider) {
+    let spec = model.spec();
+    let Ok(mut resolved) = Model::from_spec(&spec) else {
+        return;
     };
-    if let Ok(resolved) = Model::from_spec(&model.spec()) {
+    provider.adjust_model(&mut resolved);
+    if resolved != *model {
+        debug!(
+            spec = %spec,
+            old_window = model.context_window,
+            new_window = resolved.context_window,
+            old_max_output = ?model.max_output_tokens,
+            new_max_output = ?resolved.max_output_tokens,
+            "model metadata refreshed from the registry"
+        );
         *model = resolved;
-        provider.adjust_model(model);
     }
-    listed
 }
 
 async fn remember_models(
@@ -402,17 +423,22 @@ async fn remember_models(
 mod tests {
     use std::future::{pending, ready};
 
+    use test_case::test_case;
+
     use super::*;
 
     const SPEC_WITHOUT_THINKING: &str = "copilot";
     const LANDED_SLUG: &str = "ollama";
     const CURATED_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
+    const CURATED_SLUG: &str = "zai";
+    const UNREGISTERED_SLUG: &str = "no-such-provider";
     const LISTED_MODEL: &str = "listed-with-thinking";
     const LISTED_WINDOW: u32 = 123_456;
     const ADJUSTED_MAX_OUTPUT: u32 = 654;
     const LISTING_FAILED: &str = "no listing";
     const ONLY_LISTS_MODELS: &str = "only asked for its models";
     const NO_ANSWER_KEEPS_LISTING: &str = "no answer keeps the last listing";
+    const ROWS_COVER_IT: &str = "a provider its rows fully describe is never listed";
     const WAIT: Duration = Duration::from_millis(10);
 
     type Listed = Result<Vec<ModelInfo>, AgentError>;
@@ -460,15 +486,8 @@ mod tests {
         Box::pin(pending())
     }
 
-    fn lands_then_fails() -> BoxFuture<'static, Listed> {
-        set_known_models(
-            LANDED_SLUG,
-            vec![ModelInfo {
-                context_window: Some(LISTED_WINDOW),
-                ..ModelInfo::id_only(LISTED_MODEL.into())
-            }],
-        );
-        fails()
+    fn must_not_list() -> BoxFuture<'static, Listed> {
+        unreachable!("{ROWS_COVER_IT}")
     }
 
     #[tokio::test]
@@ -479,21 +498,24 @@ mod tests {
         let mut resolved_before_listing = resolve();
         assert!(!model.supports_thinking());
 
-        rediscover_model(&mut model, &Listing(fails))
+        discover_provider(&model, &Listing(fails))
             .await
             .unwrap_err();
+        refresh_model(&mut model, &Listing(fails));
         assert!(!model.supports_thinking());
 
-        rediscover_model(&mut model, &Listing(lists_thinking))
+        discover_provider(&model, &Listing(lists_thinking))
             .await
             .unwrap();
+        refresh_model(&mut model, &Listing(lists_thinking));
         assert!(model.supports_thinking());
         assert_eq!(model.context_window, LISTED_WINDOW);
         assert_eq!(model.max_output_tokens, Some(ADJUSTED_MAX_OUTPUT));
 
-        rediscover_model(&mut resolved_before_listing, &Listing(fails))
+        discover_provider(&resolved_before_listing, &Listing(fails))
             .await
             .unwrap();
+        refresh_model(&mut resolved_before_listing, &Listing(fails));
         assert_eq!(resolved_before_listing.context_window, LISTED_WINDOW);
 
         for no_answer in [fails, hangs] {
@@ -506,18 +528,41 @@ mod tests {
 
     #[tokio::test]
     async fn rows_that_cover_a_provider_need_no_listing() {
-        let mut model = Model::from_spec(CURATED_SPEC).unwrap();
-        rediscover_model(&mut model, &Listing(fails)).await.unwrap();
-        assert_ne!(model.max_output_tokens, Some(ADJUSTED_MAX_OUTPUT));
+        let model = Model::from_spec(CURATED_SPEC).unwrap();
+        discover_provider(&model, &Listing(must_not_list))
+            .await
+            .unwrap();
     }
 
-    #[tokio::test]
-    async fn a_failed_listing_still_takes_what_landed_meanwhile() {
-        let mut model = Model::from_spec(&format!("{LANDED_SLUG}/{LISTED_MODEL}")).unwrap();
-        rediscover_model(&mut model, &Listing(lands_then_fails))
-            .await
-            .unwrap_err();
+    #[test_case(LANDED_SLUG ; "provider_that_takes_any_model")]
+    #[test_case(CURATED_SLUG ; "provider_with_a_curated_table")]
+    fn refresh_model_reads_landed_discovery(slug: &str) {
+        let mut model = Model::from_spec(&format!("{slug}/{LISTED_MODEL}")).unwrap();
+        set_known_models(
+            slug,
+            vec![ModelInfo {
+                context_window: Some(LISTED_WINDOW),
+                ..ModelInfo::id_only(LISTED_MODEL.into())
+            }],
+        );
+
+        refresh_model(&mut model, &Listing(fails));
+
         assert_eq!(model.context_window, LISTED_WINDOW);
+        assert_eq!(model.max_output_tokens, Some(ADJUSTED_MAX_OUTPUT));
+    }
+
+    #[test]
+    fn refresh_model_keeps_what_it_cannot_resolve() {
+        let unresolvable = Model {
+            provider: UNREGISTERED_SLUG.into(),
+            ..Model::from_spec(&format!("{LANDED_SLUG}/{LISTED_MODEL}")).unwrap()
+        };
+        let mut model = unresolvable.clone();
+
+        refresh_model(&mut model, &Listing(fails));
+
+        assert_eq!(model, unresolvable);
     }
 
     fn policy(allowed: &[&str], excluded: &[&str]) -> ModelPolicy {
@@ -545,6 +590,44 @@ mod tests {
         assert!(!specs.is_empty());
         assert!(specs.iter().all(|spec| spec.starts_with("openai/")));
         assert!(!specs.iter().any(|spec| spec == "openai/gpt-5.6-terra"));
+    }
+
+    #[test]
+    fn available_specs_leave_an_authoritative_catalog_to_discovery() {
+        unsafe { std::env::set_var("GH_COPILOT_TOKEN", "ghu-test-offline-specs") };
+        unsafe { std::env::set_var("OPENAI_API_KEY", "sk-test-offline-specs") };
+        let specs = available_model_specs(&policy(&["copilot/*", "openai/*"], &[]));
+        unsafe { std::env::remove_var("GH_COPILOT_TOKEN") };
+        unsafe { std::env::remove_var("OPENAI_API_KEY") };
+
+        assert!(!specs.is_empty());
+        assert!(specs.iter().all(|spec| spec.starts_with("openai/")));
+    }
+
+    #[test_case("copilot", None, false ; "authoritative_live_answer")]
+    #[test_case("copilot", Some(401), false ; "authoritative_auth_failure")]
+    #[test_case("copilot", Some(500), true ; "authoritative_other_failure")]
+    #[test_case("openai", None, true ; "curated_live_answer")]
+    #[test_case("openai", Some(401), true ; "curated_auth_failure")]
+    #[test_case("openai", Some(500), true ; "curated_other_failure")]
+    fn listing_batch_lists_curated_rows(slug: &str, failed_with: Option<u16>, lists_curated: bool) {
+        let spec = ProviderRegistry::get(slug).unwrap();
+        let listed = match failed_with {
+            None => Ok(vec![ModelInfo::id_only(LISTED_MODEL.into())]),
+            Some(status) => Err(AgentError::Api {
+                status,
+                message: LISTING_FAILED.into(),
+                retry_after: None,
+            }),
+        };
+        let models = listing_batch(spec, &listed).models;
+
+        let curated = format!("{slug}/{}", spec.models()[0].prefixes[0]);
+        assert_eq!(models.contains(&curated), lists_curated);
+        assert_eq!(
+            models.contains(&format!("{slug}/{LISTED_MODEL}")),
+            failed_with.is_none()
+        );
     }
 
     #[test]

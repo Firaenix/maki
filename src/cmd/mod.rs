@@ -155,7 +155,7 @@ async fn cli_stack(
     // First, as in `cmd::tui::run`, so anything that resolves a model sees the
     // models the TUI would.
     let storage = StateDir::resolve().context("resolve data directory")?;
-    maki_providers::model_registry::load_from_storage(&storage);
+    maki_providers::model_registry::load(&storage);
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     // The `trust.paths` policy deliberately stops at the session entry points
     // (`cmd::tui`, `maki-acp`): a one-shot utility would record a grant the
@@ -190,6 +190,7 @@ async fn cli_stack(
                 .into_config(&names(host)?)
                 .context("invalid config")?;
             config.permissions = load_permissions(&trust.project_config);
+            config.validate()?;
             Ok(config)
         },
     )
@@ -201,7 +202,27 @@ async fn cli_stack(
     Ok((host, config))
 }
 
-pub async fn dispatch(cli: Cli) -> Result<()> {
+pub async fn dispatch(mut cli: Cli) -> Result<()> {
+    cli.check_run_path_flags()?;
+    // First, so anything moved out of `~/.maki` lands before this start writes
+    // a file of its own. `migrate xdg` is the same move asked for by hand.
+    let legacy_notice = match cli.command {
+        Some(Command::Migrate { .. }) => None,
+        _ => migrate::startup_notice(),
+    };
+    // The TUI and ACP show it on their own channel, which stderr from here
+    // would sit under. Everything else, `-p` and the SDK included, prints it.
+    let owns_channel = match cli.command {
+        Some(Command::Acp { .. }) => true,
+        None => !cli.print,
+        Some(_) => false,
+    };
+    let legacy_notice = if owns_channel {
+        legacy_notice
+    } else {
+        report_warnings(Vec::from_iter(legacy_notice));
+        None
+    };
     // `--trust` is a grant for this process, so every entry point under it
     // reads the same shared project config the TUI would.
     let trust_mode = if cli.trust {
@@ -209,8 +230,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
     } else {
         TrustMode::Consult
     };
-    let background = cli.background_wait().is_some();
-    match cli.command {
+    match cli.command.take() {
         Some(Command::Auth { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
             // Providers registered by a Lua plugin only reach the registry once
@@ -261,15 +281,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             update::rollback().map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
         }
         Some(Command::Acp { model, yolo }) => {
-            acp::run(
-                model,
-                yolo,
-                cli.no_plugins,
-                cli.no_jit,
-                trust_mode,
-                background,
-            )
-            .await?;
+            acp::run(&cli, model, yolo, trust_mode, legacy_notice).await?;
         }
         Some(Command::Migrate { action }) => match action {
             MigrateAction::Xdg => migrate::xdg()?,
@@ -293,17 +305,10 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Some(Command::Prompt {
-            variant,
-            plan,
-            tools,
-            names,
-        }) => {
+        Some(Command::Prompt(args)) => {
             subcmd::prompt(
-                &variant,
-                plan,
-                tools,
-                names,
+                args,
+                cli.host_prompt(),
                 cli.no_plugins,
                 cli.no_jit,
                 trust_mode,
@@ -311,7 +316,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             .await?;
         }
         None => {
-            tui::run(cli).await?;
+            tui::run(cli, legacy_notice).await?;
         }
     }
     Ok(())

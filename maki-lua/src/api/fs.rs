@@ -16,7 +16,7 @@ use mlua::{Buffer, Lua, Result as LuaResult, Table, Value};
 use tokio::task::spawn_blocking;
 
 use crate::agent_autocmd::HostEvent;
-use crate::api::util::convert::TableExt;
+use crate::api::util::convert::{TableExt, bytes_arg};
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::loader::EventHandle;
 use crate::plugin_permissions::PluginPermissions;
@@ -26,6 +26,10 @@ use crate::runtime::LUA_MEMORY_LIMIT;
 /// big read fails here with a clear error, before it can run some other tool
 /// out of memory.
 pub(crate) const MAX_READ_BYTES: u64 = LUA_MEMORY_LIMIT as u64 / 8;
+const _: () = assert!(
+    MAX_READ_BYTES == 64 * 1024 * 1024,
+    "the Lua API docs and plugin option descs say 64 MiB, change them too"
+);
 const NON_UTF8_CONTENT_ERR: &str = "non-utf8 content; use read_bytes";
 const SCAN_CHUNK: usize = 64 * 1024;
 pub(crate) const LINE_CUT_MARKER: &str = "...";
@@ -238,7 +242,9 @@ impl From<&str> for Line {
 }
 
 /// The next line without its `\n` or `\r\n`, or `None` at the end of the file.
-/// A line over `max_bytes` is cut and gets [`LINE_CUT_MARKER`]. The rest of it
+/// A line over `max_bytes` is cut and gets [`LINE_CUT_MARKER`]. This is where
+/// the line is buffered, so `max_bytes` is capped at [`MAX_READ_BYTES`] here
+/// and no caller can ask for more. The rest of it
 /// is skipped without ever landing in memory, which is how a file that is one
 /// 300 MB line still pages fine. Without `max_bytes`, a line over
 /// [`MAX_READ_BYTES`] fails the read. Bytes that are not UTF-8 fail the read,
@@ -248,7 +254,7 @@ pub(crate) fn next_line(
     max_bytes: Option<u64>,
     lossy: bool,
 ) -> IoResult<Option<Line>> {
-    let keep = max_bytes.unwrap_or(MAX_READ_BYTES);
+    let keep = max_bytes.map_or(MAX_READ_BYTES, |max| max.min(MAX_READ_BYTES));
     // The extra 2 bytes let a line of exactly `keep` bytes see its `\r\n`, so it is not cut.
     let window = keep + 2;
     let mut line = Vec::new();
@@ -348,7 +354,7 @@ impl PageQuery {
         Ok(Self {
             offset: opts.opt("offset")?.unwrap_or(1),
             limit: opts.opt::<u64>("limit")?.filter(|l| *l > 0),
-            max_line_bytes: opts.opt::<u64>("max_line_bytes")?.filter(|b| *b > 0),
+            max_line_bytes: opts.opt_nonzero("max_line_bytes")?,
             count: opts.opt_bool("count").unwrap_or(true),
         })
     }
@@ -481,7 +487,7 @@ async fn read_bytes(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pa
 /// UTF-8.
 ///
 /// @param path string Absolute or relative file path. `~/` is expanded to the home directory.
-/// @param opts table? `offset` is the 1-based line to start at (default 1). `limit` is the max number of lines, `0` or omitted reads to the end. `max_line_bytes` cuts longer lines at a UTF-8 boundary and appends `...`, omitted or `0` keeps lines whole. `count = false` stops reading after the page and leaves `total` nil.
+/// @param opts table? `offset` is the 1-based line to start at (default 1). `limit` is the max number of lines, `0` or omitted reads to the end. `max_line_bytes` cuts longer lines (at most 64 MiB) at a UTF-8 boundary and appends `...`, omitted or `0` keeps lines whole. `count = false` stops reading after the page and leaves `total` nil.
 /// @return (table?, string?) `{ lines = string[], total = integer? }`, or nil plus an error message.
 /// @example
 /// local page, err = maki.fs.read_lines("server.log", { offset = 101, limit = 100, max_line_bytes = 500 })
@@ -742,6 +748,8 @@ fn ext(_lua: &Lua, path: String) -> LuaResult<Option<String>> {
 /// List the contents of the directory at {path}.
 /// Each entry is a two-element array `{name, type}` where type is one of
 /// `"file"`, `"directory"`, `"link"`, or `"unknown"`. Follows symlinks.
+/// `name` is relative to {path}, so with `depth` > 1 nested entries keep
+/// their directory: "d/nested.txt", unambiguous and joinable onto {path}.
 ///
 /// @param path string Directory path.
 /// @param opts table? `depth` (integer, default 1): how many levels deep to recurse.
@@ -750,7 +758,7 @@ fn ext(_lua: &Lua, path: String) -> LuaResult<Option<String>> {
 /// local entries, err = maki.fs.dir("src", { depth = 2 })
 /// if err then return end
 /// for _, e in ipairs(entries) do
-///   print(e[1], e[2]) -- "main.rs"  "file"
+///   print(e[1], e[2]) -- "main.rs" "file", "tests/lib.rs" "file"
 /// end
 #[lua_fn(guard = FsRead)]
 async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Table>> {
@@ -790,13 +798,14 @@ async fn dir(lua: Lua, path: String, opts: Option<Table>) -> LuaResult<Pair<Tabl
 /// or overwriting it if it does.
 ///
 /// @param path string Destination file path. `~/` is expanded.
-/// @param content string Text to write.
+/// @param content string|buffer Bytes to write.
 /// @return (true?, string?) `true` on success, or nil plus an error message.
 /// @example
 /// local ok, err = maki.fs.write("out.txt", "hello world")
 /// if err then print("write failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
-async fn write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
+async fn write(_lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>> {
+    let content = bytes_arg(&content, "fs.write")?;
     let abs = try_pair!(make_absolute(&path));
     let result = tokio::fs::write(&abs, content).await;
     Ok(pair(touched(abs, result).await.map(|()| true)))
@@ -806,13 +815,14 @@ async fn write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>
 /// directory) if it does not exist.
 ///
 /// @param path string Destination file path. `~/` is expanded.
-/// @param content string Text to append.
+/// @param content string|buffer Bytes to append.
 /// @return (true?, string?) `true` on success, or nil plus an error message.
 /// @example
 /// local ok, err = maki.fs.append("out.log", "line\n")
 /// if err then print("append failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
-async fn append(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
+async fn append(_lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>> {
+    let content = bytes_arg(&content, "fs.append")?;
     let abs = try_pair!(make_absolute(&path));
     let appended = abs.clone();
     let result = spawn_blocking(move || {
@@ -821,7 +831,7 @@ async fn append(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool
             .create(true)
             .append(true)
             .open(&abs)
-            .and_then(|mut f| f.write_all(content.as_bytes()))
+            .and_then(|mut f| f.write_all(&content))
     })
     .await
     .map_err(mlua::Error::external)?;
@@ -833,16 +843,17 @@ async fn append(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool
 /// Existing file permissions are preserved. On Unix, new files use mode 0600.
 ///
 /// @param path string Destination file path. `~/` is expanded.
-/// @param content string Text to write.
+/// @param content string|buffer Bytes to write.
 /// @return (true?, string?) `true` on success, or nil plus an error message.
 /// @example
 /// local ok, err = maki.fs.atomic_write("state.json", encoded)
 /// if err then print("atomic write failed: " .. err) end
 #[lua_fn(guard = FsWrite)]
-async fn atomic_write(_lua: Lua, path: String, content: String) -> LuaResult<Pair<bool>> {
+async fn atomic_write(_lua: Lua, path: String, content: Value) -> LuaResult<Pair<bool>> {
+    let content = bytes_arg(&content, "fs.atomic_write")?;
     let abs = try_pair!(make_absolute(&path));
     let written = abs.clone();
-    let result = spawn_blocking(move || maki_storage::atomic_write(&abs, content.as_bytes()))
+    let result = spawn_blocking(move || maki_storage::atomic_write(&abs, &content))
         .await
         .map_err(mlua::Error::external)?;
     Ok(pair(touched(written, result).await.map(|()| true)))
@@ -1484,6 +1495,7 @@ mod tests {
     #[cfg(unix)]
     use std::io::Write;
     use std::io::repeat;
+    use std::sync::mpsc;
     use std::time::{Duration, Instant, SystemTime};
 
     use super::*;
@@ -1492,8 +1504,10 @@ mod tests {
     use mlua::Lua;
     use tempfile::TempDir;
     use test_case::test_case;
+    use tokio::runtime::Builder;
 
     const FIRST_CONTENT: &str = "first";
+    const BINARY_CONTENT: &[u8] = b"\0\xff\x80\r\n";
     const REPLACEMENT_CONTENT: &str = "replacement";
     const FS_WRITE_PERMISSION: &str = "fs_write";
     const READ_LIMIT_ERROR: &str = "file exceeds the 67108864-byte read limit";
@@ -1557,6 +1571,18 @@ mod tests {
             max_line_bytes: Some(CUT),
             ..PageQuery::default()
         }
+    }
+
+    #[test]
+    fn next_line_caps_max_bytes_at_the_read_limit() {
+        let mut huge_line = BufReader::new(repeat(b'x').take(MAX_READ_BYTES + 1));
+        let line = next_line(&mut huge_line, Some(u64::MAX), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            line.text.len() as u64,
+            MAX_READ_BYTES + LINE_CUT_MARKER.len() as u64
+        );
     }
 
     #[test_case("", &[]; "empty")]
@@ -1994,7 +2020,10 @@ mod tests {
         }
         names.sort();
         assert!(names.contains(&"d".to_owned()));
-        assert!(names.iter().any(|n| n.contains("nested.txt")));
+        assert!(
+            names.contains(&"d/nested.txt".to_owned()),
+            "recursive entries must be relative to the root dir, got {names:?}"
+        );
     }
 
     #[tokio::test]
@@ -2173,6 +2202,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "second");
+    }
+
+    #[test_case("write" ; "write")]
+    #[test_case("append" ; "append")]
+    #[test_case("atomic_write" ; "atomic_write")]
+    #[tokio::test]
+    async fn file_writes_preserve_binary_content(method: &str) {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("bytes.bin");
+        std::fs::write(&file, FIRST_CONTENT).unwrap();
+        let lua = Lua::new();
+        let table =
+            create_fs_table(&lua, &PluginPermissions::trusted(), Arc::from(TEST_PLUGIN)).unwrap();
+        let write: mlua::Function = table.get(method).unwrap();
+        let content = lua.create_buffer(BINARY_CONTENT).unwrap();
+        let (ok, error): (bool, Option<String>) = write
+            .call_async((file.to_str().unwrap(), content))
+            .await
+            .unwrap();
+        assert!(ok);
+        assert_eq!(error, None);
+        let expected = if method == "append" {
+            [FIRST_CONTENT.as_bytes(), BINARY_CONTENT].concat()
+        } else {
+            BINARY_CONTENT.to_vec()
+        };
+        assert_eq!(std::fs::read(&file).unwrap(), expected);
     }
 
     #[tokio::test]
@@ -3233,8 +3289,8 @@ mod tests {
     /// The flag can land while the blocking task is already on its way back,
     /// so an answer that was built before the cancel still must not be
     /// published, and nothing it learned on the way may be kept either.
-    #[tokio::test]
-    async fn a_query_superseded_mid_flight_publishes_nothing() {
+    #[test]
+    fn a_query_superseded_mid_flight_publishes_nothing() {
         let base = cwd_root().unwrap();
         let tmp = file_tree(&base);
         walked(tmp.path());
@@ -3246,23 +3302,34 @@ mod tests {
         opts.set("path", tmp.path().to_str().unwrap()).unwrap();
         let f: mlua::Function = tbl.get("fuzzy_files").unwrap();
 
-        let (found, err): (Option<Table>, Option<String>) = async {
-            let mut call = Box::pin(f.call_async::<(Option<Table>, Option<String>)>(opts));
-            // One poll runs the call up to its first await, which is where it
-            // has taken its flag and handed the ranking to a blocking task.
-            // Superseding it now is the flag landing while the answer it is
-            // about to return is already built.
-            assert!(
-                (&mut call).now_or_never().is_none(),
-                "the call is supposed to be waiting on its ranking here"
-            );
-            let overtaking = supersede(&plugin);
-            let out = call.await;
-            retire(&plugin, &overtaking);
-            out
-        }
-        .await
-        .unwrap();
+        // On a busy machine the ranking can finish before the call is first
+        // polled, and then the call is over before the test gets to
+        // supersede it. One blocking thread works through its queue in
+        // order, so a task waiting on a gate holds the ranking back.
+        let runtime = Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (found, err): (Option<Table>, Option<String>) = runtime
+            .block_on(async {
+                let (open_gate, gate) = mpsc::channel::<()>();
+                spawn_blocking(move || gate.recv());
+                let mut call = Box::pin(f.call_async::<(Option<Table>, Option<String>)>(opts));
+                // One poll takes the call's flag and queues its ranking.
+                assert!(
+                    (&mut call).now_or_never().is_none(),
+                    "the call is supposed to be waiting on its ranking here"
+                );
+                drop(open_gate);
+                // Queued after the ranking, so once this is back the answer is
+                // built and only the check after the await can stop it.
+                spawn_blocking(|| ()).await.unwrap();
+                let overtaking = supersede(&plugin);
+                let out = call.await;
+                retire(&plugin, &overtaking);
+                out
+            })
+            .unwrap();
         assert!(found.is_none());
         assert_eq!(err.as_deref(), Some(SUPERSEDED_ERR));
         // The roots are a least-recently-asked-for list, so an overtaken

@@ -202,6 +202,8 @@ fn discover_models(policy: Arc<ModelPolicy>, tx: WeakSender<Incoming>) {
 
 /// Discovery lands in batches after the client built its selector from the
 /// offline list, so every batch that adds something announces the fuller list.
+/// Running sessions need no push, each one reads its model from the registry
+/// again before its next turn.
 fn refresh_models(srv: &mut Server, batch: Vec<String>) {
     let known = srv.model_specs.len();
     for spec in batch {
@@ -278,7 +280,7 @@ async fn handle_request(
             Err(e) => Err(e),
         },
         "session/set_mode" => handle_set_mode(srv, raw),
-        "session/set_config_option" => handle_set_config(srv, raw),
+        "session/set_config_option" => handle_set_config(srv, raw).await,
         _ => Err(AcpError::method_not_found()),
     };
     srv.respond(id, result);
@@ -364,8 +366,9 @@ async fn load_session(
     }
     // Priced against the model the session recorded, not the one selected now
     // (which may cost 10x more or less). Later turns add their own exact cost.
-    let recorded_model =
-        Model::from_spec(&restored.session.model).unwrap_or_else(|_| params.model.clone());
+    let recorded_model = Model::from_spec_or_warm_catalog(&restored.session.model)
+        .await
+        .unwrap_or_else(|_| params.model.clone());
     // Settling writes today's estimate into entries that never recorded a cost.
     // The run saves this session back, so we settle a copy and keep that
     // estimate off disk.
@@ -485,8 +488,7 @@ fn start_session(
         storage: params.storage.clone(),
         yolo: params.yolo,
         unattended: false,
-        system_prompt_override: None,
-        append_system_prompt: None,
+        host_prompt: params.host_prompt.clone(),
         defaults: params.defaults,
         model_policy: Arc::clone(&params.model_policy),
         plugin_rules: Arc::clone(&params.plugin_rules),
@@ -660,16 +662,10 @@ fn trusted_project_config(
     policy: &TrustConfig,
 ) -> ProjectConfig {
     let mut decision = project::resolve(storage, cwd, mode);
-    let matched = decision
-        .state
-        .unanswered()
-        .and_then(|question| policy_grant(question, policy));
-    if let Some(pattern) = matched {
+    if let Some(pattern) = policy_grant(&decision.state, policy) {
         // ACP has no card, so policy is the only yes a cwd with no stored
         // decision can get. Recorded like any other yes so `maki trust list`
-        // shows what this server trusted on the client's behalf. `unanswered`
-        // and not `question`: a recorded `Never` is a stored decision, and
-        // granting over it would wipe the rejection out of the store.
+        // shows what this server trusted on the client's behalf.
         info!(%pattern, cwd = %cwd.display(), "ACP folder trusted by trust.paths policy");
         decision = project::apply_answer(storage, decision, TrustAnswer::Trust);
     }
@@ -807,7 +803,7 @@ fn handle_set_mode(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpEr
     ))
 }
 
-fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpError> {
+async fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, AcpError> {
     let req: SetSessionConfigOptionRequest = parse_params(raw)?;
     if req.config_id.0.as_ref() != methods::MODEL_CONFIG_ID {
         let detail = format!("unknown config option: {}", req.config_id);
@@ -818,11 +814,9 @@ fn handle_set_config(srv: &mut Server, raw: &Value) -> Result<AgentResponse, Acp
         return Err(AcpError::invalid_params().data(json_str(&"model must be a value id")));
     };
     let spec = value.0.to_string();
-    if !srv.model_policy.allows(&spec) {
-        return Err(AcpError::invalid_params().data(json_str(&"model is not allowed by policy")));
-    }
-    let model =
-        Model::from_spec(&spec).map_err(|e| AcpError::invalid_params().data(json_str(&e)))?;
+    let model = Model::from_spec_with_policy(&spec, &srv.model_policy)
+        .await
+        .map_err(|e| AcpError::invalid_params().data(json_str(&e)))?;
 
     let session = srv.session.as_mut().ok_or_else(no_session)?;
     session
@@ -1155,7 +1149,7 @@ mod tests {
     use maki_agent::permissions::{PermissionCheck, PermissionError, PermissionManager};
     use maki_agent::tools::PermissionScopes;
     use maki_agent::{
-        CancelToken, DoneReason, EventSender, RunTotals, SubagentInfo, ToolStartEvent,
+        CancelToken, DoneReason, EventSender, HostPrompt, RunTotals, SubagentInfo, ToolStartEvent,
         TurnCompleteEvent,
     };
     use maki_config::project::TrustQuestion;
@@ -1252,7 +1246,7 @@ mod tests {
         assert!(trusted.is_trusted());
         assert_eq!(
             trusted.config_root(),
-            ProjectConfig::for_project(project.path()).config_root()
+            ProjectConfig::discover(project.path()).config_root()
         );
         let rules = maki_config::load_permissions(&trusted).rules;
         assert!(
@@ -1403,7 +1397,8 @@ mod tests {
             permissions: Arc::new(PermissionManager::new(
                 maki_config::PermissionsConfig::default(),
                 PathBuf::from("/project"),
-                ProjectConfig::for_project(Path::new("/project")),
+                project::resolve_noninteractive(Path::new("/project"), TrustMode::Session)
+                    .project_config,
                 Arc::default(),
             )),
             task: AbortOnDropHandle::new(tokio::spawn(async { SessionEnd::default() })),
@@ -1444,6 +1439,7 @@ mod tests {
             on_session_end: None,
             storage,
             background: false,
+            host_prompt: HostPrompt::default(),
             stop: CancelToken::none(),
         }
     }
@@ -1576,7 +1572,7 @@ mod tests {
             model: None,
             opts: None,
             answer_tx,
-            inbox: Arc::default(),
+            control: Arc::default(),
             parent_call: None,
         }
     }
@@ -1883,6 +1879,7 @@ mod tests {
                 .send(AgentEvent::ObservationLine {
                     text: NOTICE_LINE.to_owned(),
                     detail: None,
+                    markdown: false,
                     end: None,
                 })
                 .unwrap();
@@ -1896,6 +1893,7 @@ mod tests {
                     event: AgentEvent::ObservationLine {
                         text: CHILD_NOTICE_LINE.to_owned(),
                         detail: None,
+                        markdown: false,
                         end: None,
                     },
                     subagent: Some(subagent(None)),

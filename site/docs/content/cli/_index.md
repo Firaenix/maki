@@ -27,13 +27,15 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `-c` / `--continue`, `-r` / `--resume` | yes | yes | yes |
 | `--exit-on-done` | yes | n/a (always exits) | n/a |
 | `--background-timeout` | with `--exit-on-done` | yes (turns moves on) | yes |
-| `--image` | no (use Ctrl+V paste) | yes | via wire protocol |
+| `--image` | error (use Ctrl+V paste) | yes | error (send images over the wire protocol) |
 | `--verbose`, `--output-format` | no | yes | stream only |
-| `--system-prompt`, `--append-system-prompt` | no | no | yes |
+| `--system-prompt`, `--append-system-prompt` | yes | yes | yes |
 | `--session-id`, `--fork-session` | yes | yes | yes |
-| `--max-turns` | no | no | yes |
-| `--permission-mode` | no | no | yes |
+| `--max-turns` | error | yes | yes |
+| `--permission-mode` | error | error | yes |
 | `--include-partial-messages` | no | no | yes |
+
+A flag marked error stops Maki before the run starts, so a script cannot think it applied. Subcommands refuse these flags too, except that `maki acp` and `maki prompt system` take `--system-prompt` and `--append-system-prompt`.
 
 ### Shared flags (detail)
 
@@ -58,15 +60,15 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--disallowed-tools <LIST>` | Comma-separated deny list |
 | `--session-id <ID>` | Write this run under a chosen id. Errors if a session already exists under it, unless `-r` / `-c` is continuing that same session |
 | `--fork-session` | Copy the resumed session's history under a new id, leaving the original untouched. See [Sessions](/docs/headless/#sessions) |
-| `--max-turns <N>` | Cap agent turns (SDK) |
-| `--system-prompt <TEXT>` | Replace the system prompt (SDK only) |
-| `--append-system-prompt <TEXT>` | Append to the built-in system prompt (SDK only) |
+| `--max-turns <N>` | Cap agent turns (`--print` and SDK) |
+| `--system-prompt <TEXT>` | Replace the main agent's system prompt. Project instructions and the built-in prompt are left out. Subagents keep their own prompts |
+| `--append-system-prompt <TEXT>` | Add text after the main agent's system prompt. Subagents do not get it, so put text they need in `AGENTS.local.md`. Pass it again when you resume a session, or the session's prompt is rebuilt without it |
 | `--permission-mode <MODE>` | SDK: `default`, `acceptEdits`, `plan`, or `bypassPermissions` |
 | `--include-partial-messages` | Stream partial deltas in SDK mode |
 
 ### Tool name lists
 
-`--allowed-tools` / `--disallowed-tools` accept Claude Code PascalCase (`Read,Edit,Bash`) or snake_case (`read,edit,bash`). Maki lowercases PascalCase to snake_case and checks the result against the built-in tool names, so `CodeExecution` works but `MultiEdit` errors: it normalizes to `multi_edit`, and the tool is called `multiedit`. Write `multiedit` or `edit_lines` as-is. Unknown names error out with the list of valid names. The edit plugin's sub-tools (`multiedit`, `edit_lines`, `insert_lines`) are valid names here even when disabled. Listing a disabled tool has no effect until you enable it in config.
+`--allowed-tools` / `--disallowed-tools` accept Claude Code PascalCase (`Read,Edit,Bash`) or snake_case (`read,edit,bash`). Maki lowercases PascalCase to snake_case and checks the result against the built-in tool names, so `CodeExecution` works but `MultiEdit` errors: it normalizes to `multi_edit`, and the tool is called `multiedit`. Write `multiedit` or `edit_lines` as-is. Unknown names in `--allowed-tools` error out with the list of valid names. `--disallowed-tools` skips them. The edit plugin's sub-tools (`multiedit`, `edit_lines`, `insert_lines`) are valid names here even when disabled. Listing a disabled tool has no effect until you enable it in config.
 
 ### Permission modes (SDK)
 
@@ -196,6 +198,7 @@ maki acp
 maki acp -m anthropic/claude-sonnet-4-6
 maki acp --yolo
 maki --no-jit acp
+maki --append-system-prompt "..." acp
 ```
 
 Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand flags are only `-m` / `--model` and `--yolo`. Global flags like `--no-jit` must come before the subcommand.
@@ -217,9 +220,10 @@ maki prompt general
 maki prompt --plan           # system prompt + plan-mode reminder (system only)
 maki prompt --tools          # tool definitions as JSON
 maki prompt --tools --names  # tool names only, one per line
+maki --append-system-prompt "..." prompt   # preview with appended text
 ```
 
-Debug helper for inspecting the prompt and tool surface the agent sees. `--plan` is rejected on non-system variants.
+Debug helper for inspecting the prompt and tool surface the agent sees. `--plan`, `--system-prompt` and `--append-system-prompt` are rejected on non-system variants, and the last two also with `--tools`.
 
 ### `maki migrate`
 
@@ -228,7 +232,7 @@ maki migrate xdg
 maki migrate providers
 ```
 
-`xdg` moves data from `~/.maki/` into platform directories. Safe to re-run. See [Configuration](/docs/configuration/#directory-layout).
+`xdg` moves `~/.maki/` into the platform directories. Maki already does this on startup, so you only need it for a symlinked `~/.maki/` or to retry a move that failed. See [Configuration](/docs/configuration/#moving-from-maki).
 
 `providers` lists the old provider scripts that no Lua plugin replaces yet, and prints a prompt that asks a coding agent to port them. The prompt goes to stdout, so `maki "$(maki migrate providers)"` starts maki on it. See [Migrating from provider scripts](/docs/providers/#migrating-from-provider-scripts).
 

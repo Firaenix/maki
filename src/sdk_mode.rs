@@ -551,7 +551,7 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
         claim,
         storage,
         model,
-        mut config,
+        config,
         permissions_config,
         timeouts,
         prompt_slots,
@@ -562,9 +562,6 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
         project_config,
     } = params;
     cli.warn_ignored_flags();
-    if let Some(max) = cli.max_turns {
-        config.max_turns = Some(max);
-    }
     let permission_mode = PermissionMode::resolve(cli.permission_mode.as_deref(), cli.yolo);
     let interrupt = Interrupt::install();
     let stop = interrupt.stop();
@@ -592,8 +589,7 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
         storage,
         yolo: permission_mode == PermissionMode::BypassPermissions,
         unattended: false,
-        system_prompt_override: cli.system_prompt.clone().filter(|s| !s.is_empty()),
-        append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
+        host_prompt: cli.host_prompt(),
         defaults,
         model_policy: Arc::clone(&model_policy),
         plugin_rules,
@@ -731,7 +727,8 @@ pub async fn run(params: SdkParams) -> Result<Interrupt> {
                     &startup_model,
                     &model_policy,
                     &cwd,
-                )?;
+                )
+                .await?;
             }
             "control_response" => {
                 let Some(cr) =
@@ -852,7 +849,7 @@ fn content_images(content: &Value) -> Vec<ImageSource> {
         .collect()
 }
 
-fn handle_control_request(
+async fn handle_control_request(
     cr: &InboundControlRequest,
     writer: &SdkWriter,
     handle: &InteractiveHandle,
@@ -898,7 +895,9 @@ fn handle_control_request(
             }
         }
         "set_model" => {
-            match resolve_set_model(cr.request.extra.get("model"), startup_model, model_policy) {
+            match resolve_set_model(cr.request.extra.get("model"), startup_model, model_policy)
+                .await
+            {
                 Some(model) => {
                     let _ = handle.model_tx.send(model.clone());
                     shared.lock().unwrap().model = model;
@@ -919,7 +918,7 @@ fn handle_control_request(
     }
 }
 
-fn resolve_set_model(
+async fn resolve_set_model(
     model_val: Option<&Value>,
     startup_model: &Model,
     model_policy: &ModelPolicy,
@@ -928,17 +927,10 @@ fn resolve_set_model(
         Value::Null => Some(startup_model.clone()),
         Value::String(model_str) => {
             let spec = resolve_model_spec(model_str);
-            if !model_policy.allows(&spec) {
-                warn!(model = %spec, "ignoring model disallowed by policy");
-                return None;
-            }
-            match Model::from_spec(&spec) {
-                Ok(m) => Some(m),
-                Err(e) => {
-                    warn!(model = %model_str, error = %e, "ignoring invalid model");
-                    None
-                }
-            }
+            Model::from_spec_with_policy(&spec, model_policy)
+                .await
+                .inspect_err(|e| warn!(model = %spec, error = %e, "ignoring requested model"))
+                .ok()
         }
         _ => None,
     }
@@ -1625,20 +1617,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resolve_set_model_null_returns_startup() {
+    #[tokio::test]
+    async fn resolve_set_model_null_returns_startup() {
         let startup = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
         let result = resolve_set_model(
             Some(&Value::Null),
             &startup,
             &maki_config::ModelPolicy::default(),
         )
+        .await
         .unwrap();
         assert_eq!(result.id, startup.id);
     }
 
-    #[test]
-    fn resolve_set_model_rejects_disallowed_exact_spec() {
+    #[tokio::test]
+    async fn resolve_set_model_rejects_disallowed_exact_spec() {
         let startup = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
         let raw: maki_config::RawConfig = serde_json::from_value(serde_json::json!({
             "provider": {"allowed_models": [startup.spec()]}
@@ -1652,6 +1645,7 @@ mod tests {
                 &startup,
                 &policy
             )
+            .await
             .is_none()
         );
     }
@@ -1947,6 +1941,7 @@ mod tests {
         pump.handle(top_level(AgentEvent::ObservationLine {
             text: NOTICE_LINE.into(),
             detail: None,
+            markdown: false,
             end: None,
         }))
         .unwrap();
@@ -1958,6 +1953,7 @@ mod tests {
             event: AgentEvent::ObservationLine {
                 text: CHILD_NOTICE_LINE.into(),
                 detail: None,
+                markdown: false,
                 end: None,
             },
             subagent: Some(SubagentInfo {
@@ -1967,7 +1963,7 @@ mod tests {
                 model: None,
                 opts: None,
                 answer_tx: None,
-                inbox: Arc::default(),
+                control: Arc::default(),
                 parent_call: None,
             }),
             run_id: 0,

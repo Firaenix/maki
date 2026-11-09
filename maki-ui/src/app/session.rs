@@ -118,7 +118,7 @@ fn moved_outcomes(
 ) -> Vec<(String, BackgroundOutcome)> {
     let mut outcomes = HashMap::new();
     for message in messages {
-        if let Some(settled) = &message.settles {
+        if let Some(settled) = message.settles() {
             outcomes.insert(settled.task.as_str(), settled.end.into());
         }
         for id in &message.receipts {
@@ -174,6 +174,7 @@ impl App {
             snapshot.as_deref(),
             meta,
             self.state.token_usage,
+            |m| m.tool_uses().map(|(id, _, _)| id.to_owned()).collect(),
         );
 
         if !session_has_content(&self.state.session) {
@@ -659,9 +660,10 @@ impl App {
         vec![Action::OpenFork(Box::new(OpenSession { session, claim }))]
     }
 
+    /// Each running task, keyed by the call whose receipt a rewind would drop.
     fn background_task_names(&self) -> Vec<(Arc<str>, String)> {
         self.running_background_tasks()
-            .filter_map(|chat| Some((Arc::clone(chat.task_id()?), chat.name.clone())))
+            .filter_map(|chat| Some((Arc::clone(chat.receipt()?), chat.name.clone())))
             .collect()
     }
 

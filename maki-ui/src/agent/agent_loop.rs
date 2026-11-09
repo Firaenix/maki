@@ -1,10 +1,8 @@
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
 use maki_agent::agent::{self, AgentHooks};
+use maki_agent::mcp::McpHandle;
 use maki_agent::mcp::config::McpServerStatus;
-use maki_agent::mcp::{McpHandle, McpSession};
-use maki_agent::permissions::PermissionManager;
 use maki_agent::prompt::ResolvedPrompts;
 use maki_agent::session::Resumed;
 use maki_agent::template;
@@ -12,18 +10,15 @@ use maki_agent::template::Vars;
 use maki_agent::tools::{BackgroundFor, RequestTools, ToolAudience, ToolRegistry};
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, AgentSeed, CancelMap,
-    CancelToken, DoneReason, Envelope, EventSender, History, Instructions, McpCommand, PromptRole,
-    RunContext, RunContextBuilder, RunLedger, RunTotals, SessionMailbox, SharedMessages,
-    ToolOutputLines,
+    CancelToken, DoneReason, Envelope, EventSender, History, HostPrompt, Instructions, McpCommand,
+    PromptRole, RunContextBuilder, RunLedger, RunTotals, SessionMailbox, SharedMessages,
 };
-use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
 use maki_providers::{AgentError, ContextGauge, Message, Model};
 use tokio::sync::Mutex;
 use tokio::task::spawn_blocking;
 use tracing::error;
 
-use super::ModelSlot;
 use super::run_cancels::RunCancels;
 use super::shared_queue::{self, Compaction, QueueReceiver, QueueRun};
 
@@ -45,6 +40,17 @@ fn base_tools(
     )
 }
 
+/// The loop's side of everything it shares with its `AgentHandles`.
+pub(super) struct LoopEnds {
+    pub(super) shared_history: SharedMessages,
+    pub(super) agent_tx: flume::Sender<Envelope>,
+    pub(super) answer_rx: flume::Receiver<String>,
+    pub(super) queue: Arc<QueueReceiver>,
+    pub(super) cancels: Arc<RunCancels>,
+    pub(super) mailbox: SessionMailbox,
+    pub(super) subagent_cancels: Arc<CancelMap<String>>,
+}
+
 pub(super) struct AgentLoop {
     /// The registry only holds the seed weakly, so plugins can reach it for
     /// exactly as long as this loop lives.
@@ -62,39 +68,26 @@ pub(super) struct AgentLoop {
     mailbox: SessionMailbox,
     lua_handle: EventHandle,
     subagent_cancels: Arc<CancelMap<String>>,
+    host_prompt: Arc<HostPrompt>,
 }
 
 impl AgentLoop {
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
-        model_slot: Arc<ArcSwap<ModelSlot>>,
-        config: AgentConfig,
-        tool_output_lines: ToolOutputLines,
+        seed: AgentSeed,
         resumed: Resumed,
-        shared_history: SharedMessages,
-        mcp_handle: Option<McpHandle>,
-        permissions: Arc<PermissionManager>,
-        agent_tx: flume::Sender<Envelope>,
-        answer_rx: flume::Receiver<String>,
-        queue: Arc<QueueReceiver>,
-        cancels: Arc<RunCancels>,
-        mailbox: SessionMailbox,
-        timeouts: maki_providers::Timeouts,
+        LoopEnds {
+            shared_history,
+            agent_tx,
+            answer_rx,
+            queue,
+            cancels,
+            mailbox,
+            subagent_cancels,
+        }: LoopEnds,
         lua_handle: EventHandle,
-        subagent_cancels: Arc<CancelMap<String>>,
-        model_policy: Arc<ModelPolicy>,
+        host_prompt: Arc<HostPrompt>,
     ) -> Self {
-        let mcp = mcp_handle.map(|h| McpSession::new(h, &resumed.history));
-        let seed = mailbox.publish_seed(AgentSeed::new(
-            resumed.id,
-            model_slot,
-            config,
-            tool_output_lines,
-            permissions,
-            mcp,
-            timeouts,
-            model_policy,
-        ));
+        let seed = mailbox.publish_seed(seed);
         Self {
             seed,
             vars: Vars::default(),
@@ -110,6 +103,7 @@ impl AgentLoop {
             mailbox,
             lua_handle,
             subagent_cancels,
+            host_prompt,
         }
     }
 
@@ -223,9 +217,10 @@ impl AgentLoop {
         let slots = Arc::clone(&prompt_slots);
         let config = self.seed.config.clone();
         let has_mcp = self.seed.mcp.is_some();
+        let host_prompt = Arc::clone(&self.host_prompt);
         let context: RunContextBuilder = Arc::new(move |model, workflow| {
             let tools = base_tools(&vars, model, &config, has_mcp, workflow);
-            RunContext::render(&vars, &instructions, &slots, model, tools)
+            host_prompt.context(&vars, &instructions, &slots, model, tools)
         });
         (context, prompt_slots)
     }
@@ -332,7 +327,6 @@ impl AgentLoop {
                 prompt_slots: Arc::clone(&prompt_slots),
                 subagent_cancels: Arc::clone(&self.subagent_cancels),
                 ledger: Arc::clone(ledger),
-                registry: Arc::clone(maki_agent::tools::ToolRegistry::global_arc()),
                 audience: ToolAudience::MAIN,
                 model_policy: Arc::clone(&self.seed.model_policy),
             },

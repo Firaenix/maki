@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use flume::TryRecvError;
-use maki_agent::tools::{MAIN_TASK_ID, ToolRegistry, ToolSource};
-use maki_agent::{AgentEvent, PartStatus, ToolDoneEvent, ToolPart};
+use maki_agent::tools::{MAIN_TASK_ID, ToolRegistry};
+use maki_agent::{AgentEvent, PartStatus, SessionMailbox, ToolDoneEvent, ToolPart};
 use maki_lua::MoveOutcome;
 use maki_storage::id::MakiId;
 use serde::Serialize;
@@ -220,6 +220,9 @@ pub(crate) struct TaskInfo {
     /// A [`TaskParent::Part`], whose stop is its parent's.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     part: bool,
+    /// See [`App::is_wrapper`].
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    wrapper: bool,
     focused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     started_at: Option<u64>,
@@ -319,10 +322,9 @@ fn part_task_id(call: &str, part: &str) -> String {
 /// The plugin that registered {tool}, or the tool itself for one no plugin
 /// owns, so the task still has an owner to show.
 fn tool_owner(tool: &Arc<str>) -> Arc<str> {
-    match ToolRegistry::global().get(tool).map(|entry| entry.source) {
-        Some(ToolSource::Lua { plugin }) => plugin,
-        _ => Arc::clone(tool),
-    }
+    ToolRegistry::global()
+        .get(tool)
+        .map_or_else(|| Arc::clone(tool), |entry| entry.source.plugin)
 }
 
 impl App {
@@ -382,9 +384,9 @@ impl App {
 
     /// A moved call keeps streaming into the buf its row was drawing. So its
     /// task tab starts as a copy of that row, holding the same buf: nothing
-    /// is replayed and nothing is lost. This runs before the row in {origin}
-    /// takes the receipt, because the receipt retires the buf there. A `task`
-    /// call already has a tab, its subagent's, and that tab is adopted.
+    /// is replayed and nothing is lost. The row in {origin} keeps drawing the
+    /// buf's head until its badge gets an outcome. A `task` call already has
+    /// a tab, its subagent's, and that tab is adopted.
     pub(super) fn open_background_call(&mut self, origin: usize, done: &ToolDoneEvent) {
         let mut outcome = None;
         if let Ok(idx) = self.chat_of_task(&done.id) {
@@ -622,14 +624,50 @@ impl App {
         self.chats[idx].plugin.clone()
     }
 
-    /// What `/tasks` counts in its hint: the tasks quitting or a rewind would
-    /// end, as opposed to the tool tasks a turn owns.
+    /// The tasks quitting, `/new` or a rewind would end, as opposed to the
+    /// tool tasks a turn owns. Counted the way `/tasks` lists them.
     pub(crate) fn running_background_tasks(&self) -> impl Iterator<Item = &Chat> {
         self.chats.iter().filter(|chat| {
             chat.plugin.is_some()
-                && chat.parent.is_none()
                 && chat.task_status() == TaskStatus::Working
+                && !self.is_wrapper(chat)
         })
+    }
+
+    /// What the agent still waits on, counted the way `/tasks` lists it. Only
+    /// receipts the model holds count, since a plugin's own sessions wake
+    /// nobody. A moved batch is its running parts, and a receipt with no tab,
+    /// like a moved `bash`, is still one.
+    pub(crate) fn awaited_tasks(&self) -> usize {
+        self.live_mailbox()
+            .map(SessionMailbox::outstanding_receipts)
+            .unwrap_or_default()
+            .iter()
+            .map(|receipt| {
+                self.running_background_tasks()
+                    .filter(|task| task.receipt().is_some_and(|call| **call == **receipt))
+                    .count()
+                    .max(1)
+            })
+            .sum()
+    }
+
+    /// One rule decides what `/tasks` lists and what every count counts, so
+    /// they never disagree. A call that runs other tasks, like a moved batch,
+    /// is shown through them, since each one reports to the model on its own.
+    /// It counts as itself again when it still works but none of them does,
+    /// like right before its final reply, so no count misses running work.
+    fn is_wrapper(&self, chat: &Chat) -> bool {
+        let Some(id) = chat.task_id() else {
+            return false;
+        };
+        let working = |task: &Chat| task.task_status() == TaskStatus::Working;
+        let mut children = self
+            .chats
+            .iter()
+            .filter(|child| child.parent.as_ref().map(TaskParent::call) == Some(id))
+            .peekable();
+        children.peek().is_some() && (!working(chat) || children.any(working))
     }
 
     /// Subagent chats only, in chat order.
@@ -661,6 +699,7 @@ impl App {
                     .and_then(|id| self.chats[MAIN_CHAT].tool_name(id)),
                 parent: chat.parent.as_ref().map(TaskParent::call).cloned(),
                 part: chat.part_of().is_some(),
+                wrapper: self.is_wrapper(chat),
                 focused: idx == self.active_chat,
                 started_at: chat.clock.as_ref().and_then(TaskClock::started_at),
                 ended_at: chat.clock.as_ref().and_then(TaskClock::ended_at),
@@ -893,12 +932,13 @@ mod tests {
         MONITOR_ID, MONITOR_PLUGIN, MOVE_RECEIPT, MOVED_ID, RESEARCH_NAME, SLOW_TOOL,
         STARTED_AT_KEY, agent_msg, app_with_moved_call, app_with_plugin_task,
         app_with_subagent_call, app_with_subagent_id, cancel_app, close_subagent_transcript, done,
-        end_turn, error_app, finish_subagent, moved_done, moved_subagent_event, plugin_event,
-        reload, start_subagent, streaming_app, subagent_info, test_app, tool_start,
+        end_turn, error_app, finish_subagent, hold_mailbox, moved_done, moved_subagent_event,
+        plugin_event, reload, start_subagent, streaming_app, subagent_info, test_app, tool_start,
     };
     use crate::chat::{DONE_TEXT, ERROR_TEXT};
-    use crate::components::Overlay;
+    use crate::components::input::Placeholder;
     use crate::components::keybindings::key;
+    use crate::components::{Overlay, Status};
     use crate::repaint::Cadence;
     use maki_agent::{Envelope, SharedBuf, ToolOutput};
     use maki_config::ToolKey;
@@ -1206,6 +1246,48 @@ mod tests {
         }));
     }
 
+    /// The quit flash and the input's wait count what `/tasks` lists: a
+    /// moved batch is its running children, and itself once none of them runs.
+    #[test_case(&[PartStatus::Working, PartStatus::Working], 2 ; "every_running_part")]
+    #[test_case(&[PartStatus::Working, PartStatus::Done], 1 ; "only_running_parts")]
+    #[test_case(&[PartStatus::Done, PartStatus::Done], 1 ; "the_call_once_no_part_runs")]
+    fn a_moved_call_counts_as_its_running_parts(statuses: &[PartStatus], expected: usize) {
+        let (mut app, _) = app_with_moved_call();
+        let parts = statuses
+            .iter()
+            .enumerate()
+            .map(|(i, &status)| ToolPart {
+                id: i.to_string(),
+                name: PART_NAME.into(),
+                tool: SUB_TOOL.into(),
+                status,
+                body: None,
+            })
+            .collect();
+        app.update(agent_msg(AgentEvent::ToolParts {
+            id: MOVED_ID.into(),
+            parts,
+        }));
+
+        assert_eq!(app.running_background_tasks().count(), expected);
+        let listed = app
+            .tasks()
+            .into_iter()
+            .filter(|task| task.status == Some(TaskStatus::Working) && !task.wrapper)
+            .count();
+        assert_eq!(listed, expected, "/tasks lists what the flash counts");
+
+        hold_mailbox(&mut app).track(MOVED_ID);
+        app.status = Status::Idle;
+        let Placeholder::Background(waiting_on) = app.input_placeholder() else {
+            panic!("the input does not say the agent waits");
+        };
+        assert_eq!(
+            waiting_on, expected,
+            "the input waits on what the flash counts"
+        );
+    }
+
     fn app_with_working_part() -> (App, Arc<SharedBuf>, String) {
         let (mut app, _) = app_with_moved_call();
         let body = Arc::new(SharedBuf::new());
@@ -1231,11 +1313,6 @@ mod tests {
         assert!(
             tab.live_buf(&part)
                 .is_some_and(|shared| Arc::ptr_eq(&shared, &body))
-        );
-        assert_eq!(
-            app.running_background_tasks().count(),
-            1,
-            "a part is counted with its call"
         );
         let listed = app.tasks().into_iter().find(|task| *task.id == *part);
         assert!(listed.as_ref().is_some_and(|task| task.part));

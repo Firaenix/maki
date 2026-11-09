@@ -4,23 +4,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
 use maki_agent::PermissionPreview;
 use maki_agent::permissions::{DEFAULT_DENY_GUIDANCE, PermissionAnswer, generalized_scopes};
+use maki_config::project::TrustState;
 use maki_config::{DEFAULT_PERMISSION_EXPAND_KEY, ToolKey};
 use maki_lua::Key;
 
 use crate::components::Overlay;
 use crate::components::code_view::{render_file, render_snippet_diff};
-use crate::components::form::render_form;
+use crate::components::form::{FORM_WRAP, render_form};
 use crate::components::hint_line;
 use crate::components::is_ctrl;
 use crate::components::shell_format::format_command;
+use crate::components::{Caret, field_line, painted_caret};
 use crate::highlight;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
@@ -54,6 +56,8 @@ const UNTRUSTED_NOTICE: &str = "folder not trusted, project answers last for thi
 /// Nothing is written into a folder the user declined, so the answer that
 /// survives a restart is the global one and the prompt has to name it.
 const UNTRUSTED_DURABLE_ANSWER: &str = "use D to save a deny that outlives this session";
+const TRUST_TO_SAVE_NOTICE: &str =
+    "/trust saves later project answers here, this folder has no .maki files to load";
 
 const CONFIRM_ALLOW_PROJECT_HINTS: &[(&str, &str)] = &[
     ("Enter / y", "Confirm allow-always (project)"),
@@ -251,7 +255,7 @@ fn preview_lines(preview: &PermissionPreview, highlight: bool) -> Vec<Line<'stat
 
 fn wrapped_height(lines: &[Line<'static>], width: u16) -> u16 {
     Paragraph::new(lines.to_vec())
-        .wrap(Wrap { trim: false })
+        .wrap(FORM_WRAP)
         .line_count(width) as u16
 }
 
@@ -298,6 +302,26 @@ pub(crate) enum PromptState {
     DenyEditing,
 }
 
+/// Where a project answer lands, which decides what the rows promise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectAnswers {
+    Saved,
+    /// Untrusted, and `/trust` would load nothing. Only here may the prompt
+    /// suggest it, because anywhere else that yes runs the repository's code.
+    SessionUntilTrusted,
+    SessionOnly,
+}
+
+impl ProjectAnswers {
+    pub fn new(project_trusted: bool, trust: &TrustState) -> Self {
+        match (project_trusted, trust) {
+            (true, _) => Self::Saved,
+            (false, TrustState::Vacant(_)) => Self::SessionUntilTrusted,
+            (false, _) => Self::SessionOnly,
+        }
+    }
+}
+
 /// Hands every queued ask a handle unique across the process. The agent's id
 /// cannot name an ask on its own: it is empty for calls nested in batch or
 /// code_execution, and each session queues its asks separately.
@@ -310,7 +334,7 @@ struct Request {
     scopes: Vec<String>,
     subagent_id: Option<String>,
     allow_scopes: Vec<String>,
-    project_trusted: bool,
+    project_answers: ProjectAnswers,
     /// Set when a plugin escalated the call, so the user sees why they are
     /// asked about a call their rules might have let through.
     reason: Option<String>,
@@ -331,6 +355,12 @@ pub struct AnsweredRequest {
     pub id: String,
     pub subagent_id: Option<String>,
     pub answer: PermissionAnswer,
+}
+
+/// Where the deny field's caret sits in the prompt's lines, before wrapping.
+struct FieldCaret {
+    row: usize,
+    caret: Caret,
 }
 
 /// Every request parks a tool call until it is answered, so asks that arrive
@@ -460,7 +490,7 @@ impl PermissionPrompt {
         tool: ToolKey,
         scopes: Vec<String>,
         subagent_id: Option<String>,
-        project_trusted: bool,
+        project_answers: ProjectAnswers,
         reason: Option<String>,
         preview: Option<PermissionPreview>,
     ) -> u64 {
@@ -478,7 +508,7 @@ impl PermissionPrompt {
             scopes,
             subagent_id,
             allow_scopes,
-            project_trusted,
+            project_answers,
             reason,
             preview,
             preview_lines: RefCell::default(),
@@ -639,21 +669,28 @@ impl PermissionPrompt {
         }
     }
 
-    /// True while the prompt is up, since it owns the keyboard then. Only the
-    /// deny editor has a place for {text}, anywhere else it is dropped.
-    pub fn handle_paste(&mut self, text: &str) -> bool {
-        let open = self.is_open();
-        if open && self.state == PromptState::DenyEditing {
+    /// Only the deny editor has a place for {text}, anywhere else it is
+    /// dropped.
+    pub fn handle_paste(&mut self, text: &str) {
+        if self.state == PromptState::DenyEditing {
             self.buffer.insert_text(text);
         }
-        open
     }
 
     fn build_lines(&self) -> Vec<Line<'static>> {
+        self.build_lines_with_caret().0
+    }
+
+    fn build_lines_with_caret(&self) -> (Vec<Line<'static>>, Option<FieldCaret>) {
         let mut lines = self.header_lines();
         lines.extend(self.scope_rows());
-        lines.extend(self.footer_lines());
-        lines
+        let (footer, field) = self.footer_lines_with_caret();
+        let field = field.map(|field| FieldCaret {
+            row: lines.len() + field.row,
+            ..field
+        });
+        lines.extend(footer);
+        (lines, field)
     }
 
     fn header_lines(&self) -> Vec<Line<'static>> {
@@ -769,13 +806,18 @@ impl PermissionPrompt {
     }
 
     fn footer_lines(&self) -> Vec<Line<'static>> {
+        self.footer_lines_with_caret().0
+    }
+
+    /// The deny field's caret row counts from the footer's first line.
+    fn footer_lines_with_caret(&self) -> (Vec<Line<'static>>, Option<FieldCaret>) {
         let Some(Request {
             allow_scopes,
-            project_trusted,
+            project_answers,
             ..
         }) = self.queue.front()
         else {
-            return vec![];
+            return (vec![], None);
         };
         let (state, buffer) = (&self.state, &self.buffer);
         let t = theme::current();
@@ -794,45 +836,45 @@ impl PermissionPrompt {
             }
         }
 
+        let mut field = None;
         if *state == PromptState::DenyEditing {
-            let text = buffer.value();
-            let (display_text, cursor_pos) = if text.is_empty() {
-                (DEFAULT_DENY_GUIDANCE, 0)
+            let (text, cursor_byte, tail_style) = if buffer.value().is_empty() {
+                (DEFAULT_DENY_GUIDANCE, 0, t.tool_dim)
             } else {
-                (text, TextBuffer::char_to_byte(text, buffer.x()))
+                (buffer.value(), buffer.cursor_byte(), Style::default())
             };
-            let (before, after) = display_text.split_at(cursor_pos);
-            let mut chars = after.chars();
-            let cursor_ch = chars.next().unwrap_or(' ');
-            let rest: String = chars.collect();
-
-            let mut spans = vec![Span::raw("  "), Span::styled("guide ", label_style)];
-            if text.is_empty() {
-                spans.push(Span::styled(cursor_ch.to_string(), Style::new().reversed()));
-                spans.push(Span::styled(rest, t.tool_dim));
-            } else {
-                spans.push(Span::raw(before.to_string()));
-                spans.push(Span::styled(cursor_ch.to_string(), Style::new().reversed()));
-                if !rest.is_empty() {
-                    spans.push(Span::raw(rest));
-                }
-            }
-            lines.push(Line::from(spans));
+            let prefix = vec![Span::raw("  "), Span::styled("guide ", label_style)];
+            let (line, caret) = field_line(
+                prefix,
+                text,
+                cursor_byte,
+                Style::new().reversed(),
+                tail_style,
+            );
+            field = Some(FieldCaret {
+                row: lines.len(),
+                caret,
+            });
+            lines.push(line);
         }
 
-        if !*project_trusted {
-            for notice in [UNTRUSTED_NOTICE, UNTRUSTED_DURABLE_ANSWER] {
-                lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(notice, t.tool_dim),
-                ]));
-            }
+        let saved = *project_answers == ProjectAnswers::Saved;
+        let notices: &[&'static str] = match project_answers {
+            ProjectAnswers::Saved => &[],
+            ProjectAnswers::SessionUntilTrusted => &[UNTRUSTED_NOTICE, TRUST_TO_SAVE_NOTICE],
+            ProjectAnswers::SessionOnly => &[UNTRUSTED_NOTICE, UNTRUSTED_DURABLE_ANSWER],
+        };
+        for &notice in notices {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(notice, t.tool_dim),
+            ]));
         }
 
         lines.push(Line::raw(""));
         match *state {
             PromptState::ConfirmAllowAlwaysProject => {
-                lines.push(hint_line(if *project_trusted {
+                lines.push(hint_line(if saved {
                     CONFIRM_ALLOW_PROJECT_HINTS
                 } else {
                     CONFIRM_ALLOW_PROJECT_SESSION_HINTS
@@ -845,7 +887,7 @@ impl PermissionPrompt {
                 lines.push(hint_line(CONFIRM_SESSION_HINTS));
             }
             PromptState::ConfirmDenyAlwaysProject => {
-                lines.push(hint_line(if *project_trusted {
+                lines.push(hint_line(if saved {
                     CONFIRM_DENY_PROJECT_HINTS
                 } else {
                     CONFIRM_DENY_PROJECT_SESSION_HINTS
@@ -858,7 +900,7 @@ impl PermissionPrompt {
                 lines.push(hint_line(DENY_GUIDANCE_HINTS));
             }
             PromptState::Normal => {
-                let (allow, deny) = if *project_trusted {
+                let (allow, deny) = if saved {
                     (HINT_ALLOW_ROW, HINT_DENY_ROW)
                 } else {
                     (HINT_ALLOW_ROW_UNTRUSTED, HINT_DENY_ROW_UNTRUSTED)
@@ -880,17 +922,31 @@ impl PermissionPrompt {
             }
         }
         lines.push(Line::raw(""));
-        lines
+        (lines, field)
     }
 
-    pub fn view(&self, frame: &mut Frame, area: Rect) {
+    /// Returns the cell the deny field painted its caret in. The row comes
+    /// from how far the lines above it wrap, and the cell is reported only if
+    /// the frame really holds the caret there.
+    pub fn view(&self, frame: &mut Frame, area: Rect) -> Option<Position> {
         if !self.is_open() {
-            return;
+            return None;
         }
         let t = theme::current();
         if !self.expanded {
-            render_form(&t, TITLE, frame, area, self.build_lines(), (0, 0));
-            return;
+            let (lines, field) = self.build_lines_with_caret();
+            let lines_above = field
+                .as_ref()
+                .map(|field| lines[..field.row].to_vec())
+                .unwrap_or_default();
+            let inner = render_form(&t, TITLE, frame, area, lines, (0, 0));
+            let field = field?;
+            return painted_caret(
+                frame.buffer_mut(),
+                inner,
+                &field.caret,
+                wrapped_height(&lines_above, inner.width).into(),
+            );
         }
         let block = Block::default()
             .borders(Borders::ALL)
@@ -901,7 +957,7 @@ impl PermissionPrompt {
         let inner = block.inner(area);
 
         let header = self.header_lines();
-        let footer = self.footer_lines();
+        let (footer, field) = self.footer_lines_with_caret();
         let [header_area, body_area, footer_area] = Layout::vertical([
             Constraint::Length(wrapped_height(&header, inner.width)),
             Constraint::Min(1),
@@ -924,17 +980,24 @@ impl PermissionPrompt {
         };
         frame.render_widget(block, area);
         let style = Style::new().fg(t.foreground);
-        let wrapped = |lines| {
-            Paragraph::new(lines)
-                .style(style)
-                .wrap(Wrap { trim: false })
-        };
+        let wrapped = |lines| Paragraph::new(lines).style(style).wrap(FORM_WRAP);
+        let footer_above = field
+            .as_ref()
+            .map(|field| footer[..field.row].to_vec())
+            .unwrap_or_default();
         frame.render_widget(wrapped(header), header_area);
         frame.render_widget(
             Paragraph::new(body).style(style).scroll((scroll, 0)),
             body_area,
         );
         frame.render_widget(wrapped(footer), footer_area);
+        let field = field?;
+        painted_caret(
+            frame.buffer_mut(),
+            footer_area,
+            &field.caret,
+            wrapped_height(&footer_above, footer_area.width).into(),
+        )
     }
 
     pub fn height(&self, width: u16) -> u16 {
@@ -973,9 +1036,13 @@ fn parse_expand_key(notation: &str) -> Result<Key, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use maki_agent::permissions::PermissionAnswer;
     use maki_config::ToolKey;
+    use maki_config::project::{TrustQuestion, TrustState};
+    use maki_storage::trusted_folders::CanonicalFolder;
     use test_case::test_case;
 
     use maki_agent::PermissionPreview;
@@ -984,21 +1051,21 @@ mod tests {
     use super::{
         COLLAPSE_HINT, CONFIRM_ALLOW_PROJECT_HINTS, CONFIRM_ALLOW_PROJECT_SESSION_HINTS,
         CONFIRM_DENY_PROJECT_HINTS, CONFIRM_DENY_PROJECT_SESSION_HINTS, EXPAND_HINT, Overlay,
-        PREVIEW_TRUNCATED, PermissionPrompt, PromptState, QUEUED_NOTICE, UNTRUSTED_DURABLE_ANSWER,
-        UNTRUSTED_NOTICE, theme,
+        PREVIEW_TRUNCATED, PermissionPrompt, ProjectAnswers, PromptState, QUEUED_NOTICE,
+        TRUST_TO_SAVE_NOTICE, UNTRUSTED_DURABLE_ANSWER, UNTRUSTED_NOTICE, theme,
     };
 
     const MAIN_ID: &str = "id";
     const SUB_ID: &str = "id-2";
     const SUB_AGENT: &str = "sub-2";
 
-    fn open_trusted(prompt: &mut PermissionPrompt, project_trusted: bool) {
+    fn open_with(prompt: &mut PermissionPrompt, project_answers: ProjectAnswers) {
         prompt.push(
             MAIN_ID.into(),
             ToolKey::native("bash"),
             vec!["execute".into()],
             None,
-            project_trusted,
+            project_answers,
             None,
             None,
         );
@@ -1010,7 +1077,7 @@ mod tests {
             ToolKey::native("read"),
             vec!["/tmp/x".into()],
             Some(SUB_AGENT.into()),
-            true,
+            ProjectAnswers::Saved,
             None,
             None,
         );
@@ -1023,7 +1090,7 @@ mod tests {
 
     fn open_prompt() -> PermissionPrompt {
         let mut prompt = PermissionPrompt::new();
-        open_trusted(&mut prompt, true);
+        open_with(&mut prompt, ProjectAnswers::Saved);
         prompt
     }
 
@@ -1054,7 +1121,7 @@ mod tests {
             ToolKey::native("bash"),
             vec![script.into()],
             None,
-            true,
+            ProjectAnswers::Saved,
             None,
             None,
         );
@@ -1073,7 +1140,7 @@ mod tests {
             ToolKey::native("read"),
             vec!["a\nb".into()],
             None,
-            true,
+            ProjectAnswers::Saved,
             None,
             None,
         );
@@ -1139,12 +1206,11 @@ mod tests {
 
     #[test]
     fn handle_paste_lands_only_in_the_deny_editor() {
-        assert!(!PermissionPrompt::new().handle_paste("closed"));
         let mut prompt = open_prompt();
-        assert!(prompt.handle_paste("dropped"));
+        prompt.handle_paste("dropped");
         assert_eq!(prompt.buffer.value(), "");
         prompt.handle_key(key(KeyCode::Char('n')));
-        assert!(prompt.handle_paste("accepted"));
+        prompt.handle_paste("accepted");
         assert_eq!(prompt.buffer.value(), "accepted");
     }
 
@@ -1156,7 +1222,7 @@ mod tests {
             ToolKey::Wildcard,
             vec![],
             None,
-            true,
+            ProjectAnswers::Saved,
             None,
             None,
         );
@@ -1201,7 +1267,7 @@ mod tests {
     fn a_cancelled_subagent_takes_its_request_with_it() {
         let mut prompt = PermissionPrompt::new();
         push_subagent_ask(&mut prompt);
-        open_trusted(&mut prompt, true);
+        open_with(&mut prompt, ProjectAnswers::Saved);
         prompt.handle_key(key(KeyCode::Char('n')));
 
         prompt.drop_subagent(SUB_AGENT);
@@ -1216,18 +1282,18 @@ mod tests {
     /// The always-answers are scoped to the project, and the hint has to say so
     /// before the user commits to one. In an untrusted folder the answer only
     /// holds for the session, and the hint says that instead.
-    #[test_case(KeyCode::Char('a'), true, PromptState::ConfirmAllowAlwaysProject, CONFIRM_ALLOW_PROJECT_HINTS ; "allow_always")]
-    #[test_case(KeyCode::Char('d'), true, PromptState::ConfirmDenyAlwaysProject, CONFIRM_DENY_PROJECT_HINTS ; "deny_always")]
-    #[test_case(KeyCode::Char('a'), false, PromptState::ConfirmAllowAlwaysProject, CONFIRM_ALLOW_PROJECT_SESSION_HINTS ; "allow_always_untrusted")]
-    #[test_case(KeyCode::Char('d'), false, PromptState::ConfirmDenyAlwaysProject, CONFIRM_DENY_PROJECT_SESSION_HINTS ; "deny_always_untrusted")]
+    #[test_case(KeyCode::Char('a'), ProjectAnswers::Saved, PromptState::ConfirmAllowAlwaysProject, CONFIRM_ALLOW_PROJECT_HINTS ; "allow_always")]
+    #[test_case(KeyCode::Char('d'), ProjectAnswers::Saved, PromptState::ConfirmDenyAlwaysProject, CONFIRM_DENY_PROJECT_HINTS ; "deny_always")]
+    #[test_case(KeyCode::Char('a'), ProjectAnswers::SessionOnly, PromptState::ConfirmAllowAlwaysProject, CONFIRM_ALLOW_PROJECT_SESSION_HINTS ; "allow_always_untrusted")]
+    #[test_case(KeyCode::Char('d'), ProjectAnswers::SessionOnly, PromptState::ConfirmDenyAlwaysProject, CONFIRM_DENY_PROJECT_SESSION_HINTS ; "deny_always_untrusted")]
     fn project_answers_confirm_before_they_apply(
         code: KeyCode,
-        project_trusted: bool,
+        project_answers: ProjectAnswers,
         expected: PromptState,
         hints: &[(&str, &str)],
     ) {
         let mut prompt = PermissionPrompt::new();
-        open_trusted(&mut prompt, project_trusted);
+        open_with(&mut prompt, project_answers);
 
         assert_eq!(answer(&mut prompt, key(code)), None);
 
@@ -1237,26 +1303,50 @@ mod tests {
     }
 
     /// The project answers stay on the screen in an untrusted folder, so the
-    /// prompt has to explain how long they last and where a lasting deny goes
-    /// instead.
-    #[test_case(true, false ; "trusted_folder_says_nothing")]
-    #[test_case(false, true ; "untrusted_folder_warns")]
-    fn untrusted_folder_notice_follows_trust(project_trusted: bool, warned: bool) {
+    /// prompt has to say how long they last and what would make them stick.
+    #[test_case(ProjectAnswers::Saved, &[] ; "trusted_folder_says_nothing")]
+    #[test_case(ProjectAnswers::SessionOnly, &[UNTRUSTED_NOTICE, UNTRUSTED_DURABLE_ANSWER] ; "untrusted_folder_warns")]
+    #[test_case(ProjectAnswers::SessionUntilTrusted, &[UNTRUSTED_NOTICE, TRUST_TO_SAVE_NOTICE] ; "vacant_folder_points_at_trust")]
+    fn untrusted_folder_notice_follows_trust(project_answers: ProjectAnswers, expected: &[&str]) {
         let mut prompt = PermissionPrompt::new();
-        open_trusted(&mut prompt, project_trusted);
+        open_with(&mut prompt, project_answers);
 
         let text = rendered(&prompt);
-        assert_eq!(text.contains(UNTRUSTED_NOTICE), warned, "rendered: {text}");
-        assert_eq!(
-            text.contains(UNTRUSTED_DURABLE_ANSWER),
-            warned,
-            "rendered: {text}"
-        );
+        for notice in [
+            UNTRUSTED_NOTICE,
+            UNTRUSTED_DURABLE_ANSWER,
+            TRUST_TO_SAVE_NOTICE,
+        ] {
+            assert_eq!(
+                text.contains(notice),
+                expected.contains(&notice),
+                "{notice:?} in: {text}"
+            );
+        }
         assert_eq!(
             answer(&mut prompt, key(KeyCode::Char('a'))),
             None,
             "the project answer stays available either way"
         );
+    }
+
+    /// Only a folder with nothing to load may point at `/trust`. Anywhere else
+    /// that yes runs repository code the card already asked about, a declined
+    /// folder included.
+    #[test_case(true, |_| TrustState::Inert, ProjectAnswers::Saved ; "trusted_project_saves")]
+    #[test_case(false, TrustState::Vacant, ProjectAnswers::SessionUntilTrusted ; "vacant_points_at_trust")]
+    #[test_case(false, TrustState::Unanswered, ProjectAnswers::SessionOnly ; "unanswered")]
+    #[test_case(false, TrustState::Declined, ProjectAnswers::SessionOnly ; "declined")]
+    #[test_case(false, |_| TrustState::Inert, ProjectAnswers::SessionOnly ; "inert")]
+    fn project_answers_follow_trust(
+        project_trusted: bool,
+        trust: fn(TrustQuestion) -> TrustState,
+        expected: ProjectAnswers,
+    ) {
+        let folder = CanonicalFolder::resolve(&env::temp_dir()).unwrap();
+        let trust = trust(TrustQuestion::for_folder(&folder));
+
+        assert_eq!(ProjectAnswers::new(project_trusted, &trust), expected);
     }
 
     const ASK_REASON: &str = "plugin wants a human to look";
@@ -1271,7 +1361,7 @@ mod tests {
             ToolKey::native("bash"),
             vec!["execute".into()],
             None,
-            true,
+            ProjectAnswers::Saved,
             reason.map(str::to_owned),
             None,
         );
@@ -1289,13 +1379,87 @@ mod tests {
         assert_eq!(why_row.as_deref(), reason);
     }
 
+    fn queue_main_and_subagent() -> (PermissionPrompt, u64, u64) {
+        let mut prompt = PermissionPrompt::new();
+        let main = prompt.push(
+            MAIN_ID.into(),
+            ToolKey::native("bash"),
+            vec!["execute".into()],
+            None,
+            ProjectAnswers::Saved,
+            None,
+            None,
+        );
+        let sub = prompt.push(
+            SUB_ID.into(),
+            ToolKey::native("read"),
+            vec!["/tmp/x".into()],
+            Some(SUB_AGENT.into()),
+            ProjectAnswers::Saved,
+            None,
+            None,
+        );
+        (prompt, main, sub)
+    }
+
+    #[test]
+    fn answer_by_handle_settles_a_queued_ask_and_leaves_the_front() {
+        let (mut prompt, _, sub) = queue_main_and_subagent();
+        let answered = prompt
+            .answer_by_handle(sub, PermissionAnswer::AllowOnce)
+            .unwrap();
+        assert_eq!(
+            (answered.id.as_str(), answered.subagent_id.as_deref()),
+            (SUB_ID, Some(SUB_AGENT))
+        );
+        let front = prompt.handle_key(key(KeyCode::Char('y'))).unwrap();
+        assert_eq!(front.id, MAIN_ID, "the ask on screen is still the user's");
+    }
+
+    #[test]
+    fn answer_by_handle_on_the_front_resets_what_the_user_was_typing() {
+        let (mut prompt, main, sub) = queue_main_and_subagent();
+        prompt.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(prompt.state, PromptState::DenyEditing);
+        prompt
+            .answer_by_handle(main, PermissionAnswer::Deny)
+            .unwrap();
+        assert_eq!(prompt.state, PromptState::Normal);
+        assert_eq!(prompt.handles(), vec![sub]);
+    }
+
+    #[test]
+    fn the_second_answer_to_one_ask_loses() {
+        let (mut prompt, main, _) = queue_main_and_subagent();
+        prompt.handle_key(key(KeyCode::Char('y'))).unwrap();
+        assert!(
+            prompt
+                .answer_by_handle(main, PermissionAnswer::Deny)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn handles_are_unique_across_prompts() {
+        let (_, first, _) = queue_main_and_subagent();
+        let (_, second, _) = queue_main_and_subagent();
+        assert_ne!(first, second, "two sessions must never share a handle");
+    }
+
+    #[test]
+    fn drop_subagent_reports_the_asks_it_dropped() {
+        let (mut prompt, main, sub) = queue_main_and_subagent();
+        assert_eq!(prompt.drop_subagent(SUB_AGENT), vec![sub]);
+        assert_eq!(prompt.handles(), vec![main]);
+    }
+
     fn push_bash(prompt: &mut PermissionPrompt, command: &str) {
         prompt.push(
             MAIN_ID.into(),
             ToolKey::native("bash"),
             vec![command.into()],
             None,
-            true,
+            ProjectAnswers::Saved,
             None,
             None,
         );
@@ -1305,7 +1469,11 @@ mod tests {
     fn screen(prompt: &PermissionPrompt, width: u16, height: u16) -> Vec<String> {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-        terminal.draw(|f| prompt.view(f, f.area())).unwrap();
+        terminal
+            .draw(|f| {
+                prompt.view(f, f.area());
+            })
+            .unwrap();
         let buf = terminal.backend().buffer();
         (0..height)
             .map(|y| {
@@ -1463,7 +1631,7 @@ mod tests {
             ToolKey::native(tool),
             vec![preview.path().to_owned()],
             None,
-            true,
+            ProjectAnswers::Saved,
             None,
             Some(preview),
         );
@@ -1592,82 +1760,8 @@ mod tests {
     #[test_case("x", key(KeyCode::Char('v')), false ; "rebound_default_is_free")]
     fn expand_key_follows_config(notation: &str, press: KeyEvent, expands: bool) {
         let mut prompt = PermissionPrompt::new().with_expand_key(notation);
-        open_trusted(&mut prompt, true);
+        open_with(&mut prompt, ProjectAnswers::Saved);
         prompt.handle_key(press);
         assert_eq!(prompt.expanded, expands);
-    }
-
-    fn queue_main_and_subagent() -> (PermissionPrompt, u64, u64) {
-        let mut prompt = PermissionPrompt::new();
-        let main = prompt.push(
-            MAIN_ID.into(),
-            ToolKey::native("bash"),
-            vec!["execute".into()],
-            None,
-            true,
-            None,
-            None,
-        );
-        let sub = prompt.push(
-            SUB_ID.into(),
-            ToolKey::native("read"),
-            vec!["/tmp/x".into()],
-            Some(SUB_AGENT.into()),
-            true,
-            None,
-            None,
-        );
-        (prompt, main, sub)
-    }
-
-    #[test]
-    fn answer_by_handle_settles_a_queued_ask_and_leaves_the_front() {
-        let (mut prompt, _, sub) = queue_main_and_subagent();
-        let answered = prompt
-            .answer_by_handle(sub, PermissionAnswer::AllowOnce)
-            .unwrap();
-        assert_eq!(
-            (answered.id.as_str(), answered.subagent_id.as_deref()),
-            (SUB_ID, Some(SUB_AGENT))
-        );
-        let front = prompt.handle_key(key(KeyCode::Char('y'))).unwrap();
-        assert_eq!(front.id, MAIN_ID, "the ask on screen is still the user's");
-    }
-
-    #[test]
-    fn answer_by_handle_on_the_front_resets_what_the_user_was_typing() {
-        let (mut prompt, main, sub) = queue_main_and_subagent();
-        prompt.handle_key(key(KeyCode::Char('n')));
-        assert_eq!(prompt.state, PromptState::DenyEditing);
-        prompt
-            .answer_by_handle(main, PermissionAnswer::Deny)
-            .unwrap();
-        assert_eq!(prompt.state, PromptState::Normal);
-        assert_eq!(prompt.handles(), vec![sub]);
-    }
-
-    #[test]
-    fn the_second_answer_to_one_ask_loses() {
-        let (mut prompt, main, _) = queue_main_and_subagent();
-        prompt.handle_key(key(KeyCode::Char('y'))).unwrap();
-        assert!(
-            prompt
-                .answer_by_handle(main, PermissionAnswer::Deny)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn handles_are_unique_across_prompts() {
-        let (_, first, _) = queue_main_and_subagent();
-        let (_, second, _) = queue_main_and_subagent();
-        assert_ne!(first, second, "two sessions must never share a handle");
-    }
-
-    #[test]
-    fn drop_subagent_reports_the_asks_it_dropped() {
-        let (mut prompt, main, sub) = queue_main_and_subagent();
-        assert_eq!(prompt.drop_subagent(SUB_AGENT), vec![sub]);
-        assert_eq!(prompt.handles(), vec![main]);
     }
 }

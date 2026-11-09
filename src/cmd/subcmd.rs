@@ -5,6 +5,7 @@ use std::path::Path;
 use color_eyre::Result;
 use color_eyre::eyre::{Context, bail};
 
+use maki_agent::HostPrompt;
 use maki_agent::mcp::{config as mcp_config, oauth as mcp_oauth};
 use maki_agent::tools::ToolRegistry;
 use maki_config::project::{self, TrustMode};
@@ -24,6 +25,7 @@ use maki_storage::auth::{
 };
 use maki_storage::model::persist_model;
 
+use crate::cli::{PromptArgs, PromptVariant};
 use crate::provider_scripts;
 
 const PROTOCOL_CHOICES: &str = "openai, openai-responses, anthropic or google";
@@ -31,6 +33,7 @@ const PROVIDERS_TOML_DOCS: &str = "https://maki.sh/docs/providers/";
 const CONFIGURED: &str = "\x1b[32m✓\x1b[0m";
 const FROM_ENV: &str = "\x1b[33m~\x1b[0m";
 const UNCONFIGURED: &str = " ";
+const CUSTOM_PROVIDER_LABEL: &str = "Custom provider...";
 const PLAN_PREVIEW_PATH: &str = "plan.md";
 
 pub async fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()> {
@@ -178,11 +181,43 @@ fn known_outside_catalog(slug: &str, catalog_slugs: &[String]) -> bool {
     !catalog_slugs.is_empty() && !catalog_slugs.iter().any(|known| known == slug)
 }
 
+/// One line of the `maki auth login` picker.
+struct LoginRow {
+    status: &'static str,
+    label: String,
+    target: LoginTarget,
+}
+
+/// What picking a [`LoginRow`] starts.
+enum LoginTarget {
+    Provider(String),
+    /// A models.dev provider, which logs in through its catalog entry.
+    Catalog(Box<ProviderData>),
+    Custom,
+}
+
+impl LoginRow {
+    fn new(status: &'static str, slug: &str, display_name: &str, target: LoginTarget) -> Self {
+        Self {
+            status,
+            label: format!("{slug:<14} {display_name}"),
+            target,
+        }
+    }
+
+    fn provider(status: &'static str, slug: &str, display_name: &str) -> Self {
+        Self::new(
+            status,
+            slug,
+            display_name,
+            LoginTarget::Provider(slug.to_owned()),
+        )
+    }
+}
+
 async fn login_interactive(storage: &StateDir) -> Result<()> {
     let config = ProvidersConfig::load();
-    // Status, slug, display name, and the models.dev entry a catalog row logs
-    // in through.
-    let mut rows: Vec<(&str, String, String, Option<ProviderData>)> = Vec::new();
+    let mut rows: Vec<LoginRow> = Vec::new();
 
     let saved = |slug: &str| load_provider_credentials(storage, slug).is_some();
     let mark = |configured: bool| if configured { CONFIGURED } else { UNCONFIGURED };
@@ -197,50 +232,55 @@ async fn login_interactive(storage: &StateDir) -> Result<()> {
         } else {
             UNCONFIGURED
         };
-        rows.push((status, b.slug.to_owned(), b.display_name.to_owned(), None));
+        rows.push(LoginRow::provider(status, b.slug, b.display_name));
     }
     for (slug, display) in hooked_login_providers() {
         let status = mark(load_plugin_auth(storage, &slug).is_some());
-        rows.push((status, slug, display, None));
+        rows.push(LoginRow::provider(status, &slug, &display));
     }
     let custom = config.providers.iter().filter(|(slug, _)| {
         builtin_provider(slug).is_none() && !plugin::is_registered(slug) && *slug != "opencode"
     });
     for (slug, def) in custom {
-        let display = def.display_name.clone().unwrap_or_else(|| slug.clone());
-        rows.push((mark(saved(slug)), slug.clone(), display, None));
+        let display = def.display_name.as_deref().unwrap_or(slug);
+        rows.push(LoginRow::provider(mark(saved(slug)), slug, display));
     }
-    for cat in catalog_providers().await {
-        let (slug, display) = (cat.slug.clone(), cat.display_name.clone());
-        rows.push((mark(saved(&slug)), slug, display, Some(cat)));
+    for provider in catalog_providers().await {
+        let (slug, display) = (provider.slug.clone(), provider.display_name.clone());
+        rows.push(LoginRow::new(
+            mark(saved(&slug)),
+            &slug,
+            &display,
+            LoginTarget::Catalog(Box::new(provider)),
+        ));
     }
+    rows.push(LoginRow {
+        status: UNCONFIGURED,
+        label: CUSTOM_PROVIDER_LABEL.to_owned(),
+        target: LoginTarget::Custom,
+    });
 
     println!();
     println!("  Available providers:");
     println!();
-    for (i, (status, slug, display, _)) in rows.iter().enumerate() {
-        println!("  {} {}. {:<14} {}", status, i + 1, slug, display);
+    for (i, row) in rows.iter().enumerate() {
+        println!("  {} {}. {}", row.status, i + 1, row.label);
     }
-    let custom_idx = rows.len() + 1;
-    println!("    {}. Custom provider...", custom_idx);
     println!();
 
-    print!("  Select [1-{}]: ", custom_idx);
+    print!("  Select [1-{}]: ", rows.len());
     io::stdout().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     let choice: usize = input.trim().parse().context("enter a number")?;
 
-    if choice == custom_idx {
-        return login_custom(storage);
-    }
-    let Some((_, slug, _, catalog)) = choice.checked_sub(1).and_then(|i| rows.into_iter().nth(i))
-    else {
+    let Some(row) = choice.checked_sub(1).and_then(|i| rows.into_iter().nth(i)) else {
         bail!("invalid selection");
     };
-    match catalog {
-        Some(provider) => login_catalog_provider(&provider, storage),
-        None => login_provider(&slug, storage).await,
+    match row.target {
+        LoginTarget::Provider(slug) => login_provider(&slug, storage).await,
+        LoginTarget::Catalog(provider) => login_catalog_provider(&provider, storage),
+        LoginTarget::Custom => login_custom(storage),
     }
 }
 
@@ -714,19 +754,23 @@ pub fn mcp_logout(server: &str, storage: &StateDir) -> Result<()> {
 }
 
 pub async fn prompt(
-    variant: &crate::cli::PromptVariant,
-    plan: bool,
-    tools: bool,
-    names: bool,
+    PromptArgs {
+        variant,
+        plan,
+        tools,
+        names,
+    }: PromptArgs,
+    host_prompt: HostPrompt,
     no_plugins: bool,
     no_jit: bool,
     trust_mode: TrustMode,
 ) -> Result<()> {
-    use crate::cli::PromptVariant;
-    use maki_agent::agent::{build_system_prompt, load_instruction_text, plan_mode_update};
+    use maki_agent::agent::{load_instruction_text, plan_mode_update};
     use maki_agent::prompt::PromptId;
     use maki_agent::template;
-    use maki_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry};
+    use maki_agent::tools::{
+        DescriptionContext, RequestTools, ToolAudience, ToolFilter, ToolRegistry,
+    };
     use maki_providers::Model;
 
     if plan && !matches!(variant, PromptVariant::System) {
@@ -772,8 +816,18 @@ pub async fn prompt(
                 .default_model
                 .as_deref()
                 .unwrap_or("anthropic/claude-sonnet-4-20250514");
-            let model = Model::from_spec(model_spec).context("invalid default model")?;
-            let prompt = build_system_prompt(&vars, &instructions, &slots, &model);
+            let model = Model::from_spec_or_warm_catalog(model_spec)
+                .await
+                .context("invalid default model")?;
+            let prompt = host_prompt
+                .context(
+                    &vars,
+                    &instructions,
+                    &slots,
+                    &model,
+                    RequestTools::default(),
+                )
+                .system;
             // Plan mode reaches the model as a context update after the
             // prompt, so this shows that message too.
             if plan {

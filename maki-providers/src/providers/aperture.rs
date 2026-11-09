@@ -46,6 +46,7 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     base_url: Cow::Borrowed(""),
     max_tokens_field: Cow::Borrowed(MAX_TOKENS_FIELD),
     include_stream_usage: true,
+    usage_cost: false,
     provider_name: Cow::Borrowed(DISPLAY_NAME),
 };
 
@@ -60,6 +61,7 @@ pub(crate) const SPEC: ProviderSpec = ProviderSpec {
     sends_thinking,
     thinking_fields_fallback,
     accepts_arbitrary_models: true,
+    catalog_is_authoritative: false,
     fallback_max_output: Some(16_384),
     fallback_context_window: 128_000,
     models_toml: NO_CURATED_MODELS,

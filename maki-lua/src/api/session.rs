@@ -11,11 +11,13 @@ use std::sync::Arc;
 use maki_agent::agent::{SessionExport, live_header, live_history, live_snapshot};
 use maki_agent::permissions::PermissionAnswer;
 use maki_agent::session::{StoredSession, store_new};
+use maki_agent::tools::Authority;
 use maki_agent::{SessionMailbox, Transcript};
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::{ContentBlock, ImageSource, Message, Role};
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
+use maki_storage::paths::session_data_dir;
 use mlua::{IntoLua, Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 use serde_json::{Map, Value as JsonValue};
 use tokio::task::{spawn_blocking, yield_now};
@@ -28,6 +30,7 @@ use crate::api::util::convert::{TableExt, json_to_lua, json_to_lua_exact, lua_to
 use crate::api::util::image::image_from_table;
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
 use crate::plugin_permissions::{MANIFEST_FILE, Permission, PluginPermissions, require};
+use crate::runtime::Lineage;
 use crate::session_snapshot::SessionSnapshot;
 
 /// Answers `maki.session.read` for a driver that has no UI to ask. Takes the
@@ -71,8 +74,8 @@ const DOCUMENT_KEYS: [&str; 8] = [
     "facts",
     MESSAGES_KEY,
 ];
+const ANSWER_DECISION_ERR: &str = "decision must \"allow\" or \"deny\"";
 const MAX_PROMPT_IMAGES: usize = 8;
-const ANSWER_DECISION_ERR: &str = "decision must be \"allow\" or \"deny\"";
 
 /// Rewind and fork put a user turn back in the chat input, and Enter runs it
 /// as if a plugin that could send prompts wrote it. So a turn that runs
@@ -317,14 +320,7 @@ async fn transcript(
 /// The serde shape, nulls as `maki.NIL`. An image block is built around a
 /// handle on its payload, which is never copied, not even into JSON.
 fn message_table(lua: &Lua, message: &Message) -> LuaResult<Value> {
-    let envelope = Message {
-        role: message.role.clone(),
-        content: Vec::new(),
-        display_text: message.display_text.clone(),
-        kind: message.kind.clone(),
-        receipts: message.receipts.clone(),
-        settles: message.settles.clone(),
-    };
+    let envelope = message.with_content(Vec::new());
     let json = serde_json::to_value(&envelope).map_err(mlua::Error::external)?;
     let table = lua.unpack::<Table>(json_to_lua_exact(lua, &json)?)?;
     let content = lua.create_table_with_capacity(message.content.len(), 0)?;
@@ -361,6 +357,16 @@ async fn messages_table(lua: &Lua, messages: &[Message]) -> LuaResult<Table> {
     }
     out.set_metatable(Some(lua.array_metatable()))?;
     Ok(out)
+}
+
+/// The newest `last` of {messages}, or all of them.
+pub(crate) async fn newest_messages_table(
+    lua: &Lua,
+    messages: &[Message],
+    last: Option<usize>,
+) -> LuaResult<Table> {
+    let skip = last.map_or(0, |n| messages.len().saturating_sub(n));
+    messages_table(lua, &messages[skip..]).await
 }
 
 async fn transcript_table(lua: &Lua, export: SessionExport) -> LuaResult<Table> {
@@ -413,7 +419,7 @@ async fn export(
 /// Each message has the same shape as in the session file:
 ///
 /// ```text
-/// { role = "user" | "assistant", kind, facts?, display_text?, receipts?, settles?, content = { blocks } }
+/// { role = "user" | "assistant", kind, facts?, display_text?, receipts?, settles?, partial?, content = { blocks } }
 /// ```
 ///
 /// `kind` is `"turn"` for something the user or the model said,
@@ -425,7 +431,9 @@ async fn export(
 /// compaction note). `receipts` lists the calls whose results in this
 /// message moved to the background, and `settles` = `{ task, end }` marks the
 /// notice that answered one, with `end` one of `"finished"`, `"failed"`,
-/// `"cancelled"` or `"lost"`. `content` lists blocks:
+/// `"cancelled"` or `"lost"`. `partial` has the same shape and marks a notice
+/// that answered one piece early, like one call of a moved batch, and left
+/// the receipt open. `content` lists blocks:
 ///
 /// ```text
 /// { type = "text", text }
@@ -470,8 +478,10 @@ async fn messages(
         Some(history) => history,
         None => try_pair!(transcript(&lua, tx.as_ref(), session).await).messages,
     };
-    let skip = last.map_or(0, |n| history.len().saturating_sub(n));
-    Ok((Some(messages_table(&lua, &history[skip..]).await?), None))
+    Ok((
+        Some(newest_messages_table(&lua, &history, last).await?),
+        None,
+    ))
 }
 
 /// Returns the id of the focused session. Under `maki -p` and the sdk,
@@ -483,6 +493,56 @@ async fn messages(
 #[lua_fn]
 async fn current(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<String>> {
     Ok(pair(focused_session(&lua, tx.as_ref()).await))
+}
+
+/// This plugin's directory for this session's data, as
+/// `state/sessions/data/<session>/<plugin>/`. Core owns it: the delete that
+/// takes the session takes everything written under it. Not created; make it
+/// with `maki.fs.mkdir` before the first write. A plugin's grants cover it
+/// like any other path.
+///
+/// The session defaults to the one the calling agent serves, so a tool of
+/// a background tab gets that tab's dir rather than the one on screen, and
+/// to the focused session otherwise.
+///
+/// @param opts table? `session` names another session.
+/// @return (string|nil, string|nil) The directory path, or nil and an error.
+/// @example
+/// local dir, err = maki.session.data_dir()
+/// if dir then
+///   maki.fs.mkdir(dir, { parents = true })
+///   maki.fs.write(maki.fs.joinpath(dir, "scratch.md"), text)
+/// end
+#[lua_fn]
+async fn data_dir(
+    lua: Lua,
+    #[ctx] plugin: Arc<str>,
+    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    opts: Option<Table>,
+) -> LuaResult<Pair<String>> {
+    let named = match &opts {
+        Some(opts) => opts.opt::<String>("session")?,
+        None => None,
+    };
+    let path: Result<String, String> = async {
+        let named = named
+            .map(|raw| raw.parse::<MakiId>().map_err(|e| e.to_string()))
+            .transpose()?;
+        let session = match named.or_else(|| Lineage::current(&lua).session) {
+            Some(id) => id,
+            None => focused_session(&lua, tx.as_ref())
+                .await?
+                .parse::<MakiId>()
+                .map_err(|e| e.to_string())?,
+        };
+        let state = state_dir(&lua)?;
+        Ok(session_data_dir(state.path(), session)
+            .join(&*plugin)
+            .display()
+            .to_string())
+    }
+    .await;
+    Ok(pair(path))
 }
 
 /// Switches the UI to the session with {id}.
@@ -878,6 +938,15 @@ async fn set_title(
     roundtrip(lua, tx, req).await
 }
 
+/// Answering a prompt answers for the user, so it costs everything an
+/// undeclared tool could reach, plus `agent`, since the answer steers a turn.
+pub(crate) fn may_answer_for_user(perms: &PluginPermissions) -> bool {
+    perms.is_allowed(Permission::Agent)
+        && !perms
+            .lacking()
+            .any(|perm| Authority::Unbounded.requires(perm))
+}
+
 /// Answers an open permission prompt, racing the user at it. The prompt stays
 /// on screen until someone answers, and whichever answer lands first settles
 /// the call. A plugin may only allow or deny that one call, so nothing it
@@ -946,7 +1015,7 @@ lua_table! {
     DOCS [
         list(tx), live(tx), current(tx), read(tx), export(perms, tx), messages(perms, tx), focus(tx),
         delete(perms, tx), new(perms, tx, grants), prompt(perms, tx), cancel(perms, tx),
-        notify(perms, grants), set_mode(perms, tx), set_title(perms, tx),
+        notify(perms, grants), set_mode(perms, tx), set_title(perms, tx), data_dir(plugin, tx),
         answer_permission(tx, plugin, full_trust),
     ]
 }
@@ -996,7 +1065,6 @@ mod tests {
     const PLUGIN: &str = "test";
     const FACTS_CWD: &str = "/origin";
     const ONE_MESSAGE: &str = "{ { role = 'user', content = { { type = 'text', text = 'hi' } } } }";
-    const TEST_PLUGIN: &str = "remote";
     const ASK_HANDLE: u64 = 7;
 
     fn lua_with_session(tx: Option<flume::Sender<UiAction>>) -> Lua {
@@ -1005,18 +1073,65 @@ mod tests {
 
     fn lua_granted(tx: Option<flume::Sender<UiAction>>, grants: PluginPermissions) -> Lua {
         let lua = Lua::new();
-        let full_trust = grants.holds_all_reach() && grants.is_allowed(Permission::Agent);
-        let t = create_session_table(
-            &lua,
-            tx,
-            &grants,
-            grants.clone(),
-            Arc::from(TEST_PLUGIN),
-            full_trust,
-        )
-        .unwrap();
+        let full_trust = may_answer_for_user(&grants);
+        let t = create_session_table(&lua, tx, &grants, grants.clone(), PLUGIN.into(), full_trust)
+            .unwrap();
         lua.globals().set("session", t).unwrap();
         lua
+    }
+
+    #[test_case(headless_focused_on ; "headless_snapshot_id")]
+    #[test_case(ui_focused_on ; "ui_current_bare_id")]
+    #[tokio::test]
+    async fn data_dir_names_the_plugin_dir_under_the_session(focused_on: fn(MakiId) -> Lua) {
+        let id = MakiId::generate();
+        let tmp = TempDir::new().unwrap();
+        let lua = focused_on(id);
+        lua.set_app_data(StateDir::from_path(tmp.path().to_path_buf()));
+        let (got, err): (Option<String>, Option<String>) = lua
+            .load("return session.data_dir()")
+            .eval_async()
+            .await
+            .unwrap();
+        assert_eq!(err, None);
+        let want = session_data_dir(tmp.path(), id).join(PLUGIN);
+        assert_eq!(got, Some(want.display().to_string()));
+        assert!(!want.exists(), "asking for the dir must not create it");
+    }
+
+    #[tokio::test]
+    async fn data_dir_prefers_the_named_then_the_lineage_session() {
+        use crate::runtime::{TaskCell, TaskHandle};
+        use maki_agent::cancel::CancelToken;
+        use std::sync::Mutex;
+
+        let (serving, focused) = (MakiId::generate(), MakiId::generate());
+        let tmp = TempDir::new().unwrap();
+        let lua = headless_focused_on(focused);
+        lua.set_app_data(StateDir::from_path(tmp.path().to_path_buf()));
+        let mut cell = TaskCell::new(CancelToken::none(), None, None);
+        cell.lineage.session = Some(serving);
+        lua.set_app_data::<TaskHandle>(Arc::new(Mutex::new(cell)));
+
+        let (got, err): (Option<String>, Option<String>) = lua
+            .load("return session.data_dir()")
+            .eval_async()
+            .await
+            .unwrap();
+        assert_eq!(err, None);
+        let want = session_data_dir(tmp.path(), serving).join(PLUGIN);
+        assert_eq!(got, Some(want.display().to_string()));
+
+        let (got, err): (Option<String>, Option<String>) = lua
+            .load(format!(
+                "return session.data_dir({{ session = '{focused}' }})"
+            ))
+            .eval_async()
+            .await
+            .unwrap();
+        assert_eq!(err, None);
+        let want = session_data_dir(tmp.path(), focused).join(PLUGIN);
+        assert_eq!(got, Some(want.display().to_string()));
     }
 
     #[tokio::test]
@@ -1074,6 +1189,46 @@ mod tests {
         checker.join().unwrap()
     }
 
+    /// Both outcomes are successes a plugin tells apart by the string, so an
+    /// idle session never reads as a failure under `if not ok`.
+    #[test_case("return session.cancel({ session = 'abc' })", Some("abc"), CANCEL_CANCELLED ; "explicit_session_id")]
+    #[test_case("return session.cancel()", None, CANCEL_IDLE ; "defaults_to_focused")]
+    #[tokio::test]
+    async fn cancel_forwards_the_session_id(code: &str, expected_id: Option<&str>, reply: &str) {
+        let (tx, rx) = flume::unbounded::<UiAction>();
+        let lua = lua_with_session(Some(tx));
+        let expected_id = expected_id.map(str::to_owned);
+        let reply = reply.to_owned();
+        let expected_reply = reply.clone();
+        let checker = std::thread::spawn(move || {
+            let Ok(UiAction::Session {
+                req: SessionRequest::Cancel { id },
+                reply_tx,
+            }) = rx.recv()
+            else {
+                panic!("expected cancel request");
+            };
+            assert_eq!(id, expected_id);
+            reply_tx.send(Ok(json!(reply))).unwrap();
+        });
+        let (val, err): (String, Option<String>) = lua.load(code).eval_async().await.unwrap();
+        checker.join().unwrap();
+        assert_eq!(err, None);
+        assert_eq!(val, expected_reply);
+    }
+
+    #[tokio::test]
+    async fn cancel_needs_the_agent_permission() {
+        let lua = lua_granted(None, PluginPermissions::denied());
+        let err = lua
+            .load("return session.cancel()")
+            .eval_async::<Value>()
+            .await
+            .unwrap_err();
+        let denied = denied_error(Permission::Agent).to_string();
+        assert!(err.to_string().contains(&denied), "{err}");
+    }
+
     #[test_case("{ decision = 'allow' }", PermissionAnswer::AllowOnce ; "allow")]
     #[test_case("{ decision = 'deny' }", PermissionAnswer::Deny ; "deny")]
     #[test_case("{ decision = 'deny', guidance = '  ' }", PermissionAnswer::Deny ; "blank_guidance_is_a_plain_deny")]
@@ -1099,7 +1254,7 @@ mod tests {
             else {
                 panic!("expected an answer_permission request");
             };
-            assert_eq!((handle, &*plugin), (ASK_HANDLE, TEST_PLUGIN));
+            assert_eq!((handle, &*plugin), (ASK_HANDLE, PLUGIN));
             assert_eq!(answer, expected);
             reply_tx.send(Ok(json!(true))).unwrap();
         });
@@ -1127,7 +1282,7 @@ mod tests {
             None,
             &PluginPermissions::trusted(),
             PluginPermissions::trusted(),
-            Arc::from(TEST_PLUGIN),
+            PLUGIN.into(),
             false,
         )
         .unwrap();
@@ -1193,46 +1348,6 @@ mod tests {
         );
         let err = lua.load(code).exec_async().await.unwrap_err();
         assert!(err.to_string().contains(expected), "got: {err}");
-    }
-
-    /// Both outcomes are successes a plugin tells apart by the string, so an
-    /// idle session never reads as a failure under `if not ok`.
-    #[test_case("return session.cancel({ session = 'abc' })", Some("abc"), CANCEL_CANCELLED ; "explicit_session_id")]
-    #[test_case("return session.cancel()", None, CANCEL_IDLE ; "defaults_to_focused")]
-    #[tokio::test]
-    async fn cancel_forwards_the_session_id(code: &str, expected_id: Option<&str>, reply: &str) {
-        let (tx, rx) = flume::unbounded::<UiAction>();
-        let lua = lua_with_session(Some(tx));
-        let expected_id = expected_id.map(str::to_owned);
-        let reply = reply.to_owned();
-        let expected_reply = reply.clone();
-        let checker = std::thread::spawn(move || {
-            let Ok(UiAction::Session {
-                req: SessionRequest::Cancel { id },
-                reply_tx,
-            }) = rx.recv()
-            else {
-                panic!("expected cancel request");
-            };
-            assert_eq!(id, expected_id);
-            reply_tx.send(Ok(json!(reply))).unwrap();
-        });
-        let (val, err): (String, Option<String>) = lua.load(code).eval_async().await.unwrap();
-        checker.join().unwrap();
-        assert_eq!(err, None);
-        assert_eq!(val, expected_reply);
-    }
-
-    #[tokio::test]
-    async fn cancel_needs_the_agent_permission() {
-        let lua = lua_granted(None, PluginPermissions::denied());
-        let err = lua
-            .load("return session.cancel()")
-            .eval_async::<Value>()
-            .await
-            .unwrap_err();
-        let denied = denied_error(Permission::Agent).to_string();
-        assert!(err.to_string().contains(&denied), "{err}");
     }
 
     /// Mode is per session like the plan it drives, so a row handler firing

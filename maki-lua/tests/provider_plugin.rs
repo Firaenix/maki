@@ -23,7 +23,9 @@ use maki_lua::{DiscoveredPackage, Origin, PluginHost, PluginPermissions, Request
 use maki_providers::model::{Model, ModelTier};
 use maki_providers::provider::Provider;
 use maki_providers::retry::RetryKind;
-use maki_providers::test_support::{Canned, JSON_HEADERS, Recorded, Requests, serve};
+use maki_providers::test_support::{
+    Canned, JSON_HEADERS, Recorded, Requests, isolated_home, serve,
+};
 use maki_providers::{
     AgentError, Effort, Message, ProviderEvent, RequestOptions, StopReason, StreamResponse,
     ThinkingConfig, Timeouts, plugin,
@@ -181,22 +183,6 @@ const OVERLOADED_SCRIPT: &[Canned] = &[Canned {
     path: None,
 }];
 
-/// Points every base directory at a throwaway tree, so the credentials the
-/// fixture's `login` and `auth` store never touch the real state dir.
-fn isolated_state() -> TempDir {
-    let dir = TempDir::new().expect(TEMPDIR_FAILED);
-    for var in [
-        "HOME",
-        "XDG_STATE_HOME",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-        "XDG_CACHE_HOME",
-    ] {
-        unsafe { std::env::set_var(var, dir.path()) };
-    }
-    dir
-}
-
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider_plugin/init.lua")
 }
@@ -228,22 +214,23 @@ fn load_inline(host: &PluginHost, source: &str, net_host: &str, slugs: &[&str]) 
 }
 
 /// The fixture plugin, loaded from disk with the grant its `plugin.toml`
-/// declares, talking to a recorded server instead of Acme.
+/// declares, talking to a recorded server instead of Acme. Fields drop in
+/// order, so the host goes before the home it may write to on its way out.
 struct Fixture {
     provider: Box<dyn Provider>,
     server: Requests,
-    _state: TempDir,
     _host: PluginHost,
+    _home: TempDir,
 }
 
 impl Fixture {
     fn start(script: &'static [Canned]) -> Self {
+        let home = isolated_home();
         let (base_url, server) = serve(script);
-        Self::at(&base_url, server)
+        Self::at(home, &base_url, server)
     }
 
-    fn at(base_url: &str, server: Requests) -> Self {
-        let state = isolated_state();
+    fn at(home: TempDir, base_url: &str, server: Requests) -> Self {
         unsafe { std::env::set_var(BASE_URL_ENV, base_url) };
 
         let host = plugin_host();
@@ -253,8 +240,8 @@ impl Fixture {
         Self {
             provider: plugin::create(SLUG, Timeouts::default()).expect(CREATE_FAILED),
             server,
-            _state: state,
             _host: host,
+            _home: home,
         }
     }
 
@@ -486,7 +473,7 @@ fn a_side_request_that_cannot_connect_is_a_transport_error() {
     let closed = TcpListener::bind((LOOPBACK_HOST, 0)).expect(IO_FAILED);
     let base_url = format!("http://{}", closed.local_addr().expect(IO_FAILED));
     drop(closed);
-    let fixture = Fixture::at(&base_url, Requests::default());
+    let fixture = Fixture::at(isolated_home(), &base_url, Requests::default());
 
     let error = runtime()
         .block_on(fixture.provider.list_models())
@@ -535,7 +522,7 @@ maki.provider.register({{
 /// branch builds its body somewhere else entirely, so it gets its own case.
 #[test]
 fn the_responses_codec_applies_the_body_hook_too() {
-    let _state = isolated_state();
+    let _state = isolated_home();
     let (base_url, server) = serve(RESPONSES_SCRIPT);
     let host = plugin_host();
     load_inline(
@@ -637,7 +624,7 @@ fn wait_for(path: &Path) {
 /// A parked host would otherwise hang the test for good instead of failing it.
 #[test]
 fn a_credential_write_does_not_park_the_plugin_host() {
-    let state = isolated_state();
+    let state = isolated_home();
     let entered = state.path().join("entered");
     let done = state.path().join("done");
 
@@ -672,7 +659,7 @@ fn a_credential_write_does_not_park_the_plugin_host() {
 /// on belong to the handle and go only once nobody holds it.
 #[test]
 fn an_in_flight_hook_call_survives_a_plugin_reload() {
-    let state = isolated_state();
+    let state = isolated_home();
     let started = state.path().join("started");
     let release = state.path().join("release");
 
@@ -695,7 +682,7 @@ fn an_in_flight_hook_call_survives_a_plugin_reload() {
 /// maki ships stays reserved, even when its bundled plugin is turned off.
 #[test]
 fn a_third_party_plugin_cannot_take_a_builtin_slug() {
-    let _state = isolated_state();
+    let _state = isolated_home();
     let host = plugin_host();
     plugin::begin_load();
 
@@ -737,7 +724,7 @@ fn takeover_catalog_cached() {
 /// holds no grant at all.
 #[test]
 fn every_registered_slug_needs_the_grant_a_package_load_carries() {
-    let _state = isolated_state();
+    let _state = isolated_home();
     takeover_catalog_cached();
 
     let site = TempDir::new().expect(TEMPDIR_FAILED);
@@ -799,7 +786,7 @@ fn every_registered_slug_needs_the_grant_a_package_load_carries() {
 /// does.
 #[test]
 fn a_failed_package_load_keeps_its_granted_slug_owned() {
-    let _state = isolated_state();
+    let _state = isolated_home();
     takeover_catalog_cached();
 
     let site = TempDir::new().expect(TEMPDIR_FAILED);

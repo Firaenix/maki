@@ -29,7 +29,7 @@ Maki builds the system prompt and tool definitions once per session and sends th
 
 When something changes mid-session (the date, the model, plan mode, the directory after `/cd`, a new memory tag), Maki appends a short update before your next message.
 
-A fresh prompt is built only on compaction, or for a change an update cannot carry: different tools (`/reload`, `/workflow`, a model with other capabilities) or a different system prompt passed in [headless](../headless/) mode. Such a change starts the cache over, and Maki tells you when it happens.
+A fresh prompt is built only on compaction, or for a change an update cannot carry: different tools (`/reload`, `/workflow`, a model with other capabilities) or a different `--system-prompt` or `--append-system-prompt` text when a session is resumed. Such a change starts the cache over, and Maki tells you when it happens.
 
 Claude binds each thinking block to the prompt it was written under. Accounts that enforce this reject a request whose prompt moved under earlier thinking. When that happens Maki drops all earlier thinking once, tells you, and the session goes on. Later thinking is bound to the new prompt.
 
@@ -93,7 +93,7 @@ context updates, including with a complete main template. Changing the static
 system or plan replacement policy starts an announced new request frame.
 A changed plan prompt applies when the agent next enters plan mode.
 Side questions use the stored frame when one exists.
-An explicit SDK system-prompt override takes precedence over a plugin's main
+An explicit `--system-prompt` takes precedence over a plugin's main
 template.
 
 Prompt text does not change tool permissions, plan-mode restrictions, or
@@ -186,12 +186,12 @@ The popup takes these keys only while it is open. Otherwise `↑` and `↓` stil
 
 The inserted path is plain text in your message. Nothing is attached or read until the agent calls `read`.
 
-The plugin is off by default while its file index is tested on large repositories. Turn it on in `init.lua`:
+The popup is on by default. To turn it off, set this in `init.lua`:
 
 ```lua
 maki.setup({
   plugins = {
-    completion = { enabled = true },
+    completion = { enabled = false },
   },
 })
 ```
@@ -202,9 +202,9 @@ Plugins can add their own entries to the popup, such as issues after `#` or peop
 
 ## When the window fills
 
-Long sessions eventually approach the model's context limit. Maki reserves a slice of the window (`agent.compaction_buffer`, default 20%) and before running out it summarizes the older turns and continues from the summary. `/compact` triggers it early, `/compact keep the repro steps` steers that one summary, `/usage` shows where the tokens went, and `agent.compaction_instructions` steers every summary.
+Long sessions eventually approach the model's context limit. Maki reserves a slice of the window (`agent.compaction_buffer`, default 20%) and before running out it summarizes the older turns and continues from the summary. `/compact` triggers it early, `/compact keep the repro steps` steers that one summary, `/usage` shows where the tokens went, and `agent.compaction_instructions` steers every summary. The summary comes from the [compaction tier](/docs/providers/) model when one is set, else from the session model. An empty summary is retried once, and after that the session stays as it was.
 
-Compaction replaces the older turns in the session's on-disk log with the summary. The dropped turns are not lost: before the rewrite, Maki parks the previous log at `sessions/archive/<session-id>/<n>.jsonl` in the [state directory](/docs/configuration/#directory-layout). It keeps the newest three per session, and at most 32 MB of them. The names count up, so the highest number is the newest.
+Compaction replaces the older turns in the session's on-disk log with the summary. The dropped turns are not lost: before the rewrite, Maki parks the previous log at `sessions/archive/<session-id>/<n>.jsonl` in the [state directory](/docs/configuration/#directory-layout). That archive holds the whole log as it stood at the time. The tool state the dropped turns held goes away with them, the same as on a rewind, so each archive carries only its own stretch of the session. Runs that live beside the chat, like a task moved to the background, keep their output until the turn that started them is gone. Archives stay until you delete the session. The names count up, so the highest number is the newest.
 
 An archive is a complete session file, so `jq` or an editor reads it as it is. To open one in Maki you have to put it back in place of the live log, which drops the session's current state, so move that out of the way first:
 

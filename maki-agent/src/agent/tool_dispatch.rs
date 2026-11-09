@@ -158,16 +158,7 @@ pub async fn run(
         }
         Verdict::Denied(reason) => {
             warn!(tool = %name, reason = %reason, "input hook stopped the call");
-            return ToolDoneEvent {
-                call: None,
-                id,
-                tool: Arc::from(name),
-                output: Arc::new(ToolOutput::Plain(reason.into())),
-                is_error: true,
-                annotation: None,
-                written_path: None,
-                backgrounded: false,
-            };
+            return ToolDoneEvent::new(id, Arc::from(name), ToolOutput::Plain(reason.into()), true);
         }
     };
 
@@ -229,14 +220,10 @@ fn ran(id: String, tool: Arc<str>, result: ToolExecResult) -> Ran {
     let backgrounded = moved.is_some();
     let done = match output {
         Ok(output) => ToolDoneEvent {
-            call: None,
-            id,
-            tool,
-            output: Arc::new(output),
-            is_error: false,
             annotation,
             written_path,
             backgrounded,
+            ..ToolDoneEvent::new(id, tool, output, false)
         },
         Err(message) => ToolDoneEvent {
             tool,
@@ -655,7 +642,8 @@ impl Route<'_> {
 
     /// What hooking this call would lend. Every route answers here, so a new
     /// one cannot reach a hook without naming its price. Only a declared
-    /// capability narrows it: reading undeclared as free is what would let an
+    /// capability, or an explicit declaration that the tool reaches nothing,
+    /// narrows it: reading undeclared as free is what would let an
     /// unprivileged plugin steer `batch` or `code_execution` into any tool it
     /// likes.
     fn authority(&self) -> Option<Authority> {
@@ -871,16 +859,12 @@ async fn run_inner(
             if ctx.mcp.is_some() && is_wire_name(name) {
                 text = format!("{text}. {MCP_SERVER_GONE}");
             }
-            ToolDoneEvent {
-                call: None,
+            ToolDoneEvent::new(
                 id,
-                tool: Arc::from(UNKNOWN_MCP),
-                output: Arc::new(ToolOutput::Plain(text.into())),
-                is_error: true,
-                annotation: None,
-                written_path: None,
-                backgrounded: false,
-            }
+                Arc::from(UNKNOWN_MCP),
+                ToolOutput::Plain(text.into()),
+                true,
+            )
             .into()
         }
     }
@@ -1101,16 +1085,7 @@ fn run_tool_search(
         Ok(found) => (found, false),
         Err(e) => (e.into(), true),
     };
-    ToolDoneEvent {
-        call: None,
-        id,
-        tool: tool_id,
-        output: Arc::new(view.output(output)),
-        is_error,
-        annotation: None,
-        written_path: None,
-        backgrounded: false,
-    }
+    ToolDoneEvent::new(id, tool_id, view.output(output), is_error)
 }
 
 /// Why a file-mutating tool is stopped before its permission check, if it is.
@@ -1190,16 +1165,7 @@ async fn run_local_tool(
             (e, true)
         }
     };
-    ToolDoneEvent {
-        call: None,
-        id,
-        tool: tool_id,
-        output: Arc::new(ToolOutput::Plain(output.into())),
-        is_error,
-        annotation: None,
-        written_path: None,
-        backgrounded: false,
-    }
+    ToolDoneEvent::new(id, tool_id, ToolOutput::Plain(output.into()), is_error)
 }
 
 /// Enforce permission for a native tool. MCP tools bypass this — they go
@@ -1341,15 +1307,13 @@ async fn execute_mcp_tool(
 ) -> ToolDoneEvent {
     let view = RoutedView::mcp(&tool);
     emit_raw_start(ctx, origin, id, &tool, view.summary.clone(), input);
-    let done = |output: TextOutput, is_error: bool| ToolDoneEvent {
-        call: None,
-        id: id.to_owned(),
-        tool: Arc::clone(&tool),
-        output: Arc::new(view.output(output)),
-        is_error,
-        annotation: None,
-        written_path: None,
-        backgrounded: false,
+    let done = |output: TextOutput, is_error: bool| {
+        ToolDoneEvent::new(
+            id.to_owned(),
+            Arc::clone(&tool),
+            view.output(output),
+            is_error,
+        )
     };
 
     let perm_tool = match ToolKey::parse(&tool) {
@@ -1546,9 +1510,8 @@ mod tests {
 
     use flume::Receiver;
     use futures::FutureExt;
-    use maki_config::{
-        Effect, Permission, PermissionRule, PermissionsConfig, ProjectConfig, ToolKey,
-    };
+    use maki_config::project::{self, TrustMode};
+    use maki_config::{Effect, Permission, PermissionRule, PermissionsConfig, ToolKey};
     use maki_providers::{ContentBlock, Message, Role, StreamResponse};
     use maki_storage::id::MakiId;
     use test_case::test_case;
@@ -1557,8 +1520,8 @@ mod tests {
 
     use super::*;
     use crate::agent::history::History;
-    use crate::call_scope::TaskHome;
-    use crate::cancel::{CancelToken, CancelTrigger};
+    use crate::call_scope::{MovedTrigger, TaskHome};
+    use crate::cancel::CancelToken;
     use crate::live_session::{BACKGROUND_PLAN_WRITE_DENIED, SessionMailbox};
     use crate::mcp::test_support::stub_session;
     use crate::mcp::{ToolDeferral, tool_names};
@@ -1602,6 +1565,10 @@ mod tests {
     const HOOK_DENY_REASON: &str = "not on my watch";
     const HOOK_OUTPUT_TEXT: &str = "trimmed";
     const HOOK_PERMISSION: Permission = Permission::Run;
+    const HOOK_REACH: ToolReach = ToolReach::Capability {
+        permission: HOOK_PERMISSION,
+        prompted: true,
+    };
     const HOOK_FIELD_TYPE: &str = "string";
     const HOOK_DIFF_COMMAND: &str = "apply";
     const HOOK_DIFF_PATH: &str = "/tmp/diffed.txt";
@@ -1714,7 +1681,7 @@ mod tests {
         registry
             .register(
                 tool,
-                ToolSource::Lua {
+                ToolSource {
                     plugin: TEST_PLUGIN.into(),
                 },
             )
@@ -1748,7 +1715,8 @@ mod tests {
         let permissions = Arc::new(PermissionManager::new(
             config,
             PathBuf::from(TEST_ROOT),
-            ProjectConfig::for_project(Path::new(TEST_ROOT)),
+            project::resolve_noninteractive(Path::new(TEST_ROOT), TrustMode::Session)
+                .project_config,
             Arc::default(),
         ));
         stub_ctx_with_permissions(mode, permissions)
@@ -1764,7 +1732,7 @@ mod tests {
 
     /// Its permission scope, its write target and its output are all its
     /// input, which is how a test sees the input each stage of dispatch got.
-    struct HookMock(Option<Permission>);
+    struct HookMock(Option<ToolReach>);
 
     struct HookMockInvocation(String);
 
@@ -1830,10 +1798,7 @@ mod tests {
             serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}})
         }
         fn reach(&self) -> Option<ToolReach> {
-            self.0.map(|permission| ToolReach {
-                permission,
-                prompted: true,
-            })
+            self.0
         }
         fn tool_kind(&self) -> Option<&str> {
             Some(HOOK_TOOL_KIND)
@@ -2006,10 +1971,10 @@ mod tests {
 
     fn hooked_with(
         mut ctx: ToolContext,
-        permission: Option<Permission>,
+        reach: Option<ToolReach>,
         hook: RecordingHook,
     ) -> (ToolContext, RecordingHook) {
-        ctx.registry = registered(Arc::new(HookMock(permission)));
+        ctx.registry = registered(Arc::new(HookMock(reach)));
         ctx.registry.set_hook(hook.clone());
         (ctx, hook)
     }
@@ -2098,22 +2063,24 @@ mod tests {
 
     /// Hooking in dispatch is what reaches a route maki did not write the code
     /// behind, and each one has to answer for what that lends. Only a declared
-    /// capability narrows the price; everything else prices at the maximum.
+    /// capability, or a declaration that the tool reaches nothing, narrows the
+    /// price. Everything else prices at the maximum.
     /// The name stays the one the model called, not whatever dispatch routes
     /// it to.
-    #[test_case(build_ctx,      HOOK_TOOL_NAME,        Some(HOOK_PERMISSION), Authority::Capability(HOOK_PERMISSION) ; "a_checked_tool_lends_its_capability")]
-    #[test_case(build_ctx,      HOOK_TOOL_NAME,        None,                  Authority::Unbounded                   ; "a_tool_declaring_nothing_declares_no_limit")]
-    #[test_case(mcp_route_ctx,  TOOL_SEARCH_TOOL_NAME, None,                  Authority::Unbounded                   ; "search_declares_nothing_either")]
-    #[test_case(mcp_route_ctx,  PROBE_WIRE,            None,                  Authority::Unbounded                   ; "an_mcp_tool_is_code_maki_does_not_own")]
-    #[test_case(host_route_ctx, CLIENT_NAME,           None,                  Authority::Unbounded                   ; "a_host_tool_is_code_maki_does_not_own")]
+    #[test_case(build_ctx,      HOOK_TOOL_NAME,        Some(HOOK_REACH),       Authority::Capability(HOOK_PERMISSION) ; "a_checked_tool_lends_its_capability")]
+    #[test_case(build_ctx,      HOOK_TOOL_NAME,        Some(ToolReach::Inert), Authority::Inert                       ; "an_inert_tool_lends_nothing")]
+    #[test_case(build_ctx,      HOOK_TOOL_NAME,        None,                   Authority::Unbounded                   ; "a_tool_declaring_nothing_declares_no_limit")]
+    #[test_case(mcp_route_ctx,  TOOL_SEARCH_TOOL_NAME, None,                   Authority::Unbounded                   ; "search_declares_nothing_either")]
+    #[test_case(mcp_route_ctx,  PROBE_WIRE,            None,                   Authority::Unbounded                   ; "an_mcp_tool_is_code_maki_does_not_own")]
+    #[test_case(host_route_ctx, CLIENT_NAME,           None,                   Authority::Unbounded                   ; "a_host_tool_is_code_maki_does_not_own")]
     #[tokio::test]
     async fn a_route_lends_the_authority_it_declares(
         build: fn() -> ToolContext,
         name: &str,
-        permission: Option<Permission>,
+        reach: Option<ToolReach>,
         expected: Authority,
     ) {
-        let (ctx, hook) = hooked_with(build(), permission, RecordingHook::default());
+        let (ctx, hook) = hooked_with(build(), reach, RecordingHook::default());
         dispatch(&ctx, name, &call_input(HOOK_PLAIN)).await;
 
         let firing = hook.at(HookStage::Input).expect("the input stage fired");
@@ -2839,7 +2806,7 @@ mod tests {
         assert!(prompts(&events).is_empty());
     }
 
-    fn moved_away(scope: &CallScope) -> CancelTrigger {
+    fn moved_away(scope: &CallScope) -> MovedTrigger {
         scope
             .move_to(TaskHome {
                 chat: MakiId::generate(),
