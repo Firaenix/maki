@@ -72,12 +72,12 @@ struct Pending {
 const ANSWER_TAG: char = '\u{1f}';
 
 fn tag_answer(id: i64, payload: String) -> String {
-    format!("{id}{ANSWER_TAG}{payload}")
+    format!("dialog:{id}{ANSWER_TAG}{payload}")
 }
 
 fn answer_for(raw: &str, id: i64) -> Option<&str> {
     let (tag, payload) = raw.split_once(ANSWER_TAG)?;
-    (tag == id.to_string()).then_some(payload)
+    (tag == format!("dialog:{id}")).then_some(payload)
 }
 
 /// How to read the answer and who gets it. A subagent's permission carries the
@@ -563,13 +563,9 @@ fn ask_client(
 }
 
 /// Reads until an answer tagged for `id` arrives. Answers tagged for another ask
-/// are dropped, not consumed, so a leftover cannot answer this question with a
-/// decision the user made about a different one.
-async fn dialog_answer(
-    cancel: &CancelToken,
-    guard: &mut Receiver<String>,
-    id: i64,
-) -> Option<String> {
+/// are discarded rather than answered with them, so a leftover from a cancelled
+/// ask cannot stand in for this question's reply.
+async fn dialog_answer(cancel: &CancelToken, guard: &Receiver<String>, id: i64) -> Option<String> {
     loop {
         match cancel.race(guard.recv_async()).await {
             Ok(Ok(raw)) => match answer_for(&raw, id) {
@@ -609,7 +605,7 @@ fn question_tool(out_tx: WeakSender<Value>, pending: PendingState, forms: bool) 
 
             // A parked permission can hold this channel across a turn, so the
             // wait has to end with ours, as in the permission path.
-            let Ok(mut guard) = ctx.cancel.race(rx.lock()).await else {
+            let Ok(guard) = ctx.cancel.race(rx.lock()).await else {
                 return Ok(elicitation::DISMISSED.to_owned());
             };
             if forms {
@@ -622,7 +618,7 @@ fn question_tool(out_tx: WeakSender<Value>, pending: PendingState, forms: bool) 
                 );
                 // Cleared while still holding the channel, so a stale id cannot
                 // clobber whatever ask comes next.
-                let answer = dialog_answer(&ctx.cancel, &mut guard, id).await;
+                let answer = dialog_answer(&ctx.cancel, &guard, id).await;
                 pending.lock().unwrap().asks.remove(&id);
                 drop(guard);
                 return Ok(answer
@@ -642,13 +638,21 @@ fn question_tool(out_tx: WeakSender<Value>, pending: PendingState, forms: bool) 
                     Ask::Dialog,
                     AgentRequest::RequestPermissionRequest(request),
                 );
-                let answer = dialog_answer(&ctx.cancel, &mut guard, id).await;
+                let answer = dialog_answer(&ctx.cancel, &guard, id).await;
                 pending.lock().unwrap().asks.remove(&id);
                 let Some(raw) = answer else {
                     drop(guard);
                     return Ok(elicitation::DISMISSED.to_owned());
                 };
-                answers.push(elicitation::format_option_response(&input, index, &raw));
+                match elicitation::format_option_response(&input, index, &raw) {
+                    Some(line) => answers.push(line),
+                    // Cancelled, or a reply with nothing in it: nobody is left to
+                    // answer the rest of the series.
+                    None => {
+                        drop(guard);
+                        return Ok(elicitation::DISMISSED.to_owned());
+                    }
+                }
             }
             drop(guard);
             Ok(answers.join("\n"))
@@ -2321,9 +2325,7 @@ mod tests {
             r#"{"outcome":{"outcome":"selected","optionId":"opt2"}}"#.to_owned(),
         ))
         .unwrap();
-        let mut rx = rx;
-
-        let answer = dialog_answer(&CancelToken::none(), &mut rx, ANSWERED_ID)
+        let answer = dialog_answer(&CancelToken::none(), &rx, ANSWERED_ID)
             .await
             .unwrap();
         assert_eq!(

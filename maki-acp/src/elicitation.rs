@@ -70,7 +70,7 @@ pub fn option_requests(
         .iter()
         .map(|question| {
             let fields = ToolCallUpdateFields::new()
-                .title(question.question.clone())
+                .title(format!("Question: {}", question.question))
                 .raw_input(serde_json::json!({ "question": question.question }));
             let options = question
                 .options
@@ -103,42 +103,41 @@ pub fn option_requests(
         .collect())
 }
 
-fn selected_option(raw: &str) -> Option<String> {
-    let response: Value = serde_json::from_str(raw).ok()?;
-    let outcome = response.get("outcome")?;
-    if outcome["outcome"] != "selected" {
+/// One `header: label` line, mirroring `format_response`'s output shape. `None`
+/// means the client cancelled or answered nothing usable, which ends the series:
+/// asking the remaining questions would only produce more empty answers.
+/// An id we never issued is no answer, so a client cannot smuggle text into the
+/// other questions' lines.
+pub fn format_option_response(input: &Value, index: usize, raw: &str) -> Option<String> {
+    let outcome = serde_json::from_str::<Value>(raw)
+        .ok()?
+        .get("outcome")?
+        .get("outcome")?
+        .as_str()?
+        .to_owned();
+    if outcome != "selected" {
         return None;
     }
-    outcome.get("optionId")?.as_str().map(str::to_owned)
-}
-
-/// One `header: label` line, mirroring `format_response`'s output shape.
-pub fn format_option_response(input: &Value, index: usize, raw: &str) -> String {
+    let option_id = serde_json::from_str::<Value>(raw)
+        .ok()?
+        .get("outcome")?
+        .get("optionId")?
+        .as_str()?
+        .to_owned();
     let questions = parse_questions(input).unwrap_or_default();
-    let Some(question) = questions.get(index) else {
-        return DISMISSED.to_owned();
-    };
+    let question = questions.get(index)?;
     let label = if question.header.is_empty() {
         format!("Q{}", index + 1)
     } else {
         question.header.clone()
     };
-    let answer = match selected_option(raw) {
-        None => NO_ANSWER.to_owned(),
-        Some(option) if option == DISMISS_OPTION => NO_ANSWER.to_owned(),
-        Some(option) => match option
-            .strip_prefix("opt")
-            .and_then(|n| n.parse::<usize>().ok())
-        {
-            Some(number) => number
-                .checked_sub(1)
-                .and_then(|index| question.options.get(index))
-                .map(|choice| choice.label.clone())
-                .unwrap_or(option),
-            None => option,
-        },
-    };
-    format!("{label}: {answer}")
+    let answer = option_id
+        .strip_prefix("opt")
+        .and_then(|number| number.parse::<usize>().ok())
+        .and_then(|number| number.checked_sub(1))
+        .and_then(|option| question.options.get(option))
+        .map_or(NO_ANSWER, |choice| choice.label.as_str());
+    Some(format!("{label}: {answer}"))
 }
 
 fn parse_questions(input: &Value) -> Result<Vec<Question>, String> {
@@ -400,7 +399,7 @@ mod tests {
         let json = serde_json::to_value(&requests[0]).unwrap();
         assert_eq!(json["sessionId"], "sess_1");
         assert_eq!(json["toolCall"]["toolCallId"], "tool_1");
-        assert_eq!(json["toolCall"]["title"], "Pick a framework");
+        assert_eq!(json["toolCall"]["title"], "Question: Pick a framework");
 
         let options = json["options"].as_array().unwrap();
         assert_eq!(options.len(), 3);
@@ -417,14 +416,14 @@ mod tests {
         assert!(option_requests("sess_1", "tool_1", &input).is_err());
     }
 
-    #[test_case(r#"{"outcome":{"outcome":"selected","optionId":"opt1"}}"# => "Framework: axum"; "first_option")]
-    #[test_case(r#"{"outcome":{"outcome":"selected","optionId":"opt2"}}"# => "Framework: actix"; "last_option")]
-    #[test_case(r#"{"outcome":{"outcome":"selected","optionId":"dismiss"}}"# => "Framework: (no answer)"; "dismissed")]
-    #[test_case(r#"{"outcome":{"outcome":"cancelled"}}"# => "Framework: (no answer)"; "cancelled")]
-    #[test_case("not json" => "Framework: (no answer)"; "unparsable")]
-    #[test_case(r#"{"outcome":{"outcome":"selected","optionId":"opt0"}}"# => "Framework: opt0"; "opt0_is_not_a_valid_index")]
-    #[test_case(r#"{"outcome":{"outcome":"selected","optionId":"sideways"}}"# => "Framework: sideways"; "unknown_option_is_passed_through")]
-    fn option_answer_formats_one_line(raw: &str) -> String {
+    #[test_case(r#"{"outcome":{"outcome":"selected","optionId":"opt1"}}"# => Some("Framework: axum".to_owned()); "first_option")]
+    #[test_case(r#"{"outcome":{"outcome":"selected","optionId":"opt2"}}"# => Some("Framework: actix".to_owned()); "last_option")]
+    #[test_case(r#"{"outcome":{"outcome":"selected","optionId":"dismiss"}}"# => Some("Framework: (no answer)".to_owned()); "dismissed_option")]
+    #[test_case(r#"{"outcome":{"outcome":"cancelled"}}"# => None; "cancelled_ends_the_series")]
+    #[test_case("not json" => None; "unparsable")]
+    #[test_case(r#"{"outcome":{"outcome":"selected","optionId":"opt0"}}"# => Some("Framework: (no answer)".to_owned()); "opt0_is_not_a_valid_index")]
+    #[test_case(r#"{"outcome":{"outcome":"selected","optionId":"sideways"}}"# => Some("Framework: (no answer)".to_owned()); "an_id_we_never_issued")]
+    fn option_answer(raw: &str) -> Option<String> {
         format_option_response(&all_optional_input(), 0, raw)
     }
 
@@ -439,19 +438,19 @@ mod tests {
                 0,
                 r#"{"outcome":{"outcome":"selected","optionId":"opt1"}}"#
             ),
-            "Q1: yes"
+            Some("Q1: yes".to_owned())
         );
     }
 
     #[test]
-    fn out_of_range_index_is_dismissed() {
+    fn an_out_of_range_question_has_no_answer_to_format() {
         assert_eq!(
             format_option_response(
                 &all_optional_input(),
                 9,
                 r#"{"outcome":{"outcome":"selected","optionId":"opt1"}}"#
             ),
-            DISMISSED
+            None
         );
     }
 }
