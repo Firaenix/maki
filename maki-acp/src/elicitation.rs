@@ -1,9 +1,7 @@
-//! Maps the `question` tool onto what the client can actually render: form
-//! elicitation (`elicitation/create`) when the client declares it, otherwise a
-//! `session/request_permission` option list. The tool keeps its Lua-advertised
-//! schema; only execution is rerouted here, so Zed and friends render native
-//! forms instead of a spinner nobody can answer, and clients with neither
-//! (Paseo, most ACP adapters) still get clickable choices.
+//! Maps the `question` tool onto what the client can render: `elicitation/create`
+//! when it declares form elicitation, one `session/request_permission` per
+//! question otherwise. Clients with neither (Paseo, most ACP adapters) still get
+//! clickable choices.
 
 use std::collections::BTreeMap;
 
@@ -46,14 +44,12 @@ pub fn supports_form(caps: &ClientCapabilities) -> bool {
 
 const DISMISS_OPTION: &str = "dismiss";
 
-/// One `session/request_permission` per question. The option list is flat, so a
-/// merged dialog could not say which answer belongs to which question, and ACP
-/// has no multi-select in this path: a `multiSelect` question degrades to one
-/// choice in clients without form elicitation.
+/// One `session/request_permission` per question: the option list is flat, so a
+/// merged dialog could not say which answer belongs to which question, and a
+/// `multiSelect` question degrades to a single choice here.
 ///
-/// A question with no options cannot be answered by picking, and there is no
-/// free-text channel in a permission request, so those are refused rather than
-/// faked with an empty answer.
+/// A question with no options has no free-text channel to answer it, so those
+/// are refused rather than faked with an empty answer.
 pub fn option_requests(
     session_id: &str,
     tool_call_id: &str,
@@ -107,7 +103,6 @@ pub fn option_requests(
         .collect())
 }
 
-/// The option the user picked, or nothing when the request was cancelled.
 fn selected_option(raw: &str) -> Option<String> {
     let response: Value = serde_json::from_str(raw).ok()?;
     let outcome = response.get("outcome")?;
@@ -117,7 +112,7 @@ fn selected_option(raw: &str) -> Option<String> {
     outcome.get("optionId")?.as_str().map(str::to_owned)
 }
 
-/// One `header: label` line for one question, mirroring `format_response`.
+/// One `header: label` line, mirroring `format_response`'s output shape.
 pub fn format_option_response(input: &Value, index: usize, raw: &str) -> String {
     let questions = parse_questions(input).unwrap_or_default();
     let Some(question) = questions.get(index) else {

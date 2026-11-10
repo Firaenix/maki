@@ -67,7 +67,7 @@ struct Pending {
 }
 
 /// Answers on the shared channel carry the id of the ask they belong to, so a
-/// waiter can tell its own reply from one left over by a cancelled ask. Same
+/// waiter can tell its own reply from one left by a cancelled ask. Same
 /// separator as `maki_agent::permissions::TaggedAnswer`.
 const ANSWER_TAG: char = '\u{1f}';
 
@@ -475,10 +475,8 @@ fn start_session(
     initial_cost: Option<f64>,
 ) -> SessionRef {
     let pending = PendingState::default();
-    // The question tool is always shadowed; `client_elicits_form` only decides
-    // which dialog it uses. Dropping it on clients without form elicitation
-    // would leave the model with no way to ask, when every ACP client can answer
-    // an option list.
+    // The question tool is always shadowed; `client_elicits_form` only picks the
+    // dialog, since every ACP client can answer an option list.
     let question = question_tool(
         srv.out_tx.downgrade(),
         Arc::clone(&pending),
@@ -564,10 +562,9 @@ fn ask_client(
     id
 }
 
-/// Reads until an answer tagged for `id` arrives. Answers tagged for any other
-/// ask are dropped, not consumed, exactly as the permission waiter does: taking
-/// a leftover would answer this question with a decision the user made about a
-/// different one.
+/// Reads until an answer tagged for `id` arrives. Answers tagged for another ask
+/// are dropped, not consumed, so a leftover cannot answer this question with a
+/// decision the user made about a different one.
 async fn dialog_answer(
     cancel: &CancelToken,
     guard: &mut Receiver<String>,
@@ -611,7 +608,7 @@ fn question_tool(out_tx: WeakSender<Value>, pending: PendingState, forms: bool) 
             let rx = ctx.user_response_rx.as_ref().ok_or("no answer channel")?;
 
             // A parked permission can hold this channel across a turn, so the
-            // wait has to end with ours, exactly as the permission path does.
+            // wait has to end with ours, as in the permission path.
             let Ok(mut guard) = ctx.cancel.race(rx.lock()).await else {
                 return Ok(elicitation::DISMISSED.to_owned());
             };
