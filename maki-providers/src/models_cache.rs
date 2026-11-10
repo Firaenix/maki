@@ -261,6 +261,22 @@ fn store_discovery(path: &Path, listing: &Listing, fingerprint: String, now_ms: 
 /// the on-disk cache. Every call carries the whole list to show, not a delta,
 /// plus the warnings of the batch that changed it. The last call has
 /// `loading` off and holds only this run's live answer.
+/// The specs the last successful discovery left on disk, filtered by `policy`.
+/// A front end that reads the model selector before the network round trip -
+/// an ACP client probing `session/new` - needs this to offer catalog providers
+/// at all, since `available_model_specs` only knows declared manifests.
+pub fn cached_model_specs(policy: &ModelPolicy) -> Vec<String> {
+    let Some(path) = cache_path() else {
+        return Vec::new();
+    };
+    replay(
+        &path,
+        policy,
+        &fingerprint(),
+        maki_storage::auth::now_millis(),
+    )
+}
+
 pub async fn fetch_all_models_cached(
     policy: &ModelPolicy,
     mut on_update: impl FnMut(ModelList, Vec<String>),

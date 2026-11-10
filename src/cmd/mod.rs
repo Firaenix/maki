@@ -1,4 +1,5 @@
 mod acp;
+mod acp_commands;
 mod migrate;
 mod session;
 mod subcmd;

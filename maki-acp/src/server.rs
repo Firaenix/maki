@@ -24,12 +24,13 @@ use maki_agent::tools::{LocalTool, LocalTools, QUESTION_TOOL_NAME, ToolAudience,
 use maki_agent::types::AgentEvent;
 use maki_agent::{
     AgentInput, AgentMode, CancelToken, CostTally, Envelope, ImageMediaType, ImageSource,
-    InputSource, SessionEndReason, SessionEvents,
+    InputSource, SessionEndReason, SessionEvents, SessionInput,
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, TrustConfig};
 use maki_providers::model::Model;
-use maki_providers::provider::{available_model_specs, fetch_all_models};
+use maki_providers::models_cache::{cached_model_specs, fetch_all_models_cached};
+use maki_providers::provider::available_model_specs;
 use maki_providers::settle_session;
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
@@ -38,13 +39,19 @@ use maki_storage::stdin;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncWriteExt, stdout};
-use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{
+    UnboundedReceiver, UnboundedSender, WeakUnboundedSender, unbounded_channel,
+};
 use tokio::task::{JoinHandle, spawn_blocking};
 use tracing::{debug, info, warn};
 
+use crate::host::HostRequest;
 use crate::{AcpParams, SessionEndHook, elicitation, methods, permissions, translate};
 
+mod slash;
+
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
+const PROMPT_RUNNING: &str = "a prompt is already running";
 /// Turns already recorded were priced when they ran. `always_fast` is a live
 /// config value, so reading it here would reprice history the user paid for at
 /// standard rates. New turns still honour it.
@@ -66,6 +73,20 @@ struct Pending {
     asks: HashMap<i64, Ask>,
 }
 
+/// Answers on the shared channel carry the id of the ask they belong to, so a
+/// waiter can tell its own reply from one left by a cancelled ask. Same
+/// separator as `maki_agent::permissions::TaggedAnswer`.
+const ANSWER_TAG: char = '\u{1f}';
+
+fn tag_answer(id: i64, payload: String) -> String {
+    format!("dialog:{id}{ANSWER_TAG}{payload}")
+}
+
+fn answer_for(raw: &str, id: i64) -> Option<&str> {
+    let (tag, payload) = raw.split_once(ANSWER_TAG)?;
+    (tag == format!("dialog:{id}")).then_some(payload)
+}
+
 /// How to read the answer and who gets it. A subagent's permission carries the
 /// channel its own agent waits on, everything else answers the main agent.
 enum Ask {
@@ -76,7 +97,9 @@ enum Ask {
         request_id: String,
         answer_tx: Option<UnboundedSender<String>>,
     },
-    Elicitation,
+    /// A form or an option list the client answers; the raw result is handed to
+    /// the parked tool call verbatim, so the question tool parses it itself.
+    Dialog,
 }
 
 type PendingState = Arc<Mutex<Pending>>;
@@ -90,6 +113,13 @@ struct SessionState {
     /// Shared with the run, so reloading the same session reads under this
     /// claim instead of clashing with it.
     claim: SessionClaim,
+    /// Where the session runs and which servers its client injected, so a
+    /// restart (`/cd`, `/trust`, `/reload`) can start the next generation.
+    cwd: PathBuf,
+    client_servers: Vec<McpServer>,
+    /// What every prompt runs under, seeded from the server's defaults and
+    /// flipped by `/fast` and `/workflow`.
+    toggles: SessionDefaults,
 }
 
 struct Server {
@@ -100,6 +130,11 @@ struct Server {
     defaults: SessionDefaults,
     session: Option<SessionState>,
     on_session_end: Option<SessionEndHook>,
+    /// Weak, so the server's own handle never keeps its input loop alive.
+    in_tx: WeakUnboundedSender<Incoming>,
+    /// A Lua command's prompt, held open for the turn its handler may start
+    /// with `maki.session.prompt`, so that turn answers it.
+    command_wait: Option<RequestId>,
 }
 
 impl Server {
@@ -111,9 +146,12 @@ impl Server {
 enum Incoming {
     Line(String),
     Models(Vec<String>),
+    Host(HostRequest),
+    /// The grace a Lua command's prompt waits for its handler ran out.
+    CommandGrace(RequestId),
 }
 
-pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
+pub async fn serve(mut params: AcpParams) -> color_eyre::Result<()> {
     let (out_tx, mut out_rx) = unbounded_channel::<Value>();
 
     let writer_task = tokio::spawn(async move {
@@ -128,17 +166,21 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         }
     });
 
+    let (in_tx, mut in_rx) = unbounded_channel::<Incoming>();
     let mut server = Server {
         out_tx,
-        model_specs: available_model_specs(&params.model_policy),
+        model_specs: seed_model_specs(&params.model_policy),
         model_policy: Arc::clone(&params.model_policy),
         client_elicits_form: false,
         defaults: params.defaults,
         session: None,
         on_session_end: params.on_session_end.clone(),
+        in_tx: in_tx.downgrade(),
+        command_wait: None,
     };
-
-    let (in_tx, mut in_rx) = unbounded_channel::<Incoming>();
+    if let Some(requests) = params.host_requests.take() {
+        forward_host_requests(requests, in_tx.downgrade());
+    }
     // Weak, so a discovery still in flight cannot keep the loop alive once stdin closes.
     discover_models(Arc::clone(&params.model_policy), in_tx.downgrade());
     let reader_task = tokio::spawn(read_stdin(in_tx));
@@ -147,6 +189,8 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         match incoming {
             Incoming::Line(line) => handle_line(&mut server, &line, &params).await,
             Incoming::Models(specs) => refresh_models(&mut server, specs),
+            Incoming::Host(request) => slash::host_request(&mut server, request),
+            Incoming::CommandGrace(id) => slash::command_grace(&mut server, &id),
         }
     }
 
@@ -182,17 +226,41 @@ async fn read_stdin(tx: UnboundedSender<Incoming>) -> std::io::Result<()> {
 /// should not wait behind it.
 fn discover_models(policy: Arc<ModelPolicy>, tx: WeakUnboundedSender<Incoming>) {
     tokio::spawn(async move {
-        fetch_all_models(
-            &policy,
-            |batch| {
-                if let Some(tx) = tx.upgrade() {
-                    let _ = tx.send(Incoming::Models(batch.models));
-                }
-            },
-            None,
-        )
+        fetch_all_models_cached(&policy, |list, _| {
+            if let Some(tx) = tx.upgrade() {
+                let _ = tx.send(Incoming::Models(list.specs));
+            }
+        })
         .await;
     });
+}
+
+/// Weak, like discovery: a plugin host outliving stdin must not keep the
+/// loop up.
+fn forward_host_requests(
+    mut requests: UnboundedReceiver<HostRequest>,
+    tx: WeakUnboundedSender<Incoming>,
+) {
+    tokio::spawn(async move {
+        while let Some(request) = requests.recv().await {
+            let Some(tx) = tx.upgrade() else { return };
+            let _ = tx.send(Incoming::Host(request));
+        }
+    });
+}
+
+/// The registry's offline list plus whatever discovery cached on disk last run.
+/// An ACP client snapshots the model selector straight after `session/new`, so
+/// catalog providers have to be in that first list rather than arrive as a
+/// config update the client has already read past.
+fn seed_model_specs(policy: &ModelPolicy) -> Vec<String> {
+    let mut specs = available_model_specs(policy);
+    for spec in cached_model_specs(policy) {
+        if !specs.contains(&spec) {
+            specs.push(spec);
+        }
+    }
+    specs
 }
 
 /// Discovery lands in batches after the client built its selector from the
@@ -270,7 +338,7 @@ async fn handle_request(
         "session/new" => new_session(srv, raw, params).await,
         "session/load" => load_session(srv, raw, params).await,
         "session/list" => list_sessions(raw, &params.storage).await,
-        "session/prompt" => match handle_prompt(srv, raw, &id) {
+        "session/prompt" => match handle_prompt(srv, raw, &id, params).await {
             Ok(()) => return,
             Err(e) => Err(e),
         },
@@ -303,6 +371,7 @@ async fn new_session(
         Resumed::empty(SessionRef::from(claim.id())),
         claim,
         mcp,
+        req.mcp_servers,
         project_config,
         None,
     );
@@ -359,21 +428,7 @@ async fn load_session(
     {
         session_update(&srv.out_tx, &sid, update);
     }
-    // Priced against the model the session recorded, not the one selected now
-    // (which may cost 10x more or less). Later turns add their own exact cost.
-    let recorded_model = Model::from_spec_or_warm_catalog(&restored.session.model)
-        .await
-        .unwrap_or_else(|_| params.model.clone());
-    // Settling writes today's estimate into entries that never recorded a cost.
-    // The run saves this session back, so we settle a copy and keep that
-    // estimate off disk.
-    let mut by_model = restored.session.usage_by_model().clone();
-    let restored_cost = settle_session(
-        &restored.session.token_usage,
-        &mut by_model,
-        &recorded_model,
-        RESTORED_FAST,
-    );
+    let restored_cost = restored_cost(&restored.session, &params.model).await;
     let started = start_session(
         srv,
         params,
@@ -381,6 +436,7 @@ async fn load_session(
         Resumed::stored(session_ref, restored.session),
         claim,
         mcp,
+        req.mcp_servers,
         project_config,
         restored_cost,
     );
@@ -389,6 +445,25 @@ async fn load_session(
     let resp = methods::load_session_response()
         .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
     Ok(AgentResponse::LoadSessionResponse(resp))
+}
+
+/// What {session} cost before this run, priced against the model it recorded,
+/// not the one selected now (which may cost 10x more or less). Later turns add
+/// their own exact cost.
+async fn restored_cost(session: &StoredSession, fallback: &Model) -> Option<f64> {
+    let recorded_model = Model::from_spec_or_warm_catalog(&session.model)
+        .await
+        .unwrap_or_else(|_| fallback.clone());
+    // Settling writes today's estimate into entries that never recorded a cost.
+    // The run saves this session back, so we settle a copy and keep that
+    // estimate off disk.
+    let mut by_model = session.usage_by_model().clone();
+    settle_session(
+        &session.token_usage,
+        &mut by_model,
+        &recorded_model,
+        RESTORED_FAST,
+    )
 }
 
 /// `session/list`: stored sessions, newest first. Reads the store, not
@@ -450,20 +525,21 @@ fn start_session(
     resumed: Resumed,
     claim: SessionClaim,
     mcp: Option<McpHandle>,
+    client_servers: Vec<McpServer>,
     project_config: ProjectConfig,
     initial_cost: Option<f64>,
 ) -> SessionRef {
     let pending = PendingState::default();
-    // Without form elicitation the question tool would spin forever waiting
-    // for a TUI that does not exist, so it is dropped and the model asks in
-    // plain text instead.
-    let (excluded_tools, local_tools) = if srv.client_elicits_form {
-        let tool = question_tool(srv.out_tx.downgrade(), Arc::clone(&pending));
-        let map: LocalTools = Arc::new(HashMap::from([(QUESTION_TOOL_NAME.to_owned(), tool)]));
-        (Vec::new(), map)
-    } else {
-        (vec![QUESTION_TOOL_NAME], LocalTools::default())
-    };
+    // The question tool is always shadowed; `client_elicits_form` only picks the
+    // dialog, since every ACP client can answer an option list.
+    let question = question_tool(
+        srv.out_tx.downgrade(),
+        Arc::clone(&pending),
+        srv.client_elicits_form,
+    );
+    let local_tools: LocalTools =
+        Arc::new(HashMap::from([(QUESTION_TOOL_NAME.to_owned(), question)]));
+    let excluded_tools: Vec<&str> = Vec::new();
     // The ACP process cwd owns env, Lua, and application config, but the client
     // picks the session cwd. So permissions, where a saved answer lands, and
     // MCP config all follow the session's project, not ours.
@@ -505,10 +581,17 @@ fn start_session(
         session_ref.clone(),
         srv.out_tx.clone(),
         Arc::clone(&pending),
-        cwd,
+        cwd.clone(),
         maki_storage::paths::home(),
         project_trusted,
         initial_cost,
+    );
+    slash::announce_commands(
+        &srv.out_tx,
+        &session_ref,
+        Arc::clone(&params.commands),
+        &cwd,
+        mcp.as_ref(),
     );
     srv.session = Some(SessionState {
         handle,
@@ -517,6 +600,9 @@ fn start_session(
         current_model: params.model.spec(),
         pending,
         claim,
+        cwd,
+        client_servers,
+        toggles: srv.defaults,
     });
     session_ref
 }
@@ -541,13 +627,37 @@ fn ask_client(
     id
 }
 
-/// Shadows the Lua `question` tool: sends `elicitation/create` to the client
-/// and blocks the tool call until the form comes back. Serializes on the same
+/// Reads until an answer tagged for `id` arrives. Answers tagged for another ask
+/// are discarded rather than answered with them, so a leftover from a cancelled
+/// ask cannot stand in for this question's reply.
+async fn dialog_answer(
+    cancel: &CancelToken,
+    answers: &mut UnboundedReceiver<String>,
+    id: i64,
+) -> Option<String> {
+    loop {
+        match cancel.race(answers.recv()).await {
+            Ok(Some(raw)) => match answer_for(&raw, id) {
+                Some(payload) => return Some(payload.to_owned()),
+                None => warn!(id, "discarding an answer tagged for another ask"),
+            },
+            _ => return None,
+        }
+    }
+}
+
+/// Shadows the Lua `question` tool and blocks the tool call until the client
+/// answers: `elicitation/create` when the client declares form elicitation, one
+/// `session/request_permission` per question otherwise. Serializes on the same
 /// answer channel as main-agent permissions.
 /// Weak, because `LocalTools` is captured verbatim by every `LuaCtx` a tool
 /// call parks and an idle VM never collects it. A strong clone here outlives
 /// `serve()` and leaves `writer_task` waiting on a sender nobody will drop.
-fn question_tool(out_tx: WeakUnboundedSender<Value>, pending: PendingState) -> LocalTool {
+fn question_tool(
+    out_tx: WeakUnboundedSender<Value>,
+    pending: PendingState,
+    forms: bool,
+) -> LocalTool {
     // The audience the Lua `question` tool carries: shadowing a tool must not
     // widen who may call it.
     local_tool(ToolAudience::MAIN, move |input, ctx| {
@@ -559,27 +669,66 @@ fn question_tool(out_tx: WeakUnboundedSender<Value>, pending: PendingState) -> L
                 .as_ref()
                 .map(ToString::to_string)
                 .ok_or("no session")?;
-            // Batch/code_execution children dispatch with an empty id; a
-            // scope pointing at a tool call the client never saw would get
-            // the elicitation rejected or dropped.
+            // Answers are matched on the ask id, not the tool call, so an empty
+            // id is only a display problem: the option path invents one so the
+            // client has something to attach the question title to.
             let tool_call_id = ctx.tool_use_id.filter(|id| !id.is_empty());
             let out_tx = out_tx.upgrade().ok_or("connection closed")?;
-            let request = elicitation::form_request(&session_id, tool_call_id, &input)?;
             let rx = ctx.user_response_rx.as_ref().ok_or("no answer channel")?;
 
-            let mut guard = rx.lock().await;
-            let request = AgentRequest::CreateElicitationRequest(request);
-            let id = ask_client(&out_tx, &pending, Ask::Elicitation, request);
-            let response = ctx.cancel.race(guard.recv()).await;
-            // Cleared while still holding the channel, so a stale id cannot
-            // clobber whatever ask comes next.
-            pending.lock().unwrap().asks.remove(&id);
-            drop(guard);
+            // A parked permission can hold this channel across a turn, so the
+            // wait has to end with ours, as in the permission path.
+            let Ok(mut guard) = ctx.cancel.race(rx.lock()).await else {
+                return Ok(elicitation::DISMISSED.to_owned());
+            };
+            if forms {
+                let request = elicitation::form_request(&session_id, tool_call_id, &input)?;
+                let id = ask_client(
+                    &out_tx,
+                    &pending,
+                    Ask::Dialog,
+                    AgentRequest::CreateElicitationRequest(request),
+                );
+                // Cleared while still holding the channel, so a stale id cannot
+                // clobber whatever ask comes next.
+                let answer = dialog_answer(&ctx.cancel, &mut guard, id).await;
+                pending.lock().unwrap().asks.remove(&id);
+                drop(guard);
+                return Ok(answer
+                    .map(|raw| elicitation::format_response(&input, &raw))
+                    .unwrap_or_else(|| elicitation::DISMISSED.to_owned()));
+            }
 
-            Ok(match response {
-                Ok(Some(raw)) => elicitation::format_response(&input, &raw),
-                _ => elicitation::DISMISSED.to_owned(),
-            })
+            let call_id = tool_call_id
+                .clone()
+                .unwrap_or_else(|| MakiId::generate().to_string());
+            let requests = elicitation::option_requests(&session_id, &call_id, &input)?;
+            let mut answers = Vec::new();
+            for (index, request) in requests.into_iter().enumerate() {
+                let id = ask_client(
+                    &out_tx,
+                    &pending,
+                    Ask::Dialog,
+                    AgentRequest::RequestPermissionRequest(request),
+                );
+                let answer = dialog_answer(&ctx.cancel, &mut guard, id).await;
+                pending.lock().unwrap().asks.remove(&id);
+                let Some(raw) = answer else {
+                    drop(guard);
+                    return Ok(elicitation::DISMISSED.to_owned());
+                };
+                match elicitation::format_option_response(&input, index, &raw) {
+                    Some(line) => answers.push(line),
+                    // Cancelled, or a reply with nothing in it: nobody is left to
+                    // answer the rest of the series.
+                    None => {
+                        drop(guard);
+                        return Ok(elicitation::DISMISSED.to_owned());
+                    }
+                }
+            }
+            drop(guard);
+            Ok(answers.join("\n"))
         })
     })
 }
@@ -748,25 +897,44 @@ impl From<StoredSession> for Restored {
     }
 }
 
-fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), AcpError> {
+async fn handle_prompt(
+    srv: &mut Server,
+    raw: &Value,
+    id: &RequestId,
+    params: &AcpParams,
+) -> Result<(), AcpError> {
     let req: PromptRequest = parse_params(raw)?;
-    let session = srv.session.as_ref().ok_or_else(no_session)?;
+    srv.session.as_ref().ok_or_else(no_session)?;
+    slash::settle_command(srv);
 
-    let (message, images) = extract_prompt_content(&req.prompt);
-    let input = AgentInput::from_defaults(
+    let (message, mut images) = extract_prompt_content(&req.prompt);
+    if let Some(handled) = slash::run(srv, params, id, &message, &mut images).await {
+        return handled;
+    }
+    let session = srv.session.as_ref().ok_or_else(no_session)?;
+    let input = prompt_input(session, message, images);
+    submit(srv, id, input.into())
+}
+
+fn prompt_input(session: &SessionState, message: String, images: Vec<ImageSource>) -> AgentInput {
+    AgentInput::from_defaults(
         message,
         session.current_mode.clone(),
         images,
-        srv.defaults,
+        session.toggles,
         InputSource::Acp,
-    );
+    )
+}
 
-    // One outstanding id per session, checked and set under the same guard:
-    // `input_tx` is unbounded, so a second prompt would queue happily and
-    // overwrite the first id, leaving that request unanswered forever.
+/// Hands {input} to the session as the turn {id} waits on. One outstanding id
+/// per session, checked and set under the same guard: `input_tx` is
+/// unbounded, so a second prompt would queue happily and overwrite the first
+/// id, leaving that request unanswered forever.
+fn submit(srv: &Server, id: &RequestId, input: SessionInput) -> Result<(), AcpError> {
+    let session = srv.session.as_ref().ok_or_else(no_session)?;
     let mut pending = session.pending.lock().unwrap();
     if pending.prompt.is_some() {
-        return Err(AcpError::new(-32603, "a prompt is already running"));
+        return Err(AcpError::new(-32603, PROMPT_RUNNING));
     }
     session
         .handle
@@ -846,9 +1014,12 @@ fn handle_notification(srv: &Server, method: &str) {
 fn handle_incoming_response(srv: &Server, raw: &Value) {
     let Some(session) = &srv.session else { return };
     let id = raw.get("id").map(request_id).unwrap_or(RequestId::Null);
-    let ask = ask_id(&id).and_then(|id| session.pending.lock().unwrap().asks.remove(&id));
-    let Some(ask) = ask else {
+    let Some(ask_id) = ask_id(&id) else {
         warn!(%id, "response for an unknown request id");
+        return;
+    };
+    let Some(ask) = session.pending.lock().unwrap().asks.remove(&ask_id) else {
+        warn!(ask_id, "response for a request nobody is waiting on");
         return;
     };
     let (answer, answer_tx) = match &ask {
@@ -861,11 +1032,14 @@ fn handle_incoming_response(srv: &Server, raw: &Value) {
         ),
         // The waiting question tool parses this; an error response decodes to
         // nothing and counts as a dismissal.
-        Ask::Elicitation => (
-            raw.get("result")
-                .cloned()
-                .unwrap_or(Value::Null)
-                .to_string(),
+        Ask::Dialog => (
+            tag_answer(
+                ask_id,
+                raw.get("result")
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_string(),
+            ),
             None,
         ),
     };
@@ -1051,6 +1225,14 @@ fn start_event_pump(
                 AgentEvent::ObservationLine { text, .. } => {
                     translate::notice(&MakiId::generate().to_string(), &text)
                 }
+                AgentEvent::CompactionDone {
+                    context_size_before,
+                    context_size_after,
+                    ..
+                } => translate::text_delta(&format!(
+                    "Compacted the conversation: {context_size_before} → {context_size_after} \
+                     tokens."
+                )),
                 AgentEvent::Done {
                     reason,
                     cost: ledger,
@@ -1385,7 +1567,7 @@ mod tests {
         iter::from_fn(|| out_rx.try_recv().ok()).collect()
     }
 
-    fn test_server() -> (Server, UnboundedReceiver<String>, UnboundedReceiver<Value>) {
+    pub(super) fn test_server() -> (Server, UnboundedReceiver<String>, UnboundedReceiver<Value>) {
         let (answer_tx, answer_rx) = unbounded_channel();
         let (out_tx, out_rx) = unbounded_channel();
         let claim = SessionClaim::fresh(&StateDir::from_path(FIXTURE_CLAIMS.path().to_path_buf()));
@@ -1414,6 +1596,8 @@ mod tests {
             client_elicits_form: false,
             defaults: SessionDefaults::default(),
             on_session_end: None,
+            in_tx: unbounded_channel::<Incoming>().0.downgrade(),
+            command_wait: None,
             session: Some(SessionState {
                 handle,
                 mcp: None,
@@ -1421,12 +1605,15 @@ mod tests {
                 current_model: String::new(),
                 pending: Arc::default(),
                 claim,
+                cwd: PathBuf::from("/project"),
+                client_servers: Vec::new(),
+                toggles: SessionDefaults::default(),
             }),
         };
         (server, answer_rx, out_rx)
     }
 
-    fn acp_params(storage: StateDir) -> AcpParams {
+    pub(super) fn acp_params(storage: StateDir) -> AcpParams {
         AcpParams {
             model: Model::from_spec(SELECTED_SPEC).expect("a shipped model"),
             config: AgentConfig::default(),
@@ -1444,6 +1631,8 @@ mod tests {
             background: false,
             host_prompt: HostPrompt::default(),
             stop: CancelToken::none(),
+            commands: Arc::new(crate::commands::testing::Host),
+            host_requests: None,
         }
     }
 
@@ -2219,8 +2408,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn elicitation_response_forwards_the_raw_result() {
-        let (srv, mut answer_rx, ..) = server_with_ask(Ask::Elicitation);
+    async fn elicitation_response_forwards_the_raw_result_tagged_with_its_ask() {
+        let (srv, mut answer_rx, ..) = server_with_ask(Ask::Dialog);
         let raw = serde_json::json!({
             "id": ANSWERED_ID,
             "result": { "action": "accept", "content": { "q1": "axum" } },
@@ -2228,9 +2417,33 @@ mod tests {
 
         handle_incoming_response(&srv, &raw);
         let forwarded = answer_rx.try_recv().unwrap();
+        let payload = answer_for(&forwarded, ANSWERED_ID).unwrap_or_default();
         assert_eq!(
-            serde_json::from_str::<Value>(&forwarded).unwrap(),
+            serde_json::from_str::<Value>(payload).unwrap(),
             raw["result"]
+        );
+        assert!(answer_for(&forwarded, ANSWERED_ID + 1).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_dialog_answer_for_another_ask_is_discarded_not_consumed() {
+        let (tx, mut rx) = unbounded_channel::<String>();
+        tx.send(tag_answer(
+            ANSWERED_ID + 1,
+            r#"{"outcome":{"outcome":"selected","optionId":"opt1"}}"#.to_owned(),
+        ))
+        .unwrap();
+        tx.send(tag_answer(
+            ANSWERED_ID,
+            r#"{"outcome":{"outcome":"selected","optionId":"opt2"}}"#.to_owned(),
+        ))
+        .unwrap();
+        let answer = dialog_answer(&CancelToken::none(), &mut rx, ANSWERED_ID)
+            .await
+            .unwrap();
+        assert_eq!(
+            answer,
+            r#"{"outcome":{"outcome":"selected","optionId":"opt2"}}"#
         );
     }
 

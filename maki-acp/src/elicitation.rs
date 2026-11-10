@@ -1,13 +1,16 @@
-//! Maps the `question` tool onto ACP form elicitation (`elicitation/create`).
-//! The tool keeps its Lua-advertised schema; only execution is rerouted here,
-//! so Zed and friends render native forms instead of a spinner nobody can answer.
+//! Maps the `question` tool onto what the client can render: `elicitation/create`
+//! when it declares form elicitation, one `session/request_permission` per
+//! question otherwise. Clients with neither (Paseo, most ACP adapters) still get
+//! clickable choices.
 
 use std::collections::BTreeMap;
 
 use agent_client_protocol_schema::v1::{
     ClientCapabilities, CreateElicitationRequest, ElicitationContentValue, ElicitationFormMode,
     ElicitationPropertySchema, ElicitationSchema, ElicitationSessionScope, EnumOption,
-    MultiSelectPropertySchema, SessionId, StringPropertySchema, ToolCallId,
+    MultiSelectPropertySchema, PermissionOption, PermissionOptionId, PermissionOptionKind,
+    RequestPermissionRequest, SessionId, StringPropertySchema, ToolCallId, ToolCallUpdate,
+    ToolCallUpdateFields,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -37,6 +40,104 @@ struct QuestionOption {
 
 pub fn supports_form(caps: &ClientCapabilities) -> bool {
     caps.elicitation.as_ref().is_some_and(|e| e.form.is_some())
+}
+
+const DISMISS_OPTION: &str = "dismiss";
+
+/// One `session/request_permission` per question: the option list is flat, so a
+/// merged dialog could not say which answer belongs to which question, and a
+/// `multiSelect` question degrades to a single choice here.
+///
+/// A question with no options has no free-text channel to answer it, so those
+/// are refused rather than faked with an empty answer.
+pub fn option_requests(
+    session_id: &str,
+    tool_call_id: &str,
+    input: &Value,
+) -> Result<Vec<RequestPermissionRequest>, String> {
+    let questions = parse_questions(input)?;
+    if questions.is_empty() {
+        return Err("at least one question is required".to_owned());
+    }
+    if questions.iter().any(|question| question.options.is_empty()) {
+        return Err(
+            "this client has no form elicitation, so every question needs options; \
+             ask free-text questions in prose instead"
+                .to_owned(),
+        );
+    }
+    Ok(questions
+        .iter()
+        .map(|question| {
+            let fields = ToolCallUpdateFields::new()
+                .title(format!("Question: {}", question.question))
+                .raw_input(serde_json::json!({ "question": question.question }));
+            let options = question
+                .options
+                .iter()
+                .enumerate()
+                .map(|(index, option)| {
+                    let title = if option.description.is_empty() {
+                        option.label.clone()
+                    } else {
+                        format!("{} - {}", option.label, option.description)
+                    };
+                    PermissionOption::new(
+                        PermissionOptionId::from(format!("opt{}", index + 1)),
+                        title,
+                        PermissionOptionKind::AllowOnce,
+                    )
+                })
+                .chain(std::iter::once(PermissionOption::new(
+                    PermissionOptionId::from(DISMISS_OPTION),
+                    "Dismiss",
+                    PermissionOptionKind::RejectOnce,
+                )))
+                .collect();
+            RequestPermissionRequest::new(
+                SessionId::from(session_id.to_owned()),
+                ToolCallUpdate::new(ToolCallId::from(tool_call_id.to_owned()), fields),
+                options,
+            )
+        })
+        .collect())
+}
+
+/// One `header: label` line, mirroring `format_response`'s output shape. `None`
+/// means the client cancelled or answered nothing usable, which ends the series:
+/// asking the remaining questions would only produce more empty answers.
+/// An id we never issued is no answer, so a client cannot smuggle text into the
+/// other questions' lines.
+pub fn format_option_response(input: &Value, index: usize, raw: &str) -> Option<String> {
+    let outcome = serde_json::from_str::<Value>(raw)
+        .ok()?
+        .get("outcome")?
+        .get("outcome")?
+        .as_str()?
+        .to_owned();
+    if outcome != "selected" {
+        return None;
+    }
+    let option_id = serde_json::from_str::<Value>(raw)
+        .ok()?
+        .get("outcome")?
+        .get("optionId")?
+        .as_str()?
+        .to_owned();
+    let questions = parse_questions(input).unwrap_or_default();
+    let question = questions.get(index)?;
+    let label = if question.header.is_empty() {
+        format!("Q{}", index + 1)
+    } else {
+        question.header.clone()
+    };
+    let answer = option_id
+        .strip_prefix("opt")
+        .and_then(|number| number.parse::<usize>().ok())
+        .and_then(|number| number.checked_sub(1))
+        .and_then(|option| question.options.get(option))
+        .map_or(NO_ANSWER, |choice| choice.label.as_str());
+    Some(format!("{label}: {answer}"))
 }
 
 fn parse_questions(input: &Value) -> Result<Vec<Question>, String> {
@@ -272,5 +373,84 @@ mod tests {
         }))
         .unwrap();
         assert!(!supports_form(&url_only));
+    }
+
+    fn all_optional_input() -> Value {
+        serde_json::json!({
+            "questions": [
+                {
+                    "question": "Pick a framework",
+                    "header": "Framework",
+                    "options": [
+                        { "label": "axum", "description": "tokio based" },
+                        { "label": "actix" }
+                    ]
+                },
+                { "question": "Ship it?", "options": [{ "label": "yes" }, { "label": "no" }] }
+            ]
+        })
+    }
+
+    #[test]
+    fn option_requests_ask_one_permission_per_question() {
+        let requests = option_requests("sess_1", "tool_1", &all_optional_input()).unwrap();
+        assert_eq!(requests.len(), 2);
+
+        let json = serde_json::to_value(&requests[0]).unwrap();
+        assert_eq!(json["sessionId"], "sess_1");
+        assert_eq!(json["toolCall"]["toolCallId"], "tool_1");
+        assert_eq!(json["toolCall"]["title"], "Question: Pick a framework");
+
+        let options = json["options"].as_array().unwrap();
+        assert_eq!(options.len(), 3);
+        assert_eq!(options[0]["optionId"], "opt1");
+        assert_eq!(options[0]["name"], "axum - tokio based");
+        assert_eq!(options[1]["name"], "actix");
+        assert_eq!(options[2]["optionId"], DISMISS_OPTION);
+        assert_eq!(options[2]["name"], "Dismiss");
+    }
+
+    #[test_case(serde_json::json!({ "questions": [] }) ; "no_questions")]
+    #[test_case(questions_input() ; "a_question_without_options")]
+    fn option_requests_refuse_unanswerable_questions(input: Value) {
+        assert!(option_requests("sess_1", "tool_1", &input).is_err());
+    }
+
+    #[test_case(r#"{"outcome":{"outcome":"selected","optionId":"opt1"}}"# => Some("Framework: axum".to_owned()); "first_option")]
+    #[test_case(r#"{"outcome":{"outcome":"selected","optionId":"opt2"}}"# => Some("Framework: actix".to_owned()); "last_option")]
+    #[test_case(r#"{"outcome":{"outcome":"selected","optionId":"dismiss"}}"# => Some("Framework: (no answer)".to_owned()); "dismissed_option")]
+    #[test_case(r#"{"outcome":{"outcome":"cancelled"}}"# => None; "cancelled_ends_the_series")]
+    #[test_case("not json" => None; "unparsable")]
+    #[test_case(r#"{"outcome":{"outcome":"selected","optionId":"opt0"}}"# => Some("Framework: (no answer)".to_owned()); "opt0_is_not_a_valid_index")]
+    #[test_case(r#"{"outcome":{"outcome":"selected","optionId":"sideways"}}"# => Some("Framework: (no answer)".to_owned()); "an_id_we_never_issued")]
+    fn option_answer(raw: &str) -> Option<String> {
+        format_option_response(&all_optional_input(), 0, raw)
+    }
+
+    #[test]
+    fn headerless_questions_are_numbered() {
+        let input = serde_json::json!({
+            "questions": [{ "question": "Ship it?", "options": [{ "label": "yes" }] }]
+        });
+        assert_eq!(
+            format_option_response(
+                &input,
+                0,
+                r#"{"outcome":{"outcome":"selected","optionId":"opt1"}}"#
+            ),
+            Some("Q1: yes".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_question_has_no_answer_to_format() {
+        assert_eq!(
+            format_option_response(
+                &all_optional_input(),
+                9,
+                r#"{"outcome":{"outcome":"selected","optionId":"opt1"}}"#
+            ),
+            None
+        );
     }
 }

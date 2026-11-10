@@ -10,6 +10,7 @@ use maki_config::{Config, load_env_files};
 use maki_lua::{InitFiles, Interaction, PluginHost};
 use maki_storage::StateDir;
 
+use super::acp_commands::{self, AcpCommands};
 use crate::cli::Cli;
 use crate::interrupt::Interrupt;
 use crate::provider_scripts;
@@ -21,7 +22,7 @@ async fn load_stack(
 ) -> Result<(PluginHost, Config, Vec<String>)> {
     let mut plugin_host = PluginHost::start(
         Arc::clone(ToolRegistry::global_arc()),
-        Interaction::None,
+        Interaction::Host,
         !cli.no_jit,
     )
     .context("initialize lua plugin host")?;
@@ -98,6 +99,11 @@ pub async fn run(
     let prompt_slots = plugin_host.event_handle().collect_prompt_slots(None).await;
 
     let event_handle = plugin_host.event_handle();
+    let commands = Arc::new(AcpCommands {
+        no_commands: cli.no_commands,
+        lua: plugin_host.command_reader(),
+        events: plugin_host.event_handle(),
+    });
     let interrupt = Interrupt::install();
     maki_acp::run(maki_acp::AcpParams {
         model,
@@ -119,6 +125,8 @@ pub async fn run(
         background: cli.background_wait().is_some(),
         host_prompt: cli.host_prompt(),
         stop: interrupt.stop(),
+        commands,
+        host_requests: plugin_host.take_ui_action_rx().map(acp_commands::forward_ui),
     })
     .await?;
     drop(plugin_host);

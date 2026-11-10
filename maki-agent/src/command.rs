@@ -11,9 +11,9 @@ const GLOBAL_THIRD_PARTY_COMMAND_DIRS: &[&str] = &[".claude/commands"];
 const ARGUMENTS_PLACEHOLDER: &str = "$ARGUMENTS";
 
 #[derive(Debug, Default, Deserialize)]
-struct Frontmatter {
-    name: Option<String>,
-    description: Option<String>,
+pub(crate) struct Frontmatter {
+    pub(crate) name: Option<String>,
+    pub(crate) description: Option<String>,
     #[serde(rename = "argument-hint")]
     argument_hint: Option<String>,
 }
@@ -52,7 +52,7 @@ pub(crate) fn git_remote_urls(root: &Path) -> Vec<String> {
         .collect()
 }
 
-fn parse_frontmatter(content: &str) -> (Frontmatter, &str) {
+pub(crate) fn parse_frontmatter(content: &str) -> (Frontmatter, &str) {
     let content = content.trim_start();
 
     let Some(rest) = content.strip_prefix("---") else {

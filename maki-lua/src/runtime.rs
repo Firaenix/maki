@@ -72,8 +72,8 @@ use crate::api::ui::marks::{InputRuleStore, InputRulesReader};
 use crate::api::ui::{HintStore, WinStore, clear_session_hints};
 use crate::api::util::command::{CommandHandlerMap, HintWriter, publish_command_snapshot};
 use crate::api::util::command::{
-    LuaCommandReader, LuaCommandWriter, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction,
-    as_plugin_load, ui_send,
+    LuaCommandReader, LuaCommandWriter, PlanActionOutcome, PlanFormRow, PlanMenu, SessionHostOnly,
+    UiAction, as_plugin_load, ui_send,
 };
 use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json_within};
 use crate::api::util::ctx::{DeadlineExpire, LuaCtx, RestoreCtx};
@@ -5651,7 +5651,7 @@ pub fn spawn(
                 tx_clone,
                 shutdown_thread,
                 bundled_dirs,
-                (interaction == Interaction::Tty).then_some(ui_action_tx),
+                matches!(interaction, Interaction::Tty | Interaction::Host).then_some(ui_action_tx),
                 command_writer,
                 keymap_writer,
                 hint_writer,
@@ -5660,6 +5660,9 @@ pub fn spawn(
                 layered_thread,
             ) {
                 Ok(r) => {
+                    if interaction == Interaction::Host {
+                        r.lua.set_app_data(SessionHostOnly);
+                    }
                     r.lua.set_app_data(key_lint_thread);
                     r.lua.set_app_data(background_thread);
                     r.lua.set_app_data(input_rule_store);

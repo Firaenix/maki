@@ -21,7 +21,7 @@ use tokio::time::{sleep_until, timeout};
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{error, warn};
 
-use crate::agent::{self, HostPrompt, RunContext, RunContextBuilder};
+use crate::agent::{self, AgentHooks, HostPrompt, RunContext, RunContextBuilder};
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::permissions::{PermissionManager, PluginRuleStore};
 use crate::prompt::ResolvedPrompts;
@@ -34,7 +34,8 @@ use crate::types::EventSender;
 use crate::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentSeed,
     EventStreamGuard, McpHandle, McpSession, ModelSlot, PermissionsConfig, RunLedger, RunTotals,
-    SessionEvents, SessionMailbox, ToolDeferral, ToolOutputLines, event_stream,
+    SessionEvents, SessionInput, SessionMailbox, ToolDeferral, ToolOutputLines, event_stream,
+    expand_mcp_prompt,
 };
 
 const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -207,8 +208,14 @@ impl KeepAlive {
 }
 
 enum Next {
-    Prompt(AgentInput),
+    Prompt(SessionInput),
     Woken(AgentInput),
+}
+
+/// What a turn does with its input.
+enum TurnKind {
+    Run,
+    Compact(Option<String>),
 }
 
 impl Next {
@@ -219,16 +226,22 @@ impl Next {
         matches!(self, Self::Woken(_))
     }
 
-    fn into_input(self) -> AgentInput {
+    fn into_turn(self) -> (AgentInput, TurnKind) {
         match self {
-            Self::Prompt(input) | Self::Woken(input) => input,
+            Self::Prompt(SessionInput::Prompt(input)) | Self::Woken(input) => {
+                (input, TurnKind::Run)
+            }
+            Self::Prompt(SessionInput::Compact {
+                settings,
+                instructions,
+            }) => (settings, TurnKind::Compact(instructions)),
         }
     }
 }
 
 /// Where an interactive session's turns come from.
 struct Inputs {
-    prompts: UnboundedReceiver<AgentInput>,
+    prompts: UnboundedReceiver<SessionInput>,
     modes: UnboundedReceiver<AgentMode>,
     keep_alive: KeepAlive,
     /// Ends the session at once, whatever is still out.
@@ -450,7 +463,7 @@ pub struct InteractiveParams {
 
 pub struct InteractiveHandle {
     pub tool_names: Vec<String>,
-    pub input_tx: UnboundedSender<AgentInput>,
+    pub input_tx: UnboundedSender<SessionInput>,
     pub answer_tx: UnboundedSender<String>,
     pub cancel_tx: watch::Sender<()>,
     pub model_tx: UnboundedSender<Model>,
@@ -502,7 +515,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
 
     let (guard, events) = event_stream();
     let base_tx = guard.sender(0);
-    let (input_tx, input_rx) = unbounded_channel::<AgentInput>();
+    let (input_tx, input_rx) = unbounded_channel::<SessionInput>();
     let (answer_tx, answer_rx) = unbounded_channel::<String>();
     let (cancel_tx, cancel_rx) = watch::channel(());
     let (model_tx, mut model_rx) = unbounded_channel::<Model>();
@@ -610,7 +623,7 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
                     provider: Arc::clone(&provider),
                 }));
             }
-            let input = next.into_input();
+            let (mut input, kind) = next.into_turn();
 
             // An ask holds this lock from before its request goes out until
             // its answer lands, so a free lock means nothing queued has a
@@ -622,42 +635,84 @@ pub fn spawn_interactive(params: InteractiveParams) -> (InteractiveHandle, Sessi
             }
 
             adopt_chat_settings(seed.as_deref(), &input);
-            inputs.keep_alive.follow(&input);
-
-            // Outlives `agent`, so this turn is on disk before the next prompt
-            // is read, without the loop body remembering to write it.
-            let mut turn = track.turn(model.spec(), &input);
-            let mut agent = Agent::new(
-                AgentParams {
-                    provider: Arc::clone(&provider),
-                    model: model.clone(),
-                    config: params.config.clone(),
-                    tool_output_lines: ToolOutputLines::default(),
-                    permissions: Arc::clone(&task_permissions),
-                    session_id: Some(session_ref_clone.clone()),
-                    background_for: BackgroundFor::None,
-                    task_id: None,
-                    mailbox: Some(mailbox.clone()),
-                    timeouts: params.timeouts,
-                    file_access: Arc::clone(&file_access),
-                    prompt_slots: Arc::clone(&params.prompt_slots),
-                    subagent_cancels: Arc::new(CancelMap::new()),
-                    ledger: turn.ledger(),
-                    audience: ToolAudience::MAIN,
-                    model_policy: Arc::clone(&params.model_policy),
-                },
-                turn.run_params(event_tx, Arc::clone(&context)),
-            )
-            .with_loaded_instructions(instructions.loaded.clone(), instructions.files.clone())
-            .with_cancel(cancel)
-            .with_local_tools(Arc::clone(&params.local_tools))
-            .with_mcp(mcp.clone());
-            if !params.unattended {
-                agent = agent.with_user_response_rx(Arc::clone(&answer_rx));
+            if matches!(kind, TurnKind::Run) {
+                inputs.keep_alive.follow(&input);
             }
 
-            let result = agent.run(input).await;
-            drop(agent);
+            // Outlives the run, so this turn is on disk before the next prompt
+            // is read, without the loop body remembering to write it.
+            let mut turn = track.turn(model.spec(), &input);
+            let result = match kind {
+                TurnKind::Compact(instructions) => {
+                    let run = turn.run_params(event_tx, Arc::clone(&context));
+                    let (compact_provider, compact_model) = agent::resolve_compaction_model(
+                        &provider,
+                        &model,
+                        params.timeouts,
+                        &params.model_policy,
+                    )
+                    .await;
+                    let hooks = AgentHooks {
+                        registry: ToolRegistry::global(),
+                        session_id: Some(&session_ref_clone),
+                        task_id: None,
+                        model: &model,
+                        cancel: &cancel,
+                        context_size: run.gauge.size(),
+                    };
+                    agent::compact(
+                        &*compact_provider,
+                        &compact_model,
+                        run.history,
+                        run.gauge,
+                        (run.context)(&model, input.workflow),
+                        mcp.as_ref(),
+                        &run.event_tx,
+                        &hooks,
+                        &params.config,
+                        instructions.as_deref(),
+                        params.timeouts.retry,
+                    )
+                    .await
+                }
+                TurnKind::Run => match expand_mcp_prompt(mcp.as_deref(), &mut input).await {
+                    Err(e) => Err(e),
+                    Ok(()) => {
+                        let mut agent = Agent::new(
+                            AgentParams {
+                                provider: Arc::clone(&provider),
+                                model: model.clone(),
+                                config: params.config.clone(),
+                                tool_output_lines: ToolOutputLines::default(),
+                                permissions: Arc::clone(&task_permissions),
+                                session_id: Some(session_ref_clone.clone()),
+                                background_for: BackgroundFor::None,
+                                task_id: None,
+                                mailbox: Some(mailbox.clone()),
+                                timeouts: params.timeouts,
+                                file_access: Arc::clone(&file_access),
+                                prompt_slots: Arc::clone(&params.prompt_slots),
+                                subagent_cancels: Arc::new(CancelMap::new()),
+                                ledger: turn.ledger(),
+                                audience: ToolAudience::MAIN,
+                                model_policy: Arc::clone(&params.model_policy),
+                            },
+                            turn.run_params(event_tx, Arc::clone(&context)),
+                        )
+                        .with_loaded_instructions(
+                            instructions.loaded.clone(),
+                            instructions.files.clone(),
+                        )
+                        .with_cancel(cancel)
+                        .with_local_tools(Arc::clone(&params.local_tools))
+                        .with_mcp(mcp.clone());
+                        if !params.unattended {
+                            agent = agent.with_user_response_rx(Arc::clone(&answer_rx));
+                        }
+                        agent.run(input).await
+                    }
+                },
+            };
             cancel_task.abort();
             let _ = cancel_task.await;
 
@@ -997,14 +1052,20 @@ mod tests {
             spawn_listing_session(&tmp, plugin_model(ANSWERING_SLUG), BackgroundMode::Blocking);
 
         for _ in 0..2 {
-            handle.input_tx.send(prompt_in(AgentMode::Build)).unwrap();
+            handle
+                .input_tx
+                .send(prompt_in(AgentMode::Build).into())
+                .unwrap();
             next_done(&mut events).await;
         }
         assert_eq!(answered.len(), 1, "{LISTED_ONCE}");
 
         handle.model_tx.send(plugin_model(HANGING_SLUG)).unwrap();
         for _ in 0..2 {
-            handle.input_tx.send(prompt_in(AgentMode::Build)).unwrap();
+            handle
+                .input_tx
+                .send(prompt_in(AgentMode::Build).into())
+                .unwrap();
             timeout(RELAY_WAIT, hung.recv())
                 .await
                 .expect(LISTING_DUE)
@@ -1035,7 +1096,10 @@ mod tests {
                 .context_window
         };
 
-        handle.input_tx.send(prompt_in(AgentMode::Build)).unwrap();
+        handle
+            .input_tx
+            .send(prompt_in(AgentMode::Build).into())
+            .unwrap();
         next_done(&mut events).await;
         assert_ne!(slot_window(), LISTED_WINDOW);
 
@@ -1046,7 +1110,10 @@ mod tests {
                 ..ModelInfo::id_only(LISTED_MODEL.into())
             }],
         );
-        handle.input_tx.send(prompt_in(AgentMode::Build)).unwrap();
+        handle
+            .input_tx
+            .send(prompt_in(AgentMode::Build).into())
+            .unwrap();
         next_done(&mut events).await;
         assert_eq!(slot_window(), LISTED_WINDOW, "{DISCOVERY_HEALS}");
         assert_eq!(listed.len(), 1, "{LISTED_ONCE}");
@@ -1273,7 +1340,7 @@ mod tests {
         stop: CancelToken,
     ) -> (
         Inputs,
-        UnboundedSender<AgentInput>,
+        UnboundedSender<SessionInput>,
         UnboundedSender<AgentMode>,
     ) {
         let (prompt_tx, prompts) = unbounded_channel();
@@ -1301,13 +1368,13 @@ mod tests {
         );
         mailbox.track(TASK_ID);
 
-        prompt_tx.send(prompt_in(AgentMode::Build)).unwrap();
+        prompt_tx.send(prompt_in(AgentMode::Build).into()).unwrap();
         let prompt = inputs.next().await.expect(PROMPT_ARRIVES);
         assert!(
             !prompt.survives_failed_switch(),
             "{PROMPT_ANSWERED_BY_ERROR}"
         );
-        inputs.keep_alive.follow(&prompt.into_input());
+        inputs.keep_alive.follow(&prompt.into_turn().0);
 
         settle_waking(&mailbox);
         assert!(
@@ -1318,7 +1385,7 @@ mod tests {
         drop(prompt_tx);
         let woken = inputs.next().await.expect(WAKES_AFTER_INPUT_END);
         assert!(woken.survives_failed_switch(), "{WOKEN_NOTICES_KEPT}");
-        let woken = woken.into_input();
+        let woken = woken.into_turn().0;
         assert_eq!(woken.preamble.len(), 1);
         assert_eq!(woken.preamble[0].first_text_content(), Some(NOTICE_BODY));
     }
@@ -1337,8 +1404,8 @@ mod tests {
         mailbox.track(TASK_ID);
 
         let woken = async {
-            prompt_tx.send(prompt_in(AgentMode::Build)).unwrap();
-            let prompt = inputs.next().await.expect(PROMPT_ARRIVES).into_input();
+            prompt_tx.send(prompt_in(AgentMode::Build).into()).unwrap();
+            let prompt = inputs.next().await.expect(PROMPT_ARRIVES).into_turn().0;
             adopt_chat_settings(seed.as_deref(), &prompt);
             inputs.keep_alive.follow(&prompt);
 
@@ -1349,7 +1416,8 @@ mod tests {
                 .next()
                 .await
                 .expect(WAKES_AFTER_INPUT_END)
-                .into_input()
+                .into_turn()
+                .0
         }
         .await;
         adopt_chat_settings(seed.as_deref(), &woken);
@@ -1375,9 +1443,9 @@ mod tests {
         );
         mailbox.track(TASK_ID);
 
-        prompt_tx.send(prompt_in(AgentMode::Build)).unwrap();
+        prompt_tx.send(prompt_in(AgentMode::Build).into()).unwrap();
         drop(prompt_tx);
-        let prompt = inputs.next().await.expect(PROMPT_ARRIVES).into_input();
+        let prompt = inputs.next().await.expect(PROMPT_ARRIVES).into_turn().0;
         inputs.keep_alive.follow(&prompt);
         inputs.keep_alive.fail();
 
@@ -1482,7 +1550,7 @@ mod tests {
         let (mut inputs, prompt_tx, _mode_tx) =
             inputs_for(&mailbox, BackgroundMode::KeepAlive(LONG_WAIT), stop);
         if prompt_queued {
-            prompt_tx.send(prompt_input()).unwrap();
+            prompt_tx.send(prompt_input().into()).unwrap();
         } else {
             drop(prompt_tx);
             inputs.keep_alive.follow(&prompt_input());

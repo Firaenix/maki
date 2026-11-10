@@ -215,7 +215,7 @@ pub fn granted(
 
 /// Whether someone is there to answer. `Tty` is the TUI: it can confirm an
 /// install on the terminal before it starts, and its loop answers `maki.ui`
-/// calls once it runs. `None` is `maki -p`, the sdk and ACP.
+/// calls once it runs. `None` is `maki -p` and the sdk.
 ///
 /// An install runs downloaded code, so it is a trust decision. With nobody to
 /// ask we refuse it rather than assume consent. Lua also gets no UI sender
@@ -224,6 +224,10 @@ pub fn granted(
 pub enum Interaction {
     Tty,
     None,
+    /// ACP: no terminal to confirm on, but a loop that drains the UI channel,
+    /// answering the session calls it can and dropping the rest, so those
+    /// fail at once as they would under `None`.
+    Host,
 }
 
 impl Interaction {

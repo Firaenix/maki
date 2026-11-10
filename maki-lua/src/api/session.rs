@@ -25,7 +25,8 @@ use tokio::task::{spawn_blocking, yield_now};
 
 use crate::api::image::LuaImage;
 use crate::api::util::command::{
-    NO_UI_ERR, SessionRequest, UiAction, ui_json_roundtrip, ui_reachable, ui_roundtrip,
+    NO_UI_ERR, SessionHostOnly, SessionRequest, UiAction, ui_json_roundtrip, ui_reachable,
+    ui_roundtrip,
 };
 use crate::api::util::convert::{TableExt, json_to_lua, json_to_lua_exact, lua_to_json};
 use crate::api::util::pair::{Pair, err_pair, pair, try_pair};
@@ -1112,7 +1113,7 @@ async fn new(
     let opens = prompt.is_some() || focus;
     // Asked once: a UI that detaches after this fails the roundtrip below
     // instead of having an opening call quietly stored.
-    let has_ui = ui_reachable(tx.as_ref());
+    let has_ui = ui_reachable(tx.as_ref()) && lua.app_data_ref::<SessionHostOnly>().is_none();
     if opens && !has_ui {
         return Ok(err_pair(NO_UI_ERR));
     }
