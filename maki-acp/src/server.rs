@@ -16,7 +16,7 @@ use agent_client_protocol_schema::v1::{
     SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent,
 };
 use color_eyre::eyre::Context;
-use flume::{Sender, WeakSender};
+use flume::{Receiver, Sender, WeakSender};
 use maki_agent::headless::{self, BackgroundMode, InteractiveHandle, InteractiveParams};
 use maki_agent::mcp::config::{RawHttpFields, RawStdioFields, RawTransport};
 use maki_agent::mcp::{self, McpHandle};
@@ -64,6 +64,20 @@ static NEXT_OUTGOING_REQUEST_ID: AtomicI64 = AtomicI64::new(FIRST_OUTGOING_REQUE
 struct Pending {
     prompt: Option<RequestId>,
     asks: HashMap<i64, Ask>,
+}
+
+/// Answers on the shared channel carry the id of the ask they belong to, so a
+/// waiter can tell its own reply from one left over by a cancelled ask. Same
+/// separator as `maki_agent::permissions::TaggedAnswer`.
+const ANSWER_TAG: char = '\u{1f}';
+
+fn tag_answer(id: i64, payload: String) -> String {
+    format!("{id}{ANSWER_TAG}{payload}")
+}
+
+fn answer_for(raw: &str, id: i64) -> Option<&str> {
+    let (tag, payload) = raw.split_once(ANSWER_TAG)?;
+    (tag == id.to_string()).then_some(payload)
 }
 
 /// How to read the answer and who gets it. A subagent's permission carries the
@@ -470,7 +484,8 @@ fn start_session(
         Arc::clone(&pending),
         srv.client_elicits_form,
     );
-    let local_tools: LocalTools = Arc::new(HashMap::from([(QUESTION_TOOL_NAME.to_owned(), question)]));
+    let local_tools: LocalTools =
+        Arc::new(HashMap::from([(QUESTION_TOOL_NAME.to_owned(), question)]));
     let excluded_tools: Vec<&str> = Vec::new();
     // The ACP process cwd owns env, Lua, and application config, but the client
     // picks the session cwd. So permissions, where a saved answer lands, and
@@ -549,6 +564,26 @@ fn ask_client(
     id
 }
 
+/// Reads until an answer tagged for `id` arrives. Answers tagged for any other
+/// ask are dropped, not consumed, exactly as the permission waiter does: taking
+/// a leftover would answer this question with a decision the user made about a
+/// different one.
+async fn dialog_answer(
+    cancel: &CancelToken,
+    guard: &mut Receiver<String>,
+    id: i64,
+) -> Option<String> {
+    loop {
+        match cancel.race(guard.recv_async()).await {
+            Ok(Ok(raw)) => match answer_for(&raw, id) {
+                Some(payload) => return Some(payload.to_owned()),
+                None => warn!(id, "discarding an answer tagged for another ask"),
+            },
+            _ => return None,
+        }
+    }
+}
+
 /// Shadows the Lua `question` tool and blocks the tool call until the client
 /// answers: `elicitation/create` when the client declares form elicitation, one
 /// `session/request_permission` per question otherwise. Serializes on the same
@@ -568,14 +603,18 @@ fn question_tool(out_tx: WeakSender<Value>, pending: PendingState, forms: bool) 
                 .as_ref()
                 .map(ToString::to_string)
                 .ok_or("no session")?;
-            // Batch/code_execution children dispatch with an empty id; a scope
-            // pointing at a tool call the client never saw would get the ask
-            // rejected or dropped, so the option path invents an id instead.
+            // Answers are matched on the ask id, not the tool call, so an empty
+            // id is only a display problem: the option path invents one so the
+            // client has something to attach the question title to.
             let tool_call_id = ctx.tool_use_id.filter(|id| !id.is_empty());
             let out_tx = out_tx.upgrade().ok_or("connection closed")?;
             let rx = ctx.user_response_rx.as_ref().ok_or("no answer channel")?;
 
-            let guard = rx.lock().await;
+            // A parked permission can hold this channel across a turn, so the
+            // wait has to end with ours, exactly as the permission path does.
+            let Ok(mut guard) = ctx.cancel.race(rx.lock()).await else {
+                return Ok(elicitation::DISMISSED.to_owned());
+            };
             if forms {
                 let request = elicitation::form_request(&session_id, tool_call_id, &input)?;
                 let id = ask_client(
@@ -584,15 +623,14 @@ fn question_tool(out_tx: WeakSender<Value>, pending: PendingState, forms: bool) 
                     Ask::Dialog,
                     AgentRequest::CreateElicitationRequest(request),
                 );
-                let response = ctx.cancel.race(guard.recv_async()).await;
                 // Cleared while still holding the channel, so a stale id cannot
                 // clobber whatever ask comes next.
+                let answer = dialog_answer(&ctx.cancel, &mut guard, id).await;
                 pending.lock().unwrap().asks.remove(&id);
                 drop(guard);
-                return Ok(match response {
-                    Ok(Ok(raw)) => elicitation::format_response(&input, &raw),
-                    _ => elicitation::DISMISSED.to_owned(),
-                });
+                return Ok(answer
+                    .map(|raw| elicitation::format_response(&input, &raw))
+                    .unwrap_or_else(|| elicitation::DISMISSED.to_owned()));
             }
 
             let call_id = tool_call_id
@@ -607,9 +645,9 @@ fn question_tool(out_tx: WeakSender<Value>, pending: PendingState, forms: bool) 
                     Ask::Dialog,
                     AgentRequest::RequestPermissionRequest(request),
                 );
-                let response = ctx.cancel.race(guard.recv_async()).await;
+                let answer = dialog_answer(&ctx.cancel, &mut guard, id).await;
                 pending.lock().unwrap().asks.remove(&id);
-                let Ok(Ok(raw)) = response else {
+                let Some(raw) = answer else {
                     drop(guard);
                     return Ok(elicitation::DISMISSED.to_owned());
                 };
@@ -883,9 +921,12 @@ fn handle_notification(srv: &Server, method: &str) {
 fn handle_incoming_response(srv: &Server, raw: &Value) {
     let Some(session) = &srv.session else { return };
     let id = raw.get("id").map(request_id).unwrap_or(RequestId::Null);
-    let ask = ask_id(&id).and_then(|id| session.pending.lock().unwrap().asks.remove(&id));
-    let Some(ask) = ask else {
+    let Some(ask_id) = ask_id(&id) else {
         warn!(%id, "response for an unknown request id");
+        return;
+    };
+    let Some(ask) = session.pending.lock().unwrap().asks.remove(&ask_id) else {
+        warn!(ask_id, "response for a request nobody is waiting on");
         return;
     };
     let (answer, answer_tx) = match &ask {
@@ -899,10 +940,13 @@ fn handle_incoming_response(srv: &Server, raw: &Value) {
         // The waiting question tool parses this; an error response decodes to
         // nothing and counts as a dismissal.
         Ask::Dialog => (
-            raw.get("result")
-                .cloned()
-                .unwrap_or(Value::Null)
-                .to_string(),
+            tag_answer(
+                ask_id,
+                raw.get("result")
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_string(),
+            ),
             None,
         ),
     };
@@ -2250,7 +2294,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn elicitation_response_forwards_the_raw_result() {
+    async fn elicitation_response_forwards_the_raw_result_tagged_with_its_ask() {
         let (srv, answer_rx, ..) = server_with_ask(Ask::Dialog);
         let raw = serde_json::json!({
             "id": ANSWERED_ID,
@@ -2259,9 +2303,35 @@ mod tests {
 
         handle_incoming_response(&srv, &raw);
         let forwarded = answer_rx.try_recv().unwrap();
+        let payload = answer_for(&forwarded, ANSWERED_ID).unwrap_or_default();
         assert_eq!(
-            serde_json::from_str::<Value>(&forwarded).unwrap(),
+            serde_json::from_str::<Value>(payload).unwrap(),
             raw["result"]
+        );
+        assert!(answer_for(&forwarded, ANSWERED_ID + 1).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_dialog_answer_for_another_ask_is_discarded_not_consumed() {
+        let (tx, rx) = flume::unbounded::<String>();
+        tx.send(tag_answer(
+            ANSWERED_ID + 1,
+            r#"{"outcome":{"outcome":"selected","optionId":"opt1"}}"#.to_owned(),
+        ))
+        .unwrap();
+        tx.send(tag_answer(
+            ANSWERED_ID,
+            r#"{"outcome":{"outcome":"selected","optionId":"opt2"}}"#.to_owned(),
+        ))
+        .unwrap();
+        let mut rx = rx;
+
+        let answer = dialog_answer(&CancelToken::none(), &mut rx, ANSWERED_ID)
+            .await
+            .unwrap();
+        assert_eq!(
+            answer,
+            r#"{"outcome":{"outcome":"selected","optionId":"opt2"}}"#
         );
     }
 

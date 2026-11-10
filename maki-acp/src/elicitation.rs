@@ -60,10 +60,14 @@ pub fn option_requests(
     input: &Value,
 ) -> Result<Vec<RequestPermissionRequest>, String> {
     let questions = parse_questions(input)?;
+    if questions.is_empty() {
+        return Err("at least one question is required".to_owned());
+    }
     if questions.iter().any(|question| question.options.is_empty()) {
         return Err(
             "this client has no form elicitation, so every question needs options; \
-             ask free-text questions in prose instead".to_owned(),
+             ask free-text questions in prose instead"
+                .to_owned(),
         );
     }
     Ok(questions
@@ -127,10 +131,13 @@ pub fn format_option_response(input: &Value, index: usize, raw: &str) -> String 
     let answer = match selected_option(raw) {
         None => NO_ANSWER.to_owned(),
         Some(option) if option == DISMISS_OPTION => NO_ANSWER.to_owned(),
-        Some(option) => match option.strip_prefix("opt").and_then(|n| n.parse::<usize>().ok()) {
-            Some(number) => question
-                .options
-                .get(number - 1)
+        Some(option) => match option
+            .strip_prefix("opt")
+            .and_then(|n| n.parse::<usize>().ok())
+        {
+            Some(number) => number
+                .checked_sub(1)
+                .and_then(|index| question.options.get(index))
                 .map(|choice| choice.label.clone())
                 .unwrap_or(option),
             None => option,
@@ -409,10 +416,10 @@ mod tests {
         assert_eq!(options[2]["name"], "Dismiss");
     }
 
-    #[test]
-    fn a_question_without_options_is_refused_not_faked() {
-        let err = option_requests("sess_1", "tool_1", &questions_input()).unwrap_err();
-        assert!(err.contains("options"), "{err}");
+    #[test_case(serde_json::json!({ "questions": [] }) ; "no_questions")]
+    #[test_case(questions_input() ; "a_question_without_options")]
+    fn option_requests_refuse_unanswerable_questions(input: Value) {
+        assert!(option_requests("sess_1", "tool_1", &input).is_err());
     }
 
     #[test_case(r#"{"outcome":{"outcome":"selected","optionId":"opt1"}}"# => "Framework: axum"; "first_option")]
@@ -420,6 +427,7 @@ mod tests {
     #[test_case(r#"{"outcome":{"outcome":"selected","optionId":"dismiss"}}"# => "Framework: (no answer)"; "dismissed")]
     #[test_case(r#"{"outcome":{"outcome":"cancelled"}}"# => "Framework: (no answer)"; "cancelled")]
     #[test_case("not json" => "Framework: (no answer)"; "unparsable")]
+    #[test_case(r#"{"outcome":{"outcome":"selected","optionId":"opt0"}}"# => "Framework: opt0"; "opt0_is_not_a_valid_index")]
     #[test_case(r#"{"outcome":{"outcome":"selected","optionId":"sideways"}}"# => "Framework: sideways"; "unknown_option_is_passed_through")]
     fn option_answer_formats_one_line(raw: &str) -> String {
         format_option_response(&all_optional_input(), 0, raw)
@@ -431,7 +439,11 @@ mod tests {
             "questions": [{ "question": "Ship it?", "options": [{ "label": "yes" }] }]
         });
         assert_eq!(
-            format_option_response(&input, 0, r#"{"outcome":{"outcome":"selected","optionId":"opt1"}}"#),
+            format_option_response(
+                &input,
+                0,
+                r#"{"outcome":{"outcome":"selected","optionId":"opt1"}}"#
+            ),
             "Q1: yes"
         );
     }
@@ -439,7 +451,11 @@ mod tests {
     #[test]
     fn out_of_range_index_is_dismissed() {
         assert_eq!(
-            format_option_response(&all_optional_input(), 9, r#"{"outcome":{"outcome":"selected","optionId":"opt1"}}"#),
+            format_option_response(
+                &all_optional_input(),
+                9,
+                r#"{"outcome":{"outcome":"selected","optionId":"opt1"}}"#
+            ),
             DISMISSED
         );
     }
