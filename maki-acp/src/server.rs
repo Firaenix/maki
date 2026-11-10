@@ -76,7 +76,9 @@ enum Ask {
         request_id: String,
         answer_tx: Option<Sender<String>>,
     },
-    Elicitation,
+    /// A form or an option list the client answers; the raw result is handed to
+    /// the parked tool call verbatim, so the question tool parses it itself.
+    Dialog,
 }
 
 type PendingState = Arc<Mutex<Pending>>;
@@ -459,16 +461,17 @@ fn start_session(
     initial_cost: Option<f64>,
 ) -> SessionRef {
     let pending = PendingState::default();
-    // Without form elicitation the question tool would spin forever waiting
-    // for a TUI that does not exist, so it is dropped and the model asks in
-    // plain text instead.
-    let (excluded_tools, local_tools) = if srv.client_elicits_form {
-        let tool = question_tool(srv.out_tx.downgrade(), Arc::clone(&pending));
-        let map: LocalTools = Arc::new(HashMap::from([(QUESTION_TOOL_NAME.to_owned(), tool)]));
-        (Vec::new(), map)
-    } else {
-        (vec![QUESTION_TOOL_NAME], LocalTools::default())
-    };
+    // The question tool is always shadowed; `client_elicits_form` only decides
+    // which dialog it uses. Dropping it on clients without form elicitation
+    // would leave the model with no way to ask, when every ACP client can answer
+    // an option list.
+    let question = question_tool(
+        srv.out_tx.downgrade(),
+        Arc::clone(&pending),
+        srv.client_elicits_form,
+    );
+    let local_tools: LocalTools = Arc::new(HashMap::from([(QUESTION_TOOL_NAME.to_owned(), question)]));
+    let excluded_tools: Vec<&str> = Vec::new();
     // The ACP process cwd owns env, Lua, and application config, but the client
     // picks the session cwd. So permissions, where a saved answer lands, and
     // MCP config all follow the session's project, not ours.
@@ -546,13 +549,14 @@ fn ask_client(
     id
 }
 
-/// Shadows the Lua `question` tool: sends `elicitation/create` to the client
-/// and blocks the tool call until the form comes back. Serializes on the same
+/// Shadows the Lua `question` tool and blocks the tool call until the client
+/// answers: `elicitation/create` when the client declares form elicitation, one
+/// `session/request_permission` per question otherwise. Serializes on the same
 /// answer channel as main-agent permissions.
 /// Weak, because `LocalTools` is captured verbatim by every `LuaCtx` a tool
 /// call parks and an idle VM never collects it. A strong clone here outlives
 /// `serve()` and leaves `writer_task` waiting on a sender nobody will drop.
-fn question_tool(out_tx: WeakSender<Value>, pending: PendingState) -> LocalTool {
+fn question_tool(out_tx: WeakSender<Value>, pending: PendingState, forms: bool) -> LocalTool {
     // The audience the Lua `question` tool carries: shadowing a tool must not
     // widen who may call it.
     local_tool(ToolAudience::MAIN, move |input, ctx| {
@@ -564,27 +568,55 @@ fn question_tool(out_tx: WeakSender<Value>, pending: PendingState) -> LocalTool 
                 .as_ref()
                 .map(ToString::to_string)
                 .ok_or("no session")?;
-            // Batch/code_execution children dispatch with an empty id; a
-            // scope pointing at a tool call the client never saw would get
-            // the elicitation rejected or dropped.
+            // Batch/code_execution children dispatch with an empty id; a scope
+            // pointing at a tool call the client never saw would get the ask
+            // rejected or dropped, so the option path invents an id instead.
             let tool_call_id = ctx.tool_use_id.filter(|id| !id.is_empty());
             let out_tx = out_tx.upgrade().ok_or("connection closed")?;
-            let request = elicitation::form_request(&session_id, tool_call_id, &input)?;
             let rx = ctx.user_response_rx.as_ref().ok_or("no answer channel")?;
 
             let guard = rx.lock().await;
-            let request = AgentRequest::CreateElicitationRequest(request);
-            let id = ask_client(&out_tx, &pending, Ask::Elicitation, request);
-            let response = ctx.cancel.race(guard.recv_async()).await;
-            // Cleared while still holding the channel, so a stale id cannot
-            // clobber whatever ask comes next.
-            pending.lock().unwrap().asks.remove(&id);
-            drop(guard);
+            if forms {
+                let request = elicitation::form_request(&session_id, tool_call_id, &input)?;
+                let id = ask_client(
+                    &out_tx,
+                    &pending,
+                    Ask::Dialog,
+                    AgentRequest::CreateElicitationRequest(request),
+                );
+                let response = ctx.cancel.race(guard.recv_async()).await;
+                // Cleared while still holding the channel, so a stale id cannot
+                // clobber whatever ask comes next.
+                pending.lock().unwrap().asks.remove(&id);
+                drop(guard);
+                return Ok(match response {
+                    Ok(Ok(raw)) => elicitation::format_response(&input, &raw),
+                    _ => elicitation::DISMISSED.to_owned(),
+                });
+            }
 
-            Ok(match response {
-                Ok(Ok(raw)) => elicitation::format_response(&input, &raw),
-                _ => elicitation::DISMISSED.to_owned(),
-            })
+            let call_id = tool_call_id
+                .clone()
+                .unwrap_or_else(|| MakiId::generate().to_string());
+            let requests = elicitation::option_requests(&session_id, &call_id, &input)?;
+            let mut answers = Vec::new();
+            for (index, request) in requests.into_iter().enumerate() {
+                let id = ask_client(
+                    &out_tx,
+                    &pending,
+                    Ask::Dialog,
+                    AgentRequest::RequestPermissionRequest(request),
+                );
+                let response = ctx.cancel.race(guard.recv_async()).await;
+                pending.lock().unwrap().asks.remove(&id);
+                let Ok(Ok(raw)) = response else {
+                    drop(guard);
+                    return Ok(elicitation::DISMISSED.to_owned());
+                };
+                answers.push(elicitation::format_option_response(&input, index, &raw));
+            }
+            drop(guard);
+            Ok(answers.join("\n"))
         })
     })
 }
@@ -866,7 +898,7 @@ fn handle_incoming_response(srv: &Server, raw: &Value) {
         ),
         // The waiting question tool parses this; an error response decodes to
         // nothing and counts as a dismissal.
-        Ask::Elicitation => (
+        Ask::Dialog => (
             raw.get("result")
                 .cloned()
                 .unwrap_or(Value::Null)
@@ -2219,7 +2251,7 @@ mod tests {
 
     #[tokio::test]
     async fn elicitation_response_forwards_the_raw_result() {
-        let (srv, answer_rx, ..) = server_with_ask(Ask::Elicitation);
+        let (srv, answer_rx, ..) = server_with_ask(Ask::Dialog);
         let raw = serde_json::json!({
             "id": ANSWERED_ID,
             "result": { "action": "accept", "content": { "q1": "axum" } },
