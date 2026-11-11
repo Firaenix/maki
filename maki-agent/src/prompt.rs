@@ -276,12 +276,22 @@ impl ResolvedPrompts {
             .map(String::as_str)
             .unwrap_or_else(|| prompt.default_section(slot));
         if slot == Slot::EfficientTools && replacement.is_none() && !entries.is_empty() {
-            let extras = entries
-                .iter()
-                .map(|entry| entry.content.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return format!("{}, {extras}.", default.trim_end_matches('.'));
+            let head = default.trim_end_matches('.');
+            let mut names: Vec<&str> = head
+                .split_once(':')
+                .map(|(_, list)| list.split(',').map(str::trim).collect())
+                .unwrap_or_default();
+            let listed = names.len();
+            for entry in entries {
+                let name = entry.content.as_str();
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            if names.len() == listed {
+                return default.to_string();
+            }
+            return format!("{head}, {}.", names[listed..].join(", "));
         }
         std::iter::once(default)
             .chain(entries.iter().map(|entry| entry.content.as_str()))
@@ -436,6 +446,30 @@ mod tests {
         );
         let out = assemble(PromptId::System, &s, "");
         assert!(out.contains(&format!("{NATIVE_EFFICIENT_LINE}, index, foo.")));
+    }
+
+    #[test]
+    fn efficient_tools_extras_skip_names_already_listed() {
+        let s = slots(
+            PromptId::System,
+            &[
+                (Slot::EfficientTools, "code_execution"),
+                (Slot::EfficientTools, "index"),
+                (Slot::EfficientTools, "index"),
+            ],
+        );
+        let out = assemble(PromptId::System, &s, "");
+        assert!(
+            out.contains(&format!("{NATIVE_EFFICIENT_LINE}, index.")),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn efficient_tools_only_listed_extras_keep_the_default() {
+        let s = slots(PromptId::System, &[(Slot::EfficientTools, "batch")]);
+        let out = assemble(PromptId::System, &s, "");
+        assert!(out.contains(&format!("{NATIVE_EFFICIENT_LINE}.")), "{out}");
     }
 
     #[test]
