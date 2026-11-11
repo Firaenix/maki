@@ -57,6 +57,7 @@ pub const TOOL_SEARCH_TOOL_NAME: &str = "tool_search";
 /// Overridden by `defer_tools` in mcp.toml.
 const DEFAULT_DEFER_TOOLS: usize = 10;
 const EMPTY_CATALOG: &str = "(none yet)";
+const MAX_CATALOG_NAMES_PER_SERVER: usize = 15;
 /// Loads per search are capped so one broad query can't flood the context.
 const MAX_SEARCH_LOADS: usize = 5;
 const NAME_HIT_SCORE: usize = 2;
@@ -1315,25 +1316,30 @@ fn tool_search_definition(deferred: &[&ToolDescriptor]) -> Value {
     // Grouping by server drops the repeated `server__` prefix, a few
     // tokens per tool. Descriptors arrive grouped because entries are
     // sorted and published per server.
-    let mut catalog = String::new();
-    let mut current_server = "";
+    let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
     for d in deferred {
         let (server, raw) = d
             .qualified_name
             .split_once(SEPARATOR)
             .unwrap_or((UNKNOWN_MCP, &d.qualified_name));
-        if server == current_server {
-            catalog.push_str(", ");
-        } else {
-            if !catalog.is_empty() {
-                catalog.push('\n');
-            }
-            catalog.push_str(server);
-            catalog.push_str(": ");
-            current_server = server;
+        match groups.last_mut() {
+            Some((current, names)) if *current == server => names.push(raw),
+            _ => groups.push((server, vec![raw])),
         }
-        catalog.push_str(raw);
     }
+    // A big server's names cost more on every request than the occasional
+    // keyword search costs to find them, so only small servers list theirs.
+    let mut catalog = groups
+        .iter()
+        .map(|(server, names)| {
+            if names.len() > MAX_CATALOG_NAMES_PER_SERVER {
+                format!("{server}: {} tools, search by keyword", names.len())
+            } else {
+                format!("{server}: {}", names.join(", "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     if catalog.is_empty() {
         catalog.push_str(EMPTY_CATALOG);
     }
@@ -1704,6 +1710,28 @@ mod tests {
         assert!(catalog.contains("srv: tool"), "catalog groups by server");
         assert!(handle.resolve(TOOL_NAME).is_some());
         assert_eq!(handle.wire_names(), vec![WIRE_TOOL_NAME]);
+    }
+
+    #[test]
+    fn catalog_counts_a_big_servers_tools_instead_of_naming_them() {
+        let big = (0..=MAX_CATALOG_NAMES_PER_SERVER)
+            .map(|i| tool_def("big", &format!("tool-{i}"), "", json!({})))
+            .collect();
+        let small = vec![tool_def("small", "alpha", "", json!({}))];
+        let (_inner, handle) = setup(vec![
+            entry_with_tools("big", big),
+            entry_with_tools("small", small),
+        ]);
+        let mut tools = json!([]);
+        handle.extend_tools(&mut tools, ToolDeferral::Client);
+        let catalog = tools[0]["description"].as_str().unwrap();
+        let count = MAX_CATALOG_NAMES_PER_SERVER + 1;
+        assert!(
+            catalog.contains(&format!("big: {count} tools, search by keyword")),
+            "{catalog}"
+        );
+        assert!(!catalog.contains("tool-0"), "{catalog}");
+        assert!(catalog.contains("small: alpha"), "{catalog}");
     }
 
     #[test_case(
