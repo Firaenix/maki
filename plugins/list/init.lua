@@ -7,12 +7,6 @@ local DESCRIPTION =
 
 - Filters out instruction files (AGENTS.md, CLAUDE.md, COPILOT.md).]]
 
-maki.api.register_prompt_hint({
-  slot = "tool_usage",
-  content = [[
-- Use the **list** tool to see what a directory contains.]],
-})
-
 maki.api.register_tool({
   name = "list",
   permission = "fs_read",

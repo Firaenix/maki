@@ -180,11 +180,6 @@ local function read_file(path, offset, limit, ctx)
   }
 end
 
-maki.api.register_prompt_hint({
-  slot = "tool_usage",
-  content = "- When using the **read** tool, only read the sections you actually need.",
-})
-
 maki.api.register_tool({
   name = "read",
   permission = "fs_read",
