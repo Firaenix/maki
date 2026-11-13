@@ -1,6 +1,7 @@
 //! Async agent loop with tools.
 
 pub mod agent;
+pub mod btw;
 pub mod call_scope;
 pub mod cancel;
 pub mod child_guard;
@@ -23,6 +24,8 @@ pub use mcp::{
 pub mod session;
 mod session_control;
 pub use session_control::{Activity, Delivery, EndReason, SessionControl};
+mod session_input;
+pub use session_input::{SessionInput, expand_mcp_prompt};
 mod session_loop;
 pub use agent::{
     Agent, AgentParams, AgentRunParams, Cutter, DisplayItem, History, HistorySnapshot, HostPrompt,

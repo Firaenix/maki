@@ -11,10 +11,10 @@ use maki_agent::tools::{BackgroundFor, RequestTools, ToolAudience, ToolRegistry}
 use maki_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentParams, AgentRunParams, AgentSeed, CancelMap,
     CancelToken, DoneReason, Envelope, EventSender, History, HostPrompt, Instructions, McpCommand,
-    PromptRole, RunContextBuilder, RunLedger, RunTotals, SessionMailbox, SharedMessages,
+    RunContextBuilder, RunLedger, RunTotals, SessionMailbox, SharedMessages,
 };
 use maki_lua::EventHandle;
-use maki_providers::{AgentError, ContextGauge, Message, Model};
+use maki_providers::{AgentError, ContextGauge, Model};
 use tokio::sync::Mutex;
 use tokio::task::spawn_blocking;
 use tracing::error;
@@ -276,33 +276,7 @@ impl AgentLoop {
     ) -> Result<DoneReason, AgentError> {
         let (context, prompt_slots) = self.context_builder().await;
 
-        if let Some(ref prompt_ref) = input.prompt {
-            let Some(ref mcp) = self.seed.mcp else {
-                return Err(AgentError::Tool {
-                    tool: "mcp_prompt".into(),
-                    message: "MCP not available".into(),
-                });
-            };
-            let messages = mcp
-                .get_prompt(&prompt_ref.qualified_name, &prompt_ref.arguments)
-                .await
-                .map_err(|e| AgentError::Tool {
-                    tool: "mcp_prompt".into(),
-                    message: e.to_string(),
-                })?;
-            for pm in messages {
-                let text = pm.text;
-                let msg = match pm.role {
-                    PromptRole::Assistant => Message {
-                        role: maki_providers::Role::Assistant,
-                        content: vec![maki_providers::ContentBlock::Text { text }],
-                        ..Default::default()
-                    },
-                    PromptRole::User => Message::user(text),
-                };
-                input.preamble.push(msg);
-            }
-        }
+        maki_agent::expand_mcp_prompt(self.seed.mcp.as_deref(), &mut input).await?;
 
         // Read after the awaits above, not before: a switch can land while the
         // run is still starting up, and the frame and the request both have to

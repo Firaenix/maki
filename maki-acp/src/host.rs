@@ -1,0 +1,25 @@
+//! What the host process asks of the ACP session on a plugin's behalf. A Lua
+//! command that calls `maki.session.prompt` lands here, since an ACP server
+//! has no TUI to take it.
+
+use flume::Sender;
+use maki_agent::ImageSource;
+use serde_json::Value;
+
+/// The words `maki.session.prompt` answers with, matching the TUI's.
+pub const PROMPT_STARTED: &str = "started";
+pub const PROMPT_QUEUED: &str = "queued";
+pub const NO_SESSION_ERR: &str = "no live session";
+pub const OTHER_SESSION_ERR: &str = "this agent only runs its current session";
+
+pub type HostReply = Result<Value, String>;
+
+pub enum HostRequest {
+    /// `maki.session.prompt`. {session} is `None` for the current one.
+    Prompt {
+        session: Option<String>,
+        text: String,
+        images: Vec<ImageSource>,
+        reply: Sender<HostReply>,
+    },
+}

@@ -980,6 +980,11 @@ pub(crate) fn ui_send(
     tx.ok_or(NO_UI_ERR)?.try_send(action).map_err(|_| NO_UI_ERR)
 }
 
+/// Set on a Lua state whose UI channel a non-TUI host drains (ACP): it
+/// answers prompts for its one session and nothing that opens or focuses a
+/// tab, so a call with a headless path takes that path.
+pub(crate) struct SessionHostOnly;
+
 /// Whether an action sent now would reach an event loop, for a call that must
 /// refuse before doing anything a missing UI would leave half done.
 pub(crate) fn ui_reachable(tx: Option<&flume::Sender<UiAction>>) -> bool {

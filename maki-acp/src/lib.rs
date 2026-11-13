@@ -1,4 +1,6 @@
+pub mod commands;
 pub mod elicitation;
+pub mod host;
 pub mod methods;
 pub mod permissions;
 pub mod server;
@@ -28,8 +30,8 @@ pub struct AcpParams {
     pub initial_wd: PathBuf,
     pub prompt_slots: Arc<ResolvedPrompts>,
     pub yolo: bool,
-    /// ACP exposes no toggles of its own, so the `always_*` knobs are the whole
-    /// answer for every prompt this server runs.
+    /// What a session starts with. `/fast` and `/workflow` flip that session's
+    /// copy, never this one.
     pub defaults: SessionDefaults,
     pub model_policy: Arc<ModelPolicy>,
     pub plugin_rules: Arc<PluginRuleStore>,
@@ -52,6 +54,10 @@ pub struct AcpParams {
     /// Firing it shuts the server down as end of input does, without waiting
     /// for the client to close stdin.
     pub stop: CancelToken,
+    /// Where slash commands the session cannot answer alone are looked up and run.
+    pub commands: Arc<dyn commands::CommandHost>,
+    /// Plugin requests for the session, `maki.session.prompt` first of all.
+    pub host_requests: Option<flume::Receiver<host::HostRequest>>,
 }
 
 pub async fn run(params: AcpParams) -> color_eyre::Result<()> {

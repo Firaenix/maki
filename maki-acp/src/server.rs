@@ -26,12 +26,13 @@ use maki_agent::tools::{LocalTool, LocalTools, QUESTION_TOOL_NAME, ToolAudience,
 use maki_agent::types::AgentEvent;
 use maki_agent::{
     AgentInput, AgentMode, CancelToken, CostTally, Envelope, ImageMediaType, ImageSource,
-    InputSource, SessionEndReason, SessionEvents,
+    InputSource, SessionEndReason, SessionEvents, SessionInput,
 };
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, SessionDefaults, TrustConfig};
 use maki_providers::model::Model;
-use maki_providers::provider::{available_model_specs, fetch_all_models};
+use maki_providers::models_cache::{cached_model_specs, fetch_all_models_cached};
+use maki_providers::provider::available_model_specs;
 use maki_providers::settle_session;
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
@@ -42,9 +43,13 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::task::{JoinHandle, spawn_blocking};
 use tracing::{debug, info, warn};
 
+use crate::host::HostRequest;
 use crate::{AcpParams, SessionEndHook, elicitation, methods, permissions, translate};
 
+mod slash;
+
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
+const PROMPT_RUNNING: &str = "a prompt is already running";
 /// Turns already recorded were priced when they ran. `always_fast` is a live
 /// config value, so reading it here would reprice history the user paid for at
 /// standard rates. New turns still honour it.
@@ -106,6 +111,13 @@ struct SessionState {
     /// Shared with the run, so reloading the same session reads under this
     /// claim instead of clashing with it.
     claim: SessionClaim,
+    /// Where the session runs and which servers its client injected, so a
+    /// restart (`/cd`, `/trust`, `/reload`) can start the next generation.
+    cwd: PathBuf,
+    client_servers: Vec<McpServer>,
+    /// What every prompt runs under, seeded from the server's defaults and
+    /// flipped by `/fast` and `/workflow`.
+    toggles: SessionDefaults,
 }
 
 struct Server {
@@ -116,6 +128,11 @@ struct Server {
     defaults: SessionDefaults,
     session: Option<SessionState>,
     on_session_end: Option<SessionEndHook>,
+    /// Weak, so the server's own handle never keeps its input loop alive.
+    in_tx: WeakSender<Incoming>,
+    /// A Lua command's prompt, held open for the turn its handler may start
+    /// with `maki.session.prompt`, so that turn answers it.
+    command_wait: Option<RequestId>,
 }
 
 impl Server {
@@ -127,6 +144,9 @@ impl Server {
 enum Incoming {
     Line(String),
     Models(Vec<String>),
+    Host(HostRequest),
+    /// The grace a Lua command's prompt waits for its handler ran out.
+    CommandGrace(RequestId),
 }
 
 pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
@@ -143,17 +163,21 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         }
     });
 
+    let (in_tx, in_rx) = flume::unbounded::<Incoming>();
     let mut server = Server {
         out_tx,
-        model_specs: available_model_specs(&params.model_policy),
+        model_specs: seed_model_specs(&params.model_policy),
         model_policy: Arc::clone(&params.model_policy),
         client_elicits_form: false,
         defaults: params.defaults,
         session: None,
         on_session_end: params.on_session_end.clone(),
+        in_tx: in_tx.downgrade(),
+        command_wait: None,
     };
-
-    let (in_tx, in_rx) = flume::unbounded::<Incoming>();
+    if let Some(requests) = params.host_requests.clone() {
+        forward_host_requests(requests, in_tx.downgrade());
+    }
     // Weak, so a discovery still in flight cannot keep the loop alive once stdin closes.
     discover_models(Arc::clone(&params.model_policy), in_tx.downgrade());
     let reader_task = tokio::spawn(read_stdin(in_tx));
@@ -162,6 +186,8 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         match incoming {
             Incoming::Line(line) => handle_line(&mut server, &line, &params).await,
             Incoming::Models(specs) => refresh_models(&mut server, specs),
+            Incoming::Host(request) => slash::host_request(&mut server, request),
+            Incoming::CommandGrace(id) => slash::command_grace(&mut server, &id),
         }
     }
 
@@ -203,17 +229,38 @@ async fn read_stdin(tx: Sender<Incoming>) -> std::io::Result<()> {
 /// should not wait behind it.
 fn discover_models(policy: Arc<ModelPolicy>, tx: WeakSender<Incoming>) {
     tokio::spawn(async move {
-        fetch_all_models(
-            &policy,
-            |batch| {
-                if let Some(tx) = tx.upgrade() {
-                    let _ = tx.send(Incoming::Models(batch.models));
-                }
-            },
-            None,
-        )
+        fetch_all_models_cached(&policy, |list, _| {
+            if let Some(tx) = tx.upgrade() {
+                let _ = tx.send(Incoming::Models(list.specs));
+            }
+        })
         .await;
     });
+}
+
+/// Weak, like discovery: a plugin host outliving stdin must not keep the
+/// loop up.
+fn forward_host_requests(requests: Receiver<HostRequest>, tx: WeakSender<Incoming>) {
+    tokio::spawn(async move {
+        while let Ok(request) = requests.recv_async().await {
+            let Some(tx) = tx.upgrade() else { return };
+            let _ = tx.send(Incoming::Host(request));
+        }
+    });
+}
+
+/// The registry's offline list plus whatever discovery cached on disk last run.
+/// An ACP client snapshots the model selector straight after `session/new`, so
+/// catalog providers have to be in that first list rather than arrive as a
+/// config update the client has already read past.
+fn seed_model_specs(policy: &ModelPolicy) -> Vec<String> {
+    let mut specs = available_model_specs(policy);
+    for spec in cached_model_specs(policy) {
+        if !specs.contains(&spec) {
+            specs.push(spec);
+        }
+    }
+    specs
 }
 
 /// Discovery lands in batches after the client built its selector from the
@@ -291,7 +338,7 @@ async fn handle_request(
         "session/new" => new_session(srv, raw, params).await,
         "session/load" => load_session(srv, raw, params).await,
         "session/list" => list_sessions(raw, &params.storage).await,
-        "session/prompt" => match handle_prompt(srv, raw, &id) {
+        "session/prompt" => match handle_prompt(srv, raw, &id, params).await {
             Ok(()) => return,
             Err(e) => Err(e),
         },
@@ -324,6 +371,7 @@ async fn new_session(
         Resumed::empty(SessionRef::from(claim.id())),
         claim,
         mcp,
+        req.mcp_servers,
         project_config,
         None,
     );
@@ -380,21 +428,7 @@ async fn load_session(
     {
         session_update(&srv.out_tx, &sid, update);
     }
-    // Priced against the model the session recorded, not the one selected now
-    // (which may cost 10x more or less). Later turns add their own exact cost.
-    let recorded_model = Model::from_spec_or_warm_catalog(&restored.session.model)
-        .await
-        .unwrap_or_else(|_| params.model.clone());
-    // Settling writes today's estimate into entries that never recorded a cost.
-    // The run saves this session back, so we settle a copy and keep that
-    // estimate off disk.
-    let mut by_model = restored.session.usage_by_model().clone();
-    let restored_cost = settle_session(
-        &restored.session.token_usage,
-        &mut by_model,
-        &recorded_model,
-        RESTORED_FAST,
-    );
+    let restored_cost = restored_cost(&restored.session, &params.model).await;
     let started = start_session(
         srv,
         params,
@@ -402,6 +436,7 @@ async fn load_session(
         Resumed::stored(session_ref, restored.session),
         claim,
         mcp,
+        req.mcp_servers,
         project_config,
         restored_cost,
     );
@@ -410,6 +445,25 @@ async fn load_session(
     let resp = methods::load_session_response()
         .config_options(vec![methods::model_config_option(&spec, &srv.model_specs)]);
     Ok(AgentResponse::LoadSessionResponse(resp))
+}
+
+/// What {session} cost before this run, priced against the model it recorded,
+/// not the one selected now (which may cost 10x more or less). Later turns add
+/// their own exact cost.
+async fn restored_cost(session: &StoredSession, fallback: &Model) -> Option<f64> {
+    let recorded_model = Model::from_spec_or_warm_catalog(&session.model)
+        .await
+        .unwrap_or_else(|_| fallback.clone());
+    // Settling writes today's estimate into entries that never recorded a cost.
+    // The run saves this session back, so we settle a copy and keep that
+    // estimate off disk.
+    let mut by_model = session.usage_by_model().clone();
+    settle_session(
+        &session.token_usage,
+        &mut by_model,
+        &recorded_model,
+        RESTORED_FAST,
+    )
 }
 
 /// `session/list`: stored sessions, newest first. Reads the store, not
@@ -471,6 +525,7 @@ fn start_session(
     resumed: Resumed,
     claim: SessionClaim,
     mcp: Option<McpHandle>,
+    client_servers: Vec<McpServer>,
     project_config: ProjectConfig,
     initial_cost: Option<f64>,
 ) -> SessionRef {
@@ -526,10 +581,17 @@ fn start_session(
         session_ref.clone(),
         srv.out_tx.clone(),
         Arc::clone(&pending),
-        cwd,
+        cwd.clone(),
         maki_storage::paths::home(),
         project_trusted,
         initial_cost,
+    );
+    slash::announce_commands(
+        &srv.out_tx,
+        &session_ref,
+        Arc::clone(&params.commands),
+        &cwd,
+        mcp.as_ref(),
     );
     srv.session = Some(SessionState {
         handle,
@@ -538,6 +600,9 @@ fn start_session(
         current_model: params.model.spec(),
         pending,
         claim,
+        cwd,
+        client_servers,
+        toggles: srv.defaults,
     });
     session_ref
 }
@@ -824,25 +889,44 @@ impl From<StoredSession> for Restored {
     }
 }
 
-fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), AcpError> {
+async fn handle_prompt(
+    srv: &mut Server,
+    raw: &Value,
+    id: &RequestId,
+    params: &AcpParams,
+) -> Result<(), AcpError> {
     let req: PromptRequest = parse_params(raw)?;
-    let session = srv.session.as_ref().ok_or_else(no_session)?;
+    srv.session.as_ref().ok_or_else(no_session)?;
+    slash::settle_command(srv);
 
-    let (message, images) = extract_prompt_content(&req.prompt);
-    let input = AgentInput::from_defaults(
+    let (message, mut images) = extract_prompt_content(&req.prompt);
+    if let Some(handled) = slash::run(srv, params, id, &message, &mut images).await {
+        return handled;
+    }
+    let session = srv.session.as_ref().ok_or_else(no_session)?;
+    let input = prompt_input(session, message, images);
+    submit(srv, id, input.into())
+}
+
+fn prompt_input(session: &SessionState, message: String, images: Vec<ImageSource>) -> AgentInput {
+    AgentInput::from_defaults(
         message,
         session.current_mode.clone(),
         images,
-        srv.defaults,
+        session.toggles,
         InputSource::Acp,
-    );
+    )
+}
 
-    // One outstanding id per session, checked and set under the same guard:
-    // `input_tx` is unbounded, so a second prompt would queue happily and
-    // overwrite the first id, leaving that request unanswered forever.
+/// Hands {input} to the session as the turn {id} waits on. One outstanding id
+/// per session, checked and set under the same guard: `input_tx` is
+/// unbounded, so a second prompt would queue happily and overwrite the first
+/// id, leaving that request unanswered forever.
+fn submit(srv: &Server, id: &RequestId, input: SessionInput) -> Result<(), AcpError> {
+    let session = srv.session.as_ref().ok_or_else(no_session)?;
     let mut pending = session.pending.lock().unwrap();
     if pending.prompt.is_some() {
-        return Err(AcpError::new(-32603, "a prompt is already running"));
+        return Err(AcpError::new(-32603, PROMPT_RUNNING));
     }
     session
         .handle
@@ -1134,6 +1218,14 @@ fn start_event_pump(
                 AgentEvent::ObservationLine { text, .. } => {
                     translate::notice(&MakiId::generate().to_string(), &text)
                 }
+                AgentEvent::CompactionDone {
+                    context_size_before,
+                    context_size_after,
+                    ..
+                } => translate::text_delta(&format!(
+                    "Compacted the conversation: {context_size_before} → {context_size_after} \
+                     tokens."
+                )),
                 AgentEvent::Done {
                     reason,
                     cost: ledger,
@@ -1459,7 +1551,7 @@ mod tests {
         assert_eq!(permission_answer(&raw), expected);
     }
 
-    fn test_server() -> (Server, flume::Receiver<String>, flume::Receiver<Value>) {
+    pub(super) fn test_server() -> (Server, flume::Receiver<String>, flume::Receiver<Value>) {
         let (answer_tx, answer_rx) = flume::unbounded();
         let (out_tx, out_rx) = flume::unbounded();
         let claim = SessionClaim::fresh(&StateDir::from_path(FIXTURE_CLAIMS.path().to_path_buf()));
@@ -1488,6 +1580,8 @@ mod tests {
             client_elicits_form: false,
             defaults: SessionDefaults::default(),
             on_session_end: None,
+            in_tx: flume::unbounded().0.downgrade(),
+            command_wait: None,
             session: Some(SessionState {
                 handle,
                 mcp: None,
@@ -1495,12 +1589,15 @@ mod tests {
                 current_model: String::new(),
                 pending: Arc::default(),
                 claim,
+                cwd: PathBuf::from("/project"),
+                client_servers: Vec::new(),
+                toggles: SessionDefaults::default(),
             }),
         };
         (server, answer_rx, out_rx)
     }
 
-    fn acp_params(storage: StateDir) -> AcpParams {
+    pub(super) fn acp_params(storage: StateDir) -> AcpParams {
         AcpParams {
             model: Model::from_spec(SELECTED_SPEC).expect("a shipped model"),
             config: AgentConfig::default(),
@@ -1518,6 +1615,8 @@ mod tests {
             background: false,
             host_prompt: HostPrompt::default(),
             stop: CancelToken::none(),
+            commands: Arc::new(crate::commands::testing::Host),
+            host_requests: None,
         }
     }
 
