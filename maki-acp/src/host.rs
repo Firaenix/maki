@@ -22,4 +22,8 @@ pub enum HostRequest {
         images: Vec<ImageSource>,
         reply: Sender<HostReply>,
     },
+    /// What a plugin showed, a toast, a flash or a window's contents, as text:
+    /// ACP has no windows. It joins the turn of the Lua command waiting on its
+    /// handler, and is dropped when none waits.
+    Say { text: String },
 }

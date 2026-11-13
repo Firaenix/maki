@@ -275,7 +275,22 @@ pub(super) fn host_request(srv: &mut Server, request: HostRequest) {
         } => {
             let _ = reply.send(host_prompt(srv, session, text, images));
         }
+        HostRequest::Say { text } => say(srv, &text),
     }
+}
+
+/// Only while a Lua command waits on its handler: plugins also toast and open
+/// status windows on their own, and as notices those would flood the client.
+fn say(srv: &Server, text: &str) {
+    let (Some(_), Some(session)) = (&srv.command_wait, srv.session.as_ref()) else {
+        return;
+    };
+    let sid = SessionId::from(session.handle.session_id.to_string());
+    session_update(
+        &srv.out_tx,
+        &sid,
+        translate::text_delta(&format!("{text}\n\n")),
+    );
 }
 
 /// `maki.session.prompt` from a plugin. A Lua command waiting on its handler
@@ -742,6 +757,33 @@ mod tests {
         assert_eq!(input.message, "Use the release skill");
         assert!(f.pending(), "the turn now owns the client's prompt");
         assert!(f.srv.command_wait.is_none());
+    }
+
+    /// `/skills` opens a window listing them; ACP shows that as the turn's text.
+    #[tokio::test]
+    async fn what_a_lua_command_shows_lands_in_its_turn() {
+        let mut f = fixture();
+        f.send("/greet").await.unwrap().unwrap();
+        host_request(
+            &mut f.srv,
+            HostRequest::Say {
+                text: "Skills (2)".into(),
+            },
+        );
+        command_grace(&mut f.srv, &RequestId::Number(PROMPT_ID));
+        assert_eq!(f.said(), ("Skills (2)\n\n".to_owned(), true));
+    }
+
+    #[tokio::test]
+    async fn what_a_plugin_shows_outside_a_command_is_dropped() {
+        let mut f = fixture();
+        host_request(
+            &mut f.srv,
+            HostRequest::Say {
+                text: "verdict: allow".into(),
+            },
+        );
+        assert!(f.wire.is_empty());
     }
 
     #[tokio::test]
