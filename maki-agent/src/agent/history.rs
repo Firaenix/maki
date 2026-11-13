@@ -252,6 +252,10 @@ impl History {
         self
     }
 
+    pub(crate) fn mirror(&self) -> Option<&SharedMessages> {
+        self.mirror.as_ref()
+    }
+
     pub fn as_slice(&self) -> &[Message] {
         &self.snapshot.messages
     }

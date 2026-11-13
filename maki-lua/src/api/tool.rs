@@ -788,6 +788,14 @@ fn register_prompt(
 /// "full" when code such as `code_execution` made the call. Apply output limits
 /// only in compact mode.
 ///
+/// `ctx:messages(opts?)` returns the transcript of the agent that made the
+/// call, as `maki.session.messages` does: the main chat's for the main agent,
+/// the subagent's own inside a subagent, where `maki.session.messages` would
+/// read the main chat. It ends with the assistant message holding this call,
+/// whose result is not in yet. `opts.last` keeps only the newest `last`
+/// messages. It needs `session_read`, and answers `nil, err` outside a handler
+/// or in a run that keeps no transcript.
+///
 /// @param spec table Tool specification:
 ///   name            (string)   Required. ASCII identifier, up to 64 chars ([a-zA-Z_][a-zA-Z0-9_]*).
 ///   description     (string)   Required. Non-empty description shown to the model.

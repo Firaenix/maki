@@ -18,11 +18,13 @@ use mlua::{
 use tokio::sync::oneshot;
 use tokio::task::spawn_blocking;
 
+use crate::api::session::newest_messages_table;
 use crate::api::tool::{LuaOutputFormat, ToolCallReply, extract_format};
 use crate::api::ui::buf::BufHandle;
 use crate::api::util::convert::{TableExt, json_to_lua};
 use crate::api::util::pair::{Pair, err_pair, pair};
 use crate::background::BackgroundTasks;
+use crate::plugin_permissions::{Permission, PluginPermissions, denied_error, require};
 use crate::runtime::{
     MoveOutcome, RestoreReason, SUBAGENT_SELF_MOVE_MSG, TaskHandle, active_task, lock_cell,
     move_self,
@@ -48,6 +50,7 @@ const NO_PART_NOW_MSG: &str =
     "report_part: the call stopped or replied, or nothing waits on it any more";
 const EXPIRE_BACKGROUND: &str = "background";
 const EXPIRE_TIMEOUT: &str = "timeout";
+const NO_TRANSCRIPT_MSG: &str = "messages: this call runs in no agent that keeps a transcript";
 
 /// What `ctx:set_deadline` does when the deadline passes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,6 +178,9 @@ pub(crate) struct LuaCtx {
     /// re-rendered.
     session_id: Option<SessionRef>,
     task_id: Option<Arc<str>>,
+    /// What the plugin owning the tool was granted, stamped by the runtime
+    /// right before its handler runs. `None` reads as nothing granted.
+    pub(crate) grants: Option<PluginPermissions>,
     pub(crate) finish_tx: Option<oneshot::Sender<ToolCallReply>>,
 }
 
@@ -215,6 +221,7 @@ impl LuaCtx {
             tool_output_lines: ctx.tool_output_lines,
             session_id: ctx.session_id.clone(),
             task_id: ctx.task_id.clone(),
+            grants: None,
             finish_tx: None,
         }
     }
@@ -250,6 +257,7 @@ impl LuaCtx {
             tool_output_lines: ctx.tool_output_lines,
             session_id: ctx.session_id,
             task_id: ctx.task_id,
+            grants: None,
             finish_tx: None,
         }
     }
@@ -362,6 +370,40 @@ impl UserData for LuaCtx {
         });
 
         methods.add_method("task_id", |_, this, ()| Ok(this.task_id().to_owned()));
+
+        // The transcript of the agent running this call, the chat `task_id`
+        // names, in the shape `maki.session.messages` returns: the main
+        // chat's in the agent owning the session, its own in a subagent.
+        // It ends with the assistant message holding this call's `tool_use`,
+        // whose result is not in yet. `opts.last` keeps the newest `last`.
+        // Needs `session_read`, like `maki.session.messages`. Handler only.
+        methods.add_async_method("messages", |lua, this, opts: Option<Table>| async move {
+            match &this.grants {
+                Some(grants) => require(&lua, grants, Permission::SessionRead)?,
+                None => return Err(denied_error(Permission::SessionRead)),
+            }
+            let Some(agent) = this.agent() else {
+                return Ok(this.cap_err_pair("messages"));
+            };
+            let last = match &opts {
+                Some(opts) => opts.opt::<usize>("last")?,
+                None => None,
+            };
+            let Some(history) = agent
+                .transcript
+                .as_ref()
+                .map(|transcript| Arc::clone(&transcript.load().messages))
+            else {
+                return Ok(err_pair(NO_TRANSCRIPT_MSG));
+            };
+            // Converting yields, and a cancel hook firing meanwhile needs
+            // `ctx:finish`, which takes the ctx mutably.
+            drop(this);
+            Ok((
+                Some(newest_messages_table(&lua, &history, last).await?),
+                None,
+            ))
+        });
 
         methods.add_method("tool_use_id", |_, this, ()| {
             Ok(this.agent().and_then(|agent| agent.tool_use_id.clone()))
@@ -658,13 +700,16 @@ fn resolve_abs_with_cwd(path: String, cwd: &Path) -> PathBuf {
 mod tests {
     use std::collections::HashMap;
 
+    use arc_swap::ArcSwap;
     use maki_agent::tools::test_support::stub_ctx_with;
     use maki_agent::tools::{LocalTool, ToolAudience};
-    use maki_agent::{AgentMode, InstructionBlock};
+    use maki_agent::{AgentMode, HistorySnapshot, InstructionBlock, SharedMessages};
+    use maki_providers::{ContentBlock, Message, Role};
     use mlua::Lua;
     use test_case::test_case;
 
     use super::*;
+    use crate::api::util::convert::lua_to_json;
     use crate::runtime::test_support::call_scope;
     use crate::runtime::{TaskCell, TaskScope};
 
@@ -674,6 +719,11 @@ mod tests {
     /// Arbitrary ids are rejected: `SessionRef` parses base58 or a uuid.
     const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
     const SUBAGENT_TASK_ID: &str = "toolu_task";
+    const MAIN_TEXT: &str = "main chat";
+    const SUBAGENT_TEXT: &str = "subagent chat";
+    const ANSWER: &str = "on it";
+    const LAST_TWO: &str = "{ last = 2 }";
+    const ALL: &str = "nil";
 
     fn session_ref() -> SessionRef {
         SESSION_ID.parse().expect("valid session id")
@@ -816,6 +866,120 @@ mod tests {
 
         assert!(!ok);
         assert!(err.contains(BACKGROUND_HOOK_ALREADY_SET_MSG), "{err}");
+    }
+
+    fn mirror_of(messages: Vec<Message>) -> SharedMessages {
+        Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(messages)))
+    }
+
+    /// A handler ctx of the agent `task_id` names, whose transcript holds
+    /// {messages}, in a tool of a plugin granted {grants}.
+    fn reading_ctx(
+        task_id: Option<&str>,
+        messages: Vec<Message>,
+        grants: Option<PluginPermissions>,
+    ) -> LuaCtx {
+        let mut ctx = populated_ctx();
+        ctx.task_id = task_id.map(Arc::from);
+        ctx.transcript = Some(mirror_of(messages));
+        let mut lua_ctx = LuaCtx::handler(&ctx);
+        lua_ctx.grants = grants;
+        lua_ctx
+    }
+
+    fn trusted() -> Option<PluginPermissions> {
+        Some(PluginPermissions::trusted())
+    }
+
+    async fn read_messages(lua: &Lua, ctx: LuaCtx, opts: &str) -> mlua::Result<Pair<LuaValue>> {
+        let ud = lua.create_userdata(ctx)?;
+        lua.load(format!("local ctx = ... return ctx:messages({opts})"))
+            .call_async(ud)
+            .await
+    }
+
+    fn assistant(text: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text { text: text.into() }],
+            ..Default::default()
+        }
+    }
+
+    /// Main and subagent share a session, so only the ctx can tell their
+    /// transcripts apart.
+    #[test_case(None, MAIN_TEXT ; "session_owner")]
+    #[test_case(Some(SUBAGENT_TASK_ID), SUBAGENT_TEXT ; "subagent")]
+    #[tokio::test]
+    async fn messages_reads_the_calling_agents_own_transcript(task_id: Option<&str>, text: &str) {
+        let lua = Lua::new();
+        let history = vec![Message::user(text.into()), assistant(ANSWER)];
+        let ctx = reading_ctx(task_id, history.clone(), trusted());
+
+        let (msgs, err) = read_messages(&lua, ctx, ALL).await.unwrap();
+
+        assert_eq!(err, None);
+        assert_eq!(
+            lua_to_json(&lua, &msgs.unwrap()).unwrap(),
+            serde_json::to_value(&history).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn messages_last_keeps_the_newest() {
+        let lua = Lua::new();
+        let history = vec![
+            Message::user(MAIN_TEXT.into()),
+            assistant(ANSWER),
+            Message::user(SUBAGENT_TEXT.into()),
+        ];
+        let ctx = reading_ctx(None, history.clone(), trusted());
+
+        let (msgs, err) = read_messages(&lua, ctx, LAST_TWO).await.unwrap();
+
+        assert_eq!(err, None);
+        assert_eq!(
+            lua_to_json(&lua, &msgs.unwrap()).unwrap(),
+            serde_json::to_value(&history[1..]).unwrap()
+        );
+    }
+
+    #[test_case(Some(PluginPermissions::denied()) ; "not_granted")]
+    #[test_case(None ; "no_grants_stamped")]
+    #[tokio::test]
+    async fn messages_without_session_read_raises(grants: Option<PluginPermissions>) {
+        let lua = Lua::new();
+        let ctx = reading_ctx(None, vec![Message::user(MAIN_TEXT.into())], grants);
+
+        let err = read_messages(&lua, ctx, ALL).await.unwrap_err();
+
+        let expected = denied_error(Permission::SessionRead).to_string();
+        assert!(err.to_string().contains(&expected), "{err}");
+    }
+
+    #[tokio::test]
+    async fn messages_without_a_transcript_is_an_error_pair() {
+        let lua = Lua::new();
+        let mut ctx = LuaCtx::handler(&populated_ctx());
+        ctx.grants = trusted();
+
+        let (msgs, err) = read_messages(&lua, ctx, ALL).await.unwrap();
+
+        assert!(msgs.is_none());
+        assert_eq!(err.as_deref(), Some(NO_TRANSCRIPT_MSG));
+    }
+
+    #[tokio::test]
+    async fn messages_is_handler_only() {
+        let lua = Lua::new();
+        let mut ctx = LuaCtx::restore(RestoreCtx::default());
+        ctx.grants = trusted();
+        let expected = ctx.cap_err("messages");
+
+        let (msgs, err) = read_messages(&lua, ctx, ALL).await.unwrap();
+
+        assert!(msgs.is_none());
+        assert_eq!(err, Some(expected));
     }
 
     /// A plain-table ctx that names no reason must read as a rerender: side
