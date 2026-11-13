@@ -12,10 +12,12 @@ use agent_client_protocol_schema::v1::{
 };
 use futures::future::BoxFuture;
 use maki_agent::command::CustomCommand;
+use maki_agent::skill::Skill;
 use maki_agent::{McpHandle, McpPromptArg, McpPromptInfo};
 
 pub const NEEDS_TUI_SUFFIX: &str = " (TUI only)";
 const ARGUMENTS_HINT: &str = "arguments";
+const SKILL_HINT: &str = "[focus]";
 
 /// A builtin as the host's command table describes it, slash included.
 pub struct HostBuiltin {
@@ -40,6 +42,8 @@ pub trait CommandHost: Send + Sync {
     fn builtins(&self) -> Vec<HostBuiltin>;
     /// Markdown commands for {cwd}, or none when the host turned them off.
     fn custom_commands(&self, cwd: &Path) -> Vec<CustomCommand>;
+    /// The skills a session in {cwd} can use, each offered as `/name`.
+    fn skills(&self, cwd: &Path) -> Vec<Skill>;
     fn lua_commands(&self) -> Vec<LuaCommand>;
     /// {session} is the chat the handler runs in, its `opts.session`.
     fn run_lua(&self, command: &LuaCommand, args: String, session: String);
@@ -132,6 +136,7 @@ pub enum Target<'a> {
     NeedsTui(String),
     Custom(&'a CustomCommand),
     Mcp(&'a McpPromptInfo),
+    Skill(&'a Skill),
     Lua(&'a LuaCommand),
 }
 
@@ -141,6 +146,7 @@ pub struct Catalogue {
     builtins: Vec<HostBuiltin>,
     custom: Vec<CustomCommand>,
     mcp: Vec<McpPromptInfo>,
+    skills: Vec<Skill>,
     lua: Vec<LuaCommand>,
 }
 
@@ -152,6 +158,7 @@ impl Catalogue {
             mcp: mcp
                 .map(|mcp| mcp.reader().load().prompts.clone())
                 .unwrap_or_default(),
+            skills: host.skills(cwd),
             lua: host.lua_commands(),
         }
     }
@@ -172,6 +179,9 @@ impl Catalogue {
         }
         if let Some(prompt) = self.mcp.iter().find(|p| is(&p.display_name)) {
             return Some(Target::Mcp(prompt));
+        }
+        if let Some(skill) = self.skills.iter().find(|s| is(&s.name)) {
+            return Some(Target::Skill(skill));
         }
         let lua = self.lua.iter().find(|c| is(&c.name))?;
         Some(match lua.interactive {
@@ -199,19 +209,59 @@ impl Catalogue {
             let hint = mcp_argument_hint(&p.arguments);
             command(&p.display_name, &p.description, hint.as_deref())
         });
-        let lua = self.lua.iter().map(|c| {
-            let name = acp_name(&c.name);
-            match c.interactive {
-                true => needs_tui(name, &c.description),
-                false => command(
-                    name,
-                    &c.description,
-                    (c.max_args > 0).then_some(ARGUMENTS_HINT),
-                ),
-            }
+        let skills = self.skills.iter().map(|skill| {
+            let description = match skill.description.is_empty() {
+                true => format!("Use the {} skill", skill.name),
+                false => skill.description.clone(),
+            };
+            command(&skill.name, &description, Some(SKILL_HINT))
         });
-        builtins.chain(custom).chain(mcp).chain(lua).collect()
+        // A plugin that offers skills as Lua commands names the same ones, and
+        // the skill already answers them.
+        let lua = self
+            .lua
+            .iter()
+            .filter(|c| !self.is_skill(&c.name))
+            .map(|c| {
+                let name = acp_name(&c.name);
+                match c.interactive {
+                    true => needs_tui(name, &c.description),
+                    false => command(
+                        name,
+                        &c.description,
+                        (c.max_args > 0).then_some(ARGUMENTS_HINT),
+                    ),
+                }
+            });
+        builtins
+            .chain(custom)
+            .chain(mcp)
+            .chain(skills)
+            .chain(lua)
+            .collect()
     }
+
+    fn is_skill(&self, name: &str) -> bool {
+        let name = acp_name(name);
+        self.skills
+            .iter()
+            .any(|skill| skill.name.eq_ignore_ascii_case(name))
+    }
+}
+
+/// What `/name focus` sends for a skill. It names the file rather than the
+/// `skill` tool, which only knows the folder the server started in.
+pub fn skill_prompt(skill: &Skill, focus: &str) -> String {
+    let mut prompt = format!(
+        "Use the {} skill: read {} and follow it.",
+        skill.name,
+        skill.path.display()
+    );
+    if !focus.is_empty() {
+        prompt.push_str(" Focus: ");
+        prompt.push_str(focus);
+    }
+    prompt
 }
 
 fn acp_name(name: &str) -> &str {
@@ -282,8 +332,9 @@ pub(crate) mod testing {
 
     use super::*;
 
-    /// Four headless builtins and two TUI-only ones, a markdown command, and a
-    /// plain and an interactive Lua command.
+    /// Four headless builtins and two TUI-only ones, a markdown command, a
+    /// skill, a plain and an interactive Lua command, and a Lua command that
+    /// shadows the skill the way the dotfiles skill plugin does.
     pub(crate) struct Host;
 
     impl CommandHost for Host {
@@ -309,8 +360,16 @@ pub(crate) mod testing {
             }]
         }
 
+        fn skills(&self, _: &Path) -> Vec<Skill> {
+            vec![Skill {
+                name: "release".into(),
+                description: "Ship a release".into(),
+                path: "/skills/release/SKILL.md".into(),
+            }]
+        }
+
         fn lua_commands(&self) -> Vec<LuaCommand> {
-            [("/greet", false), ("/picker", true)]
+            [("/greet", false), ("/picker", true), ("/release", false)]
                 .into_iter()
                 .map(|(name, interactive)| LuaCommand {
                     plugin: "p".into(),
@@ -357,6 +416,7 @@ mod tests {
     #[test_case("fork", "tui" ; "fork needs the tui")]
     #[test_case("project:review", "custom" ; "custom command")]
     #[test_case("greet", "lua" ; "lua command")]
+    #[test_case("release", "skill" ; "a skill beats the lua command of its name")]
     #[test_case("picker", "tui" ; "interactive lua command")]
     #[test_case("nope", "none" ; "unknown passes through")]
     fn resolves_every_source(name: &str, expected: &str) {
@@ -366,10 +426,18 @@ mod tests {
             Some(Target::NeedsTui(_)) => "tui",
             Some(Target::Custom(_)) => "custom",
             Some(Target::Mcp(_)) => "mcp",
+            Some(Target::Skill(_)) => "skill",
             Some(Target::Lua(_)) => "lua",
             None => "none",
         };
         assert_eq!(got, expected);
+    }
+
+    #[test_case("", "Use the release skill: read /skills/release/SKILL.md and follow it." ; "bare")]
+    #[test_case("the hotfix", "Use the release skill: read /skills/release/SKILL.md and follow it. Focus: the hotfix" ; "focus")]
+    fn a_skill_prompt_names_its_file(focus: &str, expected: &str) {
+        let skill = &Host.skills(Path::new("."))[0];
+        assert_eq!(skill_prompt(skill, focus), expected);
     }
 
     #[test]
@@ -391,6 +459,7 @@ mod tests {
                 ("theme".into(), tui.clone(), false),
                 ("fork".into(), tui, false),
                 ("project:review".into(), "Review".into(), true),
+                ("release".into(), "Ship a release".into(), true),
                 ("greet".into(), "l".into(), true),
                 ("picker".into(), lua_tui, false),
             ]

@@ -10,6 +10,7 @@ use futures::future::BoxFuture;
 use maki_acp::commands::{CommandHost, HostBuiltin, LuaCommand};
 use maki_acp::host::HostRequest;
 use maki_agent::command::{self, CustomCommand};
+use maki_agent::skill::{self, Skill};
 use maki_lua::{
     EventHandle, LuaCommandReader, NO_UI_ERR, PackCommand, PackPreparation, SessionRequest,
     UiAction,
@@ -44,6 +45,10 @@ impl CommandHost for AcpCommands {
             true => Vec::new(),
             false => command::discover_commands(cwd),
         }
+    }
+
+    fn skills(&self, cwd: &Path) -> Vec<Skill> {
+        skill::discover_skills(cwd)
     }
 
     fn lua_commands(&self) -> Vec<LuaCommand> {

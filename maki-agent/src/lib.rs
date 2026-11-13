@@ -23,6 +23,7 @@ pub use mcp::{
 };
 pub mod session;
 mod session_control;
+pub mod skill;
 pub use session_control::{Activity, Delivery, EndReason, SessionControl};
 mod session_input;
 pub use session_input::{SessionInput, expand_mcp_prompt};

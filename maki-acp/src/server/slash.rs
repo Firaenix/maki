@@ -93,6 +93,11 @@ pub(super) async fn run(
             }));
             submit(srv, id, input.into())
         }
+        Target::Skill(skill) => {
+            let text = commands::skill_prompt(skill, slash.args);
+            let input = prompt_input(session, text, std::mem::take(images));
+            submit(srv, id, input.into())
+        }
         Target::Lua(command) => {
             let session_id = session.handle.session_id.to_string();
             params
@@ -645,6 +650,23 @@ mod tests {
         };
         assert_eq!(input.message, "Review a.rs");
         assert!(f.pending());
+    }
+
+    /// The dotfiles plugin also registers `/release` as a Lua command, whose
+    /// prompt the skill must win over.
+    #[tokio::test]
+    async fn a_skill_is_sent_as_a_prompt_naming_its_file() {
+        let mut f = fixture();
+        f.send("/release the hotfix").await.unwrap().unwrap();
+        let Ok(SessionInput::Prompt(input)) = f.inputs.try_recv() else {
+            panic!("a prompt is queued");
+        };
+        assert_eq!(
+            input.message,
+            "Use the release skill: read /skills/release/SKILL.md and follow it. Focus: the hotfix"
+        );
+        assert!(f.pending());
+        assert!(f.srv.command_wait.is_none(), "no Lua handler is waited on");
     }
 
     #[tokio::test]
