@@ -39,7 +39,9 @@ use maki_config::ProjectConfig;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::agent::{CallInstructions, LoadedInstructions, default_instruction_files};
+use crate::agent::{
+    CallInstructions, LoadedInstructions, SharedMessages, default_instruction_files,
+};
 use crate::call_scope::CallScope;
 use crate::cancel::{CancelMap, CancelToken};
 use crate::live_session::SessionMailbox;
@@ -377,6 +379,12 @@ pub struct ToolContext {
     /// `session_id` with its parent on purpose (provider affinity, hooks,
     /// otel), so this is what tells their chats apart.
     pub task_id: Option<Arc<str>>,
+    /// The transcript of the agent running this tool, the one `task_id`
+    /// names: the main chat's in the agent that owns the session, its own in
+    /// a subagent. Published before the tools of a round run, so it already
+    /// holds the assistant message that made this call. `None` outside an
+    /// agent run, or in a run that mirrors its history nowhere.
+    pub transcript: Option<SharedMessages>,
     pub tool_use_id: Option<String>,
     pub user_response_rx: Option<Arc<Mutex<UnboundedReceiver<String>>>>,
     /// See [`crate::Agent::with_reauth`]. Carried here so a subagent session
@@ -657,6 +665,7 @@ pub fn interpreter_ctx(
         session_id: None,
         background_for: BackgroundFor::None,
         task_id: None,
+        transcript: None,
         tool_use_id: None,
         user_response_rx,
         reauth: false,

@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel, sync_channel};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use common::{end_session, poll_until};
 use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
 use maki_agent::template::Vars;
@@ -22,8 +23,8 @@ use maki_agent::tools::{
     ToolSource, timeout_annotation,
 };
 use maki_agent::{
-    AgentEvent, AgentMode, AgentSeed, CallScope, CancelToken, ModelSlot, SessionMailbox,
-    ToolOutput, TurnCompleteEvent,
+    AgentEvent, AgentMode, AgentSeed, CallScope, CancelToken, HistorySnapshot, ModelSlot,
+    SessionMailbox, ToolOutput, TurnCompleteEvent,
 };
 use maki_config::{
     AlwaysThinking, EDIT_SUB_TOOLS, Effect, FILE_WRITE_TOOLS, Permission, PluginsConfig,
@@ -471,6 +472,46 @@ fn ctx_task_id_names_the_calling_chat(task_id: Option<&str>, expected: &str) {
     ctx.task_id = task_id.map(Arc::from);
     assert_eq!(
         exec_with_ctx(&reg, "which_task", json!({}), &ctx).unwrap(),
+        expected
+    );
+}
+
+const TRANSCRIPT_PLUGIN: &str = r#"
+maki.api.register_tool({
+    name = "own_transcript",
+    description = "reports the caller's newest message",
+    schema = { type = "object", properties = {}, additionalProperties = false },
+    handler = function(_, ctx)
+        local ok, msgs = pcall(ctx.messages, ctx, { last = 1 })
+        if not ok then return "raised" end
+        return "newest:" .. msgs[1].content[1].text
+    end,
+})
+"#;
+const TRANSCRIPT_TEXT: &str = "the caller's own words";
+const TRANSCRIPT_DENIED: &str = "raised";
+
+/// The runtime stamps the tool owner's grants on the ctx, so `ctx:messages`
+/// answers exactly when the owner holds `session_read`.
+#[test_case::test_case(PluginPermissions::trusted(), true ; "granted")]
+#[test_case::test_case(PluginPermissions::denied(), false ; "denied")]
+fn ctx_messages_reads_the_transcript_on_the_tool_context(grants: PluginPermissions, reads: bool) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source_with_permissions("transcript_plugin", TRANSCRIPT_PLUGIN, grants)
+        .unwrap();
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&AgentMode::Build);
+    ctx.task_id = Some(Arc::from(SUBAGENT_TASK_ID));
+    ctx.transcript = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(vec![
+        Message::user(TRANSCRIPT_TEXT.into()),
+    ]))));
+    let expected = if reads {
+        format!("newest:{TRANSCRIPT_TEXT}")
+    } else {
+        TRANSCRIPT_DENIED.to_owned()
+    };
+    assert_eq!(
+        exec_with_ctx(&reg, "own_transcript", json!({}), &ctx).unwrap(),
         expected
     );
 }

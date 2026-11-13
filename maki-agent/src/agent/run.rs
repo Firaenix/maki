@@ -1088,6 +1088,7 @@ impl<'h> Agent<'h> {
             session_id: self.session_id.clone(),
             background_for: self.background_for.clone(),
             task_id: self.task_id.clone(),
+            transcript: self.history.mirror().cloned(),
             tool_use_id: None,
             user_response_rx: self.user_response_rx.clone(),
             reauth: self.reauth,
@@ -1381,7 +1382,7 @@ mod tests {
     use super::*;
     use crate::agent::Transcript;
     use crate::agent::frame::RunContext;
-    use crate::agent::history::USER_CANCEL_MARKER;
+    use crate::agent::history::{HistorySnapshot, SharedMessages, USER_CANCEL_MARKER};
     use crate::agent::hook::testing::{Seen, script};
     use crate::mcp::test_support::stub_session;
     use crate::mcp::tool_names;
@@ -4271,6 +4272,21 @@ mod tests {
             .expect("valid session id");
         agent.session_id = Some(session.clone());
         assert_eq!(agent.tool_context(Arc::default()).session_id, Some(session));
+    }
+
+    /// `ctx:messages` reads the running agent's own transcript through this.
+    #[test]
+    fn tool_context_carries_the_history_mirror() {
+        let mut unmirrored = History::new(Vec::new());
+        let (agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut unmirrored);
+        assert!(agent.tool_context(Arc::default()).transcript.is_none());
+        drop(agent);
+
+        let mirror: SharedMessages = Arc::new(ArcSwap::from_pointee(HistorySnapshot::default()));
+        let mut history = History::new(Vec::new()).with_mirror(Arc::clone(&mirror));
+        let (agent, _event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+        let transcript = agent.tool_context(Arc::default()).transcript;
+        assert!(transcript.is_some_and(|transcript| Arc::ptr_eq(&transcript, &mirror)));
     }
 
     fn answer_only(
