@@ -2101,9 +2101,6 @@ name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
-dependencies = [
- "getrandom 0.4.3",
-]
 
 [[package]]
 name = "fax"
@@ -2185,18 +2182,6 @@ dependencies = [
  "borrow-or-share",
  "ref-cast",
  "serde",
-]
-
-[[package]]
-name = "flume"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e139bc46ca777eb5efaf62df0ab8cc5fd400866427e56c68b22e414e53bd3be"
-dependencies = [
- "fastrand",
- "futures-core",
- "futures-sink",
- "spin",
 ]
 
 [[package]]
@@ -3611,7 +3596,6 @@ version = "0.7.1"
 dependencies = [
  "clap",
  "color-eyre",
- "flume",
  "futures",
  "libc",
  "maki-acp",
@@ -3643,7 +3627,6 @@ version = "0.7.1"
 dependencies = [
  "agent-client-protocol-schema",
  "color-eyre",
- "flume",
  "futures",
  "jiff",
  "maki-agent",
@@ -3667,8 +3650,6 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "bitflags 2.13.2",
- "event-listener",
- "flume",
  "futures",
  "grep-regex",
  "grep-searcher",
@@ -3754,10 +3735,11 @@ dependencies = [
 name = "maki-highlight"
 version = "0.7.1"
 dependencies = [
- "flume",
+ "arc-swap",
  "serde_json",
  "syntect",
  "test-case",
+ "tokio",
  "tracing",
  "two-face",
 ]
@@ -3784,9 +3766,7 @@ dependencies = [
  "base64 0.23.1",
  "criterion",
  "crossterm",
- "event-listener",
  "fastrand",
- "flume",
  "futures",
  "htmd",
  "image",
@@ -3821,6 +3801,7 @@ dependencies = [
  "test-case",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
  "toml",
  "tracing",
  "tree-sitter",
@@ -3919,12 +3900,13 @@ dependencies = [
 name = "maki-providers"
 version = "0.7.1"
 dependencies = [
+ "arc-swap",
  "aws-config",
  "aws-credential-types",
  "aws-sigv4",
  "base64 0.23.1",
+ "bytes",
  "fastrand",
- "flume",
  "futures",
  "getrandom 0.4.3",
  "image",
@@ -3940,12 +3922,12 @@ dependencies = [
  "serde-saphyr",
  "serde_json",
  "sha2 0.11.1",
+ "sse-stream 0.3.0",
  "strum 0.28.0",
  "tempfile",
  "test-case",
  "thiserror 2.0.21",
  "tokio",
- "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -3958,6 +3940,7 @@ version = "0.7.1"
 dependencies = [
  "bs58",
  "etcetera",
+ "futures",
  "getrandom 0.4.3",
  "reqwest",
  "serde",
@@ -3965,6 +3948,8 @@ dependencies = [
  "tempfile",
  "test-case",
  "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -3980,7 +3965,6 @@ dependencies = [
  "criterion",
  "crossterm",
  "fastrand",
- "flume",
  "futures",
  "getrandom 0.4.3",
  "image",
@@ -4016,7 +4000,6 @@ dependencies = [
  "tracing",
  "unicode-segmentation",
  "unicode-width",
- "wait-timeout",
  "windows-sys 0.61.2",
 ]
 
@@ -4349,7 +4332,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9eba4aae18a1495cd8eb448bdca59fd348db884b1cd7b6a899a8c82d78f9f0f6"
 dependencies = [
  "bitflags 2.13.2",
- "flume",
  "inotify",
  "kqueue",
  "libc",
@@ -6048,7 +6030,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
- "sse-stream",
+ "sse-stream 0.2.6",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
@@ -6819,6 +6801,22 @@ dependencies = [
  "http-body",
  "http-body-util",
  "pin-project-lite",
+]
+
+[[package]]
+name = "sse-stream"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d385160fc0fba84f7b9cc8ef3263e410d0e3ca7ab4927f1356df33145ace69a4"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http-body",
+ "http-body-util",
+ "memchr",
+ "pin-project-lite",
+ "simdutf8",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -8182,15 +8180,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d9b2acfb050df409c972a37d3b8e08cdea3bddb0c09db9d53137e504cfabed0"
 dependencies = [
  "utf8parse",
-]
-
-[[package]]
-name = "wait-timeout"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11"
-dependencies = [
- "libc",
 ]
 
 [[package]]

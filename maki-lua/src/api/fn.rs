@@ -7,6 +7,7 @@ use std::time::Duration;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_storage::id::MakiId;
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult, Table, Value};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::sleep;
 
 use crate::api::fs::expand_tilde;
@@ -471,7 +472,8 @@ async fn jobwait(
             snap.dropped_output,
         );
     }
-    let Some(lease) = with_jobs(&lua, |store| store.lease_events(job_id, task_id, &plugin)) else {
+    let Some(mut lease) = with_jobs(&lua, |store| store.lease_events(job_id, task_id, &plugin))
+    else {
         return Ok(err_pair(JOB_UNWAITABLE_ERR));
     };
 
@@ -486,7 +488,7 @@ async fn jobwait(
     let exit_code = loop {
         let event = tokio::select! {
             biased;
-            event = lease.events().recv_async() => event,
+            event = lease.recv() => event,
             () = &mut deadline => None,
         };
 
@@ -567,7 +569,7 @@ fn executable(_lua: &Lua, name: String) -> LuaResult<i32> {
 #[lua_fn]
 async fn winsaveview(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
 ) -> LuaResult<Pair<Table>> {
     let view =
         try_pair!(ui_roundtrip(tx.as_ref(), |reply_tx| UiAction::WinSaveView { reply_tx }).await);
@@ -594,7 +596,7 @@ async fn winsaveview(
 #[lua_fn]
 fn winrestview(
     _lua: &Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     view: Table,
 ) -> LuaResult<Pair<bool>> {
     let topline = view.opt::<i64>("topline")?.unwrap_or(1);
@@ -634,7 +636,7 @@ lua_table! {
         plugin: Arc<str>,
         perms: &PluginPermissions,
         grants: PluginPermissions,
-        tx: Option<flume::Sender<UiAction>>,
+        tx: Option<UnboundedSender<UiAction>>,
     ), DOCS [
         jobstart(perms, plugin, grants), jobstop(perms, plugin), jobforget(perms, plugin),
         jobwait(perms, plugin), jobinfo(perms, plugin), joblist(perms, plugin),
@@ -649,13 +651,15 @@ mod tests {
     use super::*;
     use crate::api::util::command::{NO_UI_ERR, WinView};
     use futures::FutureExt;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::unbounded_channel;
 
     const TEST_PLUGIN: &str = "test-plugin";
     /// Can't exit while a test runs, so only the code under test ends it.
     const SLEEPING_JOB: &str = "sleep 600";
     const LONG_WAIT_MS: u64 = 600_000;
 
-    fn lua_with_view(tx: Option<flume::Sender<UiAction>>) -> Lua {
+    fn lua_with_view(tx: Option<UnboundedSender<UiAction>>) -> Lua {
         let lua = Lua::new();
         let t = lua.create_table().unwrap();
         winsaveview__register(&t, &lua, tx.clone()).unwrap();
@@ -680,20 +684,19 @@ mod tests {
         const LINE_COUNT: u32 = 100;
         const HEIGHT: u16 = 24;
 
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         let lua = lua_with_view(Some(tx));
         std::thread::spawn(move || {
-            let Ok(UiAction::WinSaveView { reply_tx }) = rx.recv() else {
+            let Some(UiAction::WinSaveView { reply_tx }) = rx.blocking_recv() else {
                 panic!("expected winsaveview request");
             };
-            reply_tx
-                .send(WinView {
-                    scroll_top: SCROLL_TOP,
-                    line_count: LINE_COUNT,
-                    height: HEIGHT,
-                    auto_scroll: false,
-                })
-                .unwrap();
+            let sent = reply_tx.send(WinView {
+                scroll_top: SCROLL_TOP,
+                line_count: LINE_COUNT,
+                height: HEIGHT,
+                auto_scroll: false,
+            });
+            assert!(sent.is_ok());
         });
         let (view, err): (Table, Option<String>) = lua
             .load("return f.winsaveview()")
@@ -712,7 +715,7 @@ mod tests {
     #[test_case::test_case("{ topline = -5 }", 0 ; "below_range_clamps_to_first_line")]
     #[tokio::test]
     async fn winrestview_forwards_zero_based_scroll_top(arg: &str, expected: u32) {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         let lua = lua_with_view(Some(tx));
         let (ok, err): (bool, Option<String>) = lua
             .load(format!("return f.winrestview({arg})"))
@@ -721,7 +724,7 @@ mod tests {
             .unwrap();
         assert!(ok);
         assert_eq!(err, None);
-        let Ok(UiAction::WinRestView { scroll_top }) = rx.recv() else {
+        let Some(UiAction::WinRestView { scroll_top }) = rx.recv().await else {
             panic!("expected winrestview request");
         };
         assert_eq!(scroll_top, expected);

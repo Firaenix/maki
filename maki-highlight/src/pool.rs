@@ -19,35 +19,42 @@
 use std::any::Any;
 use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-use std::sync::OnceLock;
+use std::sync::LazyLock;
+use std::sync::mpsc::{Sender, channel, sync_channel};
 use std::thread::{self, Result as ThreadResult};
 
-use flume::{Receiver, RecvError};
+use tokio::sync::oneshot;
 use tracing::error;
 
 const UNKNOWN_PANIC: &str = "<non-string panic payload>";
+const HIGHLIGHT_THREAD: &str = "highlight";
 const THREAD_GONE: &str = "the highlight thread is gone";
 
-type Job = Box<dyn FnOnce() + Send + 'static>;
+pub type Job = Box<dyn FnOnce() + Send + 'static>;
 
-static JOBS: OnceLock<flume::Sender<Job>> = OnceLock::new();
+static JOBS: LazyLock<Sender<Job>> = LazyLock::new(|| {
+    let jobs = job_thread(HIGHLIGHT_THREAD);
+    // Queued ahead of every other job, so a nested `run` sees it.
+    let _ = jobs.send(Box::new(|| ON_HIGHLIGHT_THREAD.set(true)));
+    jobs
+});
 
-fn jobs() -> &'static flume::Sender<Job> {
-    JOBS.get_or_init(|| {
-        let (tx, rx) = flume::unbounded::<Job>();
-        thread::Builder::new()
-            .name("highlight".into())
-            .spawn(move || {
-                ON_HIGHLIGHT_THREAD.set(true);
-                while let Ok(job) = rx.recv() {
-                    if let Err(payload) = catch_unwind(AssertUnwindSafe(job)) {
-                        error!(panic = panic_message(&*payload), "highlight job panicked");
-                    }
+/// Spawns a thread named {name} that runs the jobs sent to it one at a time,
+/// in order. A job that panics is logged and the thread goes on with the next.
+pub fn job_thread(name: &str) -> Sender<Job> {
+    let (jobs, queued) = channel::<Job>();
+    let thread_name = name.to_owned();
+    thread::Builder::new()
+        .name(thread_name.clone())
+        .spawn(move || {
+            while let Ok(job) = queued.recv() {
+                if let Err(payload) = catch_unwind(AssertUnwindSafe(job)) {
+                    error!(thread = %thread_name, panic = panic_message(&*payload), "job panicked");
                 }
-            })
-            .expect("failed to spawn the highlight thread");
-        tx
-    })
+            }
+        })
+        .unwrap_or_else(|e| panic!("failed to spawn the {name} thread: {e}"));
+    jobs
 }
 
 thread_local! {
@@ -69,7 +76,11 @@ pub fn run<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     if ON_HIGHLIGHT_THREAD.get() {
         return f();
     }
-    receive_result(submit(f).recv())
+    let (done_tx, done_rx) = sync_channel(1);
+    spawn(move || {
+        let _ = done_tx.send(catch_unwind(AssertUnwindSafe(f)));
+    });
+    receive_result(done_rx.recv().ok())
 }
 
 /// Waits without occupying a blocking worker. Dropping the future discards
@@ -78,29 +89,25 @@ pub async fn run_async<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static
     if ON_HIGHLIGHT_THREAD.get() {
         return f();
     }
-    receive_result(submit(f).recv_async().await)
-}
-
-fn submit<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Receiver<ThreadResult<T>> {
-    let (done_tx, done_rx) = flume::bounded(1);
+    let (done_tx, done_rx) = oneshot::channel();
     spawn(move || {
-        if !done_tx.is_disconnected() {
+        if !done_tx.is_closed() {
             let _ = done_tx.send(catch_unwind(AssertUnwindSafe(f)));
         }
     });
-    done_rx
+    receive_result(done_rx.await.ok())
 }
 
-fn receive_result<T>(result: Result<ThreadResult<T>, RecvError>) -> T {
+fn receive_result<T>(result: Option<ThreadResult<T>>) -> T {
     match result {
-        Ok(Ok(value)) => value,
-        Ok(Err(payload)) => resume_unwind(payload),
-        Err(_) => panic!("{THREAD_GONE}"),
+        Some(Ok(value)) => value,
+        Some(Err(payload)) => resume_unwind(payload),
+        None => panic!("{THREAD_GONE}"),
     }
 }
 
 pub fn spawn(f: impl FnOnce() + Send + 'static) {
-    let _ = jobs().send(Box::new(f));
+    let _ = JOBS.send(Box::new(f));
 }
 
 #[cfg(test)]
@@ -109,6 +116,7 @@ mod tests {
     use std::panic::catch_unwind;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::channel;
     use std::task::{Context, Poll, Waker};
     use std::thread;
 
@@ -123,7 +131,7 @@ mod tests {
     #[test_case(true; "cancelled")]
     #[test_case(false; "awaited")]
     fn dropped_async_waiter_discards_queued_work(cancel: bool) {
-        let (release_tx, release_rx) = flume::bounded::<()>(1);
+        let (release_tx, release_rx) = channel::<()>();
         spawn(move || {
             let _ = release_rx.recv();
         });

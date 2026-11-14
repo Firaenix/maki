@@ -13,32 +13,17 @@ use std::cell::RefCell;
 #[cfg(test)]
 use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
-use std::thread;
 
-use flume::{Receiver, Sender};
 use maki_agent::UiWaker;
+use maki_highlight::pool::{Job, job_thread};
 
 const PARSE_THREAD: &str = "input-parse";
 
-type Job = Box<dyn FnOnce() + Send>;
+static WAKER: LazyLock<UiWaker> = LazyLock::new(UiWaker::default);
 
-static WAKER: LazyLock<(UiWaker, Receiver<()>)> = LazyLock::new(UiWaker::new);
-
-static PARSES: LazyLock<Sender<Job>> = LazyLock::new(|| {
-    let (jobs, queued) = flume::unbounded::<Job>();
-    thread::Builder::new()
-        .name(PARSE_THREAD.into())
-        .spawn(move || {
-            while let Ok(job) = queued.recv() {
-                if catch_unwind(AssertUnwindSafe(job)).is_err() {
-                    tracing::error!("input parse panicked");
-                }
-            }
-        })
-        .expect("failed to spawn the input parse thread");
-    jobs
-});
+static PARSES: LazyLock<Sender<Job>> = LazyLock::new(|| job_thread(PARSE_THREAD));
 
 #[cfg(test)]
 thread_local! {
@@ -49,8 +34,8 @@ thread_local! {
 }
 
 /// Ready once a job has finished since the loop last looked.
-pub fn wakes() -> &'static Receiver<()> {
-    &WAKER.1
+pub fn wakes() -> &'static UiWaker {
+    &WAKER
 }
 
 /// Runs {job} on the highlight thread.
@@ -98,7 +83,7 @@ fn send(job: impl FnOnce() + Send + 'static, run: impl FnOnce(Job)) {
     // A job that panicked has finished too, and its input waits to hear it.
     let job: Job = Box::new(move || {
         let finished = catch_unwind(AssertUnwindSafe(job));
-        WAKER.0.wake();
+        WAKER.wake();
         if let Err(panic) = finished {
             resume_unwind(panic);
         }
@@ -146,9 +131,9 @@ mod tests {
     fn a_job_that_panics_still_wakes_the_loop() {
         manual();
         spawn(|| panic!("{JOB_PANIC}"));
-        while wakes().try_recv().is_ok() {}
+        while wakes().take_wake() {}
 
         assert!(catch_unwind(run_queued).is_err());
-        assert!(wakes().try_recv().is_ok());
+        assert!(wakes().take_wake());
     }
 }

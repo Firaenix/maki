@@ -1,10 +1,10 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::path::Path;
+use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use flume::Sender;
 use maki_agent::agent::tool_dispatch::routed_view;
 use maki_agent::permissions::is_universal_scope;
 use maki_agent::prompt::{PromptId, Slot, SlotKind, ValidNames};
@@ -26,6 +26,7 @@ use mlua::{
     Value as LuaValue,
 };
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::time::sleep;
 
@@ -274,7 +275,7 @@ pub(crate) type PendingRules = Arc<Mutex<Vec<PendingRule>>>;
 
 pub(crate) struct LuaTool {
     pub(crate) meta: ToolMeta,
-    pub(crate) tx: Sender<Request>,
+    pub(crate) tx: UnboundedSender<Request>,
     pub(crate) plugin: Arc<str>,
     pub(crate) has_header_fn: bool,
     pub(crate) has_start_fn: bool,
@@ -298,7 +299,7 @@ impl Tool for LuaTool {
                 None => Cow::Borrowed(&self.meta.description),
             };
         }
-        let (reply_tx, reply_rx) = flume::bounded(1);
+        let (reply_tx, reply_rx) = sync_channel(1);
         let sent = self
             .tx
             .send(Request::Describe {
@@ -403,7 +404,7 @@ struct LuaToolInvocation {
     has_header_fn: bool,
     has_start_fn: bool,
     input: Value,
-    tx: Sender<Request>,
+    tx: UnboundedSender<Request>,
     permission_state: PermissionState,
     mutable_path_field: Option<Arc<str>>,
     timeout: Option<Duration>,
@@ -424,14 +425,12 @@ impl ToolInvocation for LuaToolInvocation {
         HeaderFuture::Pending {
             fallback: fallback.clone(),
             fut: Box::pin(async move {
-                let sent = tx
-                    .send_async(Request::ComputeHeader {
-                        plugin: Arc::clone(&plugin),
-                        tool: Arc::clone(&tool),
-                        input,
-                        reply: reply_tx,
-                    })
-                    .await;
+                let sent = tx.send(Request::ComputeHeader {
+                    plugin: Arc::clone(&plugin),
+                    tool: Arc::clone(&tool),
+                    input,
+                    reply: reply_tx,
+                });
                 if sent.is_err() {
                     return HeaderResult::plain(fallback);
                 }
@@ -482,7 +481,7 @@ impl ToolInvocation for LuaToolInvocation {
         };
         let tx = self.tx.clone();
         Box::pin(async move {
-            if tx.send_async(req).await.is_ok() {
+            if tx.send(req).is_ok() {
                 let _ = reply_rx.await;
             }
         })
@@ -500,13 +499,12 @@ impl ToolInvocation for LuaToolInvocation {
                 let fallback = input.to_string();
                 Box::pin(async move {
                     if tx
-                        .send_async(Request::ComputePermissionScopes {
+                        .send(Request::ComputePermissionScopes {
                             plugin,
                             tool,
                             input,
                             reply: reply_tx,
                         })
-                        .await
                         .is_err()
                     {
                         return Some(PermissionScopes::force_prompt(fallback));
@@ -557,7 +555,7 @@ impl ToolInvocation for LuaToolInvocation {
             let lua_ctx = LuaCtx::handler(ctx);
 
             if tx
-                .send_async(Request::CallTool {
+                .send(Request::CallTool {
                     plugin: Arc::clone(&plugin),
                     tool: Arc::clone(&tool),
                     input,
@@ -567,7 +565,6 @@ impl ToolInvocation for LuaToolInvocation {
                     live,
                     nested,
                 })
-                .await
                 .is_err()
             {
                 return Err("lua thread disconnected".to_string()).into();
@@ -1121,7 +1118,7 @@ fn register_command(
 #[lua_fn]
 async fn run_command(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     #[ctx] caller: PluginReach,
     cmdline: String,
     opts: Option<Table>,
@@ -1172,7 +1169,7 @@ async fn run_command(
 #[lua_fn]
 async fn list_commands(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     #[ctx] caller: PluginReach,
 ) -> LuaResult<Pair<LuaValue>> {
     ui_json_roundtrip(&lua, tx.as_ref(), |reply_tx| UiAction::ListCommands {
@@ -1197,8 +1194,16 @@ async fn list_commands(
 ///
 /// @param spec table Hint specification:
 ///   slot    (string)         Required. Aggregate slot name (e.g. "tool_usage", "conventions").
-///   content (string|function) Required. Static text, or a `function()` that returns a string. Max 1 MiB.
-///   prompt  (string|string[]) Optional. Restrict to specific prompt ids (e.g. "system").
+///   content (string|function) Required. Static text, or a `function(ctx)` that
+///                            returns a string. Max 1 MiB. `ctx` is
+///                            `{ session_id = "..." }` naming the session whose
+///                            prompt is being built, or nil when there really
+///                            is no session (startup, ACP clients).
+///   prompt  (string|string[]) Optional. Restrict to specific prompt ids
+///                            (e.g. "system"). Entries resolve with the run's
+///                            other prompt slots, so nothing caches them
+///                            across turns. One-shot clients (`maki -p`, the
+///                            SDK, ACP) resolve all hints once at startup.
 /// @return
 /// @example
 /// maki.api.register_prompt_hint({
@@ -1237,8 +1242,9 @@ fn register_prompt_hint(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaR
 ///
 /// Identity and tone are available in system, research, and general prompts.
 /// Sections target the main agent when `prompt` is omitted. Only identity and
-/// tone accept a function called before every run. Its first value goes in the
-/// system prompt. Later changes reach the main agent as a context update.
+/// tone accept a function called before every run; it receives `ctx` as in
+/// `register_prompt_hint`. Its first value goes in the system prompt. Later
+/// changes reach the main agent as a context update.
 /// Other replacements require static strings.
 /// A known section missing from the resolved template is ignored, with a warning
 /// for explicit prompt targets.
@@ -1421,7 +1427,7 @@ pub(crate) fn create_api_table(
     reach: PluginReach,
     plugin: Arc<str>,
     opts: PluginOpts,
-    ui_action_tx: Option<flume::Sender<UiAction>>,
+    ui_action_tx: Option<UnboundedSender<UiAction>>,
 ) -> LuaResult<Table> {
     let t = lua.create_table()?;
     run_command__register(&t, lua, ui_action_tx.clone(), reach.clone())?;
@@ -2206,10 +2212,12 @@ pub(crate) fn coerce_tool_result(result: &LuaValue) -> ToolCallResult {
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::mpsc::unbounded_channel;
+    use tokio::task::yield_now;
+
     use super::*;
     use crate::runtime::test_support::{call_scope, moved_home};
     use crate::runtime::wake_or_fail;
-    use tokio::task::yield_now;
 
     const BACKGROUND_PARAM: &str = "background";
 
@@ -2224,7 +2232,24 @@ mod tests {
 
         assert_eq!(background_params(&schema, offered), expected);
     }
+    use crate::plugin_status::ErrorSeam;
     use maki_agent::ImageMediaType;
+    use strum::VariantNames;
+
+    /// The seam names are public API, and the doc list is the only place a
+    /// plugin author learns them.
+    #[test]
+    fn list_plugins_doc_names_every_seam() {
+        let missing: Vec<&str> = ErrorSeam::VARIANTS
+            .iter()
+            .copied()
+            .filter(|seam| !list_plugins__doc.desc.contains(&format!("`\"{seam}\"`")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "seams missing from the doc: {missing:?}"
+        );
+    }
 
     const LEGACY_TEXT: &[u8] = b"caf\xe9";
     const DISPLAY_TEXT: &str = "caf\u{fffd}";
@@ -2246,23 +2271,6 @@ mod tests {
     #[test_case::test_case(&"a".repeat(TOOL_NAME_MAX + 1), false ; "too_long")]
     fn tool_name_validation(name: &str, expected: bool) {
         assert_eq!(is_valid_tool_name(name), expected);
-    }
-    use crate::plugin_status::ErrorSeam;
-    use strum::VariantNames;
-
-    /// The seam names are public API, and the doc list is the only place a
-    /// plugin author learns them.
-    #[test]
-    fn list_plugins_doc_names_every_seam() {
-        let missing: Vec<&str> = ErrorSeam::VARIANTS
-            .iter()
-            .copied()
-            .filter(|seam| !list_plugins__doc.desc.contains(&format!("`\"{seam}\"`")))
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "seams missing from the doc: {missing:?}"
-        );
     }
 
     #[test_case::test_case(
@@ -2322,7 +2330,7 @@ mod tests {
     }
 
     fn invocation(input: Value) -> LuaToolInvocation {
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         LuaToolInvocation {
             tool: Arc::from("test_tool"),
             plugin: Arc::from("test"),
@@ -2373,7 +2381,7 @@ mod tests {
             "required": ["url"],
         }))
         .unwrap();
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         LuaTool {
             meta: ToolMeta {
                 name: Arc::from("test_tool"),
@@ -2502,7 +2510,7 @@ mod tests {
     #[tokio::test]
     async fn needs_compute_fallback_on_failure() {
         // Closed channel → fallback to force_prompt
-        let (tx, rx) = flume::bounded(0);
+        let (tx, rx) = unbounded_channel();
         drop(rx);
         let inv = LuaToolInvocation {
             tool: Arc::from("bash"),
@@ -2521,7 +2529,7 @@ mod tests {
         assert!(!scopes.scopes.is_empty());
 
         // Callback returns None → fallback to force_prompt
-        let (tx2, rx2) = flume::bounded(1);
+        let (tx2, mut rx2) = unbounded_channel();
         let inv2 = LuaToolInvocation {
             tool: Arc::from("bash"),
             plugin: Arc::from("test"),
@@ -2535,7 +2543,7 @@ mod tests {
             has_start_fn: false,
         };
         std::thread::spawn(move || {
-            if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx2.recv() {
+            if let Some(Request::ComputePermissionScopes { reply, .. }) = rx2.blocking_recv() {
                 let _ = reply.send(None);
             }
         });
@@ -2545,7 +2553,7 @@ mod tests {
 
     #[tokio::test]
     async fn needs_compute_returns_callback_result() {
-        let (tx, rx) = flume::bounded(1);
+        let (tx, mut rx) = unbounded_channel();
         let inv = LuaToolInvocation {
             tool: Arc::from("bash"),
             plugin: Arc::from("test"),
@@ -2559,7 +2567,7 @@ mod tests {
             has_start_fn: false,
         };
         std::thread::spawn(move || {
-            if let Ok(Request::ComputePermissionScopes { reply, .. }) = rx.recv() {
+            if let Some(Request::ComputePermissionScopes { reply, .. }) = rx.blocking_recv() {
                 let _ = reply.send(Some(PermissionScopes {
                     scopes: vec!["cargo".into(), "test".into()],
                     force_prompt: false,

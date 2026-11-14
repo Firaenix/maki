@@ -1,12 +1,10 @@
 //! What `maki acp` hands its sessions for slash commands: the TUI's command
 //! table, markdown commands, and the Lua plugins this process loaded.
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use flume::Receiver;
 use futures::future::BoxFuture;
 use maki_acp::commands::{CommandHost, HostBuiltin, LuaCommand};
 use maki_acp::host::HostRequest;
@@ -17,7 +15,7 @@ use maki_lua::{
     EventHandle, LuaCommandReader, NO_UI_ERR, PackCommand, PackPreparation, SessionRequest,
     UiAction, WinEvent,
 };
-use tokio::runtime::Handle;
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 const PACK_PANIC_ERR: &str = "package preparation panicked";
 const PACK_REVIEW_MSG: &str = "This package change needs a review first. Review it in the TUI, \
@@ -88,17 +86,13 @@ impl CommandHost for AcpCommands {
                 Ok(command) => command,
                 Err(message) => return message,
             };
-            // Preparation fetches through git and blocks on the Lua thread,
-            // so it stays off the executor, like the TUI's.
-            let runtime = Handle::current();
-            let preparation = tokio::task::spawn_blocking(move || {
-                catch_unwind(AssertUnwindSafe(|| match events.package_context() {
-                    Ok(context) => {
-                        runtime.block_on(maki_lua::prepare_pack_command(&command, &context))
-                    }
+            // Its own task, like the TUI's, so a panic in preparation comes
+            // back as a message instead of taking the server down.
+            let preparation = tokio::spawn(async move {
+                match events.package_context().await {
+                    Ok(context) => maki_lua::prepare_pack_command(&command, &context).await,
                     Err(error) => PackPreparation::failed(error),
-                }))
-                .unwrap_or_else(|_| PackPreparation::failed(PACK_PANIC_ERR.to_owned()))
+                }
             })
             .await
             .unwrap_or_else(|_| PackPreparation::failed(PACK_PANIC_ERR.to_owned()));
@@ -117,10 +111,10 @@ impl CommandHost for AcpCommands {
 /// Drains the plugin host's UI channel for ACP, which has no TUI to answer it.
 /// `maki.session.prompt` goes to the session; every other call that waits
 /// for a reply hears there is no UI, and one that waits on nothing is dropped.
-pub fn forward_ui(actions: Receiver<UiAction>) -> Receiver<HostRequest> {
-    let (tx, rx) = flume::unbounded();
+pub fn forward_ui(mut actions: UnboundedReceiver<UiAction>) -> UnboundedReceiver<HostRequest> {
+    let (tx, rx) = unbounded_channel();
     tokio::spawn(async move {
-        while let Ok(action) = actions.recv_async().await {
+        while let Some(action) = actions.recv().await {
             match action {
                 UiAction::Session {
                     req: SessionRequest::Prompt { id, text, images },

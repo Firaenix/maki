@@ -273,7 +273,9 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
     // After the prompt is read, so a signal still ends a stdin read at once.
     let interrupt = Interrupt::install();
 
-    let prompt_slots = lua_handle.collect_prompt_slots();
+    let prompt_slots = lua_handle
+        .collect_prompt_slots(Some(resumed.id.as_str()))
+        .await;
 
     let initial_wd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let cwd = initial_wd.to_string_lossy().into_owned();
@@ -396,6 +398,7 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
             | AgentEvent::QueueItemConsumed { .. }
             | AgentEvent::QueueDrained
             | AgentEvent::AutoCompacting { .. }
+            | AgentEvent::CompactionStarted
             | AgentEvent::CompactionDone { .. }
             | AgentEvent::AuthRequired
             | AgentEvent::AllowedByPlugin { .. }
@@ -473,7 +476,9 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         }
     }
     let track = headless::await_shutdown(task).await;
-    lua_handle.end_sessions_blocking([session_id.id()], SessionEndReason::Completed);
+    lua_handle
+        .end_sessions([session_id.id()], SessionEndReason::Completed)
+        .await;
     // Background work and plugin jobs are stopped by now, so nothing spends
     // any more. Dropping the track saves the full bill, also what no turn
     // was left to report.

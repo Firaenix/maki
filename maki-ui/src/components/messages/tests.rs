@@ -21,6 +21,7 @@ use std::collections::HashSet;
 use std::ops::Range;
 use std::time::Duration;
 use test_case::test_case;
+use tokio::sync::mpsc::unbounded_channel;
 
 const UNDECODABLE_IMAGE: &str = "invalid image";
 const VIEW_WIDTH: u16 = 80;
@@ -826,6 +827,18 @@ fn search_text_instruction_segment_indexes_its_own_blocks() {
         !seg_search(&panel, "t1").contains(BODY),
         "the parent tool renders the code, not the instructions it carried"
     );
+}
+
+#[test_case("fix src/__init__.py" ; "underscores")]
+#[test_case("--- a/x\n+++ b/x\n- old\n+ new" ; "pasted_diff")]
+#[test_case("    indented\n# not a heading" ; "indentation_and_hash")]
+fn user_message_shows_as_typed(text: &str) {
+    let message = DisplayMessage::new(DisplayRole::User, text.into());
+    let rows: Vec<String> = build_message_lines(&message, VIEW_WIDTH)
+        .iter()
+        .map(|row| row.to_string())
+        .collect();
+    assert_eq!(rows.join("\n"), format!("{}{text}", user_style().prefix));
 }
 
 #[test]
@@ -1701,7 +1714,7 @@ fn second_register_live_buf_replaces_first() {
 #[test_case(true ; "error_finish")]
 fn handle_click_on_watched_tool_sends_click_with_fallback(is_error: bool) {
     let (eh, probe) = maki_lua::test_support::probed_event_handle();
-    let (tx, _rx) = flume::unbounded();
+    let (tx, _rx) = unbounded_channel();
     let mut panel = MessagesPanel::new(UiConfig::default(), eh);
     panel.set_restore_channel(Some(EventSender::new(tx, 0)));
     finish_with_live_buf(&mut panel, "t1", "body", is_error);
@@ -1739,7 +1752,7 @@ fn tool_done_moves_live_buf_to_watched_polled_but_not_animating() {
 #[test]
 fn watched_fifo_evicts_oldest_which_stops_polling_and_restores_with_recorded_clicks() {
     let (eh, probe) = maki_lua::test_support::probed_event_handle();
-    let (tx, _rx) = flume::unbounded();
+    let (tx, _rx) = unbounded_channel();
     let mut panel = MessagesPanel::new(UiConfig::default(), eh);
     panel.set_restore_channel(Some(EventSender::new(tx, 0)));
     let buf = finish_with_live_buf(&mut panel, "t0", "before", false);
@@ -1784,7 +1797,7 @@ fn watched_fifo_evicts_oldest_which_stops_polling_and_restores_with_recorded_cli
 #[test]
 fn tool_done_without_live_buf_is_not_watched_and_click_restores() {
     let (eh, probe) = maki_lua::test_support::probed_event_handle();
-    let (tx, _rx) = flume::unbounded();
+    let (tx, _rx) = unbounded_channel();
     let mut panel = MessagesPanel::new(UiConfig::default(), eh);
     panel.set_restore_channel(Some(EventSender::new(tx, 0)));
     let mut ev = start("t1", BASH_TOOL_NAME);
@@ -1814,7 +1827,7 @@ fn tool_done_without_live_buf_is_not_watched_and_click_restores() {
 #[test]
 fn cancel_in_progress_retires_live_buf_to_watched() {
     let (eh, probe) = maki_lua::test_support::probed_event_handle();
-    let (tx, _rx) = flume::unbounded();
+    let (tx, _rx) = unbounded_channel();
     let mut panel = MessagesPanel::new(UiConfig::default(), eh);
     panel.set_restore_channel(Some(EventSender::new(tx, 0)));
     let buf = Arc::new(maki_agent::SharedBuf::new());
@@ -1857,7 +1870,7 @@ fn cancel_in_progress_retires_live_buf_to_watched() {
 #[test]
 fn restore_reply_stops_watching_buf() {
     let (eh, probe) = maki_lua::test_support::probed_event_handle();
-    let (tx, _rx) = flume::unbounded();
+    let (tx, _rx) = unbounded_channel();
     let mut panel = MessagesPanel::new(UiConfig::default(), eh);
     panel.set_restore_channel(Some(EventSender::new(tx, 0)));
     let buf = finish_with_live_buf(&mut panel, "t1", "old-theme", false);
@@ -1900,7 +1913,7 @@ fn restore_reply_stops_watching_buf() {
 #[test]
 fn rebake_request_stops_watching_buf() {
     let (eh, probe) = maki_lua::test_support::probed_event_handle();
-    let (tx, _rx) = flume::unbounded();
+    let (tx, _rx) = unbounded_channel();
     let mut panel = MessagesPanel::new(UiConfig::default(), eh);
     panel.set_restore_channel(Some(EventSender::new(tx, 0)));
     finish_with_live_buf(&mut panel, "t1", "old-theme", false);
@@ -2081,7 +2094,7 @@ fn superseded_rebake_reply_is_dropped() {
 }
 
 fn test_event_sender() -> maki_agent::EventSender {
-    let (tx, _rx) = flume::unbounded();
+    let (tx, _rx) = unbounded_channel();
     maki_agent::EventSender::new(tx, 0)
 }
 

@@ -3,6 +3,8 @@
 
 mod common;
 
+use maki_lua::test_support::wait_next;
+use std::iter;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -15,6 +17,7 @@ use maki_lua::{MoveOutcome, PluginHost, UiAction};
 use maki_storage::id::MakiId;
 use serde_json::json;
 use test_case::test_case;
+use tokio::sync::mpsc::UnboundedReceiver;
 
 const PLUGIN: &str = "session_move_test";
 const CALL_ID: &str = "toolu_session_move";
@@ -74,7 +77,7 @@ end)
 struct Host {
     reg: Arc<ToolRegistry>,
     host: PluginHost,
-    ui: flume::Receiver<UiAction>,
+    ui: UnboundedReceiver<UiAction>,
 }
 
 impl Host {
@@ -82,8 +85,7 @@ impl Host {
         let reg = Arc::new(ToolRegistry::new());
         let host = PluginHost::new(Arc::clone(&reg)).unwrap();
         host.load_source(PLUGIN, SRC).unwrap();
-        host.ui_attachment().attach();
-        let ui = host.ui_action_rx();
+        let ui = host.take_ui_action_rx().unwrap();
         Self { reg, host, ui }
     }
 
@@ -105,10 +107,10 @@ impl Host {
 
     /// What the task tabs heard up to the moved call's final reply, and
     /// that reply.
-    fn until_task_done(&self) -> (Vec<AgentEvent>, ToolDoneEvent) {
+    fn until_task_done(&mut self) -> (Vec<AgentEvent>, ToolDoneEvent) {
         let mut relayed = Vec::new();
         loop {
-            let envelope = next_task_event(&self.ui);
+            let envelope = next_task_event(&mut self.ui);
             match (envelope.event, envelope.subagent) {
                 (AgentEvent::ToolDone(done), None) if done.id == CALL_ID => {
                     return (relayed, *done);
@@ -120,7 +122,7 @@ impl Host {
 }
 
 struct Running {
-    events: flume::Receiver<Envelope>,
+    events: UnboundedReceiver<Envelope>,
     call: JoinHandle<ToolDoneEvent>,
     run: CancelTrigger,
     /// The run's `subagent_cancels`, which run end drains.
@@ -153,14 +155,14 @@ impl Running {
 /// drop it as stale.
 #[test]
 fn a_moved_subagent_outlives_its_run_and_reports_to_the_chat() {
-    let host = Host::new();
+    let mut host = Host::new();
     let chat = Chat::live();
     let parked = Parked::new(RESULT);
     let running = Running::start(&host, chat.id, SUB, &parked);
     parked.wait_started();
     assert_eq!(host.request(), MoveOutcome::Moved);
     let Running {
-        events,
+        mut events,
         call,
         run,
         cancels,
@@ -184,8 +186,7 @@ fn a_moved_subagent_outlives_its_run_and_reports_to_the_chat() {
         "{turn:?} {run_done:?}"
     );
     assert!(
-        !events
-            .try_iter()
+        !iter::from_fn(|| events.try_recv().ok())
             .any(|envelope| matches!(envelope.event, AgentEvent::TurnComplete(_)))
     );
     assert_eq!(chat.mailbox.drain().len(), 1);
@@ -210,7 +211,7 @@ fn an_unmoved_subagent_ends_with_its_run() {
 /// turn ends would otherwise be taken for dead.
 #[test]
 fn a_move_opens_the_tab_of_a_nested_subagent_mid_turn() {
-    let host = Host::new();
+    let mut host = Host::new();
     let chat = Chat::live();
     let parked = Parked::new(RESULT);
     let running = Running::start(&host, chat.id, OUTER, &parked);
@@ -224,7 +225,7 @@ fn a_move_opens_the_tab_of_a_nested_subagent_mid_turn() {
             session,
             plugin,
             info,
-        } = host.ui.recv_timeout(WAIT).expect("tab opened at the move")
+        } = wait_next(&mut host.ui, WAIT).expect("tab opened at the move")
         {
             break (session, plugin.to_string(), info.parent_tool_use_id);
         }
@@ -242,7 +243,7 @@ fn a_move_opens_the_tab_of_a_nested_subagent_mid_turn() {
 #[test_case(SUB, None ; "a_top_level_task")]
 #[test_case(OUTER, Some(PROMPT_STOPPED) ; "a_subagent_nested_in_a_moved_call")]
 fn stopping_an_adopted_subagent_by_its_id_stops_it(tool: &str, reply: Option<&str>) {
-    let host = Host::new();
+    let mut host = Host::new();
     let chat = Chat::live();
     let parked = Parked::new(RESULT);
     let running = Running::start(&host, chat.id, tool, &parked);

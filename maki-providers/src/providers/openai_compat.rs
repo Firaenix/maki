@@ -2,19 +2,19 @@ use std::borrow::Cow;
 use std::fmt::Display;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use flume::Sender;
+use futures::TryStreamExt;
 use maki_storage::id::MakiId;
 use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::{Client, Method, RequestBuilder};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
-use super::ResolvedAuth;
 use super::copilot::copilot_usd;
+use super::{ResolvedAuth, SseBody};
 use crate::model::ModelFamily;
 use crate::types::rejects_sampling;
 use crate::{
@@ -220,7 +220,7 @@ impl OpenAiCompatProvider {
         model: &crate::model::Model,
         extra_headers: &[(&str, &str)],
         body: &Value,
-        event_tx: &Sender<ProviderEvent>,
+        event_tx: &UnboundedSender<ProviderEvent>,
         auth: &ResolvedAuth,
     ) -> Result<StreamResponse, AgentError> {
         let json_body = serde_json::to_vec(body)?;
@@ -244,8 +244,8 @@ impl OpenAiCompatProvider {
             "sending API request"
         );
 
-        super::ok_sse(&self.client, request, |body| {
-            parse_sse(body, event_tx, self.stream_timeout, self.config.usage_cost)
+        super::ok_sse(&self.client, request, self.stream_timeout, |body| {
+            parse_sse(body, event_tx, self.config.usage_cost)
         })
         .await
     }
@@ -606,10 +606,10 @@ pub(crate) struct StreamedText {
 }
 
 impl StreamedText {
-    pub(crate) async fn push_text(
+    pub(crate) fn push_text(
         &mut self,
         delta: String,
-        event_tx: &Sender<ProviderEvent>,
+        event_tx: &UnboundedSender<ProviderEvent>,
     ) -> Result<(), AgentError> {
         if delta.is_empty() {
             return Ok(());
@@ -622,23 +622,19 @@ impl StreamedText {
         };
         if !delta.is_empty() {
             self.text.push_str(&delta);
-            event_tx
-                .send_async(ProviderEvent::TextDelta { text: delta })
-                .await?;
+            event_tx.send(ProviderEvent::TextDelta { text: delta })?;
         }
         Ok(())
     }
 
-    pub(crate) async fn push_reasoning(
+    pub(crate) fn push_reasoning(
         &mut self,
         delta: String,
-        event_tx: &Sender<ProviderEvent>,
+        event_tx: &UnboundedSender<ProviderEvent>,
     ) -> Result<(), AgentError> {
         if !delta.is_empty() {
             self.reasoning.push_str(&delta);
-            event_tx
-                .send_async(ProviderEvent::ThinkingDelta { text: delta })
-                .await?;
+            event_tx.send(ProviderEvent::ThinkingDelta { text: delta })?;
         }
         Ok(())
     }
@@ -689,23 +685,18 @@ pub(crate) fn assistant_response(
 }
 
 pub async fn parse_sse(
-    reader: impl AsyncBufRead + Unpin,
-    event_tx: &Sender<ProviderEvent>,
-    stream_timeout: Duration,
+    mut events: SseBody,
+    event_tx: &UnboundedSender<ProviderEvent>,
     usage_cost: bool,
 ) -> Result<StreamResponse, AgentError> {
-    let mut lines = reader.lines();
-
     let mut streamed = StreamedText::default();
     let mut tool_accumulators: Vec<ToolAccumulator> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut stop_reason: Option<StopReason> = None;
-    let mut deadline = Instant::now() + stream_timeout;
 
-    while let Some(line) = super::next_sse_line(&mut lines, &mut deadline, stream_timeout).await? {
-        let data = match line.strip_prefix("data:") {
-            Some(d) => d.trim(),
-            None => continue,
+    while let Some(event) = events.try_next().await? {
+        let Some(data) = event.data.as_deref().map(str::trim) else {
+            continue;
         };
 
         if data == STREAM_DONE {
@@ -761,11 +752,11 @@ pub async fn parse_sse(
             .flatten()
             .find(|s| !s.is_empty())
         {
-            streamed.push_reasoning(reasoning, event_tx).await?;
+            streamed.push_reasoning(reasoning, event_tx)?;
         }
 
         match delta.content {
-            Some(ContentDelta::String(content)) => streamed.push_text(content, event_tx).await?,
+            Some(ContentDelta::String(content)) => streamed.push_text(content, event_tx)?,
             Some(ContentDelta::Array(content_array)) => {
                 for part in content_array {
                     match part {
@@ -777,11 +768,11 @@ pub async fn parse_sse(
                                     }) => content_str,
                                     ThinkingDelta::String(content_str) => content_str,
                                 };
-                                streamed.push_reasoning(content, event_tx).await?;
+                                streamed.push_reasoning(content, event_tx)?;
                             }
                         }
                         ContentDeltaPart::Text { text } => {
-                            streamed.push_text(text, event_tx).await?;
+                            streamed.push_text(text, event_tx)?;
                         }
                     }
                 }
@@ -816,12 +807,10 @@ pub async fn parse_sse(
                     }
                 }
                 if was_unnamed && !acc.name.is_empty() {
-                    event_tx
-                        .send_async(ProviderEvent::ToolUseStart {
-                            id: acc.id.clone(),
-                            name: acc.name.clone(),
-                        })
-                        .await?;
+                    event_tx.send(ProviderEvent::ToolUseStart {
+                        id: acc.id.clone(),
+                        name: acc.name.clone(),
+                    })?;
                 }
             }
         }
@@ -846,12 +835,13 @@ pub async fn parse_sse(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::iter;
     use std::sync::Arc;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use crate::model::{Model, ModelPricing, ModelTier};
-    use crate::test_support::{Canned, serve};
+    use crate::test_support::{Canned, serve, sse_body};
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
     const FIREWORKS_BASE: &str = "https://api.fireworks.ai/inference/v1";
@@ -884,7 +874,7 @@ data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"nam
 \n\
 data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}]}\n\
 \n\
-data: [DONE]\n";
+data: [DONE]\n\n";
     const IDS_MUST_DIFFER: &str =
         "two turns streaming at once must not land on the same synthetic id";
     const PENDING_ID_MUST_MATCH: &str =
@@ -935,10 +925,10 @@ data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\
 \n\
 data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10,\"prompt_tokens_details\":{\"cached_tokens\":40}}}\n\
 \n\
-data: [DONE]\n";
+data: [DONE]\n\n";
 
-        let (tx, rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
+        let (tx, mut rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse.as_bytes()), &tx, false)
             .await
             .unwrap();
 
@@ -965,10 +955,10 @@ data: [DONE]\n";
         let sse = "\
 data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10,\"prompt_cache_hit_tokens\":80,\"prompt_cache_miss_tokens\":20}}\n\
 \n\
-data: [DONE]\n";
+data: [DONE]\n\n";
 
-        let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
+        let (tx, _rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse.as_bytes()), &tx, false)
             .await
             .unwrap();
 
@@ -991,17 +981,12 @@ data: [DONE]\n";
             "choices": [{"finish_reason": "stop", "delta": {}}],
             "usage": {"prompt_tokens": 100, "completion_tokens": 10, "cost": cost},
         });
-        let sse = format!("data: {chunk}\n\ndata: [DONE]\n");
+        let sse = format!("data: {chunk}\n\ndata: [DONE]\n\n");
 
-        let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(
-            Cursor::new(sse.as_bytes()),
-            &tx,
-            TEST_STREAM_TIMEOUT,
-            usage_cost,
-        )
-        .await
-        .unwrap();
+        let (tx, _rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse.as_bytes()), &tx, usage_cost)
+            .await
+            .unwrap();
 
         assert_eq!(resp.usage.input, 100, "{COUNTS_SURVIVE_A_BAD_COST}");
         assert_eq!(resp.usage.output, 10, "{COUNTS_SURVIVE_A_BAD_COST}");
@@ -1023,10 +1008,10 @@ data: [DONE]\n";
             "usage": {"prompt_tokens": 100, "completion_tokens": 10},
             "copilot_usage": copilot_usage,
         });
-        let sse = format!("data: {chunk}\n\ndata: [DONE]\n");
+        let sse = format!("data: {chunk}\n\ndata: [DONE]\n\n");
 
-        let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
+        let (tx, _rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse.as_bytes()), &tx, false)
             .await
             .unwrap();
 
@@ -1054,10 +1039,10 @@ data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\
 \n\
 data: {\"choices\":[{\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\
 \n\
-data: [DONE]\n";
+data: [DONE]\n\n";
 
-        let (tx, rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
+        let (tx, mut rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse.as_bytes()), &tx, false)
             .await
             .unwrap();
 
@@ -1085,10 +1070,10 @@ data: [DONE]\n";
     #[test_case(r#"{"reasoning_content":"","reasoning":"think"}"#; "empty_reasoning_content_falls_back")]
     #[tokio::test]
     async fn parse_sse_proxy_reasoning_variants(delta: &str) {
-        let sse = format!("data: {{\"choices\":[{{\"delta\":{delta}}}]}}\n\ndata: [DONE]\n");
+        let sse = format!("data: {{\"choices\":[{{\"delta\":{delta}}}]}}\n\ndata: [DONE]\n\n");
 
-        let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
+        let (tx, _rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse.as_bytes()), &tx, false)
             .await
             .unwrap();
 
@@ -1119,18 +1104,17 @@ data: [DONE]\n";
         sent: &[(Kind, &str)],
         blocks: &[(Kind, &str)],
     ) {
-        let (tx, rx) = flume::unbounded();
+        let (tx, mut rx) = unbounded_channel();
         let mut streamed = StreamedText::default();
         for &(kind, delta) in pushed {
             match kind {
-                Kind::Text => streamed.push_text(delta.into(), &tx).await,
-                Kind::Reasoning => streamed.push_reasoning(delta.into(), &tx).await,
+                Kind::Text => streamed.push_text(delta.into(), &tx),
+                Kind::Reasoning => streamed.push_reasoning(delta.into(), &tx),
             }
             .unwrap();
         }
 
-        let events: Vec<_> = rx
-            .try_iter()
+        let events: Vec<_> = iter::from_fn(|| rx.try_recv().ok())
             .map(|event| match event {
                 ProviderEvent::TextDelta { text } => (Kind::Text, text),
                 ProviderEvent::ThinkingDelta { text } => (Kind::Reasoning, text),
@@ -1245,10 +1229,10 @@ data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arg
 \n\
 data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\
 \n\
-data: [DONE]\n";
+data: [DONE]\n\n";
 
-        let (tx, rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
+        let (tx, mut rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse.as_bytes()), &tx, false)
             .await
             .unwrap();
 
@@ -1262,8 +1246,7 @@ data: [DONE]\n";
         assert_eq!(tools[1].2["path"], "/tmp");
         assert_eq!(resp.stop_reason, Some(StopReason::ToolUse));
 
-        let starts: Vec<_> = rx
-            .drain()
+        let starts: Vec<_> = iter::from_fn(|| rx.try_recv().ok())
             .filter_map(|e| match e {
                 ProviderEvent::ToolUseStart { id, name } => Some((id, name)),
                 _ => None,
@@ -1278,10 +1261,10 @@ data: [DONE]\n";
     #[tokio::test]
     async fn parse_sse_error_payload_returns_err() {
         let sse = "\
-data: {\"error\":{\"message\":\"Server overloaded\",\"type\":\"overloaded_error\"}}\n";
+data: {\"error\":{\"message\":\"Server overloaded\",\"type\":\"overloaded_error\"}}\n\n";
 
-        let (tx, _rx) = flume::unbounded();
-        let err = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
+        let (tx, _rx) = unbounded_channel();
+        let err = parse_sse(sse_body(sse.as_bytes()), &tx, false)
             .await
             .unwrap_err();
 
@@ -1303,10 +1286,10 @@ data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arg
 \n\
 data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\
 \n\
-data: [DONE]\n";
+data: [DONE]\n\n";
 
-        let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
+        let (tx, _rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse.as_bytes()), &tx, false)
             .await
             .unwrap();
 
@@ -1320,15 +1303,10 @@ data: [DONE]\n";
     async fn parse_sse_unnamed_tool_ids_never_repeat() {
         let mut minted = Vec::new();
         for _ in 0..RESPONSES {
-            let (tx, rx) = flume::unbounded();
-            let resp = parse_sse(
-                Cursor::new(TWO_UNNAMED_TOOL_CALLS_SSE.as_bytes()),
-                &tx,
-                TEST_STREAM_TIMEOUT,
-                false,
-            )
-            .await
-            .unwrap();
+            let (tx, mut rx) = unbounded_channel();
+            let resp = parse_sse(sse_body(TWO_UNNAMED_TOOL_CALLS_SSE.as_bytes()), &tx, false)
+                .await
+                .unwrap();
 
             let ids: Vec<String> = resp
                 .message
@@ -1336,8 +1314,7 @@ data: [DONE]\n";
                 .map(|(id, _, _)| id.to_owned())
                 .collect();
             assert_eq!(ids.len(), TOOLS_PER_RESPONSE);
-            let started: Vec<String> = rx
-                .drain()
+            let started: Vec<String> = iter::from_fn(|| rx.try_recv().ok())
                 .filter_map(|e| match e {
                     ProviderEvent::ToolUseStart { id, .. } => Some(id),
                     _ => None,
@@ -1379,10 +1356,10 @@ data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arg
 \n\
 data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\
 \n\
-data: [DONE]\n";
+data: [DONE]\n\n";
 
-        let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
+        let (tx, _rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse.as_bytes()), &tx, false)
             .await
             .unwrap();
 
@@ -1405,10 +1382,10 @@ data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"nam
 \n\
 data: {\"choices\":[{\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\
 \n\
-data: [DONE]\n";
+data: [DONE]\n\n";
 
-        let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
+        let (tx, _rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse.as_bytes()), &tx, false)
             .await
             .unwrap();
 
@@ -1521,9 +1498,9 @@ data: [DONE]\n";
 
     #[tokio::test]
     async fn parse_sse_empty_stream() {
-        let sse = "data: [DONE]\n";
-        let (tx, _rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
+        let sse = "data: [DONE]\n\n";
+        let (tx, _rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse.as_bytes()), &tx, false)
             .await
             .unwrap();
         assert!(resp.message.content.is_empty());
@@ -1541,10 +1518,10 @@ data: {\"choices\":[{\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\"
 \n\
 data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\
 \n\
-data: [DONE]\n";
+data: [DONE]\n\n";
 
-        let (tx, rx) = flume::unbounded();
-        let resp = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT, false)
+        let (tx, mut rx) = unbounded_channel();
+        let resp = parse_sse(sse_body(sse.as_bytes()), &tx, false)
             .await
             .unwrap();
 

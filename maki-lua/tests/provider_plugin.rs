@@ -12,9 +12,11 @@
 //! every test its own process.
 
 use std::fs;
+use std::iter;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::sync_channel;
 use std::time::{Duration, Instant};
 
 use maki_agent::tools::ToolRegistry;
@@ -35,6 +37,7 @@ use maki_storage::auth::{load_plugin_auth, lock_plugin_store};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use test_case::test_case;
+use tokio::sync::mpsc::unbounded_channel;
 
 const SLUG: &str = "acmelua";
 const DISPLAY_NAME: &str = "Acme (Lua)";
@@ -281,7 +284,7 @@ fn stream(
     thinking: ThinkingConfig,
 ) -> (Vec<ProviderEvent>, Result<StreamResponse, AgentError>) {
     let messages = [Message::user(PROMPT.to_owned())];
-    let (tx, rx) = flume::unbounded();
+    let (tx, mut rx) = unbounded_channel();
     let result = runtime().block_on(provider.stream_message(
         model,
         &messages,
@@ -295,7 +298,7 @@ fn stream(
         None,
     ));
     drop(tx);
-    (rx.drain().collect(), result)
+    (iter::from_fn(|| rx.try_recv().ok()).collect(), result)
 }
 
 /// One turn, both ways round: the events a transcript produces in the order the
@@ -642,7 +645,7 @@ fn a_credential_write_does_not_park_the_plugin_host() {
     let locked = std::thread::spawn(|| runtime().block_on(plugin::login(LOCKED_SLUG)));
     wait_for(&entered);
 
-    let (served, free_login) = flume::bounded(1);
+    let (served, free_login) = sync_channel(1);
     std::thread::spawn(move || served.send(runtime().block_on(plugin::login(FREE_SLUG))));
     free_login
         .recv_timeout(STUCK_AFTER)

@@ -1,6 +1,10 @@
+use maki_lua::test_support::wait_next;
+use std::cell::Cell;
 use std::future::Future;
+use std::iter;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use maki_agent::AgentMode;
 use maki_agent::agent::{AgentCall, AgentSlot};
@@ -11,7 +15,7 @@ use maki_agent::tools::test_support::stub_ctx;
 use maki_agent::tools::{CallOrigin, ToolOutputMode, ToolRegistry};
 use maki_lua::agent_autocmd::host_event_fields;
 use maki_lua::test_support::{
-    content_omitted_message, fire_autocmd, layer_skipped_message, runtime,
+    content_omitted_message, fire_autocmd, layer_skipped_message, runtime, wait_reply,
 };
 use maki_lua::{
     Permission, PlanActionOutcome, PlanFormRow, PlanMenu, PlanRowAction, PluginHost,
@@ -19,6 +23,7 @@ use maki_lua::{
 };
 use maki_storage::id::MakiId;
 use test_case::test_case;
+use tokio::join;
 use tokio::time::timeout;
 
 const PROBE_SCHEMA: &str = r#"{ type = "object", properties = {}, additionalProperties = false }"#;
@@ -39,6 +44,10 @@ fn load(host: &PluginHost, name: &str, source: &str) {
 }
 
 fn exec_tool(reg: &ToolRegistry, name: &str) -> String {
+    runtime().block_on(run_tool(reg, name))
+}
+
+async fn run_tool(reg: &ToolRegistry, name: &str) -> String {
     let entry = reg
         .get(name)
         .unwrap_or_else(|| panic!("tool {name} not registered"));
@@ -47,8 +56,9 @@ fn exec_tool(reg: &ToolRegistry, name: &str) -> String {
         .parse(&serde_json::json!({}))
         .expect("parse failed");
     let ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
-    let out = runtime()
-        .block_on(inv.execute(&ctx))
+    let out = inv
+        .execute(&ctx)
+        .await
         .output
         .unwrap_or_else(|e| panic!("tool {name} failed: {e}"));
     match out {
@@ -109,14 +119,14 @@ fn sorted_keys<'a>(keys: impl Iterator<Item = &'a &'static str>) -> String {
 
 /// Everything flashed up to the first sentinel. Dispatch is sequential on the
 /// Lua thread, so whatever the events before it caused is already in.
-fn flashes_until_sentinel(ui: &flume::Receiver<UiAction>) -> Vec<String> {
+fn flashes_until_sentinel(ui: &mut UnboundedReceiver<UiAction>) -> Vec<String> {
     let mut out = Vec::new();
     loop {
-        match ui.recv_timeout(DISPATCH_TIMEOUT) {
-            Ok(UiAction::Flash(msg)) if msg == SENTINEL_FLASH => return out,
-            Ok(UiAction::Flash(msg)) => out.push(msg),
-            Ok(_) => {}
-            Err(e) => panic!("sentinel never flashed: {e}, got {out:?}"),
+        match wait_next(ui, DISPATCH_TIMEOUT) {
+            Some(UiAction::Flash(msg)) if msg == SENTINEL_FLASH => return out,
+            Some(UiAction::Flash(msg)) => out.push(msg),
+            Some(_) => {}
+            None => panic!("sentinel never flashed, got {out:?}"),
         }
     }
 }
@@ -130,7 +140,7 @@ fn flashes_until_sentinel(ui: &flume::Receiver<UiAction>) -> Vec<String> {
 fn content_fields_are_left_out_without_session_read(event: &str) {
     let fields = host_event_fields(event).expect("a content event is classified");
     let (_reg, host) = host();
-    let ui = host.ui_action_rx();
+    let mut ui = host.take_ui_action_rx().unwrap();
     load(&host, CONTENT_READER, &key_reporter(CONTENT_READER, event));
     load_granted(
         &host,
@@ -157,7 +167,7 @@ fn content_fields_are_left_out_without_session_read(event: &str) {
     let metadata = format!("{CONTENT_BLIND}:{}", sorted_keys(fields.metadata.iter()));
     let warning = content_omitted_message(CONTENT_BLIND, event, fields.content);
     assert_eq!(
-        flashes_until_sentinel(&ui),
+        flashes_until_sentinel(&mut ui),
         [
             everything.clone(),
             warning,
@@ -185,7 +195,7 @@ const CUSTOM_EVENT: &str = "MyPluginEvent";
 #[test_case(CUSTOM_EVENT, true ; "a_plugin_event_arrives_whole")]
 fn only_classified_metadata_reaches_a_plugin_without_session_read(event: &str, whole: bool) {
     let (_reg, host) = host();
-    let ui = host.ui_action_rx();
+    let mut ui = host.take_ui_action_rx().unwrap();
     load_granted(
         &host,
         CONTENT_BLIND,
@@ -211,7 +221,7 @@ fn only_classified_metadata_reaches_a_plugin_without_session_read(event: &str, w
             format!("{CONTENT_BLIND}:{SESSION_ID_KEY}"),
         ]
     };
-    assert_eq!(flashes_until_sentinel(&ui), expected);
+    assert_eq!(flashes_until_sentinel(&mut ui), expected);
 }
 
 const KEY_FIRER: &str = "key_firer";
@@ -243,7 +253,7 @@ maki.api.create_autocmd("{SENTINEL_EVENT}", {{
 fn a_key_that_cannot_be_named_does_not_drop_the_event() {
     let event = "TurnEnd";
     let (_reg, host) = host();
-    let ui = host.ui_action_rx();
+    let mut ui = host.take_ui_action_rx().unwrap();
     load(&host, CONTENT_READER, &key_counter(CONTENT_READER, event));
     load_granted(
         &host,
@@ -264,7 +274,7 @@ maki.api.exec_autocmds("{SENTINEL_EVENT}")
     );
 
     assert_eq!(
-        flashes_until_sentinel(&ui),
+        flashes_until_sentinel(&mut ui),
         [
             format!("{CONTENT_READER}:2"),
             content_omitted_message(CONTENT_BLIND, event, &[UNNAMEABLE_KEY]),
@@ -458,7 +468,7 @@ end }})
 
 /// A handler has to tell the teardown paths apart, so every reason arrives
 /// naming the session it left behind. Only the paths someone waits on carry a
-/// deadline, and by the time `end_sessions_blocking` is back the handler has
+/// deadline, and by the time `end_sessions` is back the handler has
 /// already had its say.
 #[test]
 fn session_end_carries_session_reason_and_deadline() {
@@ -483,13 +493,13 @@ end }})
         SessionEndReason::Completed,
     ] {
         let session = MakiId::generate();
-        host.event_handle().end_sessions_blocking([session], reason);
+        runtime().block_on(host.event_handle().end_sessions([session], reason));
         expected.push(format!("{session}|{reason}|number"));
     }
     assert_eq!(
         exec_tool(&reg, "probe_session_end"),
         expected.join(";"),
-        "end_sessions_blocking must only return once the handler ran"
+        "end_sessions must only return once the handler ran"
     );
 
     for reason in [
@@ -516,6 +526,49 @@ end }})
         );
         std::thread::sleep(DISPATCH_POLL);
     }
+}
+
+const PARK_POLL_MS: u64 = 1;
+const HANDLER_FINISHED: &str = "finished";
+const WAIT_BLOCKED_THREAD: &str = "end_sessions returned before its thread ran anything else";
+
+/// On one thread the release only runs if the wait yields, and the handler
+/// only finishes once it did.
+#[tokio::test]
+async fn end_sessions_yields_its_thread_while_a_handler_is_parked() {
+    let (reg, host) = host();
+    let parker = format!(
+        r#"
+local released, state = false, "parked"
+maki.api.create_autocmd("SessionEnd", {{ callback = function()
+    while not released do maki.async.sleep({PARK_POLL_MS}) end
+    state = "{HANDLER_FINISHED}"
+end }})
+{}{}
+"#,
+        probe_tool("release_session_end", "released = true return \"\""),
+        probe_tool("probe_parked_session_end", "return state")
+    );
+    load(&host, "parker", &parker);
+
+    let ended = Cell::new(false);
+    join!(
+        async {
+            host.event_handle()
+                .end_sessions([MakiId::generate()], SessionEndReason::Shutdown)
+                .await;
+            ended.set(true);
+        },
+        async {
+            assert!(!ended.get(), "{WAIT_BLOCKED_THREAD}");
+            run_tool(&reg, "release_session_end").await;
+        },
+    );
+
+    assert_eq!(
+        run_tool(&reg, "probe_parked_session_end").await,
+        HANDLER_FINISHED
+    );
 }
 
 #[test]
@@ -883,7 +936,7 @@ fn an_output_layer_pays_for_the_content_it_changes(granted: fn() -> PluginPermis
 #[test]
 fn a_skipped_layer_warns_once_per_gap() {
     let (reg, host) = host();
-    let ui = host.ui_action_rx();
+    let mut ui = host.take_ui_action_rx().unwrap();
     guarded_tool(&host);
     let slot = format!("tool.{GUARDED_TOOL}.{}", HookStage::Output.as_str());
 
@@ -904,7 +957,7 @@ fn a_skipped_layer_warns_once_per_gap() {
     assert_eq!(output(&reg, GUARDED_TOOL, "secret", false), None);
 
     let both = [Permission::SessionRead, Permission::SessionWrite];
-    let about_the_slot: Vec<String> = flashes(&ui)
+    let about_the_slot: Vec<String> = flashes(&mut ui)
         .into_iter()
         .filter(|msg| msg.contains(&slot))
         .collect();
@@ -917,8 +970,8 @@ fn a_skipped_layer_warns_once_per_gap() {
     );
 }
 
-fn flashes(ui: &flume::Receiver<UiAction>) -> Vec<String> {
-    ui.try_iter()
+fn flashes(ui: &mut UnboundedReceiver<UiAction>) -> Vec<String> {
+    iter::from_fn(|| ui.try_recv().ok())
         .filter_map(|action| match action {
             UiAction::Flash(msg) => Some(msg),
             _ => None,
@@ -1315,14 +1368,12 @@ fn plugin_row(extra: &str) -> String {
 }
 
 fn ask_plan_form(host: &PluginHost) -> Option<PlanMenu> {
-    host.event_handle()
-        .open_plan_form(
-            PLAN_PATH.to_owned(),
-            PLAN_SESSION.to_owned(),
-            builtin_rows(),
-        )
-        .recv_timeout(DISPATCH_TIMEOUT)
-        .expect("the plan form chains must answer")
+    let answer = host.event_handle().open_plan_form(
+        PLAN_PATH.to_owned(),
+        PLAN_SESSION.to_owned(),
+        builtin_rows(),
+    );
+    wait_reply(answer, DISPATCH_TIMEOUT).expect("the plan form chains must answer")
 }
 
 fn plan_menu(host: &PluginHost) -> PlanMenu {
@@ -1339,16 +1390,14 @@ fn menu_labels(host: &PluginHost) -> Vec<String> {
 
 /// Picks {row} of {menu} and waits for the host to say what became of it.
 fn pick_row(host: &PluginHost, menu: &PlanMenu, row: usize) -> PlanActionOutcome {
-    host.event_handle()
-        .run_plan_action(
-            PLAN_SESSION.to_owned(),
-            menu.generation,
-            row,
-            PLAN_PATH.to_owned(),
-            true,
-        )
-        .recv_timeout(DISPATCH_TIMEOUT)
-        .expect("a pick must be answered")
+    let answer = host.event_handle().run_plan_action(
+        PLAN_SESSION.to_owned(),
+        menu.generation,
+        row,
+        PLAN_PATH.to_owned(),
+        true,
+    );
+    wait_reply(answer, DISPATCH_TIMEOUT).expect("a pick must be answered")
 }
 
 fn plugin_row_index(menu: &PlanMenu) -> usize {

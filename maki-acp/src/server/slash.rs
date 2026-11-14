@@ -10,10 +10,9 @@ use agent_client_protocol_schema::v1::{
     AgentResponse, AvailableCommandsUpdate, Error as AcpError, PromptResponse, RequestId, Response,
     SessionId, SessionUpdate, StopReason,
 };
-use flume::Sender;
 use futures::future::BoxFuture;
 use maki_agent::agent::live_snapshot;
-use maki_agent::btw::{BtwEvent, BtwRequest};
+use maki_agent::btw::{BTW_EVENT_CAPACITY, BtwEvent, BtwRequest};
 use maki_agent::{
     AgentMode, ImageSource, McpHandle, McpPromptRef, RunTotals, SessionEndReason, SessionInput,
 };
@@ -24,6 +23,7 @@ use maki_providers::provider;
 use maki_storage::id::SessionRef;
 use maki_storage::paths;
 use serde_json::Value;
+use tokio::sync::mpsc::{UnboundedSender, channel};
 
 use super::{
     Incoming, Server, close_session, no_session, prompt_input, reload_history, restored_cost, send,
@@ -337,7 +337,7 @@ fn reply(srv: &Server, id: &RequestId, sid: &SessionId, text: &str) -> Result<()
     Ok(())
 }
 
-fn finish(out_tx: &Sender<Value>, id: RequestId, sid: &SessionId, text: &str) {
+fn finish(out_tx: &UnboundedSender<Value>, id: RequestId, sid: &SessionId, text: &str) {
     if !text.is_empty() {
         session_update(out_tx, sid, translate::text_delta(text));
     }
@@ -393,9 +393,9 @@ fn btw(
             opts,
             session,
         );
-        let (tx, rx) = flume::bounded(64);
+        let (tx, mut rx) = channel(BTW_EVENT_CAPACITY);
         tokio::spawn(request.run(tx));
-        while let Ok(event) = rx.recv_async().await {
+        while let Some(event) = rx.recv().await {
             match event {
                 BtwEvent::TextDelta(text) => {
                     session_update(&out_tx, &sid, translate::text_delta(&text));
@@ -523,7 +523,7 @@ async fn restart(srv: &mut Server, params: &AcpParams, cwd: PathBuf) -> Result<(
 /// Tells the client what {session} can run. MCP prompts arrive once their
 /// servers connect, so the list goes out again then.
 pub(super) fn announce_commands(
-    out_tx: &Sender<Value>,
+    out_tx: &UnboundedSender<Value>,
     session: &SessionRef,
     host: Arc<dyn CommandHost>,
     cwd: &Path,
@@ -547,7 +547,7 @@ pub(super) fn announce_commands(
 }
 
 fn send_commands(
-    out_tx: &Sender<Value>,
+    out_tx: &UnboundedSender<Value>,
     sid: &SessionId,
     host: &dyn CommandHost,
     cwd: &Path,
@@ -560,10 +560,11 @@ fn send_commands(
 #[cfg(test)]
 mod tests {
     use agent_client_protocol_schema::v1::RequestId;
-    use flume::Receiver;
     use maki_storage::StateDir;
     use tempfile::TempDir;
     use test_case::test_case;
+    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+    use tokio::sync::oneshot;
 
     use super::super::tests::{acp_params, test_server};
     use super::*;
@@ -574,14 +575,14 @@ mod tests {
     struct Fixture {
         srv: Server,
         params: AcpParams,
-        wire: Receiver<Value>,
-        inputs: Receiver<SessionInput>,
+        wire: UnboundedReceiver<Value>,
+        inputs: UnboundedReceiver<SessionInput>,
         _dir: TempDir,
     }
 
     fn fixture() -> Fixture {
         let (mut srv, _answers, wire) = test_server();
-        let (input_tx, inputs) = flume::unbounded();
+        let (input_tx, inputs) = unbounded_channel();
         srv.session.as_mut().unwrap().handle.input_tx = input_tx;
         let dir = TempDir::new().unwrap();
         let params = acp_params(StateDir::from_path(dir.path().to_path_buf()));
@@ -601,10 +602,10 @@ mod tests {
         }
 
         /// The text said and whether the prompt was answered, in wire order.
-        fn said(&self) -> (String, bool) {
+        fn said(&mut self) -> (String, bool) {
             let mut text = String::new();
             let mut answered = false;
-            for msg in self.wire.try_iter() {
+            while let Ok(msg) = self.wire.try_recv() {
                 if let Some(chunk) = msg.pointer("/params/update/content/text") {
                     text.push_str(chunk.as_str().unwrap());
                 }
@@ -724,8 +725,8 @@ mod tests {
         assert!(f.srv.session.is_none());
     }
 
-    fn host_prompt_request(session: Option<String>) -> (HostRequest, flume::Receiver<HostReply>) {
-        let (reply, answer) = flume::bounded(1);
+    fn host_prompt_request(session: Option<String>) -> (HostRequest, oneshot::Receiver<HostReply>) {
+        let (reply, answer) = oneshot::channel();
         let request = HostRequest::Prompt {
             session,
             text: "Use the release skill".into(),
@@ -748,7 +749,7 @@ mod tests {
             "held open for the handler"
         );
 
-        let (request, answer) = host_prompt_request(None);
+        let (request, mut answer) = host_prompt_request(None);
         host_request(&mut f.srv, request);
         assert_eq!(answer.try_recv().unwrap(), Ok(Value::from(PROMPT_STARTED)));
         let Ok(SessionInput::Prompt(input)) = f.inputs.try_recv() else {
@@ -803,7 +804,7 @@ mod tests {
     #[tokio::test]
     async fn a_plugin_prompt_with_no_command_waiting_runs_on_its_own() {
         let mut f = fixture();
-        let (request, answer) = host_prompt_request(None);
+        let (request, mut answer) = host_prompt_request(None);
         host_request(&mut f.srv, request);
         assert_eq!(answer.try_recv().unwrap(), Ok(Value::from(PROMPT_STARTED)));
         assert!(f.inputs.try_recv().is_ok());
@@ -813,7 +814,7 @@ mod tests {
     #[tokio::test]
     async fn a_plugin_prompt_for_another_session_is_refused() {
         let mut f = fixture();
-        let (request, answer) = host_prompt_request(Some("someone-else".into()));
+        let (request, mut answer) = host_prompt_request(Some("someone-else".into()));
         host_request(&mut f.srv, request);
         assert_eq!(
             answer.try_recv().unwrap(),

@@ -5,6 +5,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread;
 
 use common::{
@@ -20,6 +21,7 @@ use maki_agent::{
 use maki_lua::test_support::runtime;
 use maki_lua::{MoveOutcome, PluginHost};
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedReceiver;
 
 const TASK_PLUGIN_SRC: &str = include_str!("../../plugins/task/init.lua");
 const TASK_RUNNER_SRC: &str = include_str!("../../plugins/task/runner.lua");
@@ -768,8 +770,8 @@ fn background_without_a_chat_session_runs_blocking() {
 /// A blocking `task` call as dispatch makes it: one scope under the run
 /// token and its own event channel, executing on its own thread.
 struct ModelCall {
-    events: flume::Receiver<Envelope>,
-    result: flume::Receiver<ToolDoneEvent>,
+    events: UnboundedReceiver<Envelope>,
+    result: Receiver<ToolDoneEvent>,
 }
 
 impl ModelCall {
@@ -782,7 +784,7 @@ impl ModelCall {
     ) -> Self {
         let (ctx, events) = call_ctx(reg, chat.id, run, id);
         let reg = Arc::clone(reg);
-        let (result_tx, result) = flume::bounded(1);
+        let (result_tx, result) = sync_channel(1);
         thread::spawn(move || {
             let _ = result_tx.send(exec(&reg, TASK_TOOL, input, &ctx));
         });
@@ -811,12 +813,11 @@ fn a_moved_task_keeps_its_slot_and_the_next_task_waits_visibly() {
     let mut opts = serde_json::Map::new();
     opts.insert("max_concurrent".into(), json!(1));
     let (reg, host) = load_task_host_with_opts(opts);
-    host.ui_attachment().attach();
-    let ui = host.ui_action_rx();
+    let mut ui = host.take_ui_action_rx().unwrap();
     let chat = Chat::live();
     let (_run_trigger, run) = CancelToken::new();
 
-    let first = ModelCall::start(
+    let mut first = ModelCall::start(
         &reg,
         &chat,
         &run,
@@ -824,7 +825,7 @@ fn a_moved_task_keeps_its_slot_and_the_next_task_waits_visibly() {
         task_input(SCENARIO_PARKED, None),
     );
     let mut showed_waiting_row = false;
-    next_event(&first.events, |event| {
+    next_event(&mut first.events, |event| {
         showed_waiting_row |= matches!(event, AgentEvent::LiveToolBuf { .. });
         matches!(&event, AgentEvent::ToolMovable { movable: true, .. }).then_some(())
     });
@@ -838,39 +839,39 @@ fn a_moved_task_keeps_its_slot_and_the_next_task_waits_visibly() {
     let receipt = reply_text(receipt);
     assert!(receipt.starts_with(MOVED_RECEIPT), "{receipt}");
 
-    let second = ModelCall::start(
+    let mut second = ModelCall::start(
         &reg,
         &chat,
         &run,
         SECOND_CALL_ID,
         task_input(SCENARIO_PARKED_SECOND, None),
     );
-    let waiting = wait_live_buf(&second.events, SECOND_CALL_ID);
+    let waiting = wait_live_buf(&mut second.events, SECOND_CALL_ID);
     assert_eq!(buf_text(&waiting), WAITING_FOR_SLOT);
     wait(&reg, json!({ "acquires": 2 }));
     assert_eq!(
         request_move(&host.event_handle(), SECOND_CALL_ID),
         MoveOutcome::NoHook
     );
-    assert!(second.result.is_empty());
+    assert!(second.result.try_recv().is_err());
     assert_eq!(probe(&reg)["acquired"], json!(1));
 
     wait(&reg, json!({ "parked": SCENARIO_PARKED }));
     release(&reg, SCENARIO_PARKED);
     assert_eq!(
-        done_text(&next_task_done(&ui)),
+        done_text(&next_task_done(&mut ui)),
         (PLAIN_TEXT.to_owned(), false)
     );
     assert_eq!(probe(&reg)["released"], json!(1));
 
     wait(&reg, json!({ "parked": SCENARIO_PARKED_SECOND }));
     assert_eq!(buf_text(&waiting), "");
-    wait_movable(&second.events, SECOND_CALL_ID);
+    wait_movable(&mut second.events, SECOND_CALL_ID);
     release(&reg, SCENARIO_PARKED_SECOND);
     let result = second.finish();
     assert!(!result.backgrounded);
     assert_eq!(reply_text(result), PLAIN_TEXT);
-    let final_body = next_event(&second.events, |event| match event {
+    let final_body = next_event(&mut second.events, |event| match event {
         AgentEvent::ToolSnapshot { snapshot, .. } => Some(snapshot.text()),
         _ => None,
     });

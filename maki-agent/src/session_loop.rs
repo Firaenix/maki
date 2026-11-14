@@ -162,6 +162,10 @@ mod tests {
     use maki_storage::id::{MakiId, SessionRef};
     use serde_json::Value;
     use test_case::test_case;
+    use tokio::sync::Notify;
+    use tokio::sync::mpsc::UnboundedReceiver;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
     use crate::agent::testing::{agent_params, fixed_context};
@@ -194,7 +198,7 @@ mod tests {
     struct Scripted {
         replies: Mutex<VecDeque<Reply>>,
         requests: Mutex<Vec<Vec<Message>>>,
-        started: flume::Sender<()>,
+        started: Arc<Notify>,
     }
 
     impl Provider for Scripted {
@@ -204,7 +208,7 @@ mod tests {
             messages: &'a [Message],
             _: &'a str,
             _: &'a Value,
-            events: &'a flume::Sender<ProviderEvent>,
+            events: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -227,7 +231,7 @@ mod tests {
                                 text: PARTIAL.into(),
                             })
                             .unwrap();
-                        self.started.send(()).unwrap();
+                        self.started.notify_one();
                         std::future::pending().await
                     }
                 }
@@ -246,7 +250,7 @@ mod tests {
         history: History,
         gauge: ContextGauge,
         event_tx: EventSender,
-        _events: flume::Receiver<Envelope>,
+        _events: UnboundedReceiver<Envelope>,
         /// One per run, in order, done as the run ends.
         after_runs: VecDeque<AfterRun>,
     }
@@ -279,20 +283,20 @@ mod tests {
         parent: CancelTrigger,
         mailbox: SessionMailbox,
         host: Host,
-        started: flume::Receiver<()>,
+        started: Arc<Notify>,
     }
 
     impl Harness {
         fn new(replies: Vec<Reply>) -> Self {
             let (parent, parent_token) = CancelToken::new();
             let control = Arc::new(SessionControl::new(&parent_token));
-            let (started_tx, started) = flume::unbounded();
-            let (raw_tx, events) = flume::unbounded();
+            let started = Arc::new(Notify::new());
+            let (raw_tx, events) = unbounded_channel();
             let host = Host {
                 provider: Arc::new(Scripted {
                     replies: Mutex::new(replies.into()),
                     requests: Mutex::default(),
-                    started: started_tx,
+                    started: Arc::clone(&started),
                 }),
                 history: History::new(Vec::new()),
                 gauge: ContextGauge::default(),
@@ -420,9 +424,9 @@ mod tests {
         taken_back: bool,
     ) {
         let mut h = Harness::new(vec![Reply::Hang, Reply::Text(SECOND)]);
-        let (control, started) = (Arc::clone(&h.control), h.started.clone());
+        let (control, started) = (Arc::clone(&h.control), Arc::clone(&h.started));
         let interrupt = async move {
-            started.recv_async().await.unwrap();
+            started.notified().await;
             control
                 .send(input(NUDGE, source), Delivery::Interrupt)
                 .unwrap();
@@ -467,11 +471,11 @@ mod tests {
         cutter: Cutter,
     ) {
         let mut h = Harness::new(vec![Reply::Hang]);
-        let started = h.started.clone();
+        let started = Arc::clone(&h.started);
         let control = Arc::clone(&h.control);
         let parent = h.parent.handle();
         let end = async move {
-            started.recv_async().await.unwrap();
+            started.notified().await;
             match ender {
                 Ender::Control(reason) => control.end(reason),
                 Ender::Parent => parent.fire(),

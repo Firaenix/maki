@@ -37,7 +37,7 @@ pub use api::util::command::{
     InputMarks, InputRequest, InputSubmit, LuaCommandInfo, LuaCommandReader, ModelRequest,
     NO_UI_ERR, PROMPT_QUEUED, PROMPT_STARTED, PlanActionOutcome, PlanFormRow, PlanMenu,
     PlanRequest, PlanRowAction, SessionRequest, Split, TaskRequest, TextEdit, TitlePos, UiAction,
-    UiAttachment, UiReply, WinCommand, WinEvent, WinView,
+    UiReply, WinCommand, WinEvent, WinView,
 };
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
@@ -65,6 +65,10 @@ pub use session_snapshot::{SessionQueueSnapshot, SessionSnapshot};
 
 pub mod test_support {
     use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use tokio::sync::mpsc::unbounded_channel;
 
     pub use crate::api::autocmd::content_omitted_message;
     use crate::api::keymap::{InputMode, KeymapStore, KeymapWriter, SetOpts};
@@ -79,11 +83,32 @@ pub mod test_support {
     use maki_agent::SharedBuf;
     use maki_storage::id::MakiId;
     use tokio::runtime::Runtime;
+    use tokio::sync::mpsc::UnboundedReceiver;
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
 
     /// The runtime [`crate::PluginHost::start`] puts a host on, for the sync
     /// side of a test to drive futures with.
     pub fn runtime() -> &'static Runtime {
         &crate::loader::HOST_RUNTIME
+    }
+
+    /// The host's answer on {reply}, for the sync side of a test. `None` once
+    /// {limit} passed or the host dropped the reply.
+    pub fn wait_reply<T>(reply: oneshot::Receiver<T>, limit: Duration) -> Option<T> {
+        runtime()
+            .block_on(async { timeout(limit, reply).await })
+            .ok()?
+            .ok()
+    }
+
+    /// The next item on {events}, for the sync side of a test. `None` once
+    /// {limit} passed or every sender is gone.
+    pub fn wait_next<T>(events: &mut UnboundedReceiver<T>, limit: Duration) -> Option<T> {
+        runtime()
+            .block_on(async { timeout(limit, events.recv()).await })
+            .ok()
+            .flatten()
     }
 
     pub struct LuaCommandWriterHandle(LuaCommandWriter);
@@ -115,13 +140,13 @@ pub mod test_support {
 
     /// Observes which requests an [`EventHandle`] sends, without a
     /// running plugin host.
-    pub struct RequestProbe(flume::Receiver<Request>);
+    pub struct RequestProbe(Mutex<UnboundedReceiver<Request>>);
 
     impl RequestProbe {
         /// Next request as `(kind, clicks)`: `"click"` carries no clicks,
         /// `"click_fallback"` and `"restore"` carry their restore item's.
         pub fn try_recv(&self) -> Option<(&'static str, Vec<usize>)> {
-            Some(match self.0.try_recv().ok()? {
+            Some(match self.0.lock().unwrap().try_recv().ok()? {
                 Request::ClickTool { fallback: None, .. } => ("click", Vec::new()),
                 Request::ClickTool {
                     fallback: Some(fb), ..
@@ -134,8 +159,7 @@ pub mod test_support {
         /// Next dispatched slash command as `(command, args, depth, session)`,
         /// skipping other requests.
         pub fn try_recv_command(&self) -> Option<(String, String, u8, Option<String>)> {
-            use crate::runtime::Request;
-            while let Ok(req) = self.0.try_recv() {
+            while let Ok(req) = self.0.lock().unwrap().try_recv() {
                 if let Request::RunCommand {
                     command,
                     args,
@@ -161,7 +185,7 @@ pub mod test_support {
         /// [`Self::try_recv_keybind`] with the whole ticket, for a test that
         /// plays the Lua thread and reports the handler done.
         pub fn try_recv_ticket(&self) -> Option<KeybindTicket> {
-            while let Ok(req) = self.0.try_recv() {
+            while let Ok(req) = self.0.lock().unwrap().try_recv() {
                 if let Request::RunKeybindCallback { ticket } = req {
                     return Some(ticket);
                 }
@@ -171,7 +195,7 @@ pub mod test_support {
 
         /// Next queued restore item, skipping other requests.
         pub fn try_recv_restore_item(&self) -> Option<crate::RestoreItem> {
-            while let Ok(req) = self.0.try_recv() {
+            while let Ok(req) = self.0.lock().unwrap().try_recv() {
                 if let Request::RestoreToolAsync { item, .. } = req {
                     return Some(item);
                 }
@@ -181,7 +205,7 @@ pub mod test_support {
 
         /// Next fired autocmd as `(event, data)`, skipping other requests.
         pub fn try_recv_autocmd(&self) -> Option<(String, serde_json::Value)> {
-            while let Ok(req) = self.0.try_recv() {
+            while let Ok(req) = self.0.lock().unwrap().try_recv() {
                 if let Request::FireAutocmd { event, data } = req {
                     return Some((event, data));
                 }
@@ -191,7 +215,7 @@ pub mod test_support {
 
         /// Next `SessionEnd` request as the session being left behind and why.
         pub fn try_recv_end_session(&self) -> Option<(MakiId, SessionEndReason)> {
-            while let Ok(req) = self.0.try_recv() {
+            while let Ok(req) = self.0.lock().unwrap().try_recv() {
                 if let Request::EndSession(end) = req {
                     return Some((end.session, end.reason));
                 }
@@ -205,15 +229,18 @@ pub mod test_support {
     /// on purpose: host code would have to import it from `test_support`,
     /// which makes an unclassified event easy to catch in review.
     pub fn fire_autocmd(handle: &EventHandle, event: &str, data: serde_json::Value) {
-        let _ = handle.tx.try_send(Request::FireAutocmd {
+        let _ = handle.tx.send(Request::FireAutocmd {
             event: event.to_owned(),
             data,
         });
     }
 
     pub fn probed_event_handle() -> (EventHandle, RequestProbe) {
-        let (tx, rx) = flume::unbounded();
-        (EventHandle::probed_for_test(tx), RequestProbe(rx))
+        let (tx, rx) = unbounded_channel();
+        (
+            EventHandle::probed_for_test(tx),
+            RequestProbe(Mutex::new(rx)),
+        )
     }
 
     /// [`probed_event_handle`] for a host with a plugin layering the plan

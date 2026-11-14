@@ -14,6 +14,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
+use tokio::sync::mpsc::Receiver;
 
 use crate::repaint::{Cadence, Dirty};
 
@@ -39,7 +40,7 @@ pub struct BtwModal {
     /// number of theme switches, so this is what tells us to hand it new ones.
     theme_generation: u64,
     scroll: ModalScroll,
-    rx: Option<flume::Receiver<BtwEvent>>,
+    rx: Option<Receiver<BtwEvent>>,
 }
 
 impl BtwModal {
@@ -63,7 +64,7 @@ impl BtwModal {
         }
     }
 
-    pub fn open(&mut self, question: &str, rx: flume::Receiver<BtwEvent>) {
+    pub fn open(&mut self, question: &str, rx: Receiver<BtwEvent>) {
         self.close();
         self.open = true;
         self.question = question.to_string();
@@ -99,7 +100,7 @@ impl BtwModal {
     }
 
     pub fn poll(&mut self) -> Dirty {
-        let Some(ref rx) = self.rx else {
+        let Some(ref mut rx) = self.rx else {
             return Dirty::NO;
         };
         let mut dirty = Dirty::NO;
@@ -253,6 +254,9 @@ mod tests {
     use crossterm::event::KeyCode;
     use ratatui::style::Style;
     use test_case::test_case;
+    use tokio::sync::mpsc::{Sender, channel};
+
+    const EVENT_CAPACITY: usize = 64;
 
     const INSTANT: u64 = 0;
     const WIDTH: u16 = 80;
@@ -279,16 +283,17 @@ mod tests {
             .join("\n")
     }
 
-    fn open_modal(m: &mut BtwModal, question: &str) -> flume::Sender<BtwEvent> {
-        let (tx, rx) = flume::bounded(64);
+    fn open_modal(m: &mut BtwModal, question: &str) -> Sender<BtwEvent> {
+        let (tx, rx) = channel(EVENT_CAPACITY);
         m.open(question, rx);
         tx
     }
 
     fn answer_a_question(m: &mut BtwModal) {
         let tx = open_modal(m, "q");
-        tx.send(BtwEvent::ThinkingDelta(REASONING.into())).unwrap();
-        tx.send(BtwEvent::TextDelta(ANSWER.into())).unwrap();
+        tx.try_send(BtwEvent::ThinkingDelta(REASONING.into()))
+            .unwrap();
+        tx.try_send(BtwEvent::TextDelta(ANSWER.into())).unwrap();
         let _ = m.poll();
     }
 
@@ -340,8 +345,8 @@ mod tests {
     fn poll_accumulates_text() {
         let mut m = modal();
         let tx = open_modal(&mut m, "q");
-        tx.send(BtwEvent::TextDelta("hello ".into())).unwrap();
-        tx.send(BtwEvent::TextDelta("world".into())).unwrap();
+        tx.try_send(BtwEvent::TextDelta("hello ".into())).unwrap();
+        tx.try_send(BtwEvent::TextDelta("world".into())).unwrap();
         let _ = m.poll();
         assert!(m.answer_eq("hello world"));
     }
@@ -350,7 +355,7 @@ mod tests {
     fn poll_done_sets_done_and_drops_rx() {
         let mut m = modal();
         let tx = open_modal(&mut m, "q");
-        tx.send(BtwEvent::Done).unwrap();
+        tx.try_send(BtwEvent::Done).unwrap();
         let _ = m.poll();
         assert!(!m.is_streaming());
     }
@@ -359,8 +364,8 @@ mod tests {
     fn poll_error_replaces_answer_and_marks_done() {
         let mut m = modal();
         let tx = open_modal(&mut m, "q");
-        tx.send(BtwEvent::TextDelta("partial".into())).unwrap();
-        tx.send(BtwEvent::Error("oops".into())).unwrap();
+        tx.try_send(BtwEvent::TextDelta("partial".into())).unwrap();
+        tx.try_send(BtwEvent::Error("oops".into())).unwrap();
         let _ = m.poll();
         assert!(m.answer_eq("oops"));
         assert!(!m.is_streaming());
@@ -404,7 +409,8 @@ mod tests {
     fn double_open_resets_first() {
         let mut m = modal();
         let tx1 = open_modal(&mut m, "first");
-        tx1.send(BtwEvent::TextDelta("leftover".into())).unwrap();
+        tx1.try_send(BtwEvent::TextDelta("leftover".into()))
+            .unwrap();
         let _ = m.poll();
         m.scroll.update_dimensions(100, 10);
         m.scroll.scroll(-10);
@@ -420,7 +426,7 @@ mod tests {
         let mut m = modal();
         let tx = open_modal(&mut m, "q");
         m.close();
-        assert!(tx.send(BtwEvent::TextDelta("x".into())).is_err());
+        assert!(tx.try_send(BtwEvent::TextDelta("x".into())).is_err());
     }
 
     #[test]
@@ -460,7 +466,7 @@ mod tests {
     fn thinking_is_shown_from(thinking_lines: ThinkingLines, first_shown: usize) {
         let mut m = BtwModal::new(INSTANT, thinking_lines);
         let tx = open_modal(&mut m, "q");
-        tx.send(BtwEvent::ThinkingDelta(ideas())).unwrap();
+        tx.try_send(BtwEvent::ThinkingDelta(ideas())).unwrap();
         let _ = m.poll();
         let body = body_text(&mut m);
         assert!(!body.contains(EXPAND_HINT), "nothing to click: {body}");

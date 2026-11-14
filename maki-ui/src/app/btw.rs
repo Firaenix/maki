@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
-use maki_agent::btw::BtwRequest;
+use maki_agent::btw::{BTW_EVENT_CAPACITY, BtwRequest};
 use maki_providers::Model;
 use maki_providers::provider::Provider;
 use maki_storage::id::SessionRef;
+use tokio::sync::mpsc::channel;
 
 use super::App;
 
@@ -23,7 +24,7 @@ impl App {
             self.request_options(),
             SessionRef::from(self.state.session.id),
         );
-        let (tx, rx) = flume::bounded(64);
+        let (tx, rx) = channel(BTW_EVENT_CAPACITY);
         self.open_prompt(|app| app.btw_modal.open(&question, rx));
         tokio::spawn(request.run(tx));
     }
@@ -35,7 +36,6 @@ mod tests {
     use crate::app::tests::test_app;
     use crate::components::test_model;
     use arc_swap::ArcSwap;
-    use flume::Sender;
     use maki_agent::HistorySnapshot;
     use maki_agent::btw::{BTW_FALLBACK_SYSTEM, NO_TOOLS};
     use maki_agent::prompt::{PromptId, Slot};
@@ -52,6 +52,7 @@ mod tests {
     use serde_json::Value;
     use serde_json::json;
     use test_case::test_case;
+    use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
     const Q: &str = "why sqlite?";
     const FRAME_POLICY: &str = "Use the active conversation policy.";
@@ -67,7 +68,7 @@ mod tests {
     }
 
     struct FakeProvider {
-        sent: Sender<Recorded>,
+        sent: UnboundedSender<Recorded>,
         script: Vec<ProviderEvent>,
     }
 
@@ -78,7 +79,7 @@ mod tests {
             messages: &'a [Message],
             system: &'a str,
             tools: &'a Value,
-            events: &'a Sender<ProviderEvent>,
+            events: &'a UnboundedSender<ProviderEvent>,
             opts: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -136,13 +137,13 @@ mod tests {
     }
 
     async fn ask(app: &mut App) -> Recorded {
-        let (sent, requests) = flume::unbounded();
+        let (sent, mut requests) = unbounded_channel();
         let provider = FakeProvider {
             sent,
             script: Vec::new(),
         };
         app.start_btw(Q.into(), Arc::new(provider), test_model());
-        requests.recv_async().await.unwrap()
+        requests.recv().await.unwrap()
     }
 
     /// An imported session holds a frame with facts and no prompt until its
@@ -170,7 +171,7 @@ mod tests {
             share_history(&mut app, frame, None);
         }
         assert_eq!(ask(&mut app).await.system, expected);
-        let prompts = host.event_handle().collect_prompt_slots();
+        let prompts = host.event_handle().collect_prompt_slots(None).await;
         assert_eq!(
             prompts.get(PromptId::System, Slot::Identity)[0].content,
             "1"

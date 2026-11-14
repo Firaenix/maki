@@ -4,19 +4,21 @@ use std::io::BufReader;
 use std::mem;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::thread;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
-use event_listener::{Event, Listener};
 use maki_config::ShellPreference;
 use maki_providers::{shell_command, strip_provider_keys};
 use maki_storage::id::MakiId;
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult};
 use shell_words::join as shell_join;
-use tokio::sync::watch;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::{
+    Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, TryAcquireError, watch,
+};
 
 use crate::api::fs::{Line, MAX_READ_BYTES, expand_tilde, next_line};
 use crate::plugin_permissions::Ceiling;
@@ -33,10 +35,10 @@ const READER_BUF_SIZE: usize = 8 * 1024;
 /// catch up. Far above what a job normally has unread, so only a runaway
 /// command ever meets it.
 const JOB_QUEUE_BYTES: usize = 16 * 1024 * 1024;
-/// How far a full queue drains before its readers go on. Waking them for
-/// every freed line cost a cross-thread wake per line, about a third of a
-/// saturated run's time.
-const JOB_QUEUE_RESUME: usize = JOB_QUEUE_BYTES / 2;
+/// The run of bytes a reader parked on a full queue waits for, then spends
+/// line by line. Waking it for every freed line cost a cross-thread wake per
+/// line, about a third of a saturated run's time.
+const JOB_QUEUE_RESUME: u32 = JOB_QUEUE_BYTES as u32 / 2;
 const STDOUT_STREAM: &str = "stdout";
 const STDERR_STREAM: &str = "stderr";
 
@@ -176,10 +178,9 @@ struct JobMeta {
     on_stderr: Option<RegistryKey>,
     on_exit: Option<RegistryKey>,
     ceiling: Option<Ceiling>,
+    /// Locked while a `jobwait` holds it through its [`WaitLease`], which keeps
+    /// the pumps off the job until the lease drops.
     events: JobEvents,
-    /// Set while a `jobwait` holds the events. Pumps leave the job alone
-    /// until its [`WaitLease`] drops.
-    waited: Arc<AtomicBool>,
     _queue: QueueOwner,
     stdout_tail: VecDeque<String>,
     stderr_tail: VecDeque<String>,
@@ -237,11 +238,7 @@ impl JobMeta {
     }
 
     fn has_pending(&self) -> bool {
-        self.replay_exit.is_some() || self.pumpable().is_some_and(|events| !events.is_empty())
-    }
-
-    fn pumpable(&self) -> Option<&JobEvents> {
-        (!self.waited.load(Ordering::Acquire)).then_some(&self.events)
+        self.replay_exit.is_some() || !self.events.is_empty()
     }
 }
 
@@ -379,12 +376,12 @@ impl JobStore {
 
         // The owner exists before any thread does, so a failed spawn below
         // still closes the queue on a reader that is already waiting on it.
-        let (sender, events, queue) = job_queue(self.changed.clone());
+        let (mut sender, events, queue) = job_queue(self.changed.clone());
 
         macro_rules! spawn_reader {
             ($stream:expr, $name:expr, $variant:ident) => {
                 if let Some(stream) = $stream {
-                    let sender = sender.clone();
+                    let mut sender = sender.clone();
                     Some(
                         thread::Builder::new()
                             .name($name.into())
@@ -442,7 +439,6 @@ impl JobStore {
                 on_exit,
                 ceiling,
                 events,
-                waited: Arc::default(),
                 _queue: queue,
                 stdout_tail: VecDeque::new(),
                 stderr_tail: VecDeque::new(),
@@ -494,13 +490,13 @@ impl JobStore {
         plugin: &str,
     ) -> Option<WaitLease> {
         let job = self.jobs.get(&job_id)?;
-        if !job.can_access(task_id, plugin) || job.waited.swap(true, Ordering::AcqRel) {
+        if !job.can_access(task_id, plugin) {
             return None;
         }
         Some(WaitLease {
-            events: job.events.clone(),
-            waited: Arc::clone(&job.waited),
-            changed: self.changed.clone(),
+            rx: Arc::clone(&job.events.rx).try_lock_owned().ok()?,
+            queue: Arc::clone(&job.events.queue),
+            _wake: WakePumps(self.changed.clone()),
         })
     }
 
@@ -531,7 +527,7 @@ impl JobStore {
         if let Some(code) = job.replay_exit.take() {
             return Some(JobEvent::Exit(code));
         }
-        job.pumpable()?.try_recv()
+        job.events.try_recv()
     }
 
     /// Round-robins over the jobs holding events: taking the first match every
@@ -767,28 +763,32 @@ impl Drop for JobStore {
     }
 }
 
-/// A `jobwait`'s exclusive hold on one job's events. The store keeps its own
-/// receiver, so there is nothing to give back: dropping the lease only lets
-/// the pumps in again.
+/// A `jobwait`'s exclusive hold on one job's events: the lock on the job's
+/// receiver, so the pumps cannot read it until the lease drops.
 pub(crate) struct WaitLease {
-    events: JobEvents,
-    waited: Arc<AtomicBool>,
-    changed: watch::Sender<()>,
+    rx: OwnedMutexGuard<UnboundedReceiver<JobEvent>>,
+    queue: Arc<JobQueue>,
+    /// Declared after `rx`, since fields drop in order: the pumps are woken
+    /// only once the receiver is free again.
+    _wake: WakePumps,
 }
 
 impl WaitLease {
-    pub fn events(&self) -> &JobEvents {
-        &self.events
+    pub async fn recv(&mut self) -> Option<JobEvent> {
+        let event = self.rx.recv().await?;
+        self.queue.popped(&event);
+        Some(event)
     }
 }
 
 /// The GC runs this when it frees a coroutine parked in `jobwait`, so it
 /// must stay Lua-free. The bump wakes a parked pump for the events the wait
 /// left queued.
-impl Drop for WaitLease {
+struct WakePumps(watch::Sender<()>);
+
+impl Drop for WakePumps {
     fn drop(&mut self) {
-        self.waited.store(false, Ordering::Release);
-        self.changed.send_replace(());
+        self.0.send_replace(());
     }
 }
 
@@ -874,35 +874,33 @@ fn drop_callbacks(lua: &Lua, job: &mut JobMeta) {
     }
 }
 
-/// Counts the bytes a job has queued. Readers wait here once the count hits
-/// [`JOB_QUEUE_BYTES`] and go on when consumers drain it to
-/// [`JOB_QUEUE_RESUME`]. Dropping the job closes it for good, which frees
-/// them even while a `jobwait` lease keeps the pump off a job whose waiter is
-/// not draining.
-#[derive(Default)]
+/// The bytes a job may have queued, as permits. Readers take a line's bytes
+/// before sending it and park once [`JOB_QUEUE_BYTES`] are out, until
+/// consumers have given [`JOB_QUEUE_RESUME`] back. Dropping the job closes
+/// the semaphore, which frees them even while a `jobwait` lease keeps the
+/// pump off a job whose waiter is not draining.
 struct JobQueue {
-    bytes: AtomicUsize,
-    drained: Event,
-    closed: AtomicBool,
+    bytes: Arc<Semaphore>,
+}
+
+impl Default for JobQueue {
+    fn default() -> Self {
+        Self {
+            bytes: Arc::new(Semaphore::new(JOB_QUEUE_BYTES)),
+        }
+    }
 }
 
 impl JobQueue {
-    fn is_full(&self) -> bool {
-        self.bytes.load(Ordering::Acquire) >= JOB_QUEUE_BYTES
-    }
-
     fn popped(&self, event: &JobEvent) {
-        let cost = queued_bytes(event);
-        let before = self
-            .bytes
-            .update(Ordering::AcqRel, Ordering::Acquire, |bytes| {
-                bytes.saturating_sub(cost)
-            });
-        let left = before.saturating_sub(cost);
-        if left <= JOB_QUEUE_RESUME {
-            self.drained.notify(usize::MAX);
-        }
+        self.bytes.add_permits(permits(event) as usize);
     }
+}
+
+/// Capped at one run: a parked reader keeps the run it waited for, so a line
+/// costing more than the half left to the other reader could never fit.
+fn permits(event: &JobEvent) -> u32 {
+    (queued_bytes(event) as u32).min(JOB_QUEUE_RESUME)
 }
 
 /// What an event holds in the queue. The fixed part keeps a flood of empty
@@ -918,27 +916,25 @@ fn queued_bytes(event: &JobEvent) -> usize {
 /// A job's receiving end. Taking an event through it settles that event's
 /// bytes with the [`JobQueue`], so no consumer can forget to and leave the
 /// readers waiting on a queue that is long drained.
-#[derive(Clone)]
+///
+/// A [`WaitLease`] holds the receiver's lock while a `jobwait` reads, and the
+/// pumps find it locked and leave the job alone.
 pub(crate) struct JobEvents {
-    rx: flume::Receiver<JobEvent>,
+    rx: Arc<AsyncMutex<UnboundedReceiver<JobEvent>>>,
     queue: Arc<JobQueue>,
 }
 
 impl JobEvents {
     fn try_recv(&self) -> Option<JobEvent> {
-        let event = self.rx.try_recv().ok()?;
+        let event = self.rx.try_lock().ok()?.try_recv().ok()?;
         self.queue.popped(&event);
         Some(event)
     }
 
-    pub async fn recv_async(&self) -> Option<JobEvent> {
-        let event = self.rx.recv_async().await.ok()?;
-        self.queue.popped(&event);
-        Some(event)
-    }
-
+    /// A leased receiver counts as empty, as it does for [`Self::try_recv`]:
+    /// what is queued there is the wait's to take.
     fn is_empty(&self) -> bool {
-        self.rx.is_empty()
+        self.rx.try_lock().ok().is_none_or(|rx| rx.is_empty())
     }
 }
 
@@ -946,50 +942,84 @@ struct QueueOwner(Arc<JobQueue>);
 
 impl Drop for QueueOwner {
     fn drop(&mut self) {
-        self.0.closed.store(true, Ordering::Release);
-        self.0.drained.notify(usize::MAX);
+        self.0.bytes.close();
     }
 }
 
 /// The sending, receiving and owning ends of one job's queue.
 fn job_queue(changed: watch::Sender<()>) -> (JobEventSender, JobEvents, QueueOwner) {
-    let (tx, rx) = flume::unbounded();
+    let (tx, rx) = unbounded_channel();
     let queue = Arc::new(JobQueue::default());
     let sender = JobEventSender {
         tx,
         queue: Arc::clone(&queue),
         changed,
+        reserve: None,
     };
     let events = JobEvents {
-        rx,
+        rx: Arc::new(AsyncMutex::new(rx)),
         queue: Arc::clone(&queue),
     };
     (sender, events, QueueOwner(queue))
 }
 
-#[derive(Clone)]
 struct JobEventSender {
-    tx: flume::Sender<JobEvent>,
+    tx: UnboundedSender<JobEvent>,
     queue: Arc<JobQueue>,
     changed: watch::Sender<()>,
+    /// The run a parked reader waited for, spent line by line. Given back
+    /// when the reader ends.
+    reserve: Option<OwnedSemaphorePermit>,
+}
+
+/// Each reader thread starts without a reserve: permits are per reader.
+impl Clone for JobEventSender {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            queue: Arc::clone(&self.queue),
+            changed: self.changed.clone(),
+            reserve: None,
+        }
+    }
 }
 
 impl JobEventSender {
     /// Returns false once the job is gone, so the reader can stop.
-    fn send(&self, event: JobEvent) -> bool {
-        while self.queue.is_full() {
-            // Listen before looking, so a drain in between still wakes us.
-            let drained = self.queue.drained.listen();
-            if self.queue.closed.load(Ordering::Acquire) {
-                return false;
+    fn send(&mut self, event: JobEvent) -> bool {
+        let cost = permits(&event);
+        loop {
+            if let Some(spent) = self
+                .reserve
+                .as_mut()
+                .and_then(|run| run.split(cost as usize))
+            {
+                spent.forget();
+                break;
             }
-            if self.queue.bytes.load(Ordering::Acquire) > JOB_QUEUE_RESUME {
-                drained.wait();
+            match self.queue.bytes.try_acquire_many(cost) {
+                Ok(taken) => {
+                    taken.forget();
+                    break;
+                }
+                // The job is gone, so nothing drains the queue and parking
+                // would never end. What is left runs to EOF unbounded; a
+                // dropped receiver fails the send below.
+                Err(TryAcquireError::Closed) => break,
+                Err(TryAcquireError::NoPermits) => {}
+            }
+            // Parks until a whole run is free and keeps it: one wake per
+            // drained run instead of one per line, and nothing handed back
+            // for the other stream's reader to race for. The leftover goes
+            // back first: kept through the park, it plus the other reader's
+            // idle run could leave the pool one line short of a run for good.
+            self.reserve = None;
+            if let Ok(run) =
+                Arc::clone(&self.queue.bytes).blocking_acquire_many_owned(JOB_QUEUE_RESUME)
+            {
+                self.reserve = Some(run);
             }
         }
-        self.queue
-            .bytes
-            .fetch_add(queued_bytes(&event), Ordering::AcqRel);
         self.tx
             .send(event)
             .inspect(|()| self.changed.send_replace(()))
@@ -1076,8 +1106,10 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::api::fs::LINE_CUT_MARKER;
+    use crate::test_support::runtime;
     use futures::FutureExt;
     use std::time::Duration;
+    use tokio::time::timeout;
 
     const TEST_PLUGIN: &str = "test-plugin";
     const JOB_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1089,6 +1121,17 @@ mod tests {
 
     /// Pull events until {id} reports its exit, so assertions run against a
     /// job that is certainly done.
+    fn recv_within(lease: &mut WaitLease, limit: Duration) -> Option<JobEvent> {
+        runtime()
+            .block_on(async { timeout(limit, lease.recv()).await })
+            .ok()
+            .flatten()
+    }
+
+    fn senders_gone(lease: &WaitLease) -> bool {
+        lease.rx.is_closed()
+    }
+
     fn collect_until_exit(
         id: u32,
         mut next: impl FnMut() -> Option<(u32, JobEvent)>,
@@ -1151,7 +1194,6 @@ mod tests {
             on_exit,
             ceiling: None,
             events,
-            waited: Arc::default(),
             _queue: queue,
             stdout_tail: VecDeque::new(),
             stderr_tail: VecDeque::new(),
@@ -1252,13 +1294,9 @@ mod tests {
 
         let id = start_echo(&mut store);
         assert!(!store.is_empty(&owner));
-        let lease = store.lease_events(id, Some(1), TEST_PLUGIN).unwrap();
+        let mut lease = store.lease_events(id, Some(1), TEST_PLUGIN).unwrap();
         while !matches!(
-            lease
-                .events
-                .rx
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap(),
+            recv_within(&mut lease, Duration::from_secs(5)).unwrap(),
             JobEvent::Exit(_)
         ) {}
 
@@ -1369,19 +1407,19 @@ mod tests {
     fn lease_delivers_events() {
         let mut store = make_store();
         let id = start_echo(&mut store);
-        let lease = store.lease_events(id, Some(1), TEST_PLUGIN).unwrap();
+        let mut lease = store.lease_events(id, Some(1), TEST_PLUGIN).unwrap();
 
         let mut got_exit = false;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
-            match lease.events.rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(JobEvent::Exit(_)) => {
+            match recv_within(&mut lease, Duration::from_millis(200)) {
+                Some(JobEvent::Exit(_)) => {
                     got_exit = true;
                     break;
                 }
-                Ok(_) => continue,
-                Err(flume::RecvTimeoutError::Timeout) => continue,
-                Err(flume::RecvTimeoutError::Disconnected) => break,
+                Some(_) => continue,
+                None if senders_gone(&lease) => break,
+                None => continue,
             }
         }
         assert!(got_exit, "should receive exit event for completed job");
@@ -1419,7 +1457,7 @@ mod tests {
         const QUEUED_PER_JOB: usize = 2;
         let mut store = make_store();
         for id in [1, 2] {
-            let (sender, events, queue) = job_queue(store.changed.clone());
+            let (mut sender, events, queue) = job_queue(store.changed.clone());
             for _ in 0..QUEUED_PER_JOB {
                 sender.send(JobEvent::Stdout("spam".into()));
             }
@@ -1780,7 +1818,7 @@ mod tests {
     fn every_change_a_pump_can_act_on_wakes_it() {
         let lua = Lua::new();
         let mut store = make_store();
-        let (sender, events, queue) = job_queue(store.changed.clone());
+        let (mut sender, events, queue) = job_queue(store.changed.clone());
         let mut job = stub_job(plugin_owner(), None, None);
         job.events = events;
         job._queue = queue;
@@ -2024,6 +2062,101 @@ mod tests {
         store.kill_session(&lua, session);
     }
 
+    const PARKED_LINE_BYTES: usize = 4096;
+
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + JOB_EXIT_TIMEOUT;
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}");
+            thread::sleep(JOB_POLL_INTERVAL);
+        }
+    }
+
+    fn next_within(events: &JobEvents) -> Option<JobEvent> {
+        let deadline = Instant::now() + JOB_EXIT_TIMEOUT;
+        loop {
+            if let Some(event) = events.try_recv() {
+                return Some(event);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(JOB_POLL_INTERVAL);
+        }
+    }
+
+    /// A parked reader keeps the run it waited for, so a line may never cost
+    /// more than the run left to the other reader. Capped, a line longer than
+    /// the whole queue still gets through past a reader holding a run idle.
+    #[test]
+    fn a_long_line_fits_past_an_idle_reserve() {
+        let store = make_store();
+        let (mut small, events, _queue) = job_queue(store.changed.clone());
+        let line = || JobEvent::Stdout("0".repeat(PARKED_LINE_BYTES).as_str().into());
+        let lines = JOB_QUEUE_BYTES / permits(&line()) as usize;
+        for _ in 0..lines {
+            assert!(small.send(line()));
+        }
+        let mut long = small.clone();
+        let small = thread::spawn(move || (small.send(line()), small));
+        // A parked reader's owned acquire holds a clone of the semaphore.
+        wait_until("the small reader parked", || {
+            Arc::strong_count(&events.queue.bytes) == 2
+        });
+        for _ in 0..=lines {
+            assert!(matches!(next_within(&events), Some(JobEvent::Stdout(_))));
+        }
+        let (sent, _idle_reserve) = small.join().unwrap();
+        assert!(sent);
+
+        let long = thread::spawn(move || {
+            long.send(JobEvent::Stderr(
+                "0".repeat(JOB_QUEUE_BYTES).as_str().into(),
+            ))
+        });
+        assert!(matches!(next_within(&events), Some(JobEvent::Stderr(_))));
+        assert!(long.join().unwrap());
+    }
+
+    /// The other reader holds a run idle after one short line. A flooding
+    /// reader that parks again must not count its leftover against the run
+    /// it waits for, or the pool stays a few bytes short of one for good.
+    #[test]
+    fn a_parked_reader_drops_its_leftover() {
+        let store = make_store();
+        let (mut fill, events, _queue) = job_queue(store.changed.clone());
+        let line = || JobEvent::Stdout("0".repeat(PARKED_LINE_BYTES).as_str().into());
+        let lines = JOB_QUEUE_BYTES / permits(&line()) as usize;
+        for _ in 0..lines {
+            assert!(fill.send(line()));
+        }
+        // A line sized to the spare, so even a short one parks.
+        let spare = events.queue.bytes.available_permits();
+        let overhead = permits(&JobEvent::Stdout("".into())) as usize;
+        assert!(fill.send(JobEvent::Stdout(
+            "0".repeat(spare - overhead).as_str().into()
+        )));
+        assert_eq!(events.queue.bytes.available_permits(), 0);
+        let mut short = fill.clone();
+        let short = thread::spawn(move || (short.send(JobEvent::Stderr("!".into())), short));
+        wait_until("the short line's reader parked", || {
+            Arc::strong_count(&events.queue.bytes) == 2
+        });
+        for _ in 0..=lines {
+            assert!(matches!(next_within(&events), Some(JobEvent::Stdout(_))));
+        }
+        assert!(matches!(next_within(&events), Some(JobEvent::Stderr(_))));
+        let (sent, _idle_run) = short.join().unwrap();
+        assert!(sent);
+
+        let flood = 3 * lines;
+        let flooder = thread::spawn(move || (0..flood).all(|_| fill.send(line())));
+        for _ in 0..flood {
+            assert!(matches!(next_within(&events), Some(JobEvent::Stdout(_))));
+        }
+        assert!(flooder.join().unwrap());
+    }
+
     #[cfg(unix)]
     mod backpressure {
         use super::*;
@@ -2036,12 +2169,10 @@ mod tests {
         const NEVER_FILLED: &str = "the job's queue never filled";
         const NEVER_RELEASED: &str = "a reader blocked on a full queue was never released";
 
-        fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-            let deadline = Instant::now() + JOB_EXIT_TIMEOUT;
-            while !done() {
-                assert!(Instant::now() < deadline, "{what}");
-                thread::sleep(JOB_POLL_INTERVAL);
-            }
+        /// A reader parks once the next padded line no longer fits.
+        fn is_full(queue: &JobQueue) -> bool {
+            let line = JobEvent::Stdout("0".repeat(PADDED_LINE_BYTES).as_str().into());
+            queue.bytes.available_permits() < permits(&line) as usize
         }
 
         /// Starts {cmd} and waits for its queue to fill, so its readers are
@@ -2049,7 +2180,7 @@ mod tests {
         fn start_blocked(store: &mut JobStore, owner: JobOwner, cmd: &str) -> u32 {
             let id = store.start(JobSpec::new(owner, cmd)).unwrap();
             let queue = Arc::clone(&store.jobs[&id].events.queue);
-            wait_until(NEVER_FILLED, || queue.is_full());
+            wait_until(NEVER_FILLED, || is_full(&queue));
             id
         }
 
@@ -2120,8 +2251,33 @@ mod tests {
 
             wait_until(NEVER_RELEASED, || reaped.load(Ordering::Relaxed));
             if let Some(lease) = held {
-                wait_until(NEVER_RELEASED, || lease.events.rx.is_disconnected());
+                wait_until(NEVER_RELEASED, || senders_gone(&lease));
             }
+        }
+
+        /// Both readers park at once. Each keeps the run it waited for, so
+        /// released permits never bounce between them.
+        #[test]
+        fn two_blocked_streams_drain_to_exit() {
+            let mut store = make_store();
+            let cmd = format!("{FLOOD_CMD} & {FLOOD_CMD} >&2");
+            let id = start_blocked(&mut store, task_owner(1), &cmd);
+
+            store.kill(id, Some(1), TEST_PLUGIN);
+            let events = collect_until_exit(id, || store.next_event(&task_owner(1)));
+
+            let stdout = events
+                .iter()
+                .filter(|(_, event)| matches!(event, JobEvent::Stdout(_)))
+                .count();
+            let stderr = events
+                .iter()
+                .filter(|(_, event)| matches!(event, JobEvent::Stderr(_)))
+                .count();
+            assert!(stdout > 0 && stderr > 0, "both streams were read");
+            let delivered: usize = events.iter().map(|(_, event)| queued_bytes(event)).sum();
+            assert!(delivered > JOB_QUEUE_BYTES, "queued lines were lost");
+            assert!(matches!(events.last(), Some((_, JobEvent::Exit(_)))));
         }
 
         #[test]

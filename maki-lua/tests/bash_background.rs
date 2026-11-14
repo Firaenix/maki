@@ -6,8 +6,10 @@ mod common;
 
 use std::collections::HashMap;
 use std::fs;
+use std::iter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 
 use common::{Chat, Gate, WAIT, done_result, poll_until, request_move};
@@ -29,6 +31,8 @@ use maki_storage::paths::{session_data_dir, state_dir};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use test_case::test_case;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::unbounded_channel;
 
 const RECEIPT_HEAD: &str = "Running in the background.";
 const LOG_LABEL: &str = "Full output: ";
@@ -91,11 +95,11 @@ struct Run {
     call_id: String,
     session: MakiId,
     mailbox: SessionMailbox,
-    events: flume::Receiver<Envelope>,
-    result: flume::Receiver<Result<String, String>>,
+    events: UnboundedReceiver<Envelope>,
+    result: Receiver<Result<String, String>>,
     live: Option<Arc<SharedBuf>>,
     gate: Gate,
-    finish: flume::Sender<()>,
+    finish: SyncSender<()>,
     thread: Option<JoinHandle<()>>,
     _seed: Arc<AgentSeed>,
     _run_trigger: CancelTrigger,
@@ -132,11 +136,11 @@ impl Run {
             seed,
         } = Chat::live();
         let call_id = format!("toolu_{}", MakiId::generate());
-        let (events_tx, events) = flume::unbounded();
+        let (events_tx, events) = unbounded_channel();
         let (run_trigger, run_token) = CancelToken::new();
-        let (handle_tx, handle_rx) = flume::bounded(1);
-        let (result_tx, result) = flume::bounded(1);
-        let (finish, finished) = flume::bounded::<()>(1);
+        let (handle_tx, handle_rx) = sync_channel(1);
+        let (result_tx, result) = sync_channel(1);
+        let (finish, finished) = sync_channel::<()>(1);
 
         let tool = tool.to_owned();
         let thread = thread::spawn({
@@ -207,10 +211,11 @@ impl Run {
     fn wait_for_output(&mut self, needle: &str) {
         poll_until("bash never showed the expected output", || {
             if self.live.is_none() {
-                self.live = self.events.drain().find_map(|env| match env.event {
-                    AgentEvent::LiveToolBuf { id, body } if id == self.call_id => Some(body),
-                    _ => None,
-                });
+                self.live =
+                    iter::from_fn(|| self.events.try_recv().ok()).find_map(|env| match env.event {
+                        AgentEvent::LiveToolBuf { id, body } if id == self.call_id => Some(body),
+                        _ => None,
+                    });
             }
             self.live
                 .as_ref()
@@ -568,10 +573,10 @@ fn a_timeout_moves_the_command_when_background_on_timeout_is_set() {
 #[test]
 fn the_timeout_annotates_the_header_and_stays_out_of_the_summary() {
     let input = json!({ "command": "true", "description": DESCRIPTION, "timeout": TIMEOUT_SECS });
-    let run = Run::launch(json!({}), BASH_TOOL, input, Gate::closed());
+    let mut run = Run::launch(json!({}), BASH_TOOL, input, Gate::closed());
 
     let start = poll_until("bash never started", || {
-        run.events.try_iter().find_map(|env| match env.event {
+        iter::from_fn(|| run.events.try_recv().ok()).find_map(|env| match env.event {
             AgentEvent::ToolStart(start) => Some(start),
             _ => None,
         })

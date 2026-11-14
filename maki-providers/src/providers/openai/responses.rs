@@ -1,12 +1,12 @@
 use std::borrow::Cow;
-use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::collections::BTreeSet;
+use std::sync::Mutex;
+use std::time::Duration;
 
-use flume::Sender;
+use futures::TryStreamExt;
 use reqwest::Client;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
 use crate::model::Model;
@@ -14,7 +14,7 @@ use crate::providers::copilot::copilot_usd;
 use crate::providers::openai_compat::{
     StreamedText, assistant_response, parse_tool_input, tool_parameters,
 };
-use crate::providers::{ResolvedAuth, ok_sse, sse_error_status};
+use crate::providers::{ResolvedAuth, SseBody, ok_sse, sse_error_status};
 use crate::types::EffortDialect;
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
@@ -166,21 +166,14 @@ pub(crate) fn convert_tools(anthropic_tools: &Value) -> Value {
     )
 }
 
-static SUMMARY_REJECTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-
-fn init_summary_rejected() -> &'static Mutex<HashSet<String>> {
-    SUMMARY_REJECTED.get_or_init(|| Mutex::new(HashSet::new()))
-}
+static SUMMARY_REJECTED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
 fn summary_rejected(base: &str) -> bool {
-    init_summary_rejected().lock().unwrap().contains(base)
+    SUMMARY_REJECTED.lock().unwrap().contains(base)
 }
 
 fn reject_summary(base: &str) {
-    init_summary_rejected()
-        .lock()
-        .unwrap()
-        .insert(base.to_owned());
+    SUMMARY_REJECTED.lock().unwrap().insert(base.to_owned());
 }
 
 fn has_summary(body: &Value) -> bool {
@@ -199,7 +192,7 @@ pub(crate) async fn do_stream(
     client: &Client,
     model: &crate::model::Model,
     body: &Value,
-    event_tx: &Sender<ProviderEvent>,
+    event_tx: &UnboundedSender<ProviderEvent>,
     auth: &ResolvedAuth,
     stream_timeout: Duration,
 ) -> Result<StreamResponse, AgentError> {
@@ -226,7 +219,7 @@ async fn post_responses(
     client: &Client,
     model: &crate::model::Model,
     body: &Value,
-    event_tx: &Sender<ProviderEvent>,
+    event_tx: &UnboundedSender<ProviderEvent>,
     auth: &ResolvedAuth,
     base: &str,
     stream_timeout: Duration,
@@ -249,8 +242,8 @@ async fn post_responses(
         "sending Responses API request"
     );
 
-    ok_sse(client, request, |body| {
-        parse_sse(body, event_tx, stream_timeout)
+    ok_sse(client, request, stream_timeout, |body| {
+        parse_sse(body, event_tx)
     })
     .await
 }
@@ -263,31 +256,19 @@ struct ToolAccumulator {
 }
 
 pub(crate) async fn parse_sse(
-    reader: impl AsyncBufRead + Unpin,
-    event_tx: &Sender<ProviderEvent>,
-    stream_timeout: Duration,
+    mut events: SseBody,
+    event_tx: &UnboundedSender<ProviderEvent>,
 ) -> Result<StreamResponse, AgentError> {
-    let mut lines = reader.lines();
-
     let mut streamed = StreamedText::default();
     let mut tool_accumulators: Vec<ToolAccumulator> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut stop_reason: Option<StopReason> = None;
-    let mut deadline = Instant::now() + stream_timeout;
-    let mut current_event = String::new();
 
-    while let Some(line) =
-        crate::providers::next_sse_line(&mut lines, &mut deadline, stream_timeout).await?
-    {
-        if let Some(event_type) = line.strip_prefix("event:") {
-            current_event = event_type.trim().to_string();
+    while let Some(event) = events.try_next().await? {
+        let Some(data) = event.data.as_deref().map(str::trim) else {
             continue;
-        }
-
-        let data = match line.strip_prefix("data:") {
-            Some(d) => d.trim(),
-            None => continue,
         };
+        let current_event = event.event.as_deref().map_or("", str::trim);
 
         if current_event == "error" {
             if let Ok(ev) = serde_json::from_str::<crate::providers::SseErrorPayload>(data) {
@@ -308,13 +289,13 @@ pub(crate) async fn parse_sse(
         let event = if current_event.is_empty() {
             parsed["type"].as_str().unwrap_or_default()
         } else {
-            current_event.as_str()
+            current_event
         };
 
         match event {
             "response.output_text.delta" => {
                 if let Some(delta) = parsed["delta"].as_str() {
-                    streamed.push_text(delta.to_owned(), event_tx).await?;
+                    streamed.push_text(delta.to_owned(), event_tx)?;
                 }
             }
 
@@ -327,12 +308,10 @@ pub(crate) async fn parse_sse(
                     let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
                     let name = item["name"].as_str().unwrap_or_default().to_string();
                     if !name.is_empty() {
-                        event_tx
-                            .send_async(ProviderEvent::ToolUseStart {
-                                id: call_id.clone(),
-                                name: name.clone(),
-                            })
-                            .await?;
+                        event_tx.send(ProviderEvent::ToolUseStart {
+                            id: call_id.clone(),
+                            name: name.clone(),
+                        })?;
                     }
                     tool_accumulators.push(ToolAccumulator {
                         output_index,
@@ -368,13 +347,11 @@ pub(crate) async fn parse_sse(
                     let processed = pp["processed"].as_u64().unwrap_or(0) as u32;
                     let total = pp["total"].as_u64().unwrap_or(0) as u32;
                     let cache = pp["cache"].as_u64().unwrap_or(0) as u32;
-                    event_tx
-                        .send_async(ProviderEvent::PromptProgress {
-                            processed,
-                            total,
-                            cache,
-                        })
-                        .await?;
+                    event_tx.send(ProviderEvent::PromptProgress {
+                        processed,
+                        total,
+                        cache,
+                    })?;
                 }
             }
 
@@ -409,21 +386,17 @@ pub(crate) async fn parse_sse(
                             acc.arguments = arguments;
                         }
                         if should_emit_start {
-                            event_tx
-                                .send_async(ProviderEvent::ToolUseStart {
-                                    id: acc.call_id.clone(),
-                                    name: acc.name.clone(),
-                                })
-                                .await?;
+                            event_tx.send(ProviderEvent::ToolUseStart {
+                                id: acc.call_id.clone(),
+                                name: acc.name.clone(),
+                            })?;
                         }
                     } else {
                         if !name.is_empty() {
-                            event_tx
-                                .send_async(ProviderEvent::ToolUseStart {
-                                    id: call_id.clone(),
-                                    name: name.clone(),
-                                })
-                                .await?;
+                            event_tx.send(ProviderEvent::ToolUseStart {
+                                id: call_id.clone(),
+                                name: name.clone(),
+                            })?;
                         }
                         tool_accumulators.push(ToolAccumulator {
                             output_index: tool_accumulators.len() as u64,
@@ -437,12 +410,12 @@ pub(crate) async fn parse_sse(
 
             "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
                 if let Some(delta) = parsed["delta"].as_str() {
-                    streamed.push_reasoning(delta.to_owned(), event_tx).await?;
+                    streamed.push_reasoning(delta.to_owned(), event_tx)?;
                 }
             }
 
             "response.reasoning_summary_part.added" if !streamed.reasoning.is_empty() => {
-                streamed.push_reasoning("\n\n".to_owned(), event_tx).await?;
+                streamed.push_reasoning("\n\n".to_owned(), event_tx)?;
             }
 
             "response.completed" => {
@@ -520,12 +493,12 @@ fn parse_usage(event: &Value) -> Option<TokenUsage> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::io::Cursor;
+    use std::iter;
     use test_case::test_case;
+    use tokio::sync::mpsc::unbounded_channel;
 
-    use crate::test_support::sse_event;
+    use crate::test_support::{sse_body, sse_event};
 
-    const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
     const OVERLOAD_MESSAGE: &str = "Our servers are currently overloaded. Please try again later.";
     const BAD_REQUEST_MESSAGE: &str = "Invalid value for 'model'";
     const RATE_LIMIT_MESSAGE: &str = "Rate limit hit";
@@ -566,9 +539,9 @@ mod tests {
     }
 
     async fn run_sse(sse: &str) -> (Result<StreamResponse, AgentError>, Vec<ProviderEvent>) {
-        let (tx, rx) = flume::unbounded();
-        let result = parse_sse(Cursor::new(sse.as_bytes()), &tx, TEST_STREAM_TIMEOUT).await;
-        (result, rx.drain().collect())
+        let (tx, mut rx) = unbounded_channel();
+        let result = parse_sse(sse_body(sse.as_bytes()), &tx).await;
+        (result, iter::from_fn(|| rx.try_recv().ok()).collect())
     }
 
     const COPILOT_NANO_AIU: u64 = 375_000;

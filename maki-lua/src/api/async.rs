@@ -5,6 +5,7 @@ use futures::future::join_all;
 use maki_agent::cancel::CancelToken;
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
 use mlua::{Function, Lua, MultiValue, Result as LuaResult, Table, Value};
+use tokio::sync::mpsc::channel;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::yield_now;
 
@@ -460,10 +461,10 @@ pub(crate) fn create_async_table(lua: &Lua, plugin: Arc<str>) -> LuaResult<Table
                 _ => return Err(mlua::Error::runtime("second argument must be a function")),
             };
 
-            let (tx, rx) = flume::bounded(1);
+            let (tx, mut rx) = channel(1);
 
             let callback = lua.create_function(move |_lua, values: MultiValue| {
-                tx.send(values).ok();
+                tx.try_send(values).ok();
                 Ok(())
             })?;
 
@@ -473,9 +474,9 @@ pub(crate) fn create_async_table(lua: &Lua, plugin: Arc<str>) -> LuaResult<Table
             fun.call::<()>(MultiValue::from_iter(args_vec))?;
 
             let result = rx
-                .recv_async()
+                .recv()
                 .await
-                .map_err(|_| mlua::Error::runtime("async.await: callback was never called"))?;
+                .ok_or_else(|| mlua::Error::runtime("async.await: callback was never called"))?;
             Ok(result)
         })?,
     )?;
@@ -539,6 +540,7 @@ mod tests {
     use maki_agent::cancel::CancelTrigger;
     use mlua::Lua;
     use test_case::test_case;
+    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
     use tokio::task::{LocalSet, spawn_local};
 
     use super::*;
@@ -626,6 +628,21 @@ mod tests {
         assert_eq!(vals[0].as_string().unwrap().to_string_lossy(), "hello");
         assert_eq!(vals[1].as_integer().unwrap(), 42);
         assert!(vals[2].as_boolean().unwrap());
+    }
+
+    /// A second call used to block the Lua thread for good.
+    #[tokio::test]
+    async fn await_keeps_the_first_of_two_callback_calls() {
+        let (lua, _tbl) = setup();
+        let code = r#"
+            local function producer(cb)
+                cb(1)
+                cb(2)
+            end
+            return async_tbl.await(1, producer)
+        "#;
+        let first: i64 = lua.load(code).eval_async().await.unwrap();
+        assert_eq!(first, 1);
     }
 
     #[tokio::test]
@@ -838,8 +855,8 @@ mod tests {
     const HOOK_SURVIVED_MSG: &str = "a hook that waits from outside its coroutine must fail there";
     const TASK_SURVIVED_MSG: &str = "the task must keep working after a hook blew up";
 
-    fn install_notify(lua: &Lua) -> flume::Receiver<()> {
-        let (fired_tx, fired_rx) = flume::bounded(1);
+    fn install_notify(lua: &Lua) -> UnboundedReceiver<()> {
+        let (fired_tx, fired_rx) = unbounded_channel();
         let notify = lua
             .create_function(move |_, ()| {
                 fired_tx.send(()).ok();
@@ -870,7 +887,7 @@ mod tests {
     async fn on_cancel_hook_fires_while_gather_is_still_parked(bad_hook_body: &str) {
         let (lua, _tbl) = setup();
         let (trigger, scope) = live_scope(&lua);
-        let fired_rx = install_notify(&lua);
+        let mut fired_rx = install_notify(&lua);
 
         let code = format!(
             r#"
@@ -893,7 +910,7 @@ mod tests {
                 vals = scope.scope_future(lua.load(&code).eval_async::<MultiValue>()) => vals,
                 vals = async {
                     trigger.cancel();
-                    fired_rx.recv_async().await.expect(HOOK_NEVER_FIRED);
+                    fired_rx.recv().await.expect(HOOK_NEVER_FIRED);
                     assert!(
                         !lua.globals().get::<bool>("gather_returned").unwrap(),
                         "{HOOK_LATE_MSG}"

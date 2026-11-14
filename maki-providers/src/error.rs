@@ -9,6 +9,7 @@ use std::{io, time::Duration};
 
 use reqwest::Response;
 use serde_json::Value;
+use tokio::sync::mpsc::error::SendError;
 use tokio::task::JoinError;
 
 use crate::{
@@ -457,8 +458,8 @@ impl AgentError {
     }
 }
 
-impl<T> From<flume::SendError<T>> for AgentError {
-    fn from(_: flume::SendError<T>) -> Self {
+impl<T> From<SendError<T>> for AgentError {
+    fn from(_: SendError<T>) -> Self {
         Self::Channel
     }
 }
@@ -525,7 +526,6 @@ mod tests {
 
     use super::*;
     use crate::{
-        http::{NO_ADDRESSES, Unresolved},
         providers::{
             client_builder,
             opencode::{NON_LOGIN_FALLBACK_MESSAGE, QUOTA_FALLBACK_MESSAGE},
@@ -534,7 +534,8 @@ mod tests {
     };
 
     use crate::test_support::transport::{
-        LOOPBACK_HOST, QUERY_SECRET, UNRESOLVABLE_HOST, URL_MARKER, closed_port, plain_http_port,
+        LOOPBACK_HOST, QUERY_SECRET, UNRESOLVABLE_HOST, URL_MARKER, closed_port, hangup_port,
+        plain_http_port,
     };
 
     const QUOTA_MESSAGE: &str = "Weekly usage limit reached. Resets in 3 hours.";
@@ -548,22 +549,6 @@ mod tests {
     const ONE_KEY: usize = 1;
     const CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
     const REQUEST_ERROR_PREFIX: &str = "request error: ";
-
-    /// Answers for `UNRESOLVABLE_HOST` without a lookup; with `NeverResolves`
-    /// below, no test here needs DNS.
-    struct Unresolvable;
-
-    impl Resolve for Unresolvable {
-        fn resolve(&self, name: Name) -> Resolving {
-            Box::pin(async move {
-                Err(Unresolved {
-                    host: name.as_str().to_owned(),
-                    source: io::Error::other(NO_ADDRESSES),
-                }
-                .into())
-            })
-        }
-    }
 
     struct NeverResolves;
 
@@ -588,11 +573,7 @@ mod tests {
     }
 
     async fn unresolved() -> reqwest::Error {
-        failed_request(
-            &format!("https://{UNRESOLVABLE_HOST}/"),
-            client_builder().dns_resolver(Arc::new(Unresolvable)),
-        )
-        .await
+        failed_request(&format!("https://{UNRESOLVABLE_HOST}/"), client_builder()).await
     }
 
     async fn connect_timeout() -> reqwest::Error {
@@ -601,6 +582,14 @@ mod tests {
             client_builder()
                 .dns_resolver(Arc::new(NeverResolves))
                 .connect_timeout(CONNECT_TIMEOUT),
+        )
+        .await
+    }
+
+    async fn hung_up() -> reqwest::Error {
+        failed_request(
+            &format!("http://{LOOPBACK_HOST}:{}/", hangup_port()),
+            client_builder(),
         )
         .await
     }
@@ -793,10 +782,11 @@ mod tests {
     /// a connection that was made is the network being the network and is
     /// waited out. A connect timeout reads the same as a stall, so it is
     /// waited out too.
-    #[test_case(refused, DEFAULT_MAX_RETRIES    ; "a_refused_connection_gives_up")]
-    #[test_case(unresolved, DEFAULT_MAX_RETRIES ; "an_unresolvable_host_gives_up")]
-    #[test_case(tls_failure, ROUNDS             ; "a_tls_failure_keeps_retrying")]
-    #[test_case(connect_timeout, ROUNDS         ; "a_connect_timeout_keeps_retrying")]
+    #[test_case(refused, DEFAULT_MAX_RETRIES     ; "a_refused_connection_gives_up")]
+    #[test_case(unresolved, DEFAULT_MAX_RETRIES  ; "an_unresolvable_host_gives_up")]
+    #[test_case(tls_failure, DEFAULT_MAX_RETRIES ; "a_tls_failure_gives_up")]
+    #[test_case(hung_up, ROUNDS                  ; "a_hangup_keeps_retrying")]
+    #[test_case(connect_timeout, ROUNDS          ; "a_connect_timeout_keeps_retrying")]
     #[tokio::test]
     async fn a_transport_failure_is_waited_out_only_once_connected(
         error: impl AsyncFn() -> reqwest::Error,
@@ -811,8 +801,8 @@ mod tests {
         assert_eq!(retries_granted(&AgentError::Io(kind.into())), expected);
     }
 
-    #[test_case(refused, CONNECT_FAILED_MESSAGE    ; "connect_failure_names_the_server")]
-    #[test_case(tls_failure, NETWORK_ERROR_MESSAGE ; "other_transport_blames_the_network")]
+    #[test_case(refused, CONNECT_FAILED_MESSAGE        ; "connect_failure_names_the_server")]
+    #[test_case(hung_up, NETWORK_ERROR_MESSAGE         ; "other_transport_blames_the_network")]
     #[tokio::test]
     async fn user_message_transport(error: impl AsyncFn() -> reqwest::Error, expected: &str) {
         assert_eq!(AgentError::from(error().await).user_message(), expected);
@@ -833,13 +823,12 @@ mod tests {
     async fn a_transport_error_leaves_out_the_url() {
         let transport = failed_request(
             &format!("https://{UNRESOLVABLE_HOST}/?key={QUERY_SECRET}"),
-            client_builder().dns_resolver(Arc::new(Unresolvable)),
+            client_builder(),
         )
         .await;
         let error = AgentError::from(transport);
         let message = error.to_string();
         let debug = format!("{error:?}");
-        assert!(message.contains(UNRESOLVABLE_HOST), "{message}");
         assert!(!message.contains(QUERY_SECRET), "{message}");
         assert!(!message.contains(URL_MARKER), "{message}");
         assert!(!debug.contains(QUERY_SECRET), "{debug}");

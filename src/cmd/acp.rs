@@ -96,7 +96,7 @@ pub async fn run(
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
 
-    let prompt_slots = plugin_host.event_handle().collect_prompt_slots();
+    let prompt_slots = plugin_host.event_handle().collect_prompt_slots(None).await;
 
     let event_handle = plugin_host.event_handle();
     let commands = Arc::new(AcpCommands {
@@ -119,14 +119,16 @@ pub async fn run(
         trust_policy: Arc::new(config.trust),
         on_session_end: Some(Arc::new(move |id, reason| {
             let handle = event_handle.clone();
-            Box::pin(async move { handle.end_session_async(id, reason).await })
+            Box::pin(async move { handle.end_sessions([id], reason).await })
         })),
         storage,
         background: cli.background_wait().is_some(),
         host_prompt: cli.host_prompt(),
         stop: interrupt.stop(),
         commands,
-        host_requests: Some(acp_commands::forward_ui(plugin_host.ui_action_rx())),
+        host_requests: plugin_host
+            .take_ui_action_rx()
+            .map(acp_commands::forward_ui),
     })
     .await?;
     drop(plugin_host);

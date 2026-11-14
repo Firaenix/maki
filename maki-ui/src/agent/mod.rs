@@ -18,6 +18,9 @@ use maki_agent::{
 use maki_config::ModelPolicy;
 use maki_lua::EventHandle;
 use maki_storage::id::SessionRef;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::unbounded_channel;
 
 use self::run_cancels::RunCancels;
 use maki_providers::{Message, Timeouts};
@@ -86,9 +89,9 @@ impl AgentDeps {
 /// restore reply, a click, an old agent winding down) can always deliver.
 /// Stale events are filtered by `run_id`, not by killing the channel.
 pub(crate) struct AgentHandles {
-    pub(crate) agent_rx: flume::Receiver<Envelope>,
-    pub(crate) agent_tx: flume::Sender<Envelope>,
-    pub(crate) answer_tx: flume::Sender<String>,
+    pub(crate) agent_rx: UnboundedReceiver<Envelope>,
+    pub(crate) agent_tx: UnboundedSender<Envelope>,
+    pub(crate) answer_tx: UnboundedSender<String>,
     pub(crate) history: SharedMessages,
     pub(crate) deps: AgentDeps,
     pub(crate) queue: QueueSender,
@@ -110,7 +113,7 @@ impl AgentHandles {
         deps: AgentDeps,
     ) -> Self {
         let seed = deps.seed(&resumed, model_slot, config, tool_output_lines, permissions);
-        spawn_agent_internal(flume::unbounded(), seed, resumed, lua_handle, deps, false)
+        spawn_agent_internal(unbounded_channel(), seed, resumed, lua_handle, deps, false)
     }
 
     pub(crate) fn mcp_reader(&self) -> McpSnapshotReader {
@@ -201,7 +204,10 @@ impl AgentHandles {
             &app.permissions,
         );
         let new = spawn_agent_internal(
-            (self.agent_tx.clone(), self.agent_rx.clone()),
+            (
+                self.agent_tx.clone(),
+                mem::replace(&mut self.agent_rx, unbounded_channel().1),
+            ),
             seed,
             resumed,
             app.lua_event_handle.clone(),
@@ -252,14 +258,14 @@ pub(crate) async fn join_all(tasks: Vec<AbortOnDropHandle<()>>, timeout: Duratio
 }
 
 fn spawn_agent_internal(
-    (agent_tx, agent_rx): (flume::Sender<Envelope>, flume::Receiver<Envelope>),
+    (agent_tx, agent_rx): (UnboundedSender<Envelope>, UnboundedReceiver<Envelope>),
     seed: AgentSeed,
     resumed: Resumed,
     lua_handle: EventHandle,
     deps: AgentDeps,
     reload_auth: bool,
 ) -> AgentHandles {
-    let (answer_tx, answer_rx) = flume::unbounded::<String>();
+    let (answer_tx, answer_rx) = unbounded_channel::<String>();
     let (queue_tx, queue_rx) = shared_queue::queue();
     // Seeded empty because `AgentLoop::new` below publishes the real snapshot
     // synchronously, before any handle escapes.
@@ -315,18 +321,22 @@ mod tests {
     mod background_e2e;
 
     use std::path::{Path, PathBuf};
+    use std::sync::mpsc::{Receiver, Sender, channel};
     use std::time::Instant;
 
     use maki_agent::live_session::BACKGROUND_PLAN_WRITE_DENIED;
     use maki_agent::{AgentEvent, AgentInput, AgentMode, AgentSeed, InputSource};
     use maki_config::PermissionsConfig;
     use maki_config::project::{self, TrustMode};
+    use maki_lua::test_support::wait_next;
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
         AgentError, Model, ModelInfo, ProviderEvent, RequestOptions, StreamResponse, TaskEnd,
         ThinkingConfig,
     };
     use test_case::test_case;
+    use tokio::sync::Mutex as AsyncMutex;
+    use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
     use super::shared_queue::{QueueItem, QueuedInput};
     use super::*;
@@ -354,7 +364,7 @@ mod tests {
     /// its queue, until the test drops the gate's sender.
     #[derive(Default)]
     struct StubProvider {
-        auth_gate: Option<flume::Receiver<()>>,
+        auth_gate: Option<AsyncMutex<UnboundedReceiver<()>>>,
     }
 
     impl Provider for StubProvider {
@@ -364,7 +374,7 @@ mod tests {
             _messages: &'a [Message],
             _system: &'a str,
             _tools: &'a serde_json::Value,
-            _event_tx: &'a flume::Sender<ProviderEvent>,
+            _event_tx: &'a UnboundedSender<ProviderEvent>,
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -378,7 +388,7 @@ mod tests {
         fn reload_auth(&self) -> BoxFuture<'_, Result<(), AgentError>> {
             Box::pin(async {
                 if let Some(ref gate) = self.auth_gate {
-                    let _ = gate.recv_async().await;
+                    let _ = gate.lock().await.recv().await;
                 }
                 Ok(())
             })
@@ -464,8 +474,8 @@ mod tests {
     /// non-retryable error so no stream has to be faked. `gate` parks a call in
     /// flight until the test lets it go, one permit per call.
     struct RecordingProvider {
-        calls: flume::Sender<String>,
-        gate: Option<flume::Receiver<()>>,
+        calls: Sender<String>,
+        gate: Option<AsyncMutex<UnboundedReceiver<()>>>,
     }
 
     impl Provider for RecordingProvider {
@@ -475,7 +485,7 @@ mod tests {
             _messages: &'a [Message],
             _system: &'a str,
             _tools: &'a serde_json::Value,
-            _event_tx: &'a flume::Sender<ProviderEvent>,
+            _event_tx: &'a UnboundedSender<ProviderEvent>,
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -483,7 +493,7 @@ mod tests {
             Box::pin(async move {
                 let _ = self.calls.send(id);
                 if let Some(ref gate) = self.gate {
-                    gate.recv_async().await.expect(GATE_CLOSED);
+                    gate.lock().await.recv().await.expect(GATE_CLOSED);
                 }
                 Err(AgentError::Tool {
                     tool: RECORDER_TOOL.into(),
@@ -497,22 +507,18 @@ mod tests {
         }
     }
 
-    fn recorder() -> (Arc<dyn Provider>, flume::Receiver<String>) {
-        let (calls, reported) = flume::unbounded();
+    fn recorder() -> (Arc<dyn Provider>, Receiver<String>) {
+        let (calls, reported) = channel();
         (Arc::new(RecordingProvider { calls, gate: None }), reported)
     }
 
-    fn gated_recorder() -> (
-        Arc<dyn Provider>,
-        flume::Receiver<String>,
-        flume::Sender<()>,
-    ) {
-        let (calls, reported) = flume::unbounded();
-        let (release, gate) = flume::unbounded();
+    fn gated_recorder() -> (Arc<dyn Provider>, Receiver<String>, UnboundedSender<()>) {
+        let (calls, reported) = channel();
+        let (release, gate) = unbounded_channel();
         (
             Arc::new(RecordingProvider {
                 calls,
-                gate: Some(gate),
+                gate: Some(AsyncMutex::new(gate)),
             }),
             reported,
             release,
@@ -552,12 +558,9 @@ mod tests {
     /// The failed turn's `Error` is what says the run is over. Queue the next
     /// prompt before it and the running turn swallows it as an interrupt, so
     /// the second request never happens.
-    fn await_turn_end(handles: &AgentHandles) {
+    fn await_turn_end(handles: &mut AgentHandles) {
         loop {
-            let envelope = handles
-                .agent_rx
-                .recv_timeout(LONG_TIMEOUT)
-                .expect(NO_TURN_END);
+            let envelope = wait_next(&mut handles.agent_rx, LONG_TIMEOUT).expect(NO_TURN_END);
             if matches!(envelope.event, AgentEvent::Error { .. }) {
                 return;
             }
@@ -565,8 +568,8 @@ mod tests {
     }
 
     fn drive_turn(
-        handles: &AgentHandles,
-        reported: &flume::Receiver<String>,
+        handles: &mut AgentHandles,
+        reported: &Receiver<String>,
         run_id: u64,
         text: &str,
     ) -> String {
@@ -585,17 +588,17 @@ mod tests {
         let (provider_two, reported_two) = recorder();
         let cell_one = Arc::new(ArcSwap::new(slot(MODEL_A, &provider_one)));
         let cell_two = Arc::new(ArcSwap::new(slot(MODEL_A, &provider_two)));
-        let handles_one = spawn_on(&cell_one, Vec::new());
-        let handles_two = spawn_on(&cell_two, Vec::new());
+        let mut handles_one = spawn_on(&cell_one, Vec::new());
+        let mut handles_two = spawn_on(&cell_two, Vec::new());
 
         cell_one.store(slot(MODEL_B, &provider_one));
 
         assert_eq!(
-            drive_turn(&handles_one, &reported_one, 1, FIRST_PROMPT),
+            drive_turn(&mut handles_one, &reported_one, 1, FIRST_PROMPT),
             MODEL_B
         );
         assert_eq!(
-            drive_turn(&handles_two, &reported_two, 1, SECOND_PROMPT),
+            drive_turn(&mut handles_two, &reported_two, 1, SECOND_PROMPT),
             MODEL_A,
             "a swap on one runtime's cell must not move another runtime's model"
         );
@@ -615,7 +618,7 @@ mod tests {
 
         cell.store(slot(MODEL_B, &provider));
         assert_eq!(
-            drive_turn(&handles, &reported, app.run_id, FIRST_PROMPT),
+            drive_turn(&mut handles, &reported, app.run_id, FIRST_PROMPT),
             MODEL_B
         );
     }
@@ -628,19 +631,19 @@ mod tests {
         let _runtime = enter_runtime();
         let (provider, reported, release) = gated_recorder();
         let cell = Arc::new(ArcSwap::new(slot(MODEL_A, &provider)));
-        let handles = spawn_on(&cell, Vec::new());
+        let mut handles = spawn_on(&cell, Vec::new());
 
         push_prompt(&handles, 1, FIRST_PROMPT);
         let in_flight = reported.recv_timeout(LONG_TIMEOUT).expect(NO_CALL);
         cell.store(slot(MODEL_B, &provider));
         release.send(()).expect(GATE_CLOSED);
-        await_turn_end(&handles);
+        await_turn_end(&mut handles);
         assert_eq!(in_flight, MODEL_A);
 
         push_prompt(&handles, 2, SECOND_PROMPT);
         let next = reported.recv_timeout(LONG_TIMEOUT).expect(NO_CALL);
         release.send(()).expect(GATE_CLOSED);
-        await_turn_end(&handles);
+        await_turn_end(&mut handles);
         assert_eq!(
             next, MODEL_B,
             "a swap stored mid-flight must still land on the next turn"
@@ -655,10 +658,10 @@ mod tests {
     #[test]
     fn respawn_twice_keeps_channel_and_delivers_restored_queue() {
         let _runtime = enter_runtime();
-        let (open_auth, auth_gate) = flume::unbounded::<()>();
+        let (open_auth, auth_gate) = unbounded_channel::<()>();
         let (mut handles, model_slot) = stub_spawn_on(
             StubProvider {
-                auth_gate: Some(auth_gate),
+                auth_gate: Some(AsyncMutex::new(auth_gate)),
             },
             Vec::new(),
         );
@@ -693,9 +696,7 @@ mod tests {
         let mut probe_seen = false;
         let mut consumed_seen = false;
         while !(probe_seen && consumed_seen) {
-            let envelope = handles
-                .agent_rx
-                .recv_timeout(LONG_TIMEOUT)
+            let envelope = wait_next(&mut handles.agent_rx, LONG_TIMEOUT)
                 .expect("probe or restored queue item never reached the tab channel");
             match envelope.event {
                 AgentEvent::TextDelta { ref text } if text == PROBE_TEXT => probe_seen = true,
@@ -770,10 +771,7 @@ mod tests {
 
         let mut observed = false;
         loop {
-            let envelope = handles
-                .agent_rx
-                .recv_timeout(LONG_TIMEOUT)
-                .expect(NO_TURN_END);
+            let envelope = wait_next(&mut handles.agent_rx, LONG_TIMEOUT).expect(NO_TURN_END);
             match envelope.event {
                 AgentEvent::ObservationLine { end, .. } => observed |= end == Some(TaskEnd::Lost),
                 AgentEvent::Error { .. } => break,

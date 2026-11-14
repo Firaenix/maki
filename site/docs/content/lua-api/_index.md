@@ -669,8 +669,16 @@ until the next compaction.
 
 - `{spec}` (`table`) Hint specification:
   - `slot` (`string`) Required. Aggregate slot name (e.g. "tool_usage", "conventions").
-  - `content` (`string|function`) Required. Static text, or a `function()` that returns a string. Max 1 MiB.
-  - `prompt` (`string|string[]`) Optional. Restrict to specific prompt ids (e.g. "system").
+  - `content` (`string|function`) Required. Static text, or a `function(ctx)` that
+    returns a string. Max 1 MiB. `ctx` is
+    `{ session_id = "..." }` naming the session whose
+    prompt is being built, or nil when there really
+    is no session (startup, ACP clients).
+  - `prompt` (`string|string[]`) Optional. Restrict to specific prompt ids
+    (e.g. "system"). Entries resolve with the run's
+    other prompt slots, so nothing caches them
+    across turns. One-shot clients (`maki -p`, the
+    SDK, ACP) resolve all hints once at startup.
 
 **Example:**
 
@@ -739,8 +747,9 @@ Sections: `identity`, `tone`, `tool_usage`, `efficient_tools`, `conventions`,
 
 Identity and tone are available in system, research, and general prompts.
 Sections target the main agent when `prompt` is omitted. Only identity and
-tone accept a function called before every run. Its first value goes in the
-system prompt. Later changes reach the main agent as a context update.
+tone accept a function called before every run; it receives `ctx` as in
+`register_prompt_hint`. Its first value goes in the system prompt. Later
+changes reach the main agent as a context update.
 Other replacements require static strings.
 A known section missing from the resolved template is ignored, with a warning
 for explicit prompt targets.
@@ -5397,9 +5406,10 @@ Host session primitives. The interactive UI can run several sessions
 at once. These functions list, create, focus, rename, and delete them.
 
 Without a UI, most functions return `nil, "no interactive UI attached"`.
-`current`, `read`, `export`, `messages`, `notify` and `new` without
-`prompt` or `focus` still work. ACP has no focused session, so there
-`current` fails and `read`, `export` and `messages` need `session`.
+`current`, `read`, `export`, `messages`, `windows`, `subagents`,
+`notify` and `new` without `prompt` or `focus` still work. ACP has no
+focused session, so there `current` fails and the readers need
+`session`.
 
 ---
 
@@ -5568,7 +5578,7 @@ been sent so far, tool calls and results included. Read only.
 Each message has the same shape as in the session file:
 
 ```text
-{ role = "user" | "assistant", kind, facts?, display_text?, receipts?, settles?, partial?, content = { blocks } }
+{ role = "user" | "assistant", kind, facts?, display_text?, receipts?, settles?, partial?, created_at?, content = { blocks } }
 ```
 
 `kind` is `"turn"` for something the user or the model said,
@@ -5582,7 +5592,10 @@ message moved to the background, and `settles` = `{ task, end }` marks the
 notice that answered one, with `end` one of `"finished"`, `"failed"`,
 `"cancelled"` or `"lost"`. `partial` has the same shape and marks a notice
 that answered one piece early, like one call of a moved batch, and left
-the receipt open. `content` lists blocks:
+the receipt open. `created_at` is the wall clock, in epoch
+milliseconds, when the message was appended, or nil for a message older than
+the field, so a reader can tell a real zero gap from an unknown one.
+`content` lists blocks:
 
 ```text
 { type = "text", text }
@@ -5602,12 +5615,18 @@ from disk. Works in the TUI, `maki -p`, sdk mode, and ACP. ACP has no
 focused session, so pass `session` there. Hook and event payloads carry
 the `session_id` to pass.
 
+`window` reads one archived window instead, as `maki.session.windows`
+lists it. Archives never change, so they read the same in every mode and
+need no live session.
+
 Requires the `session_read` [plugin permission](#plugin-permissions).
 
 **Parameters:**
 
 - `{opts?}` (`table?`) Options:
   - `session` (`string?`) Session id, live or stored. Defaults to the focused one.
+  - `window` (`string?`) `"current"` or an archive id from `maki.session.windows`.
+    Defaults to the current window.
   - `last` (`integer?`) only the newest `last` messages.
 
 **Returns:** (`table|nil`, `string|nil`) Array of messages, or nil and an error.
@@ -5619,6 +5638,113 @@ local msgs = maki.session.messages({ last = 1 })
 local last = msgs and msgs[1]
 if last and last.role == "assistant" and last.content[1].type == "text" then
   print(last.content[1].text)
+end
+```
+
+---
+
+### `maki.session.windows()` {#maki-session-windows}
+
+```lua
+maki.session.windows({opts?})
+```
+
+Lists a session's transcript windows, newest first: the current window is
+`[1]` and holds the conversation that has not been sealed yet, then the
+archived windows from the most recent seal back to the session start,
+each labeled with the rewrite that sealed it. A compaction parks the
+turns it summarized, a rewind the turns it cut, and both stay readable.
+
+Each window is:
+```text
+{
+  id = "current" | "<seq>",  -- pass back to `messages`/`subagents`
+  created_at,                -- when the window began, in Unix seconds: the
+                             -- session start for the oldest, otherwise the
+                             -- seal time of the window before it in time;
+                             -- nil when the session header is missing or
+                             -- unreadable
+  kind = "current" | "compaction" | "rewind" | "unknown",
+}
+```
+
+Listing never parses a transcript, so it stays cheap however long the
+session is. `messages` reads one window; `subagents` reads the asked
+window and its neighbors.
+
+Works in the TUI, `maki -p`, sdk mode, and ACP. ACP has no focused
+session, so pass `session` there. Hook and event payloads carry the
+`session_id` to pass.
+
+Requires the `session_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Options:
+  - `session` (`string?`) Session id, live or stored. Defaults to the focused one.
+
+**Returns:** (`table|nil`, `string|nil`) Array of windows, or nil and an error.
+
+**Example:**
+
+```lua
+for _, window in ipairs(assert(maki.session.windows())) do
+  print(window.id, window.kind, window.created_at)
+end
+```
+
+---
+
+### `maki.session.subagents()` {#maki-session-subagents}
+
+```lua
+maki.session.subagents({opts?})
+```
+
+Reads the subagent transcripts that belong to one window, in spawn order
+where the session recorded it; transcripts with no record come last, by
+id. A transcript attaches to the window holding the `tool_use` that
+started it. A plugin run beside the chat has no parent `tool_use` and
+keeps its records across rewrites, so it attaches to the newest window
+that holds them.
+
+Each entry is:
+```text
+{
+  id,       -- the `tool_use` id that spawned it, stable in the session
+  nr,       -- 1-based position in the window's subagent list, not the
+            -- array index; a rewrite can drop entries, so numbers repeat
+            -- across windows
+  name,     -- the task description that spawned it, or "subagent"
+  messages, -- same shape as `maki.session.messages`
+}
+```
+
+Only what the host stored is visible. The TUI records subagent
+transcripts; `maki -p`, the SDK and ACP do not, so `subagents` answers an
+empty list for sessions they ran. The current window's transcripts come
+from the stored copy too, so they trail the run: a running subagent shows
+only the turns saved so far.
+
+ACP has no focused session, so pass `session` there. Hook and event
+payloads carry the `session_id` to pass.
+
+Requires the `session_read` [plugin permission](#plugin-permissions).
+
+**Parameters:**
+
+- `{opts?}` (`table?`) Options:
+  - `session` (`string?`) Session id, live or stored. Defaults to the focused one.
+  - `window` (`string?`) `"current"` or an archive id from `maki.session.windows`.
+    Defaults to the current window.
+
+**Returns:** (`table|nil`, `string|nil`) Array of subagents, or nil and an error.
+
+**Example:**
+
+```lua
+for _, sub in ipairs(assert(maki.session.subagents())) do
+  print(sub.id, sub.nr, sub.name, #sub.messages)
 end
 ```
 

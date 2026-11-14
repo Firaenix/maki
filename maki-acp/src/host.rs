@@ -2,9 +2,9 @@
 //! command that calls `maki.session.prompt` lands here, since an ACP server
 //! has no TUI to take it.
 
-use flume::Sender;
 use maki_agent::ImageSource;
 use serde_json::Value;
+use tokio::sync::oneshot;
 
 /// The words `maki.session.prompt` answers with, matching the TUI's.
 pub const PROMPT_STARTED: &str = "started";
@@ -20,7 +20,7 @@ pub enum HostRequest {
         session: Option<String>,
         text: String,
         images: Vec<ImageSource>,
-        reply: Sender<HostReply>,
+        reply: oneshot::Sender<HostReply>,
     },
     /// What a plugin showed, a toast, a flash or a window's contents, as text:
     /// ACP has no windows. It joins the turn of the Lua command waiting on its

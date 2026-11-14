@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use flume::Sender;
 use maki_storage::id::SessionRef;
 use reqwest::{Client, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
 use super::anthropic::shared;
@@ -248,7 +248,7 @@ impl Copilot {
         messages: &[Message],
         system: &str,
         tools: &Value,
-        event_tx: &Sender<ProviderEvent>,
+        event_tx: &UnboundedSender<ProviderEvent>,
     ) -> Result<StreamResponse, AgentError> {
         let auth = self.auth().await?;
         let wire_tools = openai_compat::convert_tools(tools);
@@ -272,8 +272,8 @@ impl Copilot {
             )?
             .body(serde_json::to_vec(&body)?)
             .build()?;
-        super::ok_sse(&self.client, request, |body| {
-            openai_compat::parse_sse(body, event_tx, self.stream_timeout, false)
+        super::ok_sse(&self.client, request, self.stream_timeout, |body| {
+            openai_compat::parse_sse(body, event_tx, false)
         })
         .await
     }
@@ -284,7 +284,7 @@ impl Copilot {
         messages: &[Message],
         system: &str,
         tools: &Value,
-        event_tx: &Sender<ProviderEvent>,
+        event_tx: &UnboundedSender<ProviderEvent>,
         thinking: ThinkingConfig,
     ) -> Result<StreamResponse, AgentError> {
         let auth = self.auth().await?;
@@ -326,7 +326,7 @@ impl Copilot {
         messages: &[Message],
         system: &str,
         tools: &Value,
-        event_tx: &Sender<ProviderEvent>,
+        event_tx: &UnboundedSender<ProviderEvent>,
         thinking: ThinkingConfig,
     ) -> Result<StreamResponse, AgentError> {
         let auth = self.auth().await?;
@@ -336,8 +336,8 @@ impl Copilot {
             .header("anthropic-version", "2023-06-01")
             .body(serde_json::to_vec(&body)?)
             .build()?;
-        super::ok_sse(&self.client, request, |body| {
-            super::anthropic::parse_sse(body, event_tx, self.stream_timeout)
+        super::ok_sse(&self.client, request, self.stream_timeout, |body| {
+            super::anthropic::parse_sse(body, event_tx)
         })
         .await
     }
@@ -808,7 +808,7 @@ impl Provider for Copilot {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         _session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {

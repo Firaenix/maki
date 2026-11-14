@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::env;
+use std::time::{Duration, Instant};
 
 use maki_config::AgentConfig;
 use maki_providers::retry::RetryPolicy;
@@ -11,7 +12,7 @@ use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use super::frame::{RunContext, fit_frame};
-use super::history::{History, remove_orphaned_tool_results, strip_thinking};
+use super::history::{History, remove_orphaned_tool_results, stamp_new, strip_thinking};
 use super::hook::{AgentHooks, AgentSlot};
 use super::streaming::{StreamError, StreamRequest, min_output, stream_with_retry};
 use crate::mcp::McpSession;
@@ -175,6 +176,7 @@ pub(super) fn continue_message(added: Option<&str>) -> String {
 
 pub(super) struct Compacted {
     pub summary: String,
+    pub duration: Duration,
     /// How many unanswered messages follow the summary. Context updates are
     /// never among them, see [`History::restart`].
     pub carried: usize,
@@ -200,7 +202,8 @@ pub(super) async fn compact_history(
     retry: RetryPolicy,
     ledger: &RunLedger,
 ) -> Result<Compacted, AgentError> {
-    let compact_start = std::time::Instant::now();
+    let compact_start = Instant::now();
+    event_tx.send(AgentEvent::CompactionStarted)?;
     let summarized = history.len().saturating_sub(carry_len);
     let mut compaction_history: Vec<Message> = history.as_slice()[..summarized].to_vec();
     remove_orphaned_tool_results(&mut compaction_history);
@@ -263,14 +266,19 @@ pub(super) async fn compact_history(
                         );
                     }
                     result => {
-                        let compacted = result?;
+                        let (summary, carried) = result?;
+                        let duration = compact_start.elapsed();
                         info!(
                             model = %model.id,
-                            duration_ms = compact_start.elapsed().as_millis() as u64,
+                            duration_ms = duration.as_millis() as u64,
                             attempt,
                             "compaction completed"
                         );
-                        return Ok(compacted);
+                        return Ok(Compacted {
+                            summary,
+                            duration,
+                            carried,
+                        });
                     }
                 }
             }
@@ -289,6 +297,43 @@ pub(super) async fn compact_history(
     }
 }
 
+/// Rebuild the transcript after a compaction: a summary pair, then the tail that
+/// was not summarized. Returns the new list and the length of the summary pair,
+/// so the caller can report how many messages carried over.
+///
+/// The summary pair carries the first kept message's stamp, not "now". The pair
+/// is followed by the carried tail, whose stamps predate the summary call that
+/// just returned; stamping the pair now would run the transcript's clock backwards
+/// at the join, and a timing reader would see a negative gap. The compaction
+/// call's own wall time then falls to the first carried message instead.
+fn rebuild_history(
+    summary: Message,
+    history: &[Message],
+    summarized: usize,
+    post_compaction_instructions: Option<&str>,
+) -> (Vec<Message>, usize) {
+    let carried_at = history.get(summarized).and_then(|m| m.created_at);
+    let stamp = |msg: Message| {
+        stamp_new(Message {
+            created_at: carried_at,
+            ..msg
+        })
+    };
+    let mut new_history = vec![
+        stamp(Message::user("What did we do so far?".into())),
+        stamp(summary),
+    ];
+    // Part of the summary block and not the carried input, so the next
+    // compaction summarizes this copy away instead of carrying a duplicate.
+    new_history.extend(
+        normalize(post_compaction_instructions)
+            .map(|text| stamp(Message::synthetic(text.to_owned()))),
+    );
+    let summary_len = new_history.len();
+    new_history.extend_from_slice(&history[summarized..]);
+    (new_history, summary_len)
+}
+
 fn finish_compact(
     response: StreamResponse,
     history: &mut History,
@@ -297,7 +342,7 @@ fn finish_compact(
     model: &Model,
     hooks: &AgentHooks<'_>,
     config: &AgentConfig,
-) -> Result<Compacted, AgentError> {
+) -> Result<(String, usize), AgentError> {
     let summary = response.message.first_text_content().map(str::to_owned);
     // An unusable summary leaves the session as it was, so it keeps its size.
     let context_size = if summary.is_some() {
@@ -321,24 +366,15 @@ fn finish_compact(
         return Err(AgentError::EmptySummary);
     };
 
-    let mut new_history = vec![
-        Message::user("What did we do so far?".into()),
+    let (new_history, summary_len) = rebuild_history(
         response.message,
-    ];
-    // Part of the summary block and not the carried input, so the next
-    // compaction summarizes this copy away instead of carrying a duplicate.
-    new_history.extend(
-        normalize(config.post_compaction_instructions.as_deref())
-            .map(|text| Message::synthetic(text.to_owned())),
+        history.as_slice(),
+        summarized,
+        config.post_compaction_instructions.as_deref(),
     );
-    let summary_len = new_history.len();
-    new_history.extend_from_slice(&history.as_slice()[summarized..]);
     history.restart(new_history);
 
-    Ok(Compacted {
-        summary,
-        carried: history.len() - summary_len,
-    })
+    Ok((summary, history.len() - summary_len))
 }
 
 /// `next` is what the session would start with now. The summary goes out under
@@ -385,7 +421,9 @@ pub async fn compact(
         event_tx.send(finished(size_before))?;
         return Ok(DoneReason::Compact);
     };
-    let Compacted { summary, .. } = match compact_history(
+    let Compacted {
+        summary, duration, ..
+    } = match compact_history(
         provider,
         model,
         history,
@@ -424,6 +462,7 @@ pub async fn compact(
         context_size_after,
         context_window: hooks.model.context_window,
         summary,
+        duration_ms: duration.as_millis() as u64,
     })?;
     event_tx.send(finished(context_size_after))?;
 
@@ -646,6 +685,7 @@ pub(super) fn auto_compact_enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::iter;
     use std::sync::Mutex;
 
     use maki_providers::provider::{BoxFuture, Provider};
@@ -656,6 +696,8 @@ mod tests {
     use maki_storage::id::SessionRef;
     use serde_json::Value;
     use test_case::test_case;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
     use crate::AgentConfig;
@@ -663,6 +705,61 @@ mod tests {
     use crate::cancel::CancelToken;
     use crate::tools::{RequestTools, ToolRegistry};
     use maki_config::CompactionBuffer;
+
+    #[test]
+    fn rebuild_history_keeps_timestamps_monotonic_at_the_join() {
+        let history = vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "summarized".into(),
+                }],
+                created_at: Some(100),
+                ..Default::default()
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "first kept".into(),
+                }],
+                created_at: Some(1_000),
+                ..Default::default()
+            },
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "kept".into(),
+                }],
+                created_at: Some(2_000),
+                ..Default::default()
+            },
+        ];
+        let summary = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: "the summary".into(),
+            }],
+            ..Default::default()
+        };
+
+        let (rebuilt, summary_len) = rebuild_history(summary, &history, 1, None);
+        assert_eq!(
+            summary_len, 2,
+            "a prompt and its summary head the transcript"
+        );
+        assert_eq!(rebuilt.len(), 2 + 2, "pair + the carried tail");
+        // The pair takes the first kept message's stamp (1_000), never "now": the
+        // summary call started after the tail was written, so "now" would postdate
+        // it and run the transcript clock backwards at the join.
+        assert_eq!(rebuilt[0].created_at, Some(1_000));
+        assert_eq!(rebuilt[1].created_at, Some(1_000));
+        let mut prev = 0;
+        for msg in &rebuilt {
+            let at = msg.created_at.expect("every rebuilt message is stamped");
+            assert!(at >= prev, "timestamps must not go backwards: {rebuilt:?}");
+            prev = at;
+        }
+    }
 
     const CONFIG_EXTRA: &str = "Record anything that belongs in plan.md";
     const REQUEST_EXTRA: &str = "Keep the failing test names";
@@ -710,7 +807,7 @@ mod tests {
             messages: &'a [Message],
             _: &'a str,
             _: &'a Value,
-            _: &'a flume::Sender<ProviderEvent>,
+            _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             session_id: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -784,7 +881,7 @@ mod tests {
         instructions: Option<&str>,
         cancel: &CancelToken,
     ) -> Result<DoneReason, AgentError> {
-        let (raw_tx, _rx) = flume::unbounded();
+        let (raw_tx, _rx) = unbounded_channel();
         let registry = ToolRegistry::new();
         let model = default_model();
         compact(
@@ -809,7 +906,7 @@ mod tests {
         carry_len: usize,
         session_id: Option<&SessionRef>,
     ) {
-        let (raw_tx, _rx) = flume::unbounded();
+        let (raw_tx, _rx) = unbounded_channel();
         let registry = ToolRegistry::new();
         let model = default_model();
         let cancel = CancelToken::none();
@@ -923,7 +1020,7 @@ mod tests {
         let provider = MockProvider::new(vec![empty(), empty()]);
         let mut history = History::new(vec![Message::user(KEPT_TEXT.into())]);
         let mut gauge = ContextGauge::restored(SUMMARISED_PROMPT);
-        let (raw_tx, rx) = flume::unbounded();
+        let (raw_tx, mut rx) = unbounded_channel();
         let registry = ToolRegistry::new();
         let model = default_model();
         let cancel = CancelToken::none();
@@ -949,8 +1046,11 @@ mod tests {
         assert_eq!(gauge.size(), SUMMARISED_PROMPT);
         assert_eq!(history.len(), 1);
         assert_eq!(history.as_slice()[0].user_text(), Some(KEPT_TEXT));
-        let events: Vec<_> = rx.try_iter().map(|e| e.event).collect();
+        let events: Vec<_> = iter::from_fn(|| rx.try_recv().ok())
+            .map(|e| e.event)
+            .collect();
         let [
+            AgentEvent::CompactionStarted,
             AgentEvent::TurnComplete(first),
             AgentEvent::TurnComplete(retry),
         ] = events.as_slice()
@@ -1006,7 +1106,7 @@ mod tests {
             Message::user(KEPT_TEXT.into()),
             Message::user("second".into()),
         ]);
-        let (raw_tx, rx) = flume::unbounded();
+        let (raw_tx, mut rx) = unbounded_channel();
         let registry = ToolRegistry::new();
         let model = default_model();
         let cancel = CancelToken::none();
@@ -1031,7 +1131,23 @@ mod tests {
             .iter()
             .filter(|reply| !matches!(reply, Reply::Overflow))
             .count();
-        let events: Vec<_> = rx.try_iter().map(|e| e.event).collect();
+        let events: Vec<_> = iter::from_fn(|| rx.try_recv().ok())
+            .map(|e| e.event)
+            .collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::CompactionStarted))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::CompactionDone { .. }))
+                .count(),
+            usize::from(summarised)
+        );
         let turns = events
             .iter()
             .filter(|event| matches!(event, AgentEvent::TurnComplete(_)))
@@ -1136,7 +1252,7 @@ mod tests {
         instructions: Option<&str>,
         answer: impl Fn(AgentSlot, &Value) -> Verdict + Send + Sync + 'static,
     ) -> (Result<DoneReason, AgentError>, Vec<AgentEvent>) {
-        let (raw_tx, rx) = flume::unbounded();
+        let (raw_tx, mut rx) = unbounded_channel();
         let registry = ToolRegistry::new();
         script(&registry, answer);
         let model = default_model();
@@ -1155,7 +1271,12 @@ mod tests {
             RetryPolicy::default(),
         )
         .await;
-        (result, rx.try_iter().map(|e| e.event).collect())
+        (
+            result,
+            iter::from_fn(|| rx.try_recv().ok())
+                .map(|e| e.event)
+                .collect(),
+        )
     }
 
     /// The mock holds no responses, so any request would panic.
@@ -1175,11 +1296,10 @@ mod tests {
         assert_eq!(result.unwrap(), DoneReason::Compact);
         assert_eq!(history.len(), 1);
         assert_eq!(history.as_slice()[0].user_text(), Some(KEPT_TEXT));
-        assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::CompactionDone { .. }))
-        );
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            AgentEvent::CompactionStarted | AgentEvent::CompactionDone { .. }
+        )));
         let done: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
@@ -1250,6 +1370,7 @@ mod tests {
         assert_eq!(result.unwrap(), DoneReason::Compact);
 
         let [
+            AgentEvent::CompactionStarted,
             AgentEvent::TurnComplete(turn),
             AgentEvent::CompactionDone {
                 context_size_after,

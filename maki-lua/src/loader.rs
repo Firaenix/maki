@@ -1,12 +1,14 @@
+use maki_agent::UiWaker;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use flume::Sender;
 use include_dir::{Dir, File, include_dir};
 use maki_agent::permissions::{PluginRuleStore, carries_builtin_defaults};
 use maki_agent::tools::ToolRegistry;
@@ -14,7 +16,10 @@ use maki_agent::{Cutter, SessionEndReason};
 use maki_config::{GatedFile, PluginsConfig, ProjectConfig, RawConfig};
 use maki_providers::plugin::{DeclAuthority, keep_granted};
 use tokio::runtime::{Builder, EnterGuard, Handle, Runtime, RuntimeFlavor};
-use tokio::task::spawn_blocking;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::sync::oneshot;
+use tokio::time::timeout_at;
 
 use crate::agent_autocmd::HostEvent;
 use crate::api::keymap::{KeybindTicket, KeymapReader};
@@ -22,7 +27,7 @@ use crate::api::options::{PluginOptionSpecs, PluginOpts};
 use crate::api::slot::{LayeredTools, PLAN_FORM_ACTIONS_SLOT, PLAN_FORM_SLOT};
 use crate::api::ui::marks::InputRulesReader;
 use crate::api::util::command::{
-    HintReader, LuaCommandReader, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction, UiAttachment,
+    HintReader, LuaCommandReader, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction,
 };
 use crate::background::BackgroundTasks;
 use crate::error::PluginError;
@@ -326,7 +331,7 @@ impl Drop for PluginHost {
         // Start the shutdown first, or the join below waits for all
         // queued bulk work to drain.
         self.begin_shutdown();
-        let (done_tx, done_rx) = flume::bounded(1);
+        let (done_tx, done_rx) = sync_channel(1);
         std::thread::spawn(move || {
             let _ = done_tx.send(handle.join().is_err());
         });
@@ -395,8 +400,8 @@ impl PluginHost {
     pub fn begin_shutdown(&mut self) {
         self.inner.shutdown.store(true, Ordering::Release);
         let _ = self.inner.prio_tx.send(Request::Shutdown);
-        self.inner.tx = flume::unbounded().0;
-        self.inner.prio_tx = flume::unbounded().0;
+        self.inner.tx = unbounded_channel().0;
+        self.inner.prio_tx = unbounded_channel().0;
     }
 
     /// Boots the runtime and loads every default bundled plugin into
@@ -641,8 +646,8 @@ impl PluginHost {
         })
     }
 
-    fn ask<T>(&self, request: impl FnOnce(Sender<T>) -> Request) -> Result<T, PluginError> {
-        let (reply_tx, reply_rx) = flume::bounded(1);
+    fn ask<T>(&self, request: impl FnOnce(SyncSender<T>) -> Request) -> Result<T, PluginError> {
+        let (reply_tx, reply_rx) = sync_channel(1);
         self.inner
             .tx
             .send(request(reply_tx))
@@ -905,7 +910,7 @@ impl PluginHost {
         // installed the first round is empty, and the names `init.lua` already
         // recorded still have to be collected.
         loop {
-            for pkg in round {
+            for pkg in round.drain(..) {
                 let opts = config
                     .opts
                     .get(&pkg.name)
@@ -979,7 +984,6 @@ impl PluginHost {
                     break;
                 }
             };
-            round = Vec::new();
             for op in ops {
                 let crate::api::pack::PackOp::Activate { name } = op;
                 if loaded.contains(&name.as_str()) {
@@ -1083,30 +1087,26 @@ impl PluginHost {
         self.inner.input_rules_reader.clone()
     }
 
-    pub fn ui_action_rx(&self) -> flume::Receiver<UiAction> {
-        self.inner.ui_action_rx.clone()
+    /// The one receiver of what plugins ask of the UI, for the event loop to
+    /// own. `None` once taken. The loop closes it when it stops draining, before
+    /// teardown runs `SessionEnd`, so a handler is turned away at the send
+    /// instead of parking on a reply that never comes.
+    pub fn take_ui_action_rx(&self) -> Option<UnboundedReceiver<UiAction>> {
+        self.inner.ui_action_rx.lock().unwrap().take()
     }
 
     /// Rings when a plugin changes a window or what one shows.
-    pub fn ui_wake_rx(&self) -> flume::Receiver<()> {
-        self.inner.ui_wake_rx.clone()
-    }
-
-    /// The bit every `maki.ui` and `maki.fn` roundtrip consults. The event
-    /// loop attaches while it drains [`Self::ui_action_rx`] and detaches
-    /// before teardown runs `SessionEnd`, since that receiver is a clone and
-    /// dropping it would leave a handler parked on a reply that never comes.
-    pub fn ui_attachment(&self) -> UiAttachment {
-        self.inner.ui_attachment.clone()
+    pub fn ui_waker(&self) -> UiWaker {
+        self.inner.ui_waker.clone()
     }
 }
 
 #[derive(Clone)]
 pub struct EventHandle {
-    pub(crate) tx: flume::Sender<Request>,
+    pub(crate) tx: UnboundedSender<Request>,
     /// User-initiated requests bypass queued bulk work (session restores).
-    prio_tx: flume::Sender<Request>,
-    moves: flume::Sender<MoveRequest>,
+    prio_tx: UnboundedSender<Request>,
+    moves: UnboundedSender<MoveRequest>,
     /// Published by the Lua thread and read without touching it: whether
     /// asking a chain can change the answer at all.
     layered: Arc<LayeredTools>,
@@ -1114,11 +1114,11 @@ pub struct EventHandle {
 }
 
 impl EventHandle {
-    pub(crate) fn from_tx(tx: flume::Sender<Request>) -> Self {
+    pub(crate) fn from_tx(tx: UnboundedSender<Request>) -> Self {
         Self {
             tx,
-            prio_tx: flume::unbounded().0,
-            moves: flume::unbounded().0,
+            prio_tx: unbounded_channel().0,
+            moves: unbounded_channel().0,
             layered: Arc::default(),
             background: BackgroundTasks::default(),
         }
@@ -1134,7 +1134,7 @@ impl EventHandle {
 
     #[doc(hidden)]
     pub fn disconnected_for_test() -> Self {
-        Self::from_tx(flume::unbounded().0)
+        Self::from_tx(unbounded_channel().0)
     }
 
     /// Whether a plugin is layering either of the plan form slots. False on a
@@ -1160,9 +1160,9 @@ impl EventHandle {
         row: usize,
         path: String,
         parallel: bool,
-    ) -> flume::Receiver<PlanActionOutcome> {
-        let (reply, rx) = flume::bounded(1);
-        let _ = self.prio_tx.try_send(Request::RunPlanAction {
+    ) -> oneshot::Receiver<PlanActionOutcome> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.prio_tx.send(Request::RunPlanAction {
             session,
             generation,
             row,
@@ -1182,9 +1182,9 @@ impl EventHandle {
         path: String,
         session: String,
         rows: Vec<PlanFormRow>,
-    ) -> flume::Receiver<Option<PlanMenu>> {
-        let (reply, rx) = flume::bounded(1);
-        let _ = self.prio_tx.try_send(Request::OpenPlanForm {
+    ) -> oneshot::Receiver<Option<PlanMenu>> {
+        let (reply, rx) = oneshot::channel();
+        let _ = self.prio_tx.send(Request::OpenPlanForm {
             path,
             session,
             rows,
@@ -1199,18 +1199,18 @@ impl EventHandle {
     /// this to skip async side effects (e.g. a restore-complete flip) that
     /// no live consumer would ever observe.
     pub fn is_disconnected(&self) -> bool {
-        self.tx.is_disconnected() && self.prio_tx.is_disconnected()
+        self.tx.is_closed() && self.prio_tx.is_closed()
     }
 
     /// Test probe sibling of `from_tx`: collapses both senders onto one
     /// channel so a `RequestProbe` sees every request, including the
     /// `prio_tx`-routed commands and keybind callbacks that `from_tx`
     /// would route to a disconnected channel.
-    pub(crate) fn probed_for_test(shared: flume::Sender<Request>) -> Self {
+    pub(crate) fn probed_for_test(shared: UnboundedSender<Request>) -> Self {
         Self {
             tx: shared.clone(),
             prio_tx: shared,
-            moves: flume::unbounded().0,
+            moves: unbounded_channel().0,
             layered: Arc::default(),
             background: BackgroundTasks::default(),
         }
@@ -1233,7 +1233,7 @@ impl EventHandle {
         depth: u8,
         session: Option<String>,
     ) {
-        let _ = self.prio_tx.try_send(Request::RunCommand {
+        let _ = self.prio_tx.send(Request::RunCommand {
             plugin,
             command,
             args,
@@ -1242,19 +1242,13 @@ impl EventHandle {
         });
     }
 
-    pub fn collect_prompt_slots(&self) -> ResolvedPrompts {
-        let (tx, rx) = flume::bounded(1);
-        let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
-        rx.recv().unwrap_or_default()
-    }
-
-    pub fn package_context(&self) -> Result<crate::pack::PackContext, String> {
-        let (reply_tx, reply_rx) = flume::bounded(1);
+    pub async fn package_context(&self) -> Result<crate::pack::PackContext, String> {
+        let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(Request::CollectPackageContext { reply: reply_tx })
             .map_err(|_| PACK_STATE_UNAVAILABLE.to_owned())?;
         let (declared, active) = reply_rx
-            .recv()
+            .await
             .map_err(|_| PACK_STATE_UNAVAILABLE.to_owned())?;
         let installed = crate::pack::installed_names()
             .ok_or_else(|| "could not read the package lockfile".to_owned())?;
@@ -1262,10 +1256,15 @@ impl EventHandle {
         Ok(crate::pack::PackContext::new(declared, installed, active))
     }
 
-    pub async fn collect_prompt_slots_async(&self) -> ResolvedPrompts {
-        let (tx, rx) = flume::bounded(1);
-        let _ = self.tx.send(Request::CollectPromptSlots { reply: tx });
-        rx.recv_async().await.unwrap_or_default()
+    /// `session` names the session whose prompt is being built, so content
+    /// callbacks can tell it apart from the focused tab.
+    pub async fn collect_prompt_slots(&self, session: Option<&str>) -> ResolvedPrompts {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.tx.send(Request::CollectPromptSlots {
+            session: session.map(str::to_owned),
+            reply: tx,
+        });
+        rx.await.unwrap_or_default()
     }
 
     pub fn request_restore(&self, item: RestoreItem, event_tx: maki_agent::EventSender) {
@@ -1302,7 +1301,7 @@ impl EventHandle {
 
     /// Asks the call to move to the background. The answer arrives once its
     /// `ctx:on_background` hook ran.
-    pub fn request_background(&self, tool_use_id: String) -> flume::Receiver<MoveOutcome> {
+    pub fn request_background(&self, tool_use_id: String) -> oneshot::Receiver<MoveOutcome> {
         let (request, rx) = MoveRequest::by_user(tool_use_id);
         let _ = self.moves.send(request);
         rx
@@ -1331,7 +1330,7 @@ impl EventHandle {
     /// [`HostEventKind::fields`](crate::agent_autocmd::HostEventKind::fields)
     /// classifies. {session_id} is the session the event is about.
     pub fn fire(&self, session_id: Option<&dyn Display>, event: HostEvent<'_>) {
-        let _ = self.tx.try_send(Request::FireAutocmd {
+        let _ = self.tx.send(Request::FireAutocmd {
             event: event.name().to_owned(),
             data: event.payload(session_id),
         });
@@ -1342,32 +1341,31 @@ impl EventHandle {
     /// leaves the slot empty and answers through its event loop, which owns the
     /// live session runtimes.
     pub fn install_session_snapshot(&self, provider: crate::api::session::SessionSnapshotFn) {
-        let _ = self
-            .tx
-            .try_send(Request::InstallSessionSnapshot { provider });
+        let _ = self.tx.send(Request::InstallSessionSnapshot { provider });
     }
 
     /// Queue the kill of session-owned jobs and the `SessionEnd` dispatch,
     /// then return. Call from every session-end path so a Lua monitor can
-    /// stay a plugin. Process exit wants [`Self::end_sessions_blocking`].
+    /// stay a plugin. A caller that must not outrun the handlers wants
+    /// [`Self::end_sessions`].
     ///
     /// Nothing waits here, so handlers get no deadline and the UI is still
     /// there to answer them.
     pub fn end_session(&self, session: MakiId, reason: SessionEndReason) {
-        let _ = self.tx.try_send(Request::EndSession(EndSession {
+        let _ = self.tx.send(Request::EndSession(EndSession {
             session,
             reason,
             wait: None,
         }));
     }
 
-    /// [`Self::end_session`] for process exit: block until the handlers ran
-    /// and the jobs were reaped, so the `Shutdown` that follows on the
-    /// priority lane cannot skip ahead of them.
+    /// [`Self::end_session`] for process exit and an ACP session close: wait
+    /// until the handlers ran and the jobs were reaped, so the `Shutdown`
+    /// that follows on the priority lane cannot skip ahead of them.
     ///
     /// Every session is queued first and the deadline is shared, so quitting
     /// with many tabs open costs one `SHUTDOWN_TIMEOUT`, not one per tab.
-    pub fn end_sessions_blocking(
+    pub async fn end_sessions(
         &self,
         sessions: impl IntoIterator<Item = MakiId>,
         reason: SessionEndReason,
@@ -1380,8 +1378,7 @@ impl EventHandle {
             })
             .collect();
         for (session, reply_rx) in waits {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if reply_rx.recv_timeout(left).is_err() {
+            if !matches!(timeout_at(deadline.into(), reply_rx).await, Ok(Ok(()))) {
                 tracing::warn!(
                     session = %session,
                     "SessionEnd did not finish within timeout, continuing teardown"
@@ -1390,23 +1387,13 @@ impl EventHandle {
         }
     }
 
-    /// [`Self::end_sessions_blocking`] parked on a spare thread. ACP calls
-    /// this from its executor, where blocking would freeze stdin for the
-    /// whole grace period.
-    pub async fn end_session_async(&self, session: MakiId, reason: SessionEndReason) {
-        let handle = self.clone();
-        spawn_blocking(move || handle.end_sessions_blocking([session], reason))
-            .await
-            .expect("end_sessions_blocking panicked");
-    }
-
     fn send_end_session(
         &self,
         session: MakiId,
         reason: SessionEndReason,
         deadline: Instant,
-    ) -> Option<flume::Receiver<()>> {
-        let (reply_tx, reply_rx) = flume::bounded(1);
+    ) -> Option<oneshot::Receiver<()>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(Request::EndSession(EndSession {
                 session,
@@ -1422,7 +1409,7 @@ impl EventHandle {
     /// for the key in the same keystroke.
     pub fn run_keybind_callback(&self, ticket: KeybindTicket) -> bool {
         self.prio_tx
-            .try_send(Request::RunKeybindCallback { ticket })
+            .send(Request::RunKeybindCallback { ticket })
             .is_ok()
     }
 }
@@ -1438,6 +1425,8 @@ mod tests {
     use crate::key_lint::{MODE_WARNING, UPGRADE_DOCS};
     use crate::plugin_permissions::{Permission, PluginReach, denied_error};
     use crate::runtime::{FALLBACK_SPENT_ERR, OUTSIDE_TASK_ERR};
+    use crate::test_support::runtime;
+    use crate::test_support::wait_next;
     use crossterm::event::KeyCode;
     use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, assemble};
     use maki_agent::tools::ToolRegistry;
@@ -1507,14 +1496,14 @@ mod tests {
         let handle = host.event_handle();
         host.begin_shutdown();
 
-        let slots = handle.collect_prompt_slots();
+        let slots = runtime().block_on(handle.collect_prompt_slots(None));
         assert!(
             contents(&slots, PromptId::System, Slot::ToolUsage).is_empty(),
             "dead host must yield defaults, not real slots"
         );
 
         drop(host);
-        let slots = handle.collect_prompt_slots();
+        let slots = runtime().block_on(handle.collect_prompt_slots(None));
         assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
     }
 
@@ -1523,7 +1512,7 @@ mod tests {
     fn slots_from(plugin: &str, src: &str) -> (PluginHost, ResolvedPrompts) {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(plugin, src).unwrap();
-        let slots = host.event_handle().collect_prompt_slots();
+        let slots = runtime().block_on(host.event_handle().collect_prompt_slots(None));
         (host, slots)
     }
 
@@ -1573,12 +1562,12 @@ mod tests {
 
     #[test]
     fn run_command_sends_correct_request() {
-        let (prio_tx, prio_rx) = flume::bounded(8);
-        let (tx, _rx) = flume::bounded(8);
+        let (prio_tx, mut prio_rx) = unbounded_channel();
+        let (tx, _rx) = unbounded_channel();
         let handle = EventHandle {
             tx,
             prio_tx,
-            moves: flume::unbounded().0,
+            moves: unbounded_channel().0,
             layered: Arc::default(),
             background: BackgroundTasks::default(),
         };
@@ -1679,10 +1668,10 @@ mod tests {
     /// one of them registered {FIRED_COMMAND}, which is how a test on this
     /// side of the channel sees that a handler ran.
     fn assert_fired_after(host: &PluginHost, presses: usize) {
-        let ui = host.ui_action_rx();
+        let mut ui = host.take_ui_action_rx().unwrap();
         for _ in 0..presses {
             while !matches!(
-                ui.recv_timeout(KEYBIND_TIMEOUT).expect(KEYBIND_NEVER_DONE),
+                wait_next(&mut ui, KEYBIND_TIMEOUT).expect(KEYBIND_NEVER_DONE),
                 UiAction::KeybindDone(_)
             ) {}
         }
@@ -1762,18 +1751,18 @@ mod tests {
         .unwrap();
         let reader = host.keymap_reader();
         let handle = host.event_handle();
-        let ui = host.ui_action_rx();
+        let mut ui = host.take_ui_action_rx().unwrap();
         let press = |lhs| {
             let mode = reader.sync_mode(true);
             reader.dispatch(Key::parse(lhs).unwrap(), mode, None, |t| {
                 handle.run_keybind_callback(t)
             })
         };
-        let flashed_mode = || {
-            let Ok(UiAction::Flash(mode)) = ui.recv_timeout(KEYBIND_TIMEOUT) else {
+        let mut flashed_mode = || {
+            let Some(UiAction::Flash(mode)) = wait_next(&mut ui, KEYBIND_TIMEOUT) else {
                 panic!("{KEYBIND_NEVER_RAN}");
             };
-            let Ok(UiAction::KeybindDone(_)) = ui.recv_timeout(KEYBIND_TIMEOUT) else {
+            let Some(UiAction::KeybindDone(_)) = wait_next(&mut ui, KEYBIND_TIMEOUT) else {
                 panic!("{KEYBIND_NEVER_DONE}");
             };
             mode
@@ -1854,7 +1843,7 @@ mod tests {
         )
         .unwrap();
         let reader = host.keymap_reader();
-        let ui = host.ui_action_rx();
+        let mut ui = host.take_ui_action_rx().unwrap();
         host.event_handle().run_command(
             Arc::from(VIM_PLUGIN),
             Arc::from(PARKED_COMMAND),
@@ -1864,7 +1853,7 @@ mod tests {
         );
         let parked = loop {
             if let UiAction::Input { reply_tx, .. } =
-                ui.recv_timeout(KEYBIND_TIMEOUT).expect(PARKED_NEVER_RAN)
+                wait_next(&mut ui, KEYBIND_TIMEOUT).expect(PARKED_NEVER_RAN)
             {
                 break reply_tx;
             }
@@ -1873,7 +1862,7 @@ mod tests {
         host.unload(VIM_PLUGIN).unwrap();
         parked.send(Ok(serde_json::Value::Null)).unwrap();
         while !matches!(
-            ui.recv_timeout(KEYBIND_TIMEOUT).expect(PARKED_NEVER_DONE),
+            wait_next(&mut ui, KEYBIND_TIMEOUT).expect(PARKED_NEVER_DONE),
             UiAction::Flash(said) if said == PARKED_DONE
         ) {}
 
@@ -1906,7 +1895,7 @@ mod tests {
         .unwrap();
         let reader = host.keymap_reader();
         let handle = host.event_handle();
-        let ui = host.ui_action_rx();
+        let mut ui = host.take_ui_action_rx().unwrap();
 
         let mut pressed = None;
         assert!(reader.dispatch(
@@ -1926,10 +1915,10 @@ mod tests {
             }
         ));
 
-        let Ok(UiAction::Input {
+        let Some(UiAction::Input {
             req: InputRequest::Edit(edit),
             reply_tx,
-        }) = ui.recv_timeout(KEYBIND_TIMEOUT)
+        }) = wait_next(&mut ui, KEYBIND_TIMEOUT)
         else {
             panic!("{KEYBIND_NEVER_RAN}");
         };
@@ -1941,7 +1930,7 @@ mod tests {
         assert_eq!(edit.edits[0].text, TAB, "`ev.key` names the key");
         reply_tx.send(Ok(serde_json::Value::Null)).unwrap();
 
-        let Ok(UiAction::KeybindDone(done)) = ui.recv_timeout(KEYBIND_TIMEOUT) else {
+        let Some(UiAction::KeybindDone(done)) = wait_next(&mut ui, KEYBIND_TIMEOUT) else {
             panic!("{KEYBIND_NEVER_DONE}");
         };
         assert_eq!(Some(done), pressed);
@@ -1974,7 +1963,7 @@ mod tests {
         .unwrap();
         let reader = host.keymap_reader();
         let handle = host.event_handle();
-        let ui = host.ui_action_rx();
+        let mut ui = host.take_ui_action_rx().unwrap();
         let press = |key: Key| {
             let mut id = None;
             assert!(reader.dispatch(key, reader.sync_mode(true), None, |t| {
@@ -1984,7 +1973,7 @@ mod tests {
             }));
             id.unwrap()
         };
-        let next = || ui.recv_timeout(KEYBIND_TIMEOUT).expect(KEYBIND_NEVER_RAN);
+        let mut next = || wait_next(&mut ui, KEYBIND_TIMEOUT).expect(KEYBIND_NEVER_RAN);
 
         let paste = press(PASTE);
         assert!(matches!(next(), UiAction::KeybindFallback(id) if id == paste));
@@ -2056,7 +2045,9 @@ mod tests {
                     handle.run_keybind_callback(t)
                 })
         );
-        let Ok(UiAction::Flash(said)) = host.ui_action_rx().recv_timeout(KEYBIND_TIMEOUT) else {
+        let Some(UiAction::Flash(said)) =
+            wait_next(&mut host.take_ui_action_rx().unwrap(), KEYBIND_TIMEOUT)
+        else {
             panic!("{KEYBIND_NEVER_RAN}");
         };
         said
@@ -2099,7 +2090,9 @@ mod tests {
                 handle.run_keybind_callback(t)
             }
         ));
-        let Ok(UiAction::Flash(said)) = host.ui_action_rx().recv_timeout(KEYBIND_TIMEOUT) else {
+        let Some(UiAction::Flash(said)) =
+            wait_next(&mut host.take_ui_action_rx().unwrap(), KEYBIND_TIMEOUT)
+        else {
             panic!("{KEYBIND_NEVER_RAN}");
         };
         said
@@ -2473,6 +2466,38 @@ mod tests {
         assert!(!assemble(PromptId::Research, &slots, "").contains("never lands"));
     }
 
+    /// Content callbacks receive the session whose prompt is built, not the
+    /// focused tab.
+    #[tokio::test]
+    async fn hint_callback_names_the_prompt_session() {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(
+            "sid",
+            r#"
+            maki.api.register_prompt_hint({
+                slot = "tool_usage",
+                content = function(ctx)
+                    return ctx and ctx.session_id or "no session"
+                end,
+            })
+            "#,
+        )
+        .unwrap();
+        let named = host
+            .event_handle()
+            .collect_prompt_slots(Some("session-x"))
+            .await;
+        assert_eq!(
+            contents(&named, PromptId::System, Slot::ToolUsage),
+            ["session-x"]
+        );
+        let unnamed = host.event_handle().collect_prompt_slots(None).await;
+        assert_eq!(
+            contents(&unnamed, PromptId::System, Slot::ToolUsage),
+            ["no session"]
+        );
+    }
+
     #[test]
     fn prompt_list_targets_each_listed_prompt() {
         const CONTENT: &str = "shared";
@@ -2511,7 +2536,7 @@ mod tests {
             )
             .unwrap();
         }
-        let slots = host.event_handle().collect_prompt_slots();
+        let slots = runtime().block_on(host.event_handle().collect_prompt_slots(None));
         assert_eq!(
             contents(&slots, PromptId::System, Slot::ToolUsage),
             ["from_aaa", "from_zzz"],
@@ -2533,7 +2558,7 @@ mod tests {
         .unwrap();
         let handle = host.event_handle();
 
-        let slots = handle.collect_prompt_slots();
+        let slots = runtime().block_on(handle.collect_prompt_slots(None));
         assert_eq!(
             contents(&slots, PromptId::System, Slot::ToolUsage),
             ["usage"]
@@ -2544,7 +2569,7 @@ mod tests {
         );
 
         host.unload("multi").unwrap();
-        let slots = handle.collect_prompt_slots();
+        let slots = runtime().block_on(handle.collect_prompt_slots(None));
         assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
         assert!(contents(&slots, PromptId::System, Slot::Conventions).is_empty());
     }
@@ -2593,7 +2618,7 @@ mod tests {
             r#"maki.api.set_prompt({ slot = "identity", content = "ZZZ" })"#,
         )
         .unwrap();
-        let slots = host.event_handle().collect_prompt_slots();
+        let slots = runtime().block_on(host.event_handle().collect_prompt_slots(None));
         let entries = slots.get(PromptId::System, Slot::Identity);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries.last().unwrap().content, "ZZZ");
@@ -2686,7 +2711,7 @@ mod tests {
             r#"maki.api.set_prompt({ slot = "identity", content = "SET" })"#,
         )
         .unwrap();
-        let slots = host.event_handle().collect_prompt_slots();
+        let slots = runtime().block_on(host.event_handle().collect_prompt_slots(None));
         assert_eq!(
             contents(&slots, PromptId::System, Slot::ToolUsage),
             ["HINT"]
@@ -2773,7 +2798,7 @@ mod tests {
             end })
             "#,
         );
-        let second = host.event_handle().collect_prompt_slots();
+        let second = runtime().block_on(host.event_handle().collect_prompt_slots(None));
         for &pid in PromptId::ALL {
             assert_eq!(contents(&first, pid, Slot::Identity), ["1"]);
             assert_eq!(contents(&second, pid, Slot::Identity), ["2"]);
@@ -2800,7 +2825,7 @@ mod tests {
         assert_eq!(
             assemble(
                 PromptId::System,
-                &host.event_handle().collect_prompt_slots(),
+                &runtime().block_on(host.event_handle().collect_prompt_slots(None)),
                 INSTRUCTIONS,
             ),
             format!("Analysis policy.\n{SECTION}\n{INSTRUCTIONS}")
@@ -2856,7 +2881,7 @@ mod tests {
             r#"maki.api.set_prompt({ prompt = "plan", content = "{{conventions}}" })"#,
         )
         .unwrap();
-        let slots = host.event_handle().collect_prompt_slots();
+        let slots = runtime().block_on(host.event_handle().collect_prompt_slots(None));
         assert_eq!(assemble(PromptId::Plan, &slots, ""), CONTENT);
     }
 
@@ -2880,13 +2905,13 @@ mod tests {
             maki.api.set_prompt({ prompt = "system", slot = "conventions", content = "first section" })
             "#,
         ).unwrap();
-        let slots = host.event_handle().collect_prompt_slots();
+        let slots = runtime().block_on(host.event_handle().collect_prompt_slots(None));
         assert_eq!(assemble(PromptId::System, &slots, ""), CONTENT);
         host.unload("zzz").unwrap();
         assert_eq!(
             assemble(
                 PromptId::System,
-                &host.event_handle().collect_prompt_slots(),
+                &runtime().block_on(host.event_handle().collect_prompt_slots(None)),
                 ""
             ),
             "first template: first section"
@@ -2934,25 +2959,33 @@ mod tests {
         host.load_source("owned", source).unwrap();
         let handle = host.event_handle();
         assert_eq!(
-            assemble(PromptId::System, &handle.collect_prompt_slots(), ""),
+            assemble(
+                PromptId::System,
+                &runtime().block_on(handle.collect_prompt_slots(None)),
+                ""
+            ),
             TEMPLATE
         );
         host.unload("owned").unwrap();
-        assert!(!handle.collect_prompt_slots().has_replacements());
+        assert!(
+            !runtime()
+                .block_on(handle.collect_prompt_slots(None))
+                .has_replacements()
+        );
         host.load_source("owned", source).unwrap();
         host.load_source(
             "owned",
             r#"maki.api.set_prompt({ prompt = "system", content = "new" })"#,
         )
         .unwrap();
-        let reloaded = handle.collect_prompt_slots();
+        let reloaded = runtime().block_on(handle.collect_prompt_slots(None));
         assert_eq!(assemble(PromptId::System, &reloaded, ""), "new");
         assert!(contents(&reloaded, PromptId::System, Slot::Identity).is_empty());
         assert!(
             host.load_source("owned", &format!("{source}\nerror('failed load')"))
                 .is_err()
         );
-        let failed = handle.collect_prompt_slots();
+        let failed = runtime().block_on(handle.collect_prompt_slots(None));
         assert!(!failed.has_replacements());
         assert!(contents(&failed, PromptId::System, Slot::Identity).is_empty());
         assert_eq!(
@@ -2984,9 +3017,8 @@ mod tests {
                 .is_err()
         );
         assert!(
-            !host
-                .event_handle()
-                .collect_prompt_slots()
+            !runtime()
+                .block_on(host.event_handle().collect_prompt_slots(None))
                 .has_replacements()
         );
     }
@@ -3009,11 +3041,11 @@ mod tests {
     #[test]
     fn a_ui_roundtrip_fails_fast_while_its_plugin_loads() {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
-        let ui = host.ui_action_rx();
+        let mut ui = host.take_ui_action_rx().unwrap();
         host.load_source("early_ui", UI_CALLS_AT_LOAD).unwrap();
-        let next = || loop {
+        let mut next = || loop {
             if let action @ (UiAction::Flash(_) | UiAction::Builtin { .. }) =
-                ui.recv_timeout(KEYBIND_TIMEOUT).expect(UI_NEVER_HEARD)
+                wait_next(&mut ui, KEYBIND_TIMEOUT).expect(UI_NEVER_HEARD)
             {
                 break action;
             }

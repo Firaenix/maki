@@ -19,6 +19,7 @@ use maki_providers::Timeouts;
 use maki_providers::model::Model;
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
+use tokio::sync::mpsc::UnboundedReceiver;
 
 pub type SessionEndHook =
     Arc<dyn Fn(MakiId, SessionEndReason) -> BoxFuture<'static, ()> + Send + Sync>;
@@ -57,7 +58,7 @@ pub struct AcpParams {
     /// Where slash commands the session cannot answer alone are looked up and run.
     pub commands: Arc<dyn commands::CommandHost>,
     /// Plugin requests for the session, `maki.session.prompt` first of all.
-    pub host_requests: Option<flume::Receiver<host::HostRequest>>,
+    pub host_requests: Option<UnboundedReceiver<host::HostRequest>>,
 }
 
 pub async fn run(params: AcpParams) -> color_eyre::Result<()> {

@@ -4,8 +4,9 @@ use std::future::Future;
 use std::iter;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use tokio::sync::mpsc::unbounded_channel;
 
-use flume::Sender;
+use arc_swap::ArcSwap;
 use maki_config::host_allowed;
 use maki_config::providers::{Protocol, ProvidersConfig, base_url_override, plan_base_url};
 use maki_storage::StateDir;
@@ -14,6 +15,7 @@ use maki_storage::id::SessionRef;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::task::spawn_blocking;
 use tracing::{debug, warn};
@@ -474,16 +476,13 @@ type AuthCell = (Option<Arc<str>>, Arc<AuthState>);
 /// What every read answers. Only ever replaced whole, by [`commit_load`], so
 /// there is no moment at which a reader can see a half-built registry: during
 /// a load the previous generation is still the published one.
-static PROVIDERS: LazyLock<RwLock<Arc<Registry>>> = LazyLock::new(RwLock::default);
+static PROVIDERS: LazyLock<ArcSwap<Registry>> = LazyLock::new(ArcSwap::default);
 /// The load in progress. `Some` between [`begin_load`] and [`commit_load`],
 /// and open at process start so a host that loads plugins without driving the
 /// phases (tests, embedders) still registers.
-static STAGING: LazyLock<Mutex<Option<Registry>>> =
-    LazyLock::new(|| Mutex::new(Some(Registry::new())));
-/// One cell of credentials per slug, for the life of the process: see
-/// [`shared_auth`].
+static STAGING: Mutex<Option<Registry>> = Mutex::new(Some(Registry::new()));
 /// The current owner and auth state of each slug: see [`shared_auth`].
-static AUTH: LazyLock<RwLock<HashMap<Box<str>, AuthCell>>> = LazyLock::new(RwLock::default);
+static AUTH: LazyLock<Mutex<HashMap<Box<str>, AuthCell>>> = LazyLock::new(Mutex::default);
 /// Slugs granted to enabled packages, kept even when their load fails so the
 /// catalog client cannot take over the slug and receive the saved key. Maps
 /// the package name to its granted slugs, so unloading the package releases
@@ -552,7 +551,7 @@ pub fn commit_load() {
     }
     let logins = staged.values().filter_map(|e| e.built.login).collect();
     maki_config::providers::set_registered_providers(logins);
-    *PROVIDERS.write().unwrap() = Arc::new(staged);
+    PROVIDERS.store(Arc::new(staged));
 }
 
 /// Takes back everything `plugin` staged in the load in progress, for a plugin
@@ -749,7 +748,7 @@ fn target_of(decl: &ProviderDecl, hooks: &ProviderHooks) -> Result<Target, Regis
 /// Reusing stops at the owner, though: a slug another package took over gets
 /// a fresh cell, so a token one of them minted never serves the other.
 fn shared_auth(slug: &str, owner: Option<Arc<str>>) -> Arc<AuthState> {
-    let mut states = AUTH.write().unwrap();
+    let mut states = AUTH.lock().unwrap();
     let (current_owner, state) = states
         .entry(slug.into())
         .or_insert_with(|| (owner.clone(), Arc::new(AuthState::new())));
@@ -761,7 +760,7 @@ fn shared_auth(slug: &str, owner: Option<Arc<str>>) -> Arc<AuthState> {
 }
 
 fn entries() -> Arc<Registry> {
-    Arc::clone(&PROVIDERS.read().unwrap())
+    PROVIDERS.load_full()
 }
 
 fn entry(slug: &str) -> Option<Arc<PluginEntry>> {
@@ -1246,7 +1245,7 @@ impl Provider for PluginProvider {
         messages: &'a [Message],
         system: &'a str,
         tools: &'a Value,
-        event_tx: &'a Sender<ProviderEvent>,
+        event_tx: &'a UnboundedSender<ProviderEvent>,
         opts: RequestOptions,
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -1262,7 +1261,7 @@ impl Provider for PluginProvider {
                     // channel that already delivered part of the answer would
                     // duplicate text in the UI and, after a cancel, in the
                     // history.
-                    let (tx, rx) = flume::unbounded();
+                    let (tx, mut rx) = unbounded_channel();
                     let attempt = async {
                         let result = self
                             .inner
@@ -1273,9 +1272,9 @@ impl Provider for PluginProvider {
                     };
                     let forward = async move {
                         let mut forwarded = false;
-                        while let Ok(ev) = rx.recv_async().await {
+                        while let Some(ev) = rx.recv().await {
                             forwarded = true;
-                            if event_tx.send_async(ev).await.is_err() {
+                            if event_tx.send(ev).is_err() {
                                 break;
                             }
                         }
@@ -1657,6 +1656,8 @@ mod tests {
     use std::borrow::Cow;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
+    use tokio::sync::Notify;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use futures::FutureExt;
     use maki_config::PROVIDER_BUILTINS;
@@ -1834,16 +1835,16 @@ mod tests {
     /// Says when it has started, then holds on until released, so a test can
     /// drop the caller while the hook is known to be mid-flight.
     struct ParkedAuth {
-        entered: flume::Sender<()>,
-        released: flume::Receiver<()>,
+        entered: Notify,
+        released: Notify,
         calls: AtomicUsize,
     }
 
     impl Hook<AuthPurpose, PluginAuth> for ParkedAuth {
         fn call(&self, _purpose: AuthPurpose) -> BoxFuture<'_, Result<PluginAuth, AgentError>> {
             Box::pin(async move {
-                let _ = self.entered.send(());
-                let _ = self.released.recv_async().await;
+                self.entered.notify_one();
+                self.released.notified().await;
                 self.calls.fetch_add(1, Ordering::AcqRel);
                 Ok(PluginAuth {
                     base_url: None,
@@ -1879,7 +1880,7 @@ mod tests {
             _messages: &'a [Message],
             _system: &'a str,
             _tools: &'a Value,
-            _event_tx: &'a Sender<ProviderEvent>,
+            _event_tx: &'a UnboundedSender<ProviderEvent>,
             _opts: RequestOptions,
             _session_id: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -2141,7 +2142,7 @@ mod tests {
 
         assert!(!is_registered(SLUG), "{RELOAD_DROPS_STALE}");
         assert!(
-            AUTH.read().unwrap().contains_key(SLUG),
+            AUTH.lock().unwrap().contains_key(SLUG),
             "{CREDENTIALS_DROPPED}"
         );
     }
@@ -2400,11 +2401,9 @@ mod tests {
     #[tokio::test]
     async fn a_refresh_outlives_the_caller_that_started_it() {
         const MINT_DROPPED: &str = "what the abandoned refresh minted never landed";
-        let (entered_tx, entered) = flume::bounded(1);
-        let (release, released) = flume::bounded(1);
         let hook = Arc::new(ParkedAuth {
-            entered: entered_tx,
-            released,
+            entered: Notify::new(),
+            released: Notify::new(),
             calls: AtomicUsize::new(0),
         });
         let entry = entry_with(ProviderHooks {
@@ -2414,8 +2413,8 @@ mod tests {
 
         let abandoned = entry.run_auth(AuthPurpose::Refresh).now_or_never();
         assert!(abandoned.is_none());
-        entered.recv_async().await.unwrap();
-        release.send(()).unwrap();
+        hook.entered.notified().await;
+        hook.released.notify_one();
         let _gate = entry.auth.gate.lock.lock().await;
 
         assert_eq!(hook.calls.load(Ordering::Acquire), 1, "{ONE_HOOK_CALL}");
@@ -2461,7 +2460,7 @@ mod tests {
         let provider = create(slug, Timeouts::default()).unwrap();
         let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
         let messages = [Message::user(PROMPT.to_owned())];
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let result = provider
             .stream_message(
                 &model,
@@ -2509,7 +2508,7 @@ mod tests {
 
         let provider = create(slug, Timeouts::default()).unwrap();
         let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let _ = provider
             .stream_message(
                 &model,
@@ -2561,7 +2560,7 @@ mod tests {
         let provider = create(slug, Timeouts::default()).unwrap();
         let model = Model::from_spec(&format!("{slug}/{MODEL_ID}")).unwrap();
         let session = SessionRef::generate();
-        let (tx, _rx) = flume::unbounded();
+        let (tx, _rx) = unbounded_channel();
         let _ = provider
             .stream_message(
                 &model,

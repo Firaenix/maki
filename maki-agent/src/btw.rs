@@ -3,12 +3,12 @@
 
 use std::sync::Arc;
 
-use flume::Sender;
 use maki_providers::provider::Provider;
 use maki_providers::{Message, Model, ProviderEvent, RequestOptions};
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionTools;
 use serde_json::Value;
+use tokio::sync::mpsc::{Sender, unbounded_channel};
 
 use crate::{HistorySnapshot, UNAVAILABLE_RESULT, close_dangling_tool_calls, unbind_thinking};
 
@@ -22,6 +22,8 @@ pub const BTW_FALLBACK_SYSTEM: &str = "You are a helpful coding assistant. Answe
 from the conversation context.";
 
 pub const NO_TOOLS: Value = Value::Array(Vec::new());
+/// How many events a side question buffers ahead of its reader.
+pub const BTW_EVENT_CAPACITY: usize = 64;
 
 #[derive(Debug, PartialEq)]
 pub enum BtwEvent {
@@ -111,7 +113,7 @@ impl BtwRequest {
     }
 
     pub async fn run(self, btw_tx: Sender<BtwEvent>) {
-        let (event_tx, event_rx) = flume::unbounded();
+        let (event_tx, mut event_rx) = unbounded_channel();
         let messages = maki_providers::adapt_images_for_model(&self.model, &self.messages).await;
 
         // The pinned future outlives the stream, so the sender is dropped by
@@ -136,17 +138,17 @@ impl BtwRequest {
         // False when it stopped early, on a tool call or a closed receiver,
         // so the stream's outcome is never sent.
         let forward = async {
-            while let Ok(event) = event_rx.recv_async().await {
+            while let Some(event) = event_rx.recv().await {
                 let event = match event {
                     ProviderEvent::TextDelta { text } => BtwEvent::TextDelta(text),
                     ProviderEvent::ThinkingDelta { text } => BtwEvent::ThinkingDelta(text),
                     ProviderEvent::ToolUseStart { name, .. } => {
-                        let _ = btw_tx.send(BtwEvent::Error(reached_for_tool(&name)));
+                        let _ = btw_tx.send(BtwEvent::Error(reached_for_tool(&name))).await;
                         return false;
                     }
                     ProviderEvent::PromptProgress { .. } => continue,
                 };
-                if btw_tx.send(event).is_err() {
+                if btw_tx.send(event).await.is_err() {
                     return false;
                 }
             }
@@ -163,10 +165,12 @@ impl BtwRequest {
             _ = &mut forward => return,
         };
         if forward.await {
-            let _ = btw_tx.send(match result {
-                Ok(_) => BtwEvent::Done,
-                Err(e) => BtwEvent::Error(e.to_string()),
-            });
+            let _ = btw_tx
+                .send(match result {
+                    Ok(_) => BtwEvent::Done,
+                    Err(e) => BtwEvent::Error(e.to_string()),
+                })
+                .await;
         }
     }
 }
@@ -177,7 +181,10 @@ mod tests {
     use maki_providers::{
         AgentError, ContentBlock, ModelInfo, StopReason, StreamResponse, TokenUsage,
     };
+    use std::iter;
+
     use test_case::test_case;
+    use tokio::sync::mpsc::{UnboundedSender, channel};
 
     use super::*;
 
@@ -195,7 +202,7 @@ mod tests {
             _: &'a [Message],
             _: &'a str,
             _: &'a Value,
-            events: &'a Sender<ProviderEvent>,
+            events: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -227,7 +234,7 @@ mod tests {
     #[test_case(Some("read"), BtwEvent::Error(reached_for_tool("read")) ; "tool_call_is_a_note")]
     #[tokio::test]
     async fn forwards_every_delta_then_stops(tool: Option<&str>, last: BtwEvent) {
-        let (tx, rx) = flume::bounded(64);
+        let (tx, mut rx) = channel(BTW_EVENT_CAPACITY);
         let mut script = vec![ProviderEvent::TextDelta {
             text: ANSWER.into(),
         }];
@@ -245,7 +252,7 @@ mod tests {
         )
         .run(tx)
         .await;
-        let events: Vec<BtwEvent> = rx.drain().collect();
+        let events: Vec<BtwEvent> = iter::from_fn(|| rx.try_recv().ok()).collect();
         assert_eq!(events, [BtwEvent::TextDelta(ANSWER.into()), last]);
     }
 

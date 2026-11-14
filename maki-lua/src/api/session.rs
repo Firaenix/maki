@@ -6,6 +6,7 @@
 //! document `maki session export` prints. The one difference is an image
 //! block's `source`, which is a `maki.image.Image` sharing the payload.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use maki_agent::agent::{SessionExport, live_header, live_history, live_snapshot};
@@ -18,8 +19,10 @@ use maki_providers::{ContentBlock, ImageSource, Message, Role};
 use maki_storage::StateDir;
 use maki_storage::id::MakiId;
 use maki_storage::paths::session_data_dir;
+use maki_storage::sessions::ArchiveWindow;
 use mlua::{IntoLua, Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 use serde_json::{Map, Value as JsonValue};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::{spawn_blocking, yield_now};
 
 use crate::api::image::LuaImage;
@@ -56,6 +59,14 @@ const CONTENT_KEY: &str = "content";
 const SOURCE_KEY: &str = "source";
 const TYPE_KEY: &str = "type";
 const BLOCK_IMAGE: &str = "image";
+const CURRENT_WINDOW_ID: &str = "current";
+const WINDOW_KEY: &str = "window";
+const ID_KEY: &str = "id";
+const KIND_KEY: &str = "kind";
+const CREATED_AT_KEY: &str = "created_at";
+const NR_KEY: &str = "nr";
+const NAME_KEY: &str = "name";
+const FALLBACK_SUBAGENT_NAME: &str = "subagent";
 const CWD_KEY: &str = "cwd";
 const PROMPT_KEY: &str = "prompt";
 const FOCUS_KEY: &str = "focus";
@@ -75,8 +86,8 @@ const DOCUMENT_KEYS: [&str; 8] = [
     "facts",
     MESSAGES_KEY,
 ];
-const ANSWER_DECISION_ERR: &str = "decision must \"allow\" or \"deny\"";
 const MAX_PROMPT_IMAGES: usize = 8;
+const ANSWER_DECISION_ERR: &str = "decision must be \"allow\" or \"deny\"";
 
 /// Rewind and fork put a user turn back in the chat input, and Enter runs it
 /// as if a plugin that could send prompts wrote it. So a turn that runs
@@ -134,7 +145,7 @@ async fn from_disk<T: Send + 'static>(
 
 async fn roundtrip(
     lua: Lua,
-    tx: Option<flume::Sender<UiAction>>,
+    tx: Option<UnboundedSender<UiAction>>,
     req: SessionRequest,
 ) -> LuaResult<Pair<Value>> {
     ui_json_roundtrip(&lua, tx.as_ref(), |reply_tx| UiAction::Session {
@@ -151,7 +162,7 @@ async fn roundtrip(
 /// @example
 /// local stored, err = maki.session.list()
 #[lua_fn]
-async fn list(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
+async fn list(lua: Lua, #[ctx] tx: Option<UnboundedSender<UiAction>>) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, SessionRequest::List).await
 }
 
@@ -163,7 +174,7 @@ async fn list(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult
 /// @example
 /// local live, err = maki.session.live()
 #[lua_fn]
-async fn live(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<Value>> {
+async fn live(lua: Lua, #[ctx] tx: Option<UnboundedSender<UiAction>>) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, SessionRequest::Live).await
 }
 
@@ -220,7 +231,7 @@ async fn unhosted_snapshot(lua: &Lua, raw: &str) -> Result<JsonValue, String> {
 #[lua_fn]
 async fn read(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
     let id = match opts {
@@ -258,7 +269,7 @@ async fn read(
 /// The focused tab, or under a headless driver the one session it runs.
 async fn focused_session(
     lua: &Lua,
-    tx: Option<&flume::Sender<UiAction>>,
+    tx: Option<&UnboundedSender<UiAction>>,
 ) -> Result<String, String> {
     // Asked in its own statement, so the borrow of the app data ends before
     // the roundtrip below parks the task.
@@ -286,7 +297,7 @@ async fn focused_session(
 
 async fn named_or_focused(
     lua: &Lua,
-    tx: Option<&flume::Sender<UiAction>>,
+    tx: Option<&UnboundedSender<UiAction>>,
     id: Option<String>,
 ) -> Result<MakiId, String> {
     let raw = match id {
@@ -300,9 +311,9 @@ async fn named_or_focused(
 /// disk. The UI answers for its tabs. A headless driver publishes its
 /// session's settings next to the transcript, so a session it has not saved
 /// yet reads too.
-async fn transcript(
+async fn session_export(
     lua: &Lua,
-    tx: Option<&flume::Sender<UiAction>>,
+    tx: Option<&UnboundedSender<UiAction>>,
     id: MakiId,
 ) -> Result<SessionExport, String> {
     match ui_roundtrip(tx, |reply_tx| UiAction::ExportSession { id, reply_tx }).await {
@@ -402,7 +413,7 @@ async fn transcript_table(lua: &Lua, export: SessionExport) -> LuaResult<Table> 
 #[lua_fn(guard = SessionRead)]
 async fn export(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Table>> {
     let id = match &opts {
@@ -410,8 +421,8 @@ async fn export(
         None => None,
     };
     let session = try_pair!(named_or_focused(&lua, tx.as_ref(), id).await);
-    let transcript = try_pair!(transcript(&lua, tx.as_ref(), session).await);
-    Ok((Some(transcript_table(&lua, transcript).await?), None))
+    let session_export = try_pair!(session_export(&lua, tx.as_ref(), session).await);
+    Ok((Some(transcript_table(&lua, session_export).await?), None))
 }
 
 /// Reads a session's transcript, oldest first: everything the model has
@@ -420,7 +431,7 @@ async fn export(
 /// Each message has the same shape as in the session file:
 ///
 /// ```text
-/// { role = "user" | "assistant", kind, facts?, display_text?, receipts?, settles?, partial?, content = { blocks } }
+/// { role = "user" | "assistant", kind, facts?, display_text?, receipts?, settles?, partial?, created_at?, content = { blocks } }
 /// ```
 ///
 /// `kind` is `"turn"` for something the user or the model said,
@@ -434,7 +445,10 @@ async fn export(
 /// notice that answered one, with `end` one of `"finished"`, `"failed"`,
 /// `"cancelled"` or `"lost"`. `partial` has the same shape and marks a notice
 /// that answered one piece early, like one call of a moved batch, and left
-/// the receipt open. `content` lists blocks:
+/// the receipt open. `created_at` is the wall clock, in epoch
+/// milliseconds, when the message was appended, or nil for a message older than
+/// the field, so a reader can tell a real zero gap from an unknown one.
+/// `content` lists blocks:
 ///
 /// ```text
 /// { type = "text", text }
@@ -454,8 +468,14 @@ async fn export(
 /// focused session, so pass `session` there. Hook and event payloads carry
 /// the `session_id` to pass.
 ///
+/// `window` reads one archived window instead, as `maki.session.windows`
+/// lists it. Archives never change, so they read the same in every mode and
+/// need no live session.
+///
 /// @param opts table? Options:
 ///   `session` (string?) Session id, live or stored. Defaults to the focused one.
+///   `window` (string?) `"current"` or an archive id from `maki.session.windows`.
+///     Defaults to the current window.
 ///   `last` (integer?) only the newest `last` messages.
 /// @return (table|nil, string|nil) Array of messages, or nil and an error.
 /// @example
@@ -467,17 +487,29 @@ async fn export(
 #[lua_fn(guard = SessionRead)]
 async fn messages(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Table>> {
-    let (id, last) = match &opts {
-        Some(opts) => (opts.opt::<String>("session")?, opts.opt::<usize>("last")?),
-        None => (None, None),
+    let (id, last, window) = match &opts {
+        Some(opts) => (
+            opts.opt::<String>("session")?,
+            opts.opt::<usize>("last")?,
+            opts.opt::<String>(WINDOW_KEY)?,
+        ),
+        None => (None, None, None),
     };
     let session = try_pair!(named_or_focused(&lua, tx.as_ref(), id).await);
+    if let Some(window) = window.filter(|window| window != CURRENT_WINDOW_ID) {
+        let seq = try_pair!(parse_window_id(&window));
+        let messages = try_pair!(archive_messages(&lua, session, seq).await);
+        return Ok((
+            Some(newest_messages_table(&lua, &messages, last).await?),
+            None,
+        ));
+    }
     let history = match live_history(session) {
         Some(history) => history,
-        None => try_pair!(transcript(&lua, tx.as_ref(), session).await).messages,
+        None => try_pair!(session_export(&lua, tx.as_ref(), session).await).messages,
     };
     Ok((
         Some(newest_messages_table(&lua, &history, last).await?),
@@ -492,7 +524,10 @@ async fn messages(
 /// @example
 /// local id = maki.session.current()
 #[lua_fn]
-async fn current(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaResult<Pair<String>> {
+async fn current(
+    lua: Lua,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
+) -> LuaResult<Pair<String>> {
     Ok(pair(focused_session(&lua, tx.as_ref()).await))
 }
 
@@ -518,7 +553,7 @@ async fn current(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaRes
 async fn data_dir(
     lua: Lua,
     #[ctx] plugin: Arc<str>,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     opts: Option<Table>,
 ) -> LuaResult<Pair<String>> {
     let named = match &opts {
@@ -546,6 +581,361 @@ async fn data_dir(
     Ok(pair(path))
 }
 
+/// Lists a session's transcript windows, newest first: the current window is
+/// `[1]` and holds the conversation that has not been sealed yet, then the
+/// archived windows from the most recent seal back to the session start,
+/// each labeled with the rewrite that sealed it. A compaction parks the
+/// turns it summarized, a rewind the turns it cut, and both stay readable.
+///
+/// Each window is:
+/// ```text
+/// {
+///   id = "current" | "<seq>",  -- pass back to `messages`/`subagents`
+///   created_at,                -- when the window began, in Unix seconds: the
+///                              -- session start for the oldest, otherwise the
+///                              -- seal time of the window before it in time;
+///                              -- nil when the session header is missing or
+///                              -- unreadable
+///   kind = "current" | "compaction" | "rewind" | "unknown",
+/// }
+/// ```
+///
+/// Listing never parses a transcript, so it stays cheap however long the
+/// session is. `messages` reads one window; `subagents` reads the asked
+/// window and its neighbors.
+///
+/// Works in the TUI, `maki -p`, sdk mode, and ACP. ACP has no focused
+/// session, so pass `session` there. Hook and event payloads carry the
+/// `session_id` to pass.
+///
+/// @param opts table? Options:
+///   `session` (string?) Session id, live or stored. Defaults to the focused one.
+/// @return (table|nil, string|nil) Array of windows, or nil and an error.
+/// @example
+/// for _, window in ipairs(assert(maki.session.windows())) do
+///   print(window.id, window.kind, window.created_at)
+/// end
+#[lua_fn(guard = SessionRead)]
+async fn windows(
+    lua: Lua,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
+    opts: Option<Table>,
+) -> LuaResult<Pair<Table>> {
+    let id = match &opts {
+        Some(opts) => opts.opt::<String>("session")?,
+        None => None,
+    };
+    let session = try_pair!(named_or_focused(&lua, tx.as_ref(), id).await);
+    let dir = try_pair!(state_dir(&lua));
+    let live = live_history(session).is_some();
+    let read = spawn_blocking(move || {
+        let archives = StoredSession::archive_windows(session, &dir);
+        let exists = StoredSession::exists(session, &dir);
+        let started_at = StoredSession::started_at(session, &dir);
+        (archives, exists, started_at)
+    })
+    .await
+    .map_err(mlua::Error::external)?;
+    let (archives, exists, started_at) = read;
+    if !exists && !live && archives.is_empty() {
+        return Ok(err_pair(format!("session not found: {session}")));
+    }
+    Ok((Some(windows_table(&lua, &archives, started_at)?), None))
+}
+
+/// Reads the subagent transcripts that belong to one window, in spawn order
+/// where the session recorded it; transcripts with no record come last, by
+/// id. A transcript attaches to the window holding the `tool_use` that
+/// started it. A plugin run beside the chat has no parent `tool_use` and
+/// keeps its records across rewrites, so it attaches to the newest window
+/// that holds them.
+///
+/// Each entry is:
+/// ```text
+/// {
+///   id,       -- the `tool_use` id that spawned it, stable in the session
+///   nr,       -- 1-based position in the window's subagent list, not the
+///             -- array index; a rewrite can drop entries, so numbers repeat
+///             -- across windows
+///   name,     -- the task description that spawned it, or "subagent"
+///   messages, -- same shape as `maki.session.messages`
+/// }
+/// ```
+///
+/// Only what the host stored is visible. The TUI records subagent
+/// transcripts; `maki -p`, the SDK and ACP do not, so `subagents` answers an
+/// empty list for sessions they ran. The current window's transcripts come
+/// from the stored copy too, so they trail the run: a running subagent shows
+/// only the turns saved so far.
+///
+/// ACP has no focused session, so pass `session` there. Hook and event
+/// payloads carry the `session_id` to pass.
+///
+/// @param opts table? Options:
+///   `session` (string?) Session id, live or stored. Defaults to the focused one.
+///   `window` (string?) `"current"` or an archive id from `maki.session.windows`.
+///     Defaults to the current window.
+/// @return (table|nil, string|nil) Array of subagents, or nil and an error.
+/// @example
+/// for _, sub in ipairs(assert(maki.session.subagents())) do
+///   print(sub.id, sub.nr, sub.name, #sub.messages)
+/// end
+#[lua_fn(guard = SessionRead)]
+async fn subagents(
+    lua: Lua,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
+    opts: Option<Table>,
+) -> LuaResult<Pair<Table>> {
+    let (id, window) = match &opts {
+        Some(opts) => (
+            opts.opt::<String>("session")?,
+            opts.opt::<String>(WINDOW_KEY)?,
+        ),
+        None => (None, None),
+    };
+    let session = try_pair!(named_or_focused(&lua, tx.as_ref(), id).await);
+    let live = live_history(session);
+    let live_exists = live.is_some();
+    let dir = try_pair!(state_dir(&lua));
+    let read = spawn_blocking(move || -> Result<_, String> {
+        let archives = StoredSession::archive_windows(session, &dir);
+        let index = window_index(window.as_deref(), &archives)?;
+        let start = index.saturating_sub(1);
+        let end = (index + 1).min(archives.len());
+        let mut windows = Vec::with_capacity(end + 1 - start);
+        for position in start..=end {
+            windows.push(load_window(
+                session,
+                &dir,
+                &archives,
+                position,
+                live.as_ref(),
+            )?);
+        }
+        Ok((index - start, windows))
+    })
+    .await
+    .map_err(mlua::Error::external)?;
+    let (asked, windows) = try_pair!(read);
+    let window = windows[asked].session.as_ref();
+    if window.is_none() && !live_exists {
+        return Ok(err_pair(format!("session not found: {session}")));
+    }
+    let attach = subagent_attach(&windows, asked);
+    let table = subagents_table(&lua, window, &attach).await?;
+    Ok((Some(table), None))
+}
+
+fn parse_window_id(raw: &str) -> Result<u64, String> {
+    raw.parse().map_err(|_| format!("window not found: {raw}"))
+}
+
+fn window_index(window: Option<&str>, archives: &[ArchiveWindow]) -> Result<usize, String> {
+    match window {
+        None | Some(CURRENT_WINDOW_ID) => Ok(archives.len()),
+        Some(raw) => {
+            let seq = parse_window_id(raw)?;
+            archives
+                .iter()
+                .position(|archive| archive.seq == seq)
+                .ok_or_else(|| format!("window not found: {raw}"))
+        }
+    }
+}
+
+/// One window's transcript, and the stored session that holds its subagent
+/// records. Only the asked window and its two neighbors are ever loaded.
+struct WindowData {
+    messages: Arc<Vec<Message>>,
+    session: Option<StoredSession>,
+}
+
+/// Loads the window at `index`, the current window last. The current window
+/// reads the live transcript when there is one, since it holds turns the
+/// stored copy does not.
+fn load_window(
+    id: MakiId,
+    dir: &StateDir,
+    archives: &[ArchiveWindow],
+    index: usize,
+    live: Option<&Arc<Vec<Message>>>,
+) -> Result<WindowData, String> {
+    if let Some(archive) = archives.get(index) {
+        let session = StoredSession::archive(id, archive.seq, dir)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("window not found: {}", archive.seq))?;
+        return Ok(WindowData {
+            messages: session.shared_messages().clone(),
+            session: Some(session),
+        });
+    }
+    let session = match StoredSession::read_only(id, dir) {
+        Ok(session) => Some(session),
+        Err(e) if e.is_not_found() => None,
+        Err(e) => return Err(e.to_string()),
+    };
+    let messages = match (live, session.as_ref()) {
+        (Some(live), _) => live.clone(),
+        (None, Some(session)) => session.shared_messages().clone(),
+        (None, None) => Arc::default(),
+    };
+    Ok(WindowData { messages, session })
+}
+
+async fn archive_messages(lua: &Lua, id: MakiId, seq: u64) -> Result<Vec<Message>, String> {
+    let dir = state_dir(lua)?;
+    spawn_blocking(move || {
+        StoredSession::archive(id, seq, &dir)
+            .map_err(|e| e.to_string())?
+            .map(StoredSession::take_messages)
+            .ok_or_else(|| format!("window not found: {seq}"))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn windows_table(
+    lua: &Lua,
+    archives: &[ArchiveWindow],
+    started_at: Option<u64>,
+) -> LuaResult<Table> {
+    let out = lua.create_table_with_capacity(archives.len() + 1, 0)?;
+    let current_at = archives
+        .last()
+        .map_or(started_at, |archive| Some(archive.sealed_at));
+    out.raw_set(
+        1,
+        window_table(lua, CURRENT_WINDOW_ID, current_at, CURRENT_WINDOW_ID)?,
+    )?;
+    let mut began = started_at;
+    for (index, archive) in archives.iter().enumerate() {
+        out.raw_set(
+            archives.len() - index + 1,
+            window_table(
+                lua,
+                &archive.seq.to_string(),
+                began,
+                archive.sealed_by.as_str(),
+            )?,
+        )?;
+        began = Some(archive.sealed_at);
+    }
+    out.set_metatable(Some(lua.array_metatable()))?;
+    Ok(out)
+}
+
+fn window_table(lua: &Lua, id: &str, created_at: Option<u64>, kind: &str) -> LuaResult<Table> {
+    let table = lua.create_table_with_capacity(0, 3)?;
+    table.set(ID_KEY, id)?;
+    table.set(CREATED_AT_KEY, created_at)?;
+    table.set(KIND_KEY, kind)?;
+    Ok(table)
+}
+
+fn tool_use_ids(messages: &[Message]) -> impl Iterator<Item = &str> {
+    messages
+        .iter()
+        .flat_map(|message| message.tool_uses().map(|(id, _, _)| id))
+}
+
+/// The subagent ids whose transcript attaches to the asked window. A
+/// transcript belongs to the window holding its parent `tool_use`; one
+/// without a parent, like a plugin run beside the chat, goes to the newest
+/// loaded window that holds its records, since it keeps running across
+/// rewrites. Both are decided by the asked window and its two neighbors: a
+/// rewrite carries every record forward.
+fn subagent_attach(windows: &[WindowData], asked: usize) -> Vec<String> {
+    let mut parent_at: HashMap<&str, usize> = HashMap::new();
+    let mut records_at: HashMap<&str, usize> = HashMap::new();
+    for (index, window) in windows.iter().enumerate() {
+        for id in tool_use_ids(&window.messages) {
+            parent_at.insert(id, index);
+        }
+        if let Some(session) = &window.session {
+            for id in session.subagent_messages().keys() {
+                records_at.insert(id.as_str(), index);
+            }
+        }
+    }
+    records_at
+        .into_iter()
+        .filter(|(id, records_at)| parent_at.get(id).copied().unwrap_or(*records_at) == asked)
+        .map(|(id, _)| id.to_owned())
+        .collect()
+}
+
+async fn subagents_table(
+    lua: &Lua,
+    window: Option<&StoredSession>,
+    attach: &[String],
+) -> LuaResult<Table> {
+    let out = lua.create_table_with_capacity(attach.len(), 0)?;
+    let attached: HashSet<&str> = attach.iter().map(String::as_str).collect();
+    let meta = window.map(StoredSession::subagents).unwrap_or_default();
+    let mut index = 1;
+    for (position, subagent) in meta.iter().enumerate() {
+        if !attached.contains(subagent.tool_use_id.as_str()) {
+            continue;
+        }
+        let Some(messages) = window.and_then(|s| s.subagent_messages().get(&subagent.tool_use_id))
+        else {
+            continue;
+        };
+        out.raw_set(
+            index,
+            subagent_table(
+                lua,
+                &subagent.tool_use_id,
+                position + 1,
+                &subagent.name,
+                messages,
+            )
+            .await?,
+        )?;
+        index += 1;
+    }
+    let mut unlisted: Vec<&str> = attach
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !meta.iter().any(|subagent| subagent.tool_use_id == *id))
+        .collect();
+    unlisted.sort_unstable();
+    for (position, id) in unlisted.into_iter().enumerate() {
+        let Some(messages) = window.and_then(|s| s.subagent_messages().get(id)) else {
+            continue;
+        };
+        out.raw_set(
+            index,
+            subagent_table(
+                lua,
+                id,
+                meta.len() + position + 1,
+                FALLBACK_SUBAGENT_NAME,
+                messages,
+            )
+            .await?,
+        )?;
+        index += 1;
+    }
+    out.set_metatable(Some(lua.array_metatable()))?;
+    Ok(out)
+}
+
+async fn subagent_table(
+    lua: &Lua,
+    id: &str,
+    nr: usize,
+    name: &str,
+    messages: &[Message],
+) -> LuaResult<Table> {
+    let table = lua.create_table_with_capacity(0, 4)?;
+    table.set(ID_KEY, id)?;
+    table.set(NR_KEY, nr)?;
+    table.set(NAME_KEY, name)?;
+    table.set(MESSAGES_KEY, messages_table(lua, messages).await?)?;
+    Ok(table)
+}
+
 /// Switches the UI to the session with {id}.
 ///
 /// @param id string Session id, as returned by `list()` or `live()`.
@@ -555,7 +945,7 @@ async fn data_dir(
 #[lua_fn]
 async fn focus(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     id: String,
 ) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, SessionRequest::Focus { id }).await
@@ -571,7 +961,7 @@ async fn focus(
 #[lua_fn(guard = SessionWrite)]
 async fn delete(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     id: String,
 ) -> LuaResult<Pair<Value>> {
     roundtrip(lua, tx, SessionRequest::Delete { id }).await
@@ -712,7 +1102,7 @@ fn headless_cwd(lua: &Lua) -> Result<String, String> {
 #[lua_fn(guard = SessionWrite)]
 async fn new(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     #[ctx] grants: PluginPermissions,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
@@ -781,7 +1171,7 @@ async fn new(
 #[lua_fn(guard = [Agent, SessionWrite])]
 async fn prompt(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     text: String,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
@@ -838,7 +1228,7 @@ fn prompt_images(opts: &Table) -> LuaResult<Vec<ImageSource>> {
 #[lua_fn(guard = [Agent, SessionWrite])]
 async fn cancel(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
     let id = match opts {
@@ -908,7 +1298,7 @@ fn notify(
 #[lua_fn(guard = SessionSettings)]
 async fn set_mode(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     mode: String,
     opts: Option<Table>,
 ) -> LuaResult<Pair<Value>> {
@@ -929,7 +1319,7 @@ async fn set_mode(
 #[lua_fn(guard = SessionSettings)]
 async fn set_title(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     opts: Table,
 ) -> LuaResult<Pair<Value>> {
     let req = SessionRequest::SetTitle {
@@ -968,7 +1358,7 @@ pub(crate) fn may_answer_for_user(perms: &PluginPermissions) -> bool {
 #[lua_fn]
 async fn answer_permission(
     lua: Lua,
-    #[ctx] tx: Option<flume::Sender<UiAction>>,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
     #[ctx] plugin: Arc<str>,
     #[ctx] full_trust: bool,
     request_id: u64,
@@ -1003,20 +1393,22 @@ lua_table! {
     /// at once. These functions list, create, focus, rename, and delete them.
     ///
     /// Without a UI, most functions return `nil, "no interactive UI attached"`.
-    /// `current`, `read`, `export`, `messages`, `notify` and `new` without
-    /// `prompt` or `focus` still work. ACP has no focused session, so there
-    /// `current` fails and `read`, `export` and `messages` need `session`.
+    /// `current`, `read`, `export`, `messages`, `windows`, `subagents`,
+    /// `notify` and `new` without `prompt` or `focus` still work. ACP has no
+    /// focused session, so there `current` fails and the readers need
+    /// `session`.
     "maki.session" => pub(crate) fn create_session_table(
-        tx: Option<flume::Sender<UiAction>>,
+        tx: Option<UnboundedSender<UiAction>>,
         perms: &PluginPermissions,
         grants: PluginPermissions,
         plugin: Arc<str>,
         full_trust: bool,
     ),
     DOCS [
-        list(tx), live(tx), current(tx), read(tx), export(perms, tx), messages(perms, tx), focus(tx),
-        delete(perms, tx), new(perms, tx, grants), prompt(perms, tx), cancel(perms, tx),
-        notify(perms, grants), set_mode(perms, tx), set_title(perms, tx), data_dir(plugin, tx),
+        list(tx), live(tx), current(tx), read(tx), export(perms, tx), messages(perms, tx),
+        windows(perms, tx), subagents(perms, tx), focus(tx), delete(perms, tx),
+        new(perms, tx, grants), prompt(perms, tx), cancel(perms, tx), notify(perms, grants),
+        set_mode(perms, tx), set_title(perms, tx), data_dir(plugin, tx),
         answer_permission(tx, plugin, full_trust),
     ]
 }
@@ -1036,8 +1428,10 @@ mod tests {
     use maki_agent::session::{NOTHING_TO_STORE, SessionHeader};
     use maki_providers::{ImageMediaType, ImageSource, MessageKind, Role};
     use maki_storage::frame::{FactsUpdate, PromptFacts, StoredFrame};
-    use maki_storage::sessions::{StoredMode, StoredThinking};
+    use maki_storage::sessions::{SessionClaim, StoredMode, StoredSubagent, StoredThinking};
     use tempfile::TempDir;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
     use crate::api::base64::create_base64_table;
@@ -1053,6 +1447,8 @@ mod tests {
 
     const FOCUSED_TEXT: &str = "focused";
     const TOOL_ID: &str = "toolu_1";
+    const TOOL_ID_2: &str = "toolu_2";
+    const PLUGIN_ID: &str = "plugin-1";
     const TOOL_NAME: &str = "read";
     const TOOL_PATH: &str = "src/main.rs";
     const TOOL_OUTPUT: &str = "no such file";
@@ -1068,11 +1464,11 @@ mod tests {
     const ONE_MESSAGE: &str = "{ { role = 'user', content = { { type = 'text', text = 'hi' } } } }";
     const ASK_HANDLE: u64 = 7;
 
-    fn lua_with_session(tx: Option<flume::Sender<UiAction>>) -> Lua {
+    fn lua_with_session(tx: Option<UnboundedSender<UiAction>>) -> Lua {
         lua_granted(tx, PluginPermissions::trusted())
     }
 
-    fn lua_granted(tx: Option<flume::Sender<UiAction>>, grants: PluginPermissions) -> Lua {
+    fn lua_granted(tx: Option<UnboundedSender<UiAction>>, grants: PluginPermissions) -> Lua {
         let lua = Lua::new();
         let full_trust = may_answer_for_user(&grants);
         let t = create_session_table(&lua, tx, &grants, grants.clone(), PLUGIN.into(), full_trust)
@@ -1149,13 +1545,13 @@ mod tests {
 
     #[tokio::test]
     async fn focus_roundtrips_through_ui_channel() {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         let lua = lua_with_session(Some(tx));
         std::thread::spawn(move || {
-            let Ok(UiAction::Session {
+            let Some(UiAction::Session {
                 req: SessionRequest::Focus { id },
                 reply_tx,
-            }) = rx.recv()
+            }) = rx.blocking_recv()
             else {
                 panic!("expected focus request");
             };
@@ -1170,66 +1566,6 @@ mod tests {
         assert_eq!(val.get::<String>("focused").unwrap(), "abc");
     }
 
-    async fn run_prompt(code: &str) -> (Option<String>, String, Vec<ImageSource>) {
-        let (tx, rx) = flume::unbounded::<UiAction>();
-        let lua = lua_with_session(Some(tx));
-        let checker = std::thread::spawn(move || {
-            let Ok(UiAction::Session {
-                req: SessionRequest::Prompt { id, text, images },
-                reply_tx,
-            }) = rx.recv()
-            else {
-                panic!("expected prompt request");
-            };
-            reply_tx.send(Ok(json!(PROMPT_QUEUED))).unwrap();
-            (id, text, images)
-        });
-        let (val, err): (String, Option<String>) = lua.load(code).eval_async().await.unwrap();
-        assert_eq!(err, None);
-        assert_eq!(val, PROMPT_QUEUED);
-        checker.join().unwrap()
-    }
-
-    /// Both outcomes are successes a plugin tells apart by the string, so an
-    /// idle session never reads as a failure under `if not ok`.
-    #[test_case("return session.cancel({ session = 'abc' })", Some("abc"), CANCEL_CANCELLED ; "explicit_session_id")]
-    #[test_case("return session.cancel()", None, CANCEL_IDLE ; "defaults_to_focused")]
-    #[tokio::test]
-    async fn cancel_forwards_the_session_id(code: &str, expected_id: Option<&str>, reply: &str) {
-        let (tx, rx) = flume::unbounded::<UiAction>();
-        let lua = lua_with_session(Some(tx));
-        let expected_id = expected_id.map(str::to_owned);
-        let reply = reply.to_owned();
-        let expected_reply = reply.clone();
-        let checker = std::thread::spawn(move || {
-            let Ok(UiAction::Session {
-                req: SessionRequest::Cancel { id },
-                reply_tx,
-            }) = rx.recv()
-            else {
-                panic!("expected cancel request");
-            };
-            assert_eq!(id, expected_id);
-            reply_tx.send(Ok(json!(reply))).unwrap();
-        });
-        let (val, err): (String, Option<String>) = lua.load(code).eval_async().await.unwrap();
-        checker.join().unwrap();
-        assert_eq!(err, None);
-        assert_eq!(val, expected_reply);
-    }
-
-    #[tokio::test]
-    async fn cancel_needs_the_agent_permission() {
-        let lua = lua_granted(None, PluginPermissions::denied());
-        let err = lua
-            .load("return session.cancel()")
-            .eval_async::<Value>()
-            .await
-            .unwrap_err();
-        let denied = denied_error(Permission::Agent).to_string();
-        assert!(err.to_string().contains(&denied), "{err}");
-    }
-
     #[test_case("{ decision = 'allow' }", PermissionAnswer::AllowOnce ; "allow")]
     #[test_case("{ decision = 'deny' }", PermissionAnswer::Deny ; "deny")]
     #[test_case("{ decision = 'deny', guidance = '  ' }", PermissionAnswer::Deny ; "blank_guidance_is_a_plain_deny")]
@@ -1240,10 +1576,10 @@ mod tests {
     )]
     #[tokio::test]
     async fn answer_permission_forwards_the_verdict(answer: &str, expected: PermissionAnswer) {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         let lua = lua_with_session(Some(tx));
         let checker = std::thread::spawn(move || {
-            let Ok(UiAction::Session {
+            let Some(UiAction::Session {
                 req:
                     SessionRequest::AnswerPermission {
                         handle,
@@ -1251,7 +1587,7 @@ mod tests {
                         plugin,
                     },
                 reply_tx,
-            }) = rx.recv()
+            }) = rx.blocking_recv()
             else {
                 panic!("expected an answer_permission request");
             };
@@ -1291,6 +1627,26 @@ mod tests {
         let code = "return session.answer_permission(1, { decision = 'allow' })";
         let err = lua.load(code).eval_async::<Value>().await.unwrap_err();
         assert!(err.to_string().contains(MANIFEST_FILE), "{err}");
+    }
+
+    async fn run_prompt(code: &str) -> (Option<String>, String, Vec<ImageSource>) {
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
+        let lua = lua_with_session(Some(tx));
+        let checker = std::thread::spawn(move || {
+            let Some(UiAction::Session {
+                req: SessionRequest::Prompt { id, text, images },
+                reply_tx,
+            }) = rx.blocking_recv()
+            else {
+                panic!("expected prompt request");
+            };
+            reply_tx.send(Ok(json!(PROMPT_QUEUED))).unwrap();
+            (id, text, images)
+        });
+        let (val, err): (String, Option<String>) = lua.load(code).eval_async().await.unwrap();
+        assert_eq!(err, None);
+        assert_eq!(val, PROMPT_QUEUED);
+        checker.join().unwrap()
     }
 
     #[test_case("return session.prompt('hi', { session = 'abc' })", Some("abc") ; "explicit_session_id")]
@@ -1341,7 +1697,7 @@ mod tests {
         "at most 8 images per prompt, got 9" ; "too_many")]
     #[tokio::test]
     async fn prompt_rejects_invalid_images(opts: &str, expected: &str) {
-        let (tx, _rx) = flume::unbounded::<UiAction>();
+        let (tx, _rx) = unbounded_channel::<UiAction>();
         let lua = lua_with_session(Some(tx));
         let code = format!(
             "local e = {{ media_type = 'image/png', data = 'aGk=' }}
@@ -1349,6 +1705,46 @@ mod tests {
         );
         let err = lua.load(code).exec_async().await.unwrap_err();
         assert!(err.to_string().contains(expected), "got: {err}");
+    }
+
+    /// Both outcomes are successes a plugin tells apart by the string, so an
+    /// idle session never reads as a failure under `if not ok`.
+    #[test_case("return session.cancel({ session = 'abc' })", Some("abc"), CANCEL_CANCELLED ; "explicit_session_id")]
+    #[test_case("return session.cancel()", None, CANCEL_IDLE ; "defaults_to_focused")]
+    #[tokio::test]
+    async fn cancel_forwards_the_session_id(code: &str, expected_id: Option<&str>, reply: &str) {
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
+        let lua = lua_with_session(Some(tx));
+        let expected_id = expected_id.map(str::to_owned);
+        let reply = reply.to_owned();
+        let expected_reply = reply.clone();
+        let checker = std::thread::spawn(move || {
+            let Some(UiAction::Session {
+                req: SessionRequest::Cancel { id },
+                reply_tx,
+            }) = rx.blocking_recv()
+            else {
+                panic!("expected cancel request");
+            };
+            assert_eq!(id, expected_id);
+            reply_tx.send(Ok(json!(reply))).unwrap();
+        });
+        let (val, err): (String, Option<String>) = lua.load(code).eval_async().await.unwrap();
+        checker.join().unwrap();
+        assert_eq!(err, None);
+        assert_eq!(val, expected_reply);
+    }
+
+    #[tokio::test]
+    async fn cancel_needs_the_agent_permission() {
+        let lua = lua_granted(None, PluginPermissions::denied());
+        let err = lua
+            .load("return session.cancel()")
+            .eval_async::<Value>()
+            .await
+            .unwrap_err();
+        let denied = denied_error(Permission::Agent).to_string();
+        assert!(err.to_string().contains(&denied), "{err}");
     }
 
     /// Mode is per session like the plan it drives, so a row handler firing
@@ -1361,15 +1757,15 @@ mod tests {
         expected_id: Option<&str>,
         expected_mode: &str,
     ) {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         let lua = lua_with_session(Some(tx));
         let expected_id = expected_id.map(str::to_owned);
         let expected_mode = expected_mode.to_owned();
         let checker = std::thread::spawn(move || {
-            let Ok(UiAction::Session {
+            let Some(UiAction::Session {
                 req: SessionRequest::SetMode { id, mode },
                 reply_tx,
-            }) = rx.recv()
+            }) = rx.blocking_recv()
             else {
                 panic!("expected set_mode request");
             };
@@ -1387,7 +1783,7 @@ mod tests {
     fn notify_is_synchronous_and_queues_an_observation() {
         let id = MakiId::generate();
         let mailbox = SessionMailbox::register(id);
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         let lua = lua_with_session(Some(tx));
         lua.globals().set("session_id", id.to_string()).unwrap();
 
@@ -1546,12 +1942,12 @@ mod tests {
 
     /// The UI answers `Current` with the bare id, not a snapshot.
     fn ui_focused_on(id: MakiId) -> Lua {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         std::thread::spawn(move || {
-            let Ok(UiAction::Session {
+            let Some(UiAction::Session {
                 req: SessionRequest::Current,
                 reply_tx,
-            }) = rx.recv()
+            }) = rx.blocking_recv()
             else {
                 panic!("expected current request");
             };
@@ -1602,10 +1998,10 @@ mod tests {
 
     #[tokio::test]
     async fn messages_without_a_focused_session_is_an_error_pair() {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         let lua = lua_with_session(Some(tx));
         std::thread::spawn(move || {
-            let Ok(UiAction::Session { reply_tx, .. }) = rx.recv() else {
+            let Some(UiAction::Session { reply_tx, .. }) = rx.blocking_recv() else {
                 panic!("expected session request");
             };
             reply_tx.send(Ok(serde_json::Value::Null)).unwrap();
@@ -1620,7 +2016,7 @@ mod tests {
 
     /// `session` plus the `maki` pieces a plugin round trips with, and
     /// `one_message`, the smallest history `new` stores.
-    fn plugin_lua(tx: Option<flume::Sender<UiAction>>) -> Lua {
+    fn plugin_lua(tx: Option<UnboundedSender<UiAction>>) -> Lua {
         with_plugin_globals(lua_with_session(tx))
     }
 
@@ -1738,6 +2134,243 @@ mod tests {
         store_new(session, &storage(lua)).unwrap()
     }
 
+    /// Saves a session that already has a file, the way a run that rewrites
+    /// its log does.
+    fn save_again(lua: &Lua, mut session: StoredSession) {
+        let dir = storage(lua);
+        let claim = SessionClaim::acquire(session.id, &dir).unwrap();
+        session.save(&claim, &dir).unwrap();
+    }
+
+    /// Two archives: a compaction of the first window, then a rewind of the
+    /// turn after it.
+    fn stored_with_windows(lua: &Lua) -> MakiId {
+        let dir = storage(lua);
+        let mut session = StoredSession::new(MODEL, FACTS_CWD);
+        session.replace_messages(vec![
+            Message::user("old question".into()),
+            assistant(vec![ContentBlock::Text {
+                text: "old answer".into(),
+            }]),
+        ]);
+        let id = store_new(session, &dir).unwrap();
+
+        let mut session = StoredSession::load(id, &dir).unwrap();
+        session.replace_messages(vec![Message::user("summary".into())]);
+        save_again(lua, session);
+
+        let mut session = StoredSession::load(id, &dir).unwrap();
+        session.push_message(Message::user("next turn".into()));
+        save_again(lua, session);
+
+        let mut session = StoredSession::load(id, &dir).unwrap();
+        session.truncate_messages(1);
+        save_again(lua, session);
+        id
+    }
+
+    fn subagent_meta(id: &str, name: &str) -> StoredSubagent {
+        StoredSubagent {
+            tool_use_id: id.into(),
+            name: name.into(),
+            model: None,
+            thinking: None,
+            fast: false,
+            plugin: None,
+            cost: None,
+            started_at: None,
+            ended_at: None,
+        }
+    }
+
+    fn with_subagent(mut session: StoredSession, id: &str, name: &str) -> StoredSession {
+        session.set_subagent_messages(
+            id.into(),
+            vec![Message::user(format!("{name} task"))],
+            |_| Vec::new(),
+        );
+        session.set_subagents(vec![subagent_meta(id, name)]);
+        session
+    }
+
+    /// What a compaction or rewind leaves of the state whose turns it dropped.
+    fn prune(session: &mut StoredSession) {
+        session.prune_orphans(|message| {
+            message
+                .tool_uses()
+                .map(|(id, _, _)| id.to_owned())
+                .collect()
+        });
+    }
+
+    fn with_plugin_subagent(mut session: StoredSession, said: &str) -> StoredSession {
+        let mut messages = session
+            .subagent_messages()
+            .get(PLUGIN_ID)
+            .map(|messages| messages.as_ref().clone())
+            .unwrap_or_default();
+        messages.push(Message::user(said.into()));
+        session.set_subagent_messages(PLUGIN_ID.into(), messages, |_| Vec::new());
+        session.set_subagents(vec![StoredSubagent {
+            plugin: Some(PLUGIN.into()),
+            ..subagent_meta(PLUGIN_ID, "beside")
+        }]);
+        session
+    }
+
+    fn stored_with_subagent(lua: &Lua) -> MakiId {
+        let mut session = StoredSession::new(MODEL, FACTS_CWD);
+        session.replace_messages(vec![assistant(vec![ContentBlock::tool_use(
+            TOOL_ID,
+            TOOL_NAME,
+            json!({}),
+        )])]);
+        store_new(with_subagent(session, TOOL_ID, "worker"), &storage(lua)).unwrap()
+    }
+
+    /// The subagent's parent `tool_use` is in the first window, which a
+    /// compaction then archives.
+    fn stored_with_archived_subagent(lua: &Lua) -> MakiId {
+        let dir = storage(lua);
+        let mut session = StoredSession::new(MODEL, FACTS_CWD);
+        session.replace_messages(vec![
+            Message::user("start".into()),
+            assistant(vec![ContentBlock::tool_use(TOOL_ID, TOOL_NAME, json!({}))]),
+        ]);
+        let id = store_new(with_subagent(session, TOOL_ID, "worker"), &dir).unwrap();
+
+        let mut session = StoredSession::load(id, &dir).unwrap();
+        session.replace_messages(vec![Message::user("summary".into())]);
+        prune(&mut session);
+        save_again(lua, session);
+        id
+    }
+
+    /// Three archives, with the subagent spawned in the middle window.
+    fn stored_with_middle_subagent(lua: &Lua) -> MakiId {
+        let dir = storage(lua);
+        let mut session = StoredSession::new(MODEL, FACTS_CWD);
+        session.replace_messages(vec![
+            Message::user("start".into()),
+            assistant(vec![ContentBlock::Text {
+                text: "answer".into(),
+            }]),
+        ]);
+        let id = store_new(session, &dir).unwrap();
+
+        let mut session = StoredSession::load(id, &dir).unwrap();
+        session.replace_messages(vec![Message::user("summary".into())]);
+        save_again(lua, session);
+
+        let mut session = StoredSession::load(id, &dir).unwrap();
+        session.push_message(Message::user("second".into()));
+        session.push_message(assistant(vec![ContentBlock::tool_use(
+            TOOL_ID,
+            TOOL_NAME,
+            json!({}),
+        )]));
+        save_again(lua, with_subagent(session, TOOL_ID, "worker"));
+
+        let mut session = StoredSession::load(id, &dir).unwrap();
+        session.replace_messages(vec![Message::user("summary again".into())]);
+        prune(&mut session);
+        save_again(lua, session);
+
+        let mut session = StoredSession::load(id, &dir).unwrap();
+        session.push_message(Message::user("third".into()));
+        save_again(lua, session);
+
+        let mut session = StoredSession::load(id, &dir).unwrap();
+        session.replace_messages(vec![Message::user("last summary".into())]);
+        save_again(lua, session);
+
+        let mut session = StoredSession::load(id, &dir).unwrap();
+        session.push_message(Message::user("fourth".into()));
+        save_again(lua, session);
+        id
+    }
+
+    /// A rewind keeps the subagent's parent `tool_use` in the next window.
+    fn stored_with_carried_parent(lua: &Lua) -> MakiId {
+        let dir = storage(lua);
+        let mut session = StoredSession::new(MODEL, FACTS_CWD);
+        session.replace_messages(vec![
+            Message::user("start".into()),
+            assistant(vec![ContentBlock::tool_use(TOOL_ID, TOOL_NAME, json!({}))]),
+            Message::user("next".into()),
+        ]);
+        let id = store_new(with_subagent(session, TOOL_ID, "worker"), &dir).unwrap();
+
+        let mut session = StoredSession::load(id, &dir).unwrap();
+        session.truncate_messages(2);
+        save_again(lua, session);
+        id
+    }
+
+    /// Two windows whose subagents both take `nr = 1`.
+    fn stored_with_two_subagent_windows(lua: &Lua) -> MakiId {
+        let dir = storage(lua);
+        let mut session = StoredSession::new(MODEL, FACTS_CWD);
+        session.replace_messages(vec![
+            Message::user("start".into()),
+            assistant(vec![ContentBlock::tool_use(TOOL_ID, TOOL_NAME, json!({}))]),
+        ]);
+        let id = store_new(with_subagent(session, TOOL_ID, "worker"), &dir).unwrap();
+
+        let mut session = StoredSession::load(id, &dir).unwrap();
+        session.replace_messages(vec![Message::user("summary".into())]);
+        prune(&mut session);
+        save_again(lua, session);
+
+        let mut session = StoredSession::load(id, &dir).unwrap();
+        session.push_message(Message::user("second".into()));
+        session.push_message(assistant(vec![ContentBlock::tool_use(
+            TOOL_ID_2,
+            TOOL_NAME,
+            json!({}),
+        )]));
+        save_again(lua, with_subagent(session, TOOL_ID_2, "helper"));
+        id
+    }
+
+    /// A plugin run beside the chat has no parent `tool_use` and keeps its
+    /// records across a compaction.
+    fn stored_with_running_plugin_subagent(lua: &Lua) -> MakiId {
+        let dir = storage(lua);
+        let mut session = StoredSession::new(MODEL, FACTS_CWD);
+        session.replace_messages(vec![
+            Message::user("start".into()),
+            assistant(vec![ContentBlock::Text {
+                text: "answer".into(),
+            }]),
+        ]);
+        let id = store_new(with_plugin_subagent(session, "started"), &dir).unwrap();
+
+        let mut session = StoredSession::load(id, &dir).unwrap();
+        session.replace_messages(vec![Message::user("summary".into())]);
+        save_again(lua, session);
+
+        let mut session = StoredSession::load(id, &dir).unwrap();
+        session.push_message(Message::user("next".into()));
+        save_again(lua, with_plugin_subagent(session, "finished"));
+        id
+    }
+
+    async fn subagents_of(lua: &Lua, id: MakiId, window: Option<&str>) -> Vec<(String, usize)> {
+        let window = window.map_or_else(String::new, |window| format!(", window = '{window}'"));
+        let table: Table = eval(
+            lua,
+            &format!("return session.subagents({{ session = '{id}'{window} }})"),
+        )
+        .await;
+        (1..=table.raw_len())
+            .map(|index| {
+                let row: Table = table.get(index).unwrap();
+                (row.get("id").unwrap(), row.get("nr").unwrap())
+            })
+            .collect()
+    }
+
     async fn eval<T: mlua::FromLuaMulti>(lua: &Lua, code: &str) -> T {
         lua.load(code).eval_async().await.unwrap()
     }
@@ -1842,6 +2475,204 @@ mod tests {
         assert_eq!(
             json_of(&lua, msgs),
             serde_json::to_value(&history[history.len() - 2..]).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn windows_lists_current_then_archives_newest_first() {
+        let (lua, _dir) = headless();
+        let id = stored_with_windows(&lua);
+
+        let windows: Table = eval(
+            &lua,
+            &format!("return session.windows({{ session = '{id}' }})"),
+        )
+        .await;
+        let rows: Vec<(String, String, u64)> = (1..=windows.raw_len())
+            .map(|index| {
+                let row: Table = windows.get(index).unwrap();
+                (
+                    row.get("id").unwrap(),
+                    row.get("kind").unwrap(),
+                    row.get("created_at").unwrap(),
+                )
+            })
+            .collect();
+
+        let labels: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|(id, kind, _)| (id.as_str(), kind.as_str()))
+            .collect();
+        assert_eq!(
+            labels,
+            [("current", "current"), ("2", "rewind"), ("1", "compaction"),]
+        );
+        assert!(rows[2].2 <= rows[1].2 && rows[1].2 <= rows[0].2);
+    }
+
+    #[tokio::test]
+    async fn windows_leave_created_at_nil_without_a_header() {
+        let (lua, _dir) = headless();
+        let id = MakiId::generate();
+        let _live = live_unsaved(id, vec![Message::user(TEXT.into())]);
+        lua.globals().set("id", id.to_string()).unwrap();
+
+        let windows: Table = eval(&lua, "return assert(session.windows({ session = id }))").await;
+
+        assert_eq!(windows.raw_len(), 1);
+        let window: Table = windows.get(1).unwrap();
+        assert_eq!(window.get::<String>("id").unwrap(), CURRENT_WINDOW_ID);
+        assert!(window.get::<Option<u64>>(CREATED_AT_KEY).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn messages_reads_one_archived_window() {
+        let (lua, _dir) = headless();
+        let id = stored_with_windows(&lua);
+
+        let archived: Value = eval(
+            &lua,
+            &format!("return session.messages({{ session = '{id}', window = '1' }})"),
+        )
+        .await;
+        assert_eq!(
+            json_of(&lua, archived),
+            serde_json::to_value([
+                Message::user("old question".into()),
+                assistant(vec![ContentBlock::Text {
+                    text: "old answer".into(),
+                }]),
+            ])
+            .unwrap()
+        );
+
+        let current: Value = eval(
+            &lua,
+            &format!("return session.messages({{ session = '{id}' }})"),
+        )
+        .await;
+        assert_eq!(
+            json_of(&lua, current),
+            serde_json::to_value([Message::user("summary".into())]).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn messages_rejects_an_unknown_window() {
+        let (lua, _dir) = headless();
+        let id = stored(&lua, vec![Message::user(TEXT.into())]);
+
+        let (messages, error): (Value, Option<String>) = eval(
+            &lua,
+            &format!("return session.messages({{ session = '{id}', window = '9' }})"),
+        )
+        .await;
+
+        assert!(messages.is_nil());
+        assert_eq!(error.as_deref(), Some("window not found: 9"));
+    }
+
+    #[tokio::test]
+    async fn subagents_reads_the_transcripts_of_one_window() {
+        let (lua, _dir) = headless();
+        let id = stored_with_subagent(&lua);
+
+        let subagents: Table = eval(
+            &lua,
+            &format!("return session.subagents({{ session = '{id}' }})"),
+        )
+        .await;
+
+        assert_eq!(subagents.raw_len(), 1);
+        let subagent: Table = subagents.get(1).unwrap();
+        assert_eq!(subagent.get::<String>("id").unwrap(), TOOL_ID);
+        assert_eq!(subagent.get::<usize>("nr").unwrap(), 1);
+        assert_eq!(subagent.get::<String>("name").unwrap(), "worker");
+        let messages: Value = subagent.get(MESSAGES_KEY).unwrap();
+        assert_eq!(
+            json_of(&lua, messages),
+            serde_json::to_value([Message::user("worker task".into())]).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn subagents_attach_to_the_window_that_spawned_them() {
+        let (lua, _dir) = headless();
+        let id = stored_with_archived_subagent(&lua);
+
+        assert_eq!(
+            subagents_of(&lua, id, Some("1")).await,
+            [(TOOL_ID.to_owned(), 1)]
+        );
+        assert!(subagents_of(&lua, id, None).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn subagents_of_a_middle_window_come_from_its_neighbors() {
+        let (lua, _dir) = headless();
+        let id = stored_with_middle_subagent(&lua);
+
+        assert_eq!(
+            subagents_of(&lua, id, Some("2")).await,
+            [(TOOL_ID.to_owned(), 1)]
+        );
+        assert!(subagents_of(&lua, id, Some("1")).await.is_empty());
+        assert!(subagents_of(&lua, id, Some("3")).await.is_empty());
+        assert!(subagents_of(&lua, id, None).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn subagents_follow_a_parent_carried_into_the_next_window() {
+        let (lua, _dir) = headless();
+        let id = stored_with_carried_parent(&lua);
+
+        assert!(subagents_of(&lua, id, Some("1")).await.is_empty());
+        assert_eq!(
+            subagents_of(&lua, id, None).await,
+            [(TOOL_ID.to_owned(), 1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn subagents_in_different_windows_can_share_a_number() {
+        let (lua, _dir) = headless();
+        let id = stored_with_two_subagent_windows(&lua);
+
+        assert_eq!(
+            subagents_of(&lua, id, Some("1")).await,
+            [(TOOL_ID.to_owned(), 1)]
+        );
+        assert_eq!(
+            subagents_of(&lua, id, None).await,
+            [(TOOL_ID_2.to_owned(), 1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plugin_subagent_attaches_to_the_newest_window() {
+        let (lua, _dir) = headless();
+        let id = stored_with_running_plugin_subagent(&lua);
+
+        assert!(subagents_of(&lua, id, Some("1")).await.is_empty());
+        assert_eq!(
+            subagents_of(&lua, id, None).await,
+            [(PLUGIN_ID.to_owned(), 1)]
+        );
+
+        let subagents: Table = eval(
+            &lua,
+            &format!("return session.subagents({{ session = '{id}' }})"),
+        )
+        .await;
+        let subagent: Table = subagents.get(1).unwrap();
+        let messages: Value = subagent.get(MESSAGES_KEY).unwrap();
+        assert_eq!(
+            json_of(&lua, messages),
+            serde_json::to_value([
+                Message::user("started".into()),
+                Message::user("finished".into()),
+            ])
+            .unwrap()
         );
     }
 
@@ -1954,11 +2785,11 @@ mod tests {
     /// blank session, so the transcript arrives as parsed.
     #[tokio::test]
     async fn new_with_a_ui_hands_it_the_parsed_transcript() {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         let lua = plugin_lua(Some(tx));
         let id = MakiId::generate();
         let checker = std::thread::spawn(move || {
-            let Ok(UiAction::Session {
+            let Some(UiAction::Session {
                 req:
                     SessionRequest::New {
                         transcript,
@@ -1966,7 +2797,7 @@ mod tests {
                         focus,
                     },
                 reply_tx,
-            }) = rx.recv()
+            }) = rx.blocking_recv()
             else {
                 panic!("expected new request");
             };
@@ -1988,14 +2819,14 @@ mod tests {
 
     #[tokio::test]
     async fn export_with_a_ui_is_answered_by_it() {
-        let (tx, rx) = flume::unbounded::<UiAction>();
+        let (tx, mut rx) = unbounded_channel::<UiAction>();
         let lua = lua_with_session(Some(tx));
         let id = MakiId::generate();
         std::thread::spawn(move || {
-            let Ok(UiAction::ExportSession {
+            let Some(UiAction::ExportSession {
                 id: asked,
                 reply_tx,
-            }) = rx.recv()
+            }) = rx.blocking_recv()
             else {
                 panic!("expected export request");
             };
@@ -2003,7 +2834,8 @@ mod tests {
             let mut session = StoredSession::new(MODEL, FACTS_CWD);
             session.set_title(TITLE.into());
             session.replace_messages(vec![Message::user(TEXT.into())]);
-            reply_tx.send(Ok(SessionExport::stored(session))).unwrap();
+            let sent = reply_tx.send(Ok(SessionExport::stored(session)));
+            assert!(sent.is_ok());
         });
 
         let doc: Value = eval(

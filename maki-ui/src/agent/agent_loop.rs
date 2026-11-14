@@ -1,3 +1,4 @@
+use crate::agent::UnboundedSender;
 use std::sync::Arc;
 
 use maki_agent::agent::{self, AgentHooks};
@@ -16,6 +17,7 @@ use maki_agent::{
 use maki_lua::EventHandle;
 use maki_providers::{AgentError, ContextGauge, Model};
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::spawn_blocking;
 use tracing::error;
 
@@ -43,8 +45,8 @@ fn base_tools(
 /// The loop's side of everything it shares with its `AgentHandles`.
 pub(super) struct LoopEnds {
     pub(super) shared_history: SharedMessages,
-    pub(super) agent_tx: flume::Sender<Envelope>,
-    pub(super) answer_rx: flume::Receiver<String>,
+    pub(super) agent_tx: UnboundedSender<Envelope>,
+    pub(super) answer_rx: UnboundedReceiver<String>,
     pub(super) queue: Arc<QueueReceiver>,
     pub(super) cancels: Arc<RunCancels>,
     pub(super) mailbox: SessionMailbox,
@@ -62,8 +64,8 @@ pub(super) struct AgentLoop {
     /// every run over it, so the provider's own counts pile up between turns.
     gauge: ContextGauge,
     cancels: Arc<RunCancels>,
-    agent_tx: flume::Sender<Envelope>,
-    answer_rx: Arc<Mutex<flume::Receiver<String>>>,
+    agent_tx: UnboundedSender<Envelope>,
+    answer_rx: Arc<Mutex<UnboundedReceiver<String>>>,
     queue: Arc<QueueReceiver>,
     mailbox: SessionMailbox,
     lua_handle: EventHandle,
@@ -112,7 +114,7 @@ impl AgentLoop {
             return;
         }
 
-        while let Ok(()) = self.queue.recv_notify().await {
+        while let Some(()) = self.queue.recv_notify().await {
             let mut last_run_id = None;
             while let Some(mut run) = self.queue.pop_run() {
                 let Some(run_id) = run.drop_cancelled(self.cancels.min_run_id()) else {
@@ -211,7 +213,11 @@ impl AgentLoop {
         if *self.vars.apply("{cwd}") != old_cwd {
             self.reload_instructions().await;
         }
-        let prompt_slots = Arc::new(self.lua_handle.collect_prompt_slots_async().await);
+        let prompt_slots = Arc::new(
+            self.lua_handle
+                .collect_prompt_slots(Some(self.seed.session_id.as_str()))
+                .await,
+        );
         let vars = self.vars.clone();
         let instructions = self.instructions.text.clone();
         let slots = Arc::clone(&prompt_slots);

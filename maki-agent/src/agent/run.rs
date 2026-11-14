@@ -5,6 +5,7 @@ use std::time::Instant;
 use arc_swap::ArcSwap;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{debug, error, info, warn};
 
 use maki_providers::provider::Provider;
@@ -162,7 +163,7 @@ pub struct Agent<'h> {
     /// within a run, and not before every request.
     prompt_facts: Option<PromptFacts>,
     mode: AgentMode,
-    user_response_rx: Option<Arc<Mutex<flume::Receiver<String>>>>,
+    user_response_rx: Option<Arc<Mutex<UnboundedReceiver<String>>>>,
     interrupt_source: Option<Arc<dyn InterruptSource>>,
     cancel: CancelToken,
     ledger: Arc<RunLedger>,
@@ -262,7 +263,7 @@ impl<'h> Agent<'h> {
         self
     }
 
-    pub fn with_user_response_rx(mut self, rx: Arc<Mutex<flume::Receiver<String>>>) -> Self {
+    pub fn with_user_response_rx(mut self, rx: Arc<Mutex<UnboundedReceiver<String>>>) -> Self {
         self.user_response_rx = Some(rx);
         self
     }
@@ -982,9 +983,9 @@ impl<'h> Agent<'h> {
         self.reauth_attempts += 1;
         warn!(error = %err, attempt = self.reauth_attempts, "auth error, waiting for re-authentication");
         self.event_tx.send(AgentEvent::AuthRequired)?;
-        let rx = rx.lock().await;
-        match self.cancel.race(rx.recv_async()).await {
-            Ok(Ok(_)) => {
+        let mut rx = rx.lock().await;
+        match self.cancel.race(rx.recv()).await {
+            Ok(Some(_)) => {
                 self.provider.refresh_auth().await?;
                 Ok(TurnOutcome::Continue)
             }
@@ -1169,7 +1170,11 @@ impl<'h> Agent<'h> {
             cancel: &self.cancel,
             context_size: context_size_before,
         };
-        let Compacted { summary, carried } = compaction::compact_history(
+        let Compacted {
+            summary,
+            duration,
+            carried,
+        } = compaction::compact_history(
             &*compact_provider,
             &compact_model,
             self.history,
@@ -1209,6 +1214,7 @@ impl<'h> Agent<'h> {
             context_size_after,
             context_window: self.model.context_window,
             summary,
+            duration_ms: duration.as_millis() as u64,
         })
     }
 
@@ -1351,8 +1357,9 @@ pub(crate) mod testing {
 mod tests {
     use std::borrow::Cow;
     use std::collections::{BTreeMap, VecDeque};
+    use std::iter;
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
     use maki_providers::model::FastSupport;
@@ -1367,6 +1374,8 @@ mod tests {
     use serde_json::Value;
     use test_case::test_case;
     use tokio::sync::Mutex as AsyncMutex;
+    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::mpsc::unbounded_channel;
 
     use super::compaction::FIELD_CONTINUE;
     use super::testing::{agent_params, fixed_context};
@@ -1488,7 +1497,7 @@ mod tests {
             messages: &'a [Message],
             system: &'a str,
             tools: &'a Value,
-            _: &'a flume::Sender<ProviderEvent>,
+            _: &'a UnboundedSender<ProviderEvent>,
             opts: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -1534,7 +1543,7 @@ mod tests {
             _: &'a [Message],
             _: &'a str,
             _: &'a Value,
-            ptx: &'a flume::Sender<ProviderEvent>,
+            ptx: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -1630,7 +1639,7 @@ mod tests {
     fn make_agent(
         provider: impl Provider + 'static,
         history: &mut History,
-    ) -> (Agent<'_>, flume::Receiver<Envelope>) {
+    ) -> (Agent<'_>, UnboundedReceiver<Envelope>) {
         make_agent_with(Arc::new(provider), default_model(), history)
     }
 
@@ -1640,8 +1649,8 @@ mod tests {
         provider: Arc<dyn Provider>,
         model: Model,
         history: &mut History,
-    ) -> (Agent<'_>, flume::Receiver<Envelope>) {
-        let (raw_tx, event_rx) = flume::unbounded();
+    ) -> (Agent<'_>, UnboundedReceiver<Envelope>) {
+        let (raw_tx, event_rx) = unbounded_channel();
         let mut agent = Agent::new(
             agent_params(provider, model),
             AgentRunParams {
@@ -1692,7 +1701,7 @@ mod tests {
                 }
             }
             let prompts = Arc::new(prompts);
-            let (mut agent, events) =
+            let (mut agent, mut events) =
                 make_agent_with(Arc::clone(&provider), default_model(), &mut history);
             agent.prompt_slots = Arc::clone(&prompts);
             agent.context = Arc::new(move |model, _| {
@@ -1700,7 +1709,7 @@ mod tests {
             });
             agent.run(default_input()).await.unwrap();
             drop(agent);
-            let rebuilt = drain_events(&events).iter().any(|event| {
+            let rebuilt = drain_events(&mut events).iter().any(|event| {
                 matches!(&event.event, AgentEvent::Notice { text } if text == FRAME_REBUILT)
             });
             assert_eq!(rebuilt, !changed);
@@ -1750,7 +1759,7 @@ mod tests {
         let mut stored = history.frame().unwrap().as_ref().clone();
         stored.facts.as_mut().unwrap().hints.clear();
         let mut history = History::restored(Vec::new()).with_frame(Some(Arc::new(stored)));
-        let (mut agent, events) = make_agent(
+        let (mut agent, mut events) = make_agent(
             MockProvider::new(vec![text_response(StopReason::EndTurn)]),
             &mut history,
         );
@@ -1760,7 +1769,7 @@ mod tests {
         agent.run(default_input()).await.unwrap();
         drop(agent);
         assert!(updates(&history).is_empty());
-        assert!(!drain_events(&events).iter().any(|event| {
+        assert!(!drain_events(&mut events).iter().any(|event| {
             matches!(&event.event, AgentEvent::Notice { text } if text == FRAME_REBUILT)
         }));
     }
@@ -1795,7 +1804,7 @@ mod tests {
                 OLD_INSTRUCTIONS
             };
             let slots = Arc::clone(&prompts);
-            let (mut agent, events) =
+            let (mut agent, mut events) =
                 make_agent_with(Arc::clone(&provider), default_model(), &mut history);
             agent.prompt_slots = Arc::clone(&prompts);
             agent.context = Arc::new(move |model, _| {
@@ -1803,7 +1812,7 @@ mod tests {
             });
             agent.run(default_input()).await.unwrap();
             drop(agent);
-            assert!(!drain_events(&events).iter().any(|event| {
+            assert!(!drain_events(&mut events).iter().any(|event| {
                 matches!(&event.event, AgentEvent::Notice { text } if text == FRAME_REBUILT)
             }));
         }
@@ -2041,7 +2050,7 @@ mod tests {
             NoticePath::NextPrompt | NoticePath::Interrupt => {}
         }
         let mut history = History::new(Vec::new());
-        let (mut agent, event_rx) = make_agent(
+        let (mut agent, mut event_rx) = make_agent(
             MockProvider::new(vec![text_response(StopReason::EndTurn)]),
             &mut history,
         );
@@ -2056,7 +2065,7 @@ mod tests {
         }
 
         assert_eq!(
-            notice_lines(&drain_events(&event_rx)),
+            notice_lines(&drain_events(&mut event_rx)),
             [(NOTICE_LINE, Some(NOTICE_BODY))]
         );
         let landed = observations(&history);
@@ -2076,7 +2085,7 @@ mod tests {
         let mailbox = SessionMailbox::register(id);
         SessionMailbox::notify(id, NOTICE_BODY.into(), Some(NOTICE_LINE), false).unwrap();
         let mut history = History::new(Vec::new());
-        let (agent, event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+        let (agent, mut event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
         let mut agent = agent.with_interrupt_source(MockInterruptSource::new(vec![
             ExtractedCommand::Interrupt(vec![
                 default_input(),
@@ -2102,7 +2111,7 @@ mod tests {
             .iter()
             .map(Message::is_observation)
             .collect();
-        let events = drain_events(&event_rx);
+        let events = drain_events(&mut event_rx);
         let lines = notice_lines(&events);
         if drop_last {
             assert_eq!(kinds, [false]);
@@ -2120,7 +2129,7 @@ mod tests {
         let mailbox = SessionMailbox::register(id);
         SessionMailbox::notify(id, NOTICE_BODY.into(), None, false).unwrap();
         let mut history = History::new(Vec::new());
-        let (mut agent, event_rx) = make_agent(
+        let (mut agent, mut event_rx) = make_agent(
             MockProvider::new(vec![text_response(StopReason::EndTurn)]),
             &mut history,
         );
@@ -2129,7 +2138,7 @@ mod tests {
         agent.run(default_input()).await.unwrap();
         drop(agent);
 
-        assert!(notice_lines(&drain_events(&event_rx)).is_empty());
+        assert!(notice_lines(&drain_events(&mut event_rx)).is_empty());
         let landed = observations(&history);
         assert_eq!(landed.len(), 1);
         assert_eq!(landed[0].display_text, None);
@@ -2178,7 +2187,7 @@ mod tests {
         ]);
         let requests = Arc::clone(&mock.requests);
         let mut history = History::new(Vec::new());
-        let (mut agent, event_rx) = make_agent(mock, &mut history);
+        let (mut agent, mut event_rx) = make_agent(mock, &mut history);
         agent.mailbox = Some(mailbox.clone());
         let mut agent = agent.with_interrupt_source(NotifyOnce::new(id, false));
 
@@ -2200,7 +2209,7 @@ mod tests {
         assert_eq!(observations(&history).len(), 1);
         assert!(mailbox.drain().is_empty());
         assert_eq!(
-            notice_lines(&drain_events(&event_rx)),
+            notice_lines(&drain_events(&mut event_rx)),
             [(NOTICE_LINE, Some(NOTICE_BODY))]
         );
 
@@ -2220,7 +2229,7 @@ mod tests {
         let mock = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
         let requests = Arc::clone(&mock.requests);
         let mut history = History::new(Vec::new());
-        let (mut agent, event_rx) = make_agent(mock, &mut history);
+        let (mut agent, mut event_rx) = make_agent(mock, &mut history);
         agent.mailbox = Some(mailbox.clone());
         let mut agent = agent.with_interrupt_source(NotifyOnce::new(id, true));
 
@@ -2229,13 +2238,13 @@ mod tests {
 
         assert_eq!(requests.lock().unwrap().len(), 1);
         assert!(observations(&history).is_empty());
-        assert!(notice_lines(&drain_events(&event_rx)).is_empty());
+        assert!(notice_lines(&drain_events(&mut event_rx)).is_empty());
         let woken = mailbox.claim_wake();
         assert_eq!(woken.len(), 1);
         assert_eq!(woken[0].first_text_content(), Some(NOTICE_BODY));
     }
 
-    fn drain_events(rx: &flume::Receiver<Envelope>) -> Vec<Envelope> {
+    fn drain_events(rx: &mut UnboundedReceiver<Envelope>) -> Vec<Envelope> {
         let mut events = Vec::new();
         while let Ok(e) = rx.try_recv() {
             events.push(e);
@@ -2243,12 +2252,27 @@ mod tests {
         events
     }
 
+    fn compaction_events(events: &[Envelope]) -> Vec<&AgentEvent> {
+        events
+            .iter()
+            .map(|envelope| &envelope.event)
+            .filter(|event| {
+                matches!(
+                    event,
+                    AgentEvent::AutoCompacting { .. }
+                        | AgentEvent::CompactionStarted
+                        | AgentEvent::CompactionDone { .. }
+                )
+            })
+            .collect()
+    }
+
     async fn run_agent(provider: MockProvider, max_turns: Option<u32>) -> (u32, DoneReason) {
         let mut history = History::new(Vec::new());
-        let (mut agent, event_rx) = make_agent(provider, &mut history);
+        let (mut agent, mut event_rx) = make_agent(provider, &mut history);
         agent.config.max_turns = max_turns;
         let _ = agent.run(default_input()).await;
-        drain_events(&event_rx)
+        drain_events(&mut event_rx)
             .into_iter()
             .find_map(|e| match e.event {
                 AgentEvent::Done {
@@ -2494,12 +2518,12 @@ mod tests {
         };
 
         let mut history = History::new(Vec::new());
-        let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+        let (mut agent, mut event_rx) = make_agent(MockProvider::new(responses), &mut history);
         if let Some(s) = source {
             agent = agent.with_interrupt_source(s);
         }
         let _ = agent.run(default_input()).await;
-        let events = drain_events(&event_rx);
+        let events = drain_events(&mut event_rx);
 
         assert_eq!(
             has_event(&events, |e| matches!(
@@ -2704,7 +2728,7 @@ mod tests {
         tool: Arc<Mutex<&'static str>>,
         authored: Arc<Mutex<&'static str>>,
         /// The host wrote the prompt, so it states no facts maki knows of.
-        host_written: Arc<Mutex<bool>>,
+        host_written: Arc<AtomicBool>,
     }
 
     impl World {
@@ -2726,7 +2750,7 @@ mod tests {
                         &AgentConfig::default(),
                         model,
                     ),
-                    facts: (!*world.host_written.lock().unwrap()).then_some(facts),
+                    facts: (!world.host_written.load(Ordering::Relaxed)).then_some(facts),
                     authored: world.authored.lock().unwrap().to_string(),
                 }
             })
@@ -2762,13 +2786,13 @@ mod tests {
             let mut mock = MockProvider::new(responses);
             mock.requests = Arc::clone(&self.requests);
             mock.served_window = self.served_window;
-            let (mut agent, event_rx) =
+            let (mut agent, mut event_rx) =
                 make_agent_with(Arc::new(mock), self.model.clone(), &mut self.history);
             agent.context = self.world.builder();
             configure(&mut agent);
             let reason = agent.run(input).await.unwrap();
             drop(agent);
-            (reason, drain_events(&event_rx))
+            (reason, drain_events(&mut event_rx))
         }
 
         async fn run_in(&mut self, mode: AgentMode) -> Vec<Envelope> {
@@ -2903,10 +2927,14 @@ mod tests {
     #[tokio::test]
     async fn switching_who_wrote_the_prompt_tells_only_plan_mode(host_written_first: bool) {
         let mut h = Harness::new(Vec::new());
-        *h.world.host_written.lock().unwrap() = host_written_first;
+        h.world
+            .host_written
+            .store(host_written_first, Ordering::Relaxed);
         h.run_in(AgentMode::Plan(PLAN_FILE.into())).await;
         h.world.change(|f| f.date = NEXT_DATE.into());
-        *h.world.host_written.lock().unwrap() = !host_written_first;
+        h.world
+            .host_written
+            .store(!host_written_first, Ordering::Relaxed);
         *h.world.authored.lock().unwrap() = "host prompt";
         h.run_in(AgentMode::Build).await;
 
@@ -3448,7 +3476,7 @@ mod tests {
         }));
         let source = MockInterruptSource::new(vec![ExtractedCommand::Interrupt(inputs)]);
         let mut history = History::new(Vec::new());
-        let (agent, event_rx) = make_agent(
+        let (agent, mut event_rx) = make_agent(
             MockProvider::new(vec![
                 text_response(StopReason::EndTurn),
                 text_response(StopReason::EndTurn),
@@ -3458,7 +3486,7 @@ mod tests {
 
         let mut agent = agent.with_interrupt_source(source);
         agent.run(default_input()).await.unwrap();
-        let events = drain_events(&event_rx);
+        let events = drain_events(&mut event_rx);
         drop(agent);
 
         let user_texts: Vec<_> = history
@@ -3492,13 +3520,20 @@ mod tests {
         let source = MockInterruptSource::new(commands);
 
         let mut history = History::new(prior);
-        let (agent, _event_rx) = make_agent(MockProvider::new(responses), &mut history);
+        let (agent, mut event_rx) = make_agent(MockProvider::new(responses), &mut history);
         let result = agent
             .with_interrupt_source(source)
             .run(default_input())
             .await;
 
         assert!(result.is_ok());
+        assert!(matches!(
+            compaction_events(&drain_events(&mut event_rx)).as_slice(),
+            [
+                AgentEvent::CompactionStarted,
+                AgentEvent::CompactionDone { .. }
+            ]
+        ));
     }
 
     /// `TurnComplete`, `Done` and the auto-compaction trigger all report the
@@ -3515,11 +3550,11 @@ mod tests {
         };
         let expected = response.usage.total_input() as u32;
         let mut history = History::new(vec![Message::user("go".into())]);
-        let (mut agent, event_rx) = make_agent(MockProvider::new(vec![response]), &mut history);
+        let (mut agent, mut event_rx) = make_agent(MockProvider::new(vec![response]), &mut history);
         agent.run(default_input()).await.unwrap();
         drop(agent);
 
-        let events = drain_events(&event_rx);
+        let events = drain_events(&mut event_rx);
         let reported: Vec<u32> = events
             .iter()
             .filter_map(|e| match &e.event {
@@ -3548,7 +3583,7 @@ mod tests {
         };
         let usage = response.usage;
         let mut history = History::new(vec![Message::user("go".into())]);
-        let (mut agent, event_rx) = make_agent(MockProvider::new(vec![response]), &mut history);
+        let (mut agent, mut event_rx) = make_agent(MockProvider::new(vec![response]), &mut history);
         agent.run(default_input()).await.unwrap();
         drop(agent);
 
@@ -3557,7 +3592,7 @@ mod tests {
             .expect("the curated table prices this model");
         assert!(expected > 0.0);
 
-        let events = drain_events(&event_rx);
+        let events = drain_events(&mut event_rx);
         let turn_subsidised_list_cost = events.iter().find_map(|e| match &e.event {
             AgentEvent::TurnComplete(tc) => Some(tc.subsidised_list_cost),
             _ => None,
@@ -3639,19 +3674,27 @@ mod tests {
             vec![]
         };
         let mut history = History::new(vec![Message::user("go".into())]);
-        let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+        let (mut agent, mut event_rx) = make_agent(MockProvider::new(responses), &mut history);
         *agent.gauge = ContextGauge::restored(context_size);
         agent.model = Arc::new(small_context_model(200_000, 8_192));
         agent.auto_compact = enabled;
         agent.try_auto_compact().await.unwrap();
         drop(agent);
+        let events = drain_events(&mut event_rx);
         assert_eq!(
-            has_event(&drain_events(&event_rx), |e| matches!(
-                e,
-                AgentEvent::AutoCompacting { .. }
-            )),
+            matches!(
+                compaction_events(&events).as_slice(),
+                [
+                    AgentEvent::AutoCompacting { .. },
+                    AgentEvent::CompactionStarted,
+                    AgentEvent::CompactionDone { .. }
+                ]
+            ),
             expected,
         );
+        if !expected {
+            assert!(compaction_events(&events).is_empty());
+        }
     }
 
     const OVERFLOW_CHUNK: &str = "restored transcript chunk ";
@@ -3673,7 +3716,7 @@ mod tests {
             .map(|i| Message::user(format!("{OVERFLOW_CHUNK}{i}")))
             .collect();
         let mut history = History::new(prior);
-        let (mut agent, event_rx) = make_agent(
+        let (mut agent, mut event_rx) = make_agent(
             MockProvider::new(vec![
                 text_response(StopReason::EndTurn),
                 text_response(StopReason::EndTurn),
@@ -3691,7 +3734,7 @@ mod tests {
             .unwrap();
         drop(agent);
 
-        let first = drain_events(&event_rx)
+        let first = drain_events(&mut event_rx)
             .into_iter()
             .map(|e| e.event)
             .find(|e| {
@@ -3720,7 +3763,7 @@ mod tests {
     const GIVE_UP_MSG: &str = "a second overflow in a row must surface, not compact again";
 
     /// Overflows the next `0` requests, then behaves.
-    struct OverflowProvider(Mutex<u32>);
+    struct OverflowProvider(AtomicU32);
 
     impl Provider for OverflowProvider {
         fn stream_message<'a>(
@@ -3729,18 +3772,17 @@ mod tests {
             _: &'a [Message],
             _: &'a str,
             _: &'a Value,
-            _: &'a flume::Sender<ProviderEvent>,
+            _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async {
-                let mut remaining = self.0.lock().unwrap();
-                match remaining.checked_sub(1) {
-                    Some(rest) => {
-                        *remaining = rest;
-                        Err(AgentError::api(OVERFLOW_STATUS, OVERFLOW_MESSAGE))
-                    }
-                    None => Ok(text_response(StopReason::EndTurn)),
+                match self
+                    .0
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                {
+                    Ok(_) => Err(AgentError::api(OVERFLOW_STATUS, OVERFLOW_MESSAGE)),
+                    Err(_) => Ok(text_response(StopReason::EndTurn)),
                 }
             })
         }
@@ -3758,7 +3800,8 @@ mod tests {
     #[tokio::test]
     async fn overflow_recovery(recoveries: u32, expected: bool, message: &str) {
         let mut history = History::new(vec![Message::user("go".into())]);
-        let (mut agent, event_rx) = make_agent(OverflowProvider(Mutex::new(1)), &mut history);
+        let (mut agent, mut event_rx) =
+            make_agent(OverflowProvider(AtomicU32::new(1)), &mut history);
         agent.auto_compact = true;
         agent.overflow_recoveries = recoveries;
 
@@ -3767,7 +3810,7 @@ mod tests {
 
         assert_eq!(recovered, expected, "{message}");
         assert_eq!(
-            has_event(&drain_events(&event_rx), |e| matches!(
+            has_event(&drain_events(&mut event_rx), |e| matches!(
                 e,
                 AgentEvent::AutoCompacting { .. }
             )),
@@ -3793,7 +3836,7 @@ mod tests {
             messages: &'a [Message],
             _: &'a str,
             _: &'a Value,
-            _: &'a flume::Sender<ProviderEvent>,
+            _: &'a UnboundedSender<ProviderEvent>,
             _: RequestOptions,
             _: Option<&'a SessionRef>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
@@ -3834,7 +3877,8 @@ mod tests {
             ],
             ..Default::default()
         });
-        let (mut agent, event_rx) = make_agent(UnboundThinkingProvider { always }, &mut history);
+        let (mut agent, mut event_rx) =
+            make_agent(UnboundThinkingProvider { always }, &mut history);
 
         let recovered = agent.run(default_input()).await.is_ok();
         drop(agent);
@@ -3849,7 +3893,7 @@ mod tests {
             "{message}"
         );
         assert!(
-            has_event(&drain_events(&event_rx), |e| matches!(
+            has_event(&drain_events(&mut event_rx), |e| matches!(
                 e,
                 AgentEvent::Notice { text } if text == THINKING_DROPPED
             )),
@@ -3873,7 +3917,7 @@ mod tests {
             },
             ..text_response(StopReason::EndTurn)
         };
-        let (mut agent, event_rx) = make_agent(
+        let (mut agent, mut event_rx) = make_agent(
             MockProvider::new(vec![
                 filling,
                 text_response(StopReason::EndTurn),
@@ -3893,7 +3937,7 @@ mod tests {
         drop(agent);
 
         assert!(
-            has_event(&drain_events(&event_rx), |e| matches!(
+            has_event(&drain_events(&mut event_rx), |e| matches!(
                 e,
                 AgentEvent::AutoCompacting { .. }
             )),
@@ -3915,7 +3959,7 @@ mod tests {
         trigger.cancel();
 
         let mut history = History::new(Vec::new());
-        let (agent, event_rx) = make_agent(StubStreamProvider::default(), &mut history);
+        let (agent, mut event_rx) = make_agent(StubStreamProvider::default(), &mut history);
         let mut agent = agent.with_cancel(cancel);
 
         assert_eq!(
@@ -3924,7 +3968,7 @@ mod tests {
         );
         drop(agent);
         assert_ends_with_cancel_marker(&history);
-        assert!(has_event(&drain_events(&event_rx), |e| matches!(
+        assert!(has_event(&drain_events(&mut event_rx), |e| matches!(
             e,
             AgentEvent::Done {
                 reason: DoneReason::Cancelled,
@@ -3974,12 +4018,12 @@ mod tests {
             ..Default::default()
         };
         let mut history = History::new(Vec::new());
-        let (agent, event_rx) = make_agent(provider, &mut history);
+        let (agent, mut event_rx) = make_agent(provider, &mut history);
         let mut agent = agent.with_cancel(cancel);
 
         let mut trigger = Some(trigger);
         let pump = tokio::spawn(async move {
-            while let Ok(envelope) = event_rx.recv_async().await {
+            while let Some(envelope) = event_rx.recv().await {
                 if matches!(envelope.event, AgentEvent::Retry { .. })
                     && let Some(t) = trigger.take()
                 {
@@ -4016,14 +4060,13 @@ mod tests {
             ..Default::default()
         };
         let mut history = History::new(Vec::new());
-        let (agent, event_rx) = make_agent(provider, &mut history);
-        let answer_rx = flume::unbounded::<String>().1;
+        let (agent, mut event_rx) = make_agent(provider, &mut history);
+        let answer_rx = unbounded_channel::<String>().1;
         let mut agent = agent.with_user_response_rx(Arc::new(AsyncMutex::new(answer_rx)));
 
         assert!(agent.run(default_input()).await.is_err());
         assert!(
-            event_rx
-                .drain()
+            iter::from_fn(|| event_rx.try_recv().ok())
                 .all(|e| !matches!(e.event, AgentEvent::AuthRequired))
         );
     }
@@ -4041,10 +4084,10 @@ mod tests {
     #[tokio::test]
     async fn error_emits_tool_done_event(responses: Vec<StreamResponse>, expected_error_id: &str) {
         let mut history = History::new(Vec::new());
-        let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+        let (mut agent, mut event_rx) = make_agent(MockProvider::new(responses), &mut history);
         let _ = agent.run(default_input()).await;
         drop(agent);
-        let events = drain_events(&event_rx);
+        let events = drain_events(&mut event_rx);
 
         assert!(has_event(&events, |e| matches!(
             e,
@@ -4092,10 +4135,10 @@ mod tests {
         expected_nudges: usize,
     ) {
         let mut history = History::new(Vec::new());
-        let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+        let (mut agent, mut event_rx) = make_agent(MockProvider::new(responses), &mut history);
         let _ = agent.run(default_input()).await;
         drop(agent);
-        let events = drain_events(&event_rx);
+        let events = drain_events(&mut event_rx);
 
         let nudges = events
             .iter()
@@ -4133,11 +4176,11 @@ mod tests {
             .chain([empty_response(), text_response(StopReason::EndTurn)])
             .collect();
         let mut history = History::new(Vec::new());
-        let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+        let (mut agent, mut event_rx) = make_agent(MockProvider::new(responses), &mut history);
         let _ = agent.run(default_input()).await;
         let _ = agent.run(default_input()).await;
         drop(agent);
-        let events = drain_events(&event_rx);
+        let events = drain_events(&mut event_rx);
 
         let nudges = events
             .iter()
@@ -4195,7 +4238,7 @@ mod tests {
             text_response(StopReason::EndTurn),
         ];
         let mut history = History::new(Vec::new());
-        let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
+        let (mut agent, mut event_rx) = make_agent(MockProvider::new(responses), &mut history);
         let registry = ToolRegistry::new();
         registry
             .register(
@@ -4209,7 +4252,7 @@ mod tests {
         let _ = agent.run(default_input()).await;
         drop(agent);
 
-        let nudges = drain_events(&event_rx)
+        let nudges = drain_events(&mut event_rx)
             .iter()
             .filter(|e| matches!(e.event, AgentEvent::Nudge))
             .count();
@@ -4288,7 +4331,7 @@ mod tests {
     #[tokio::test]
     async fn user_message_rewrite_is_what_the_model_sees() {
         let mut history = History::new(Vec::new());
-        let (mut agent, event_rx) = make_agent(
+        let (mut agent, mut event_rx) = make_agent(
             MockProvider::new(vec![text_response(StopReason::EndTurn)]),
             &mut history,
         );
@@ -4305,7 +4348,7 @@ mod tests {
         assert_eq!(slot, AgentSlot::UserMessage);
         assert_eq!(value["source"], InputSource::Tui.as_str());
         assert_eq!(
-            steers(&drain_events(&event_rx)),
+            steers(&drain_events(&mut event_rx)),
             [(SteerKind::MessageRewritten, REWRITTEN.to_owned())]
         );
     }
@@ -4355,7 +4398,7 @@ mod tests {
         reason: &str,
     ) {
         let mut history = History::new(Vec::new());
-        let (mut agent, event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
+        let (mut agent, mut event_rx) = make_agent(MockProvider::new(Vec::new()), &mut history);
         script(&agent.registry, answer);
 
         let done = agent.run(default_input()).await.unwrap();
@@ -4364,7 +4407,7 @@ mod tests {
         assert_eq!(done, DoneReason::Dropped);
         assert!(history.is_empty());
         assert_eq!(
-            steers(&drain_events(&event_rx)),
+            steers(&drain_events(&mut event_rx)),
             [(SteerKind::MessageDropped, reason.to_owned())]
         );
     }
@@ -4444,7 +4487,7 @@ mod tests {
     async fn stop_continuations_are_bounded(max_turns: Option<u32>, allowed: u32) {
         let allowed = allowed as usize;
         let mut history = History::new(Vec::new());
-        let (mut agent, event_rx) = make_agent(
+        let (mut agent, mut event_rx) = make_agent(
             MockProvider::new(
                 (0..=allowed)
                     .map(|_| text_response(StopReason::EndTurn))
@@ -4462,7 +4505,7 @@ mod tests {
         drop(agent);
 
         assert_eq!(reason, DoneReason::EndTurn);
-        assert_continued(&drain_events(&event_rx), &history, allowed);
+        assert_continued(&drain_events(&mut event_rx), &history, allowed);
     }
 
     /// The user is told about every continuation and the model reads each one.
@@ -4556,7 +4599,7 @@ mod tests {
         compacts: bool,
     ) {
         let mut history = History::new(vec![Message::user("go".into())]);
-        let (mut agent, event_rx) = make_agent(
+        let (mut agent, mut event_rx) = make_agent(
             MockProvider::new(vec![text_response(StopReason::EndTurn)]),
             &mut history,
         );
@@ -4565,13 +4608,21 @@ mod tests {
         agent.compact_now(reason).await.unwrap();
         drop(agent);
 
+        let events = drain_events(&mut event_rx);
         assert_eq!(
-            has_event(&drain_events(&event_rx), |e| matches!(
-                e,
-                AgentEvent::CompactionDone { .. }
-            )),
+            matches!(
+                compaction_events(&events).as_slice(),
+                [
+                    AgentEvent::AutoCompacting { .. },
+                    AgentEvent::CompactionStarted,
+                    AgentEvent::CompactionDone { .. }
+                ]
+            ),
             compacts
         );
+        if !compacts {
+            assert!(compaction_events(&events).is_empty());
+        }
     }
 
     const POST_COMPACTION: &str = "Re-read plan.md";
@@ -4654,7 +4705,7 @@ mod tests {
     #[tokio::test]
     async fn compaction_done_describes_the_final_history() {
         let mut history = History::new(vec![Message::user("go".into())]);
-        let (mut agent, event_rx) =
+        let (mut agent, mut event_rx) =
             make_agent(MockProvider::new(vec![summary_response()]), &mut history);
         agent.carry_from = agent.history.len();
 
@@ -4670,7 +4721,7 @@ mod tests {
         let (system, tools) = agent.history.request_prefix().unwrap();
         expected_gauge.reset(agent.history.as_slice(), system, tools);
         assert_eq!(agent.gauge.size(), expected_gauge.size());
-        let completions: Vec<_> = drain_events(&event_rx)
+        let completions: Vec<_> = drain_events(&mut event_rx)
             .into_iter()
             .filter_map(|e| match e.event {
                 AgentEvent::CompactionDone {
@@ -4682,6 +4733,17 @@ mod tests {
             })
             .collect();
         assert_eq!(completions, [(SUMMARY.into(), expected_gauge.size())]);
+    }
+
+    /// Messages are compared by content and order here; the append paths stamp
+    /// `created_at`, and pinning that is compaction.rs and history.rs's job.
+    fn without_clock(msgs: &[Message]) -> Vec<Message> {
+        msgs.iter()
+            .map(|m| Message {
+                created_at: None,
+                ..m.clone()
+            })
+            .collect()
     }
 
     /// The configured instructions close the summary block, ahead of the
@@ -4718,18 +4780,21 @@ mod tests {
 
         let messages = agent.history.as_slice();
         assert_eq!(
-            messages[1..agent.carry_from],
-            [
+            without_clock(&messages[1..agent.carry_from]),
+            without_clock(&[
                 summary_response().message,
-                Message::synthetic(POST_COMPACTION.into())
-            ]
+                Message::synthetic(POST_COMPACTION.into()),
+            ])
         );
         let expected_tail = if carried.is_empty() {
             vec![Message::synthetic(compaction::continue_message(None))]
         } else {
             carried
         };
-        assert_eq!(messages[agent.carry_from..], expected_tail);
+        assert_eq!(
+            without_clock(&messages[agent.carry_from..]),
+            without_clock(&expected_tail)
+        );
     }
 
     /// Lands its command once the stop layer has spent the allowance, keyed on
@@ -4761,7 +4826,7 @@ mod tests {
     async fn interrupt_restores_the_stop_allowance() {
         let allowed = 2 * MAX_STOP_CONTINUATIONS as usize;
         let mut history = History::new(Vec::new());
-        let (agent, event_rx) = make_agent(
+        let (agent, mut event_rx) = make_agent(
             MockProvider::new(
                 (0..allowed + 2)
                     .map(|_| text_response(StopReason::EndTurn))
@@ -4785,6 +4850,6 @@ mod tests {
         drop(agent);
 
         assert_eq!(reason, DoneReason::EndTurn);
-        assert_continued(&drain_events(&event_rx), &history, allowed);
+        assert_continued(&drain_events(&mut event_rx), &history, allowed);
     }
 }
