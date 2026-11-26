@@ -7,7 +7,7 @@ use crate::components::status_bar::{StatusBarContext, UsageStats};
 use crate::components::usage_modal::UsageModalContext;
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
-use maki_lua::Split;
+use maki_lua::{CursorStyle, Split};
 use maki_providers::RequestOptions;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -15,6 +15,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Widget};
 
 use super::{App, KeyboardOwner, Mode};
+
+const PICKING_ARROW: &str = " → ";
 
 /// A tab without an input box, a finished task's or a moved call's, has
 /// only this hint to say how to get out and where to stop it.
@@ -53,7 +55,9 @@ impl App {
         match owner {
             KeyboardOwner::Chat => input,
             KeyboardOwner::Permission => prompt,
-            KeyboardOwner::FocusedWindow => self.float_mgr.focused_caret(),
+            KeyboardOwner::FocusedFloat | KeyboardOwner::FocusedSplit => {
+                self.float_mgr.focused_caret()
+            }
             KeyboardOwner::Search
             | KeyboardOwner::FilePicker
             | KeyboardOwner::RewindPicker
@@ -115,6 +119,18 @@ impl App {
         self.register_zones(&layout, overlay_rect);
         self.apply_selection(frame, render_chat, &thumbs);
         self.keyboard_caret(owner, caret, prompt_caret, picker_caret)
+    }
+
+    /// Whether the terminal draws the caret. Only the chat input stopped
+    /// painting its own; every other field still paints one.
+    pub(crate) fn shows_terminal_cursor(&self) -> bool {
+        self.keyboard_owner() == KeyboardOwner::Chat
+    }
+
+    /// The shape a plugin set with `maki.ui.set_cursor_shape`, None if no
+    /// plugin ever did.
+    pub(crate) fn cursor_style(&self) -> Option<CursorStyle> {
+        self.keymap_reader.cursor_style()
     }
 
     fn compute_layout(&self, area: Rect) -> ViewLayout {
@@ -279,7 +295,6 @@ impl App {
                 layout.input_area,
                 placeholder,
                 self.separator_style(),
-                self.input_focused(),
                 panel_hint,
             );
             self.command_palette
@@ -412,14 +427,19 @@ impl App {
             fast: self.state.fast,
         });
         let (mode_label, mode_style) = self.mode_label();
+        let picking = self
+            .picking
+            .as_ref()
+            .filter(|_| chat.model_id.is_none())
+            .map(|picked| format!("{}{PICKING_ARROW}{picked}", self.state.session.model));
         let ctx = StatusBarContext {
             status: &self.status,
             motion: self.status_motion(),
             mode_label,
             mode_style,
-            model_id: chat
-                .model_id
+            model_id: picking
                 .as_deref()
+                .or(chat.model_id.as_deref())
                 .unwrap_or(&self.state.session.model),
             stats: UsageStats {
                 global_cost: self.state.cost,
@@ -437,6 +457,11 @@ impl App {
             workflow: self.state.workflow,
             restricted: self.trust.question().is_some(),
             yolo: self.permissions.is_yolo(),
+            plugin_segments: self.hints.get().map_or_else(Vec::new, |snap| {
+                snap.visible_segments(self.state.session.id)
+                    .map(|segment| (segment.text.clone(), segment.style.clone()))
+                    .collect()
+            }),
         };
         self.status_bar.view(frame, status_area, &ctx);
     }

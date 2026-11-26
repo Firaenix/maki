@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use arc_swap::{ArcSwap, Guard};
 use maki_agent::SpanColor;
@@ -13,7 +13,8 @@ use syntect::highlighting::{
     Color as SynColor, FontStyle, ScopeSelectors, StyleModifier, ThemeItem, ThemeSettings,
 };
 
-const DEFAULT_THEME: &str = "dracula";
+const DEFAULT_THEME: &str = "ayu_dark";
+const BUNDLED_DEFAULT_THEME_LOADS: &str = "the bundled default theme must parse";
 const THEMES_DIR: &str = "themes";
 const RESERVED_KEYS: &[&str] = &["palette", "ui", "inherits"];
 
@@ -270,14 +271,14 @@ pub static BUNDLED_THEMES: &[ThemeEntry] = &[
     },
 ];
 
-static THEME: LazyLock<ArcSwap<Theme>> =
-    LazyLock::new(|| ArcSwap::from_pointee(Theme::load_or_bundled()));
+static THEME: LazyLock<ArcSwap<Theme>> = LazyLock::new(|| {
+    ArcSwap::from_pointee(Theme::load_or_bundled(
+        user_themes_dir().as_deref(),
+        read_theme_name(),
+    ))
+});
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
-
-static CURSOR_FOCUSED: AtomicBool = AtomicBool::new(true);
-
-static CURRENT_NAME: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn current() -> Guard<Arc<Theme>> {
     THEME.load()
@@ -291,48 +292,31 @@ pub fn set(theme: Theme) {
     GENERATION.fetch_add(1, Ordering::Release);
 }
 
-/// Tracks terminal focus so the input caret can recolor itself when the user
-/// switches away. Terminals that never report focus keep the focused look.
-pub fn set_cursor_focused(focused: bool) {
-    CURSOR_FOCUSED.store(focused, Ordering::Relaxed);
-}
-
-/// The `[ui] cursor` style while focused, `[ui] cursor_unfocused` otherwise.
-pub fn cursor_style() -> Style {
-    let t = current();
-    if CURSOR_FOCUSED.load(Ordering::Relaxed) {
-        t.cursor
-    } else {
-        t.cursor_unfocused
-    }
-}
-
-/// True for a buffer cell that carries the `cursor_style()` paint, so tests
-/// assert against the theme instead of one theme's hardcoded colors.
-#[cfg(test)]
-pub(crate) fn is_caret_cell(cell: &ratatui::buffer::Cell) -> bool {
-    let cursor = cursor_style();
-    cursor.fg.is_none_or(|fg| cell.fg == fg)
-        && cursor.bg.is_none_or(|bg| cell.bg == bg)
-        && cell.modifier.contains(cursor.add_modifier)
-}
-
 pub fn generation() -> u64 {
     GENERATION.load(Ordering::Acquire)
 }
 
 pub fn load_by_name(name: &str) -> Result<Theme, String> {
-    if let Some(path) = user_themes_dir().map(|dir| dir.join(format!("{name}.toml")))
+    load_from(user_themes_dir().as_deref(), name)
+}
+
+fn load_from(user_dir: Option<&Path>, name: &str) -> Result<Theme, String> {
+    let theme = if let Some(path) = user_dir.map(|dir| dir.join(format!("{name}.toml")))
         && path.is_file()
         && let Ok(toml) = std::fs::read_to_string(&path)
     {
-        return Theme::from_toml(&toml).map_err(|e| format!("{}: {e}", path.display()));
-    }
-    BUNDLED_THEMES
-        .iter()
-        .find(|e| e.name == name)
-        .map(|e| Theme::from_toml(e.toml))
-        .unwrap_or_else(|| Err(format!("unknown theme: {name}")))
+        Theme::from_toml(&toml).map_err(|e| format!("{}: {e}", path.display()))
+    } else {
+        BUNDLED_THEMES
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| Theme::from_toml(e.toml))
+            .unwrap_or_else(|| Err(format!("unknown theme: {name}")))
+    }?;
+    Ok(Theme {
+        name: name.to_owned(),
+        ..theme
+    })
 }
 
 fn user_themes_dir() -> Option<PathBuf> {
@@ -365,12 +349,7 @@ fn merge_theme_names(user_names: impl IntoIterator<Item = String>) -> Vec<String
     names
 }
 
-pub fn set_current_name(name: &str) {
-    *CURRENT_NAME.lock().unwrap() = Some(name.to_owned());
-}
-
 pub fn persist_theme(name: &str) {
-    set_current_name(name);
     if let Ok(dir) = StateDir::resolve() {
         maki_storage::theme::persist_theme_name(&dir, name);
     }
@@ -382,10 +361,7 @@ fn read_theme_name() -> Option<String> {
 }
 
 pub fn current_theme_name() -> String {
-    if let Some(name) = CURRENT_NAME.lock().unwrap().clone() {
-        return name;
-    }
-    read_theme_name().unwrap_or_else(|| DEFAULT_THEME.to_owned())
+    current().name.clone()
 }
 
 /// One list of names feeds both the span lookup and what Lua sees, so a name a
@@ -414,6 +390,8 @@ named_styles!(t => {
     "tool_annotation" => t.tool_annotation,
     "spinner" => t.spinner,
     "thinking" => t.thinking,
+    "user_bg" => t.user_bg,
+    "user_text" => t.user_text,
     "error" => t.error,
     "bold" => t.bold,
     "italic" => t.italic,
@@ -441,7 +419,6 @@ named_styles!(t => {
     "item_match" | "match" => t.item_match,
     "item_match_selected" | "match_selected" => t.item_match_selected,
     "cursor" => t.cursor,
-    "cursor_unfocused" => t.cursor_unfocused,
     "background" => Style::new().bg(t.background),
     "foreground" => Style::new().fg(t.foreground),
     "accent" => t.accent,
@@ -458,10 +435,13 @@ named_styles!(t => {
 
 #[derive(Debug)]
 pub struct Theme {
+    name: String,
     pub background: Color,
     pub foreground: Color,
 
     pub user: Style,
+    pub user_bg: Style,
+    pub user_text: Style,
     pub assistant: Style,
     pub assistant_prefix: Style,
     pub thinking: Style,
@@ -508,7 +488,6 @@ pub struct Theme {
     pub panel_border: Style,
     pub panel_title: Style,
     pub cursor: Style,
-    pub cursor_unfocused: Style,
     pub input_border: Style,
     pub accent: Style,
     pub active: Style,
@@ -851,22 +830,21 @@ impl Theme {
             Modifier::BOLD,
         );
 
-        // Themes that leave `cursor` unset get a visible caret everywhere,
-        // including pickers that paint `t.cursor` directly.
+        // The pickers and plugins paint their own carets with `cursor`, so a
+        // theme that leaves it unset still gets a visible one.
         let cursor = match style("cursor") {
             s if s == Style::default() => Style::new().reversed(),
             s => s,
         };
-        let cursor_unfocused = match style("cursor_unfocused") {
-            s if s == Style::default() => cursor,
-            s => s,
-        };
 
         Ok(Self {
+            name: String::new(),
             background: color("background"),
             foreground: color("foreground"),
 
             user: style("user"),
+            user_bg: style("user_bg"),
+            user_text: style_or("user_text", "assistant"),
             assistant: style("assistant"),
             assistant_prefix: style("assistant_prefix"),
             thinking: brighten_toward(
@@ -958,7 +936,6 @@ impl Theme {
             panel_border: style("panel_border"),
             panel_title: style("panel_title"),
             cursor,
-            cursor_unfocused,
             input_border: style("input_border"),
             accent: style("accent"),
             active: {
@@ -1012,13 +989,11 @@ impl Theme {
         })
     }
 
-    fn load_or_bundled() -> Self {
-        if let Some(name) = read_theme_name()
-            && let Ok(theme) = load_by_name(&name)
-        {
-            return theme;
-        }
-        Self::from_toml(BUNDLED_THEMES[0].toml).expect("bundled theme must parse")
+    fn load_or_bundled(user_dir: Option<&Path>, saved_name: Option<String>) -> Self {
+        saved_name
+            .and_then(|name| load_from(user_dir, &name).ok())
+            .or_else(|| load_from(user_dir, DEFAULT_THEME).ok())
+            .unwrap_or_else(|| load_from(None, DEFAULT_THEME).expect(BUNDLED_DEFAULT_THEME_LOADS))
     }
 }
 
@@ -1054,7 +1029,14 @@ fn brighten_toward(style: Style, from: Color, to: Color, t: f32) -> Style {
 mod tests {
     use super::*;
     use maki_highlight::UiStyle;
+    use tempfile::TempDir;
     use test_case::test_case;
+
+    const ZENBURN: &str = "zenburn";
+    const ZENBURN_BG: Color = Color::Rgb(0x3f, 0x3f, 0x3f);
+    const UNKNOWN_THEME: &str = "nonexistent";
+    const BROKEN_TOML: &str = "not valid {{{{";
+    const BLACK_TOML: &str = "[palette]\nbackground = \"black\"";
 
     #[test_case(Color::Rgb(1, 2, 3), SegmentColor::Rgb((1, 2, 3)); "truecolor")]
     #[test_case(Color::Indexed(200), SegmentColor::Ansi(200); "indexed")]
@@ -1089,6 +1071,7 @@ mod tests {
         assert_eq!(t.background, Color::Rgb(0x28, 0x2a, 0x36));
         assert_eq!(t.foreground, Color::Rgb(0xf8, 0xf8, 0xf2));
         assert_eq!(t.user.fg, Some(Color::Rgb(0x8b, 0xe9, 0xfd)));
+        assert_eq!(t.user_text.fg, Some(Color::Rgb(0xf8, 0xf8, 0xf2)));
         assert_eq!(t.error.fg, Some(Color::Rgb(0xff, 0x55, 0x55)));
         assert!(t.bold.add_modifier.contains(Modifier::BOLD));
         assert!(t.thinking.add_modifier.contains(Modifier::ITALIC));
@@ -1245,6 +1228,8 @@ scrollbar_thumb = { fg = "magenta", bg = "default" }
 "#;
         let theme = Theme::from_toml(toml).unwrap();
         assert_eq!(theme.user, Style::default());
+        assert_eq!(theme.user_bg, Style::default());
+        assert_eq!(theme.user_text, theme.assistant);
     }
 
     #[test]
@@ -1267,7 +1252,7 @@ scrollbar_thumb = { fg = "magenta", bg = "default" }
 
     #[test]
     fn load_by_name_unknown() {
-        assert!(load_by_name("nonexistent").is_err());
+        assert!(load_by_name(UNKNOWN_THEME).is_err());
     }
 
     #[test]
@@ -1278,9 +1263,35 @@ scrollbar_thumb = { fg = "magenta", bg = "default" }
     }
 
     #[test]
-    fn current_theme_name_prefers_in_memory_name() {
-        set_current_name("zenburn");
-        assert_eq!(current_theme_name(), "zenburn");
+    fn current_theme_name_follows_the_set_theme() {
+        for name in [DEFAULT_THEME, ZENBURN] {
+            set(load_by_name(name).expect(name));
+            assert_eq!(current_theme_name(), name);
+        }
+    }
+
+    #[test_case(BROKEN_TOML, None, DEFAULT_THEME, DEFAULT_BG ; "nothing_saved")]
+    #[test_case(BROKEN_TOML, Some(DEFAULT_THEME), DEFAULT_THEME, DEFAULT_BG ; "broken_default_saved")]
+    #[test_case(BROKEN_TOML, Some(UNKNOWN_THEME), DEFAULT_THEME, DEFAULT_BG ; "unknown_saved")]
+    #[test_case(BROKEN_TOML, Some(ZENBURN), ZENBURN, ZENBURN_BG ; "bundled_saved")]
+    #[test_case(BLACK_TOML, None, DEFAULT_THEME, Color::Black ; "user_default_beats_bundled")]
+    fn startup_loads_saved_then_user_default_then_bundled_default(
+        user_default: &str,
+        saved: Option<&str>,
+        expected_name: &str,
+        expected_background: Color,
+    ) {
+        let user_dir = TempDir::new().unwrap();
+        std::fs::write(
+            user_dir.path().join(format!("{DEFAULT_THEME}.toml")),
+            user_default,
+        )
+        .unwrap();
+
+        let theme = Theme::load_or_bundled(Some(user_dir.path()), saved.map(str::to_owned));
+
+        assert_eq!(theme.name, expected_name);
+        assert_eq!(theme.background, expected_background);
     }
 
     #[test]
@@ -1447,6 +1458,8 @@ diff_new_line_nr = { fg = "red" }
     fn style_by_name_resolves() {
         set(dracula());
         let t = current();
+        assert_eq!(style_by_name("user_bg"), t.user_bg);
+        assert_eq!(style_by_name("user_text"), t.user_text);
         assert_eq!(style_by_name("dim"), t.tool_dim);
         assert_eq!(style_by_name("tool_dim"), t.tool_dim);
         assert_eq!(style_by_name("path"), t.tool_path);
@@ -1473,7 +1486,6 @@ diff_new_line_nr = { fg = "red" }
         assert_eq!(style_by_name("item"), t.item);
         assert_eq!(style_by_name("item_desc"), t.item_desc);
         assert_eq!(style_by_name("cursor"), t.cursor);
-        assert_eq!(style_by_name("cursor_unfocused"), t.cursor_unfocused);
         assert_eq!(style_by_name("accent"), t.accent);
         assert_eq!(style_by_name("active"), t.active);
         assert_eq!(style_by_name("foreground"), Style::new().fg(t.foreground));
@@ -1495,6 +1507,7 @@ diff_new_line_nr = { fg = "red" }
         assert_eq!(style_by_name(name), Style::default());
     }
 
+    const DEFAULT_BG: Color = Color::Rgb(0x0d, 0x10, 0x17);
     const DRACULA_BG: Color = Color::Rgb(0x28, 0x2a, 0x36);
     const TOKYONIGHT_BG: Color = Color::Rgb(0x1a, 0x1b, 0x26);
 
@@ -1655,28 +1668,6 @@ magenta    = "magenta"
 
         let ty = scope("type");
         assert_eq!((ty.r, ty.g, ty.b, ty.a), (0xfd, 0xa3, 0x31, 0xFF));
-    }
-
-    #[test]
-    fn cursor_unfocused_falls_back_to_cursor() {
-        let t = Theme::from_toml(
-            r##"
-[ui]
-"cursor" = { fg = "#ff0000" }
-"##,
-        )
-        .unwrap();
-        assert_eq!(t.cursor_unfocused, t.cursor);
-
-        let t = Theme::from_toml(
-            r##"
-[ui]
-"cursor"          = { fg = "#ff0000" }
-"cursor_unfocused" = { fg = "#00ff00" }
-"##,
-        )
-        .unwrap();
-        assert_eq!(t.cursor_unfocused.fg, Some(Color::Rgb(0, 255, 0)));
     }
 
     #[test]

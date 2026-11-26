@@ -7,9 +7,16 @@ group = "Reference"
 
 # Providers
 
-Maki talks to LLM providers over their HTTP APIs. Models are split into three tiers: **weak** (cheap and fast), **medium** (balanced), and **strong** (highest capability, highest cost). There is also a **compaction** tier for choosing a dedicated model to summarize context when the conversation grows long. The summary comes from the first of: your `/model` compaction pick, a `tier = "compaction"` model of the session's provider, one from any other provider in slug order, then the session model.
+Maki talks to LLM providers over their HTTP APIs. Models are split into three tiers: **weak** (cheap and fast), **medium** (balanced), and **strong** (highest capability, highest cost). A fourth tier, **compaction**, picks the model that summarizes the conversation when it grows long.
 
 Open the model picker with `/model` and press `!`, `@`, `#`, or `$` on any row to assign it to strong, medium, weak, or compaction. Press the same key again to remove the assignment. Your overrides are saved to `~/.local/state/maki/model-tiers` and apply across sessions.
+
+Compaction uses the first model it finds:
+
+1. Your `/model` compaction pick.
+2. A `tier = "compaction"` model of the session's provider.
+3. A `tier = "compaction"` model of any other provider, in slug order.
+4. The session model, also used when the chosen model is unavailable.
 
 ## Auth Reloading
 
@@ -42,6 +49,10 @@ base_url = "http://xxxx:1234/v1"
 ```
 
 The built-in provider still owns the slug, so `api_key_env`, `discover_models`, `models` and `protocol` are ignored with a warning. Use a custom slug if you need those. `ollama` and `llama-cpp` read `protocol` values `openai` and `openai-responses` to pick the chat or Responses API.
+
+### Self-signed certificates
+
+Maki checks provider certificates against the operating system's trust store. To use an endpoint with a self-signed certificate, add that certificate to the store. On Linux, you can instead point `SSL_CERT_FILE` at a bundle that holds it and the public CAs. Maki accepts a self-signed certificate from the store when the server presents that exact certificate, even if it has the CA flag set, as `openssl req -x509` makes by default. The certificate must name the host in the base URL, and it must be in date. The same check covers plugin requests, OAuth logins and MCP servers without a `ca_file`.
 
 ## Built-in Providers
 
@@ -104,12 +115,14 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 | Medium | gpt-6-sol | $2.00 / $10.00 | 1050K ctx / 128K out |
 | Medium | gpt-6.1-sol | $2.00 / $10.00 | 1050K ctx / 128K out |
 | Medium | gpt-6.1-terra | $1.00 / $5.00 | 1050K ctx / 128K out |
+| Medium | gpt-6.2-sol | $2.00 / $10.00 | 1050K ctx / 128K out |
 | Medium | gpt-4.1-mini | $0.40 / $1.60 | 1047K ctx / 32K out |
 | Medium | gpt-4.1 | $2.00 / $8.00 | 1047K ctx / 32K out |
 | Medium | o4-mini | $1.10 / $4.40 | 200K ctx / 100K out |
 | Medium | gpt-5.1-codex-mini | $0.25 / $2.00 | 400K ctx / 128K out |
 | Strong | **gpt-5.6-sol** (default) | $5.00 / $30.00 | 372K ctx / 128K out |
 | Strong | gpt-6-astra | $10.00 / $50.00 | 1050K ctx / 128K out |
+| Strong | gpt-6.2-astra | $8.00 / $40.00 | 1050K ctx / 128K out |
 | Strong | gpt-5.5 | $5.00 / $30.00 | 1050K ctx / 128K out |
 | Strong | gpt-5.4 | $2.50 / $15.00 | 1050K ctx / 128K out |
 | Strong | o3 | $2.00 / $8.00 | 200K ctx / 100K out |
@@ -122,7 +135,7 @@ Defaults: gpt-5.6-luna (weak), gpt-5.6-terra (medium), gpt-5.6-sol (strong)
 
 `maki auth login openai` offers browser login (PKCE, callback on `localhost:1455`) and device code login. Browser is the desktop default; device code is recommended over SSH or in a container. Tokens refresh automatically.
 
-With ChatGPT OAuth the model list comes from the Codex backend's own `/models` endpoint, so a model your plan gains shows up without a Maki update, with the context window and reasoning levels the backend declares for it. The table above is the offline fallback. The endpoint hides models newer than the Codex CLI version Maki reports, so a brand new release can lag until that version is bumped.
+With ChatGPT OAuth the model list comes from the Codex backend's `/models` endpoint. A model your plan gains shows up without a Maki update, with the context window and reasoning levels the backend reports. When that request fails, the picker falls back to the table above. A model missing from the list still works if you type its id into `/model` or pass it to `--model`.
 
 ### Google
 
@@ -207,19 +220,22 @@ Connects to any OpenAI-compatible `/v1` endpoint. Point `LLAMA_CPP_HOST` to your
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
-| Weak | glm-5.3-flash | $0.15 / $0.50 | 1000K ctx / 131K out |
 | Weak | **glm-4.7-flash** (default) | $0.00 / $0.00 | 200K ctx / 131K out |
 | Weak | glm-4.5-flash | $0.00 / $0.00 | 131K ctx / 98K out |
 | Weak | glm-4.5-air | $0.20 / $1.10 | 131K ctx / 98K out |
-| Medium | **glm-4.7, glm-4.6** (default) | $0.60 / $2.20 | 200K ctx / 131K out |
+| Medium | **glm-5.3-flash** (default) | $0.15 / $0.50 | 1000K ctx / 131K out |
+| Medium | glm-4.7, glm-4.6 | $0.60 / $2.20 | 200K ctx / 131K out |
 | Medium | glm-4.5 | $0.60 / $2.20 | 131K ctx / 98K out |
-| Strong | **glm-5-code** (default) | $1.20 / $5.00 | 200K ctx / 131K out |
-| Strong | glm-5.3 | $1.40 / $4.40 | 1000K ctx / 131K out |
+| Strong | glm-5-code | $1.20 / $5.00 | 200K ctx / 131K out |
+| Strong | glm-5.4 | unknown | 1000K ctx / 131K out |
+| Strong | **glm-5.3** (default) | $1.40 / $4.40 | 1000K ctx / 131K out |
 | Strong | glm-5.2 | $1.40 / $4.40 | 1000K ctx / 131K out |
 | Strong | glm-5.1 | $1.40 / $4.40 | 200K ctx / 131K out |
 | Strong | glm-5 | $1.00 / $3.20 | 200K ctx / 131K out |
 
-Defaults: glm-5-code (strong), glm-4.7-flash (weak), glm-4.7 (medium)
+Defaults: glm-5.3 (strong), glm-5.3-flash (medium), glm-4.7-flash (weak)
+
+The model list comes from the `/models` endpoint of the plan you log in with, so a model Z.AI adds shows up without a Maki update. A model missing from the table above reads its limits, vision and rates from models.dev, and its tier from the closest row (`glm-5.5` is strong like `glm-5`). The coding plan's models.dev entry lends limits and vision to a model only that plan serves so far, and never its zero rates.
 
 ### Opencode Zen
 
@@ -274,6 +290,15 @@ Aperture discovers models from your gateway. Set `APERTURE_HOST` to your Tailsca
 
 No hardcoded model catalog. Use any model ID supported by this provider. An API key is required.
 
+Free models are hidden by default, like on Opencode Zen. To list them, add this to `~/.config/maki/providers.toml` under `[opencode]`, not `[opencode-go]`:
+
+```toml
+[opencode]
+enable_free_models = true
+```
+
+The default is `false`.
+
 ### DeepSeek
 
 - **Env var**: `DEEPSEEK_API_KEY`
@@ -292,7 +317,7 @@ Defaults: deepseek-flash (medium), deepseek-v4-pro (strong)
 
 - **Env var**: `MISTRAL_API_KEY`
 - **API**: `https://api.mistral.ai/v1`
-- **Features**: `/usage` reads the plan and monthly Vibe Code allowance from `/v1/billing/subscription` and `/v1/billing/budget` (the budget needs the `see_org_inference_usage` permission)
+- **Features**: `/usage` shows the plan and the monthly Vibe Code allowance. The allowance shows only when the key has the `see_org_inference_usage` permission
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
@@ -340,7 +365,7 @@ Models are listed live from the API. Managed policies come first, with short ids
 
 - **Env var**: `SYNTHETIC_API_KEY`
 - **API**: `https://api.synthetic.new/openai/v1`
-- **Features**: Reasoning effort (low, medium, high), open-weight models
+- **Features**: Reasoning effort (minimal, low, medium, high, xhigh, max), open-weight models
 
 | Tier | Models | Pricing (in/out per 1M tokens) | Context |
 |------|--------|-------------------------------|---------|
@@ -437,7 +462,7 @@ supports_vision = false
 | `plan` | string | Built-in plan key (see Plans below). Sets base URL and default model |
 | `api_key_env` | string | Env var that holds the key. Defaults to `<SLUG>_API_KEY` |
 | `api_key` | string | Inline key (prefer the env var or `maki auth login`) |
-| `headers` | table | Extra HTTP headers sent on every request to this provider. Values expand `${VAR}` from the environment; an unset or empty variable fails the provider instead of sending a half-filled header. A same-name header (case-insensitive) replaces the built-in auth header and survives key rotation |
+| `headers` | table | Extra HTTP headers for every request to this provider. Values expand `${VAR}` from the environment, and an unset or empty variable fails the provider. A header with the same name (case-insensitive) replaces the one maki would send, auth included, and survives key rotation. `anthropic-beta` values add to the betas maki sends |
 | `default_model` | string | Used after login when no model is saved yet. On a custom entry it is also the startup fallback when no built-in or plugin provider is available. Without it, startup picks a declared `strong` or `medium` model |
 | `top_p` | f64 | Nucleus sampling probability, sent as `top_p` in the request body for OpenAI-compatible, Anthropic, Bedrock and Google providers. Claude and GPT models reject it while thinking is on, and Claude Opus 4.7, Claude 5 and later always do, so it is dropped there. Never sent to Copilot or over the OpenAI responses path. Only sent when set, so the provider's own default applies otherwise. Must be in `(0, 1]` |
 | `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
@@ -464,6 +489,7 @@ supports_vision = false
 | `pricing_input` / `pricing_output` | f64 | 0 | USD per 1M tokens |
 | `pricing_cache_write` / `pricing_cache_read` | f64 | 0 | USD per 1M tokens |
 | `pricing_fast_input` / `pricing_fast_output` | f64 | unset | Fast-mode pricing when the provider supports it |
+| `like` | string | unset | `<slug>/<model>` to borrow capabilities from. See [Borrowing with like](#borrowing-with-like) |
 
 Custom slugs must not reuse a built-in provider name. Maki exits with code 2 at startup if `providers.toml` does not parse or contains an unknown key, so a typo like `api_key_evn` fails there rather than being silently ignored.
 
@@ -489,6 +515,21 @@ Without `thinking_fields`, maki sends `"thinking": {"type": "disabled"}` when th
 
 You can also create a custom provider interactively with `maki auth login` and choosing the custom option. That writes a starter entry to this file.
 
+In `/model`, a custom provider without a key shows `no key`. A provider whose model list request fails shows `offline`, or `fallback` when Maki still has models to list for it. Press Enter on a `no key` or `offline` row to open `/login` for that provider. For an entry in this file, login first shows its `base_url` so you can fix a moved endpoint, then asks for the key. Leave the key blank to keep the one from the env var, `api_key`, or an earlier login.
+
+### Borrowing with like
+
+`like = "<slug>/<model>"` says that a model is a known one under another name. It works the same on a `providers.toml` model, an [Aperture override](#aperture-overrides) and a plugin's [model row](#model-rows). Family, vision and tool examples that the model leaves out come from the row `<slug>` uses for `<model>`, so a local copy of a known model needs no repeated flags. Fields the model states and what discovery reports still win:
+
+```toml
+[[my-proxy.models]]
+id = "local-deepseek-flash"
+like = "deepseek/deepseek-flash"
+supports_vision = false
+```
+
+Limits, pricing and thinking stay with the model and its own provider, because they describe one deployment and the wire it speaks. The route stays the same too. Maki ignores a `like` that names no model it knows, and logs a warning for one in `providers.toml`.
+
 ### Aperture overrides
 
 Aperture proxies upstream providers, exposing each model as `aperture/<upstream>/<model>`. Overrides keyed by upstream provider id live under `[aperture.overrides]`:
@@ -504,7 +545,31 @@ context_window = 262144
 supports_vision = true
 ```
 
-Provider-level fields apply to every model from that upstream; per-model entries under `models` win field by field. Fields: `context_window`, `max_output_tokens`, `supports_thinking`, `supports_vision`, `base` (remaps an opaque vendor to a native provider; e.g. `llama-cpp`, `google`, `anthropic`), and `path_prefix`. Model ids containing dots must be quoted (`"qwen3.6"`) since TOML treats a bare dotted key as a nested table.
+Provider-level fields apply to every model from that upstream; per-model entries under `models` win field by field. Fields: `context_window`, `max_output_tokens`, `supports_thinking`, `supports_vision`, `base` (remaps an opaque vendor to a native provider; e.g. `llama-cpp`, `google`, `anthropic`), `path_prefix`, and `like` (see [Borrowing with like](#borrowing-with-like)). Model ids containing dots must be quoted (`"qwen3.6"`) since TOML treats a bare dotted key as a nested table.
+
+Without `like`, an Aperture model borrows from the row its upstream id names when Maki knows that provider, so `aperture/openai/gpt-5.4` reads like `openai/gpt-5.4`. For limits, explicit fields win, then the gateway's published limits, then the routed table, then Aperture's fallback. Price comes only from the gateway. A namespaced or unfamiliar id needs a pin:
+
+```toml
+[aperture.overrides.bedrock-mantle.models."anthropic.claude-opus-5-5"]
+base = "anthropic"
+
+[aperture.overrides.baseten.models."deepseek-ai/DeepSeek-V4.1-Flash"]
+like = "deepseek/deepseek-flash"
+```
+
+`base` routes the model through the upstream's own protocol, so one that exposes `/v1/messages` (as the Bedrock example does) keeps native thinking. `like` keeps the generic route. The bundled `deepseek` plugin declares `deepseek-flash` as V4.1 Flash. Use `like` instead of `base` when the route should stay generic:
+
+```toml
+[aperture.overrides.bedrock-mantle.models."anthropic.claude-opus-5-5"]
+like = "anthropic/claude-opus-5"
+```
+
+A model without a native route goes out as chat completions, and claims thinking only with `supports_thinking = true`. It then sends the effort as chat's `reasoning_effort`, whatever `like` names. A gateway that refuses the field gets one replay without it, and Maki leaves the field out for that model until restart:
+
+```toml
+[aperture.overrides.azureai.models."gpt-6.1-sol"]
+supports_thinking = true
+```
 
 Maki sends `/v1` (or `/v1beta` for Gemini routes, nothing for Anthropic and Z.AI), and Aperture appends that path to the upstream's base url. If an upstream base url already carries its own path, set `path_prefix = ""` for it to avoid a doubled path. Z.AI defaults to no prefix since its API path has no `/v1` segment; point the upstream base url at the full API root (e.g. `https://api.z.ai/api/paas/v4`).
 
@@ -526,8 +591,8 @@ Current plans:
 |----------|------|--------------|
 | Mistral | `standard` | Standard at `https://api.mistral.ai/v1`, default `mistral/mistral-large-4` |
 | Mistral | `coding` | Vibe / Coding at `https://api.mistral.ai/v1`, default `mistral/mistral-vibe-cli-latest` |
-| Z.AI | `standard` | Pay-as-you-go at `https://api.z.ai/api/paas/v4`, default `zai/glm-5.1` |
-| Z.AI | `coding` | Coding plan at `https://api.z.ai/api/coding/paas/v4`, default `zai/glm-5-code` |
+| Z.AI | `standard` | Pay-as-you-go at `https://api.z.ai/api/paas/v4`, default `zai/glm-5.3` |
+| Z.AI | `coding` | Coding plan at `https://api.z.ai/api/coding/paas/v4`, default `zai/glm-5.4` |
 
 Env `<SLUG>_BASE_URL` still wins over both the plan and a `base_url` in this file.
 
@@ -616,9 +681,10 @@ A row matches every model id that starts with one of its `prefixes`, and the lon
 | `requires_thinking` | bool | `false` | For APIs that reject a request with thinking off. Implies `supports_thinking` and raises thinking to minimal effort when off |
 | `supports_vision` | bool | unset | When false, image input and `view_image` are off for this model |
 | `supports_tool_examples` | bool | unset | |
-| `pricing` | table | unset | `input`, `output`, `cache_write`, `cache_read`, in dollars per 1M tokens |
+| `pricing` | table | unset | `input`, `output`, `cache_write`, `cache_read`, in dollars per 1M tokens. Unset reads the rates models.dev lists for this model under the provider's slug, or its `base`. Without them the price is unknown |
 | `thinking_fields` | table | unset | How this model spells each thinking mode on the wire |
 | `family` | string | provider's | `generic`, `claude`, `gpt`, `gemini`, `glm` or `synthetic` |
+| `like` | string | unset | `<slug>/<model>` to borrow capabilities from. See [Borrowing with like](#borrowing-with-like) |
 | `default` | bool | first row of its tier | The tier's default model. At most one per tier |
 
 An unset `supports_*` flag uses the codec or base provider's answer, and `false` turns the feature off for that model.

@@ -117,10 +117,26 @@ pub struct HintEntry {
 
 pub type HintEntries = Vec<HintEntry>;
 
+/// One status bar segment a plugin asked for. The id names it, so a plugin
+/// updates and removes its own segments exactly.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SegmentEntry {
+    pub plugin: Arc<str>,
+    pub id: String,
+    /// `None` shows in every tab.
+    pub session: Option<MakiId>,
+    pub text: String,
+    pub style: String,
+}
+
+/// One snapshot of what plugins asked the status bar to show: their key
+/// hints and their segments. Plugin-keyed on the way in, flattened here in
+/// plugin order, so every tab renders the same spans.
 #[derive(Clone, Default)]
 pub struct HintSnapshot {
     pub entries: HintEntries,
-    pub generation: u64,
+    /// The segments, rendered as `[ text ]` on the right of the bar.
+    pub segments: Vec<SegmentEntry>,
 }
 
 impl HintSnapshot {
@@ -136,6 +152,22 @@ impl HintSnapshot {
                     .entries
                     .iter()
                     .any(|other| other.plugin == entry.plugin && other.session == Some(session)),
+            })
+    }
+
+    /// The segments of this session, with the every-tab ones of a plugin
+    /// left out when that plugin has a segment for this session: the same
+    /// rule the hints follow.
+    pub fn visible_segments(&self, session: MakiId) -> impl Iterator<Item = &SegmentEntry> {
+        self.segments
+            .iter()
+            .filter(move |entry| match entry.session {
+                Some(owner) => owner == session,
+                None => !self.segments.iter().any(|other| {
+                    other.plugin == entry.plugin
+                        && other.id == entry.id
+                        && other.session == Some(session)
+                }),
             })
     }
 }
@@ -158,7 +190,6 @@ impl HintReader {
 /// Publishing end of a plugin's status hints, owned by the Lua thread.
 pub(crate) struct HintWriter {
     store: Arc<ArcSwap<HintSnapshot>>,
-    generation: AtomicU64,
 }
 
 impl HintWriter {
@@ -167,18 +198,14 @@ impl HintWriter {
         (
             Self {
                 store: Arc::clone(&inner),
-                generation: AtomicU64::new(0),
             },
             HintReader(inner),
         )
     }
 
-    pub fn publish(&self, entries: HintEntries) {
-        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        self.store.store(Arc::new(HintSnapshot {
-            entries,
-            generation,
-        }));
+    pub fn publish(&self, entries: HintEntries, segments: Vec<SegmentEntry>) {
+        self.store
+            .store(Arc::new(HintSnapshot { entries, segments }));
     }
 }
 
@@ -647,9 +674,9 @@ pub enum PlanActionOutcome {
     /// all.
     Failed,
 }
-/// The menu one draft's chain answered with. The form echoes `generation`
-/// back on a pick, so a chain that resumes late and installs its handlers
-/// over a menu already on screen cannot have a pick routed to it.
+/// The menu one draft's chain answered with. `generation` is the request
+/// number the UI asked with, and the form echoes it back on a pick, so a pick
+/// from a menu a newer draft replaced cannot reach that draft's handlers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanMenu {
     pub generation: u64,
@@ -842,6 +869,12 @@ pub enum UiAction {
         req: ModelRequest,
         reply_tx: oneshot::Sender<UiReply>,
     },
+    /// Usage from the focused session's live provider, the same instance
+    /// `/usage` reads, so key rotation and retries are already accounted for.
+    ProviderUsage {
+        slug: String,
+        reply_tx: oneshot::Sender<UiReply>,
+    },
     Plan {
         req: PlanRequest,
         reply_tx: oneshot::Sender<UiReply>,
@@ -919,6 +952,30 @@ pub enum UiAction {
         id: String,
         end: TaskEnd,
     },
+    /// A plugin-owned transcript item for one chat session: `running` creates
+    /// or re-titles it, `done` / `failed` closes it. The `id` is already
+    /// plugin-scoped.
+    ChatItem {
+        session: MakiId,
+        item: ChatItem,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatItemStatus {
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatItem {
+    pub id: Arc<str>,
+    pub label: Arc<str>,
+    pub title: String,
+    pub status: ChatItemStatus,
+    pub detail: Option<String>,
 }
 
 // Lives on the Lua thread so `ui_roundtrip` can consult it without threading
@@ -936,11 +993,6 @@ pub(crate) fn ui_send(
 ) -> Result<(), &'static str> {
     tx.ok_or(NO_UI_ERR)?.send(action).map_err(|_| NO_UI_ERR)
 }
-
-/// Set on a Lua state whose UI channel a non-TUI host drains (ACP): it
-/// answers prompts for its one session and nothing that opens or focuses a
-/// tab, so a call with a headless path takes that path.
-pub(crate) struct SessionHostOnly;
 
 /// Whether an action sent now would reach an event loop, for a call that must
 /// refuse before doing anything a missing UI would leave half done.
@@ -1247,11 +1299,16 @@ mod tests {
         let (writer, reader) = HintWriter::new();
         assert!(reader.load_full().entries.is_empty());
 
-        writer.publish(vec![hint(OTHER_PLUGIN, None, EVERY_TAB_HINT)]);
+        writer.publish(
+            vec![hint(OTHER_PLUGIN, None, EVERY_TAB_HINT)],
+            vec![segment(OTHER_PLUGIN, "2 running")],
+        );
 
         let snap = reader.load_full();
         assert_eq!(snap.entries.len(), 1);
-        assert_eq!(snap.generation, 1);
+        assert_eq!(snap.segments.len(), 1);
+        assert_eq!(snap.segments[0].text, "2 running");
+        assert_eq!(snap.segments[0].style, "status_dim");
     }
 
     const SHADOWED_PLUGIN: &str = "shadowed";
@@ -1267,6 +1324,16 @@ mod tests {
         }
     }
 
+    fn segment(plugin: &str, text: &str) -> SegmentEntry {
+        SegmentEntry {
+            plugin: Arc::from(plugin),
+            id: "jobs".into(),
+            session: None,
+            text: text.into(),
+            style: "status_dim".into(),
+        }
+    }
+
     #[test_case(true, &[EVERY_TAB_HINT, SESSION_HINT] ; "own_tab_swaps_in_the_session_hint")]
     #[test_case(false, &[EVERY_TAB_HINT, EVERY_TAB_HINT] ; "other_tab_keeps_the_every_tab_hint")]
     fn session_hint_shadows_the_plugins_every_tab_hint(own_tab: bool, expected: &[&str]) {
@@ -1277,7 +1344,7 @@ mod tests {
                 hint(SHADOWED_PLUGIN, None, EVERY_TAB_HINT),
                 hint(SHADOWED_PLUGIN, Some(owner), SESSION_HINT),
             ],
-            generation: 0,
+            segments: Vec::new(),
         };
         let tab = if own_tab { owner } else { MakiId::generate() };
 

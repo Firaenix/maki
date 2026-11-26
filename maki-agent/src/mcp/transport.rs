@@ -10,9 +10,10 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use maki_providers::headers::parse_headers;
 use maki_providers::http::error_chain;
-use maki_providers::strip_provider_keys;
-use maki_storage::StateDir;
+use maki_providers::{strip_provider_keys, with_system_trust};
+use maki_storage::{StateDir, blocking};
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderName, HeaderValue};
 use reqwest::redirect::{Action, Attempt, Policy};
 use reqwest::{Certificate, Client, ClientBuilder, Error as ReqwestError, StatusCode};
@@ -89,6 +90,7 @@ pub struct Connection {
     /// the DELETE that ends an HTTP session.
     service: Mutex<Option<RunningService<RoleClient, ClientConfig>>>,
     timeout: Duration,
+    startup_timeout: Duration,
     process: Option<StdioProcess>,
 }
 
@@ -97,14 +99,14 @@ struct StdioProcess {
     _stderr: AbortOnDropHandle<()>,
 }
 
-/// `timeout` bounds the handshake and each request after it, as the server
-/// config says.
+/// `startup_timeout` bounds the handshake and each listing, `timeout` every
+/// other request, as the server config says.
 pub async fn connect(
     config: &ServerConfig,
     storage: Option<&StateDir>,
 ) -> Result<Connection, McpError> {
     let name = config.name.as_str();
-    let (service, process) = within(config.timeout, name, async {
+    let (service, process) = within(config.startup_timeout, name, async {
         match &config.transport {
             Transport::Stdio {
                 program,
@@ -132,6 +134,7 @@ pub async fn connect(
         peer: service.peer().clone(),
         service: Mutex::new(Some(service)),
         timeout: config.timeout,
+        startup_timeout: config.startup_timeout,
         process,
     })
 }
@@ -150,25 +153,26 @@ impl Connection {
     }
 
     pub async fn list_tools(&self) -> Result<Vec<Tool>, McpError> {
-        paginate(|params| async move {
+        self.listing(paginate(|params| async move {
             let page = match self.send(ListToolsRequest::with_param(params)).await? {
                 ServerResult::ListToolsResult(page) => page,
                 other => reparse(&self.name, ListToolsRequestMethod::VALUE, &other)?,
             };
             Ok((page.tools, page.next_cursor))
-        })
+        }))
         .await
     }
 
     pub async fn list_prompts(&self) -> Result<Vec<Prompt>, McpError> {
-        let listed = paginate(|params| async move {
-            let page = match self.send(ListPromptsRequest::with_param(params)).await? {
-                ServerResult::ListPromptsResult(page) => page,
-                other => reparse(&self.name, ListPromptsRequestMethod::VALUE, &other)?,
-            };
-            Ok((page.prompts, page.next_cursor))
-        })
-        .await;
+        let listed = self
+            .listing(paginate(|params| async move {
+                let page = match self.send(ListPromptsRequest::with_param(params)).await? {
+                    ServerResult::ListPromptsResult(page) => page,
+                    other => reparse(&self.name, ListPromptsRequestMethod::VALUE, &other)?,
+                };
+                Ok((page.prompts, page.next_cursor))
+            }))
+            .await;
         match listed {
             Err(McpError::RpcError { code, .. })
                 if code == i64::from(ErrorCode::METHOD_NOT_FOUND.0) =>
@@ -185,7 +189,19 @@ impl Connection {
     /// "unexpected response", so this hands back the raw result for
     /// [`reparse`].
     async fn send(&self, request: impl Into<ClientRequest>) -> Result<ServerResult, McpError> {
-        self.request(self.peer.send_request(request.into())).await
+        self.peer
+            .send_request(request.into())
+            .await
+            .map_err(|e| service_error(&self.name, e))
+    }
+
+    /// Listing runs at startup, so all its pages share the startup timeout,
+    /// not the request one meant for long tool calls.
+    async fn listing<T>(
+        &self,
+        pages: impl Future<Output = Result<Vec<T>, McpError>>,
+    ) -> Result<Vec<T>, McpError> {
+        within(self.startup_timeout, &self.name, pages).await
     }
 
     /// Bounds a request by the server's timeout. A tool call dropped
@@ -355,15 +371,22 @@ async fn connect_http(
     ca_file: Option<&Path>,
     storage: Option<&StateDir>,
 ) -> Result<RunningService<RoleClient, ClientConfig>, McpError> {
-    let client = http_client(ca_file).map_err(|reason| start_failed(name, reason))?;
     let custom_headers = header_map(name, headers).map_err(|reason| start_failed(name, reason))?;
-    let configured_auth = custom_headers.contains_key(&AUTHORIZATION);
+    let oauth_storage = storage.filter(|_| !custom_headers.contains_key(&AUTHORIZATION));
+    let refreshes = oauth_storage.is_some();
+    let (client, oauth_client) = build_clients(ca_file, move |certs| {
+        let client = http_client(certs)?;
+        let oauth_client = refreshes
+            .then(|| oauth_http_client(certs, oauth::REFRESH_TIMEOUT))
+            .transpose()?;
+        Ok((client, oauth_client))
+    })
+    .await
+    .map_err(|reason| start_failed(name, reason))?;
     let config = StreamableHttpClientTransportConfig::with_uri(url).custom_headers(custom_headers);
 
-    let stored = match storage {
-        Some(storage) if !configured_auth => {
-            let oauth_client = oauth_http_client(ca_file, oauth::REFRESH_TIMEOUT)
-                .map_err(|reason| start_failed(name, reason))?;
+    let stored = match oauth_storage.zip(oauth_client) {
+        Some((storage, oauth_client)) => {
             // Without the manager the stored token can't go out, so a new
             // login has to replace it.
             oauth::stored_manager(storage, name, url, oauth_client)
@@ -375,7 +398,7 @@ async fn connect_http(
                     }
                 })?
         }
-        _ => None,
+        None => None,
     };
     // Without stored tokens the manager has none to add, and requests go out
     // as configured. One client type keeps a single copy of rmcp's HTTP worker
@@ -396,18 +419,18 @@ async fn connect_http(
 
 /// No timeout: it would also cut off the event streams, whose requests are bounded by the
 /// server's timeout instead.
-fn http_client(ca_file: Option<&Path>) -> Result<Client, String> {
-    client_builder(ca_file)?.build().map_err(|e| e.to_string())
+fn http_client(certs: Option<&[Certificate]>) -> Result<Client, String> {
+    client_builder(certs).build().map_err(|e| e.to_string())
 }
 
 /// rmcp's own client follows a discovery redirect only within one origin, and never one
 /// for tokens. A client handed to rmcp keeps its own redirect policy, so reqwest's default
 /// would let any server bounce discovery, or a refresh token, to another host.
 pub(super) fn oauth_http_client(
-    ca_file: Option<&Path>,
+    certs: Option<&[Certificate]>,
     timeout: Duration,
 ) -> Result<Client, String> {
-    client_builder(ca_file)?
+    client_builder(certs)
         .timeout(timeout)
         .redirect(Policy::custom(same_origin_redirect))
         .build()
@@ -427,19 +450,36 @@ fn same_origin_redirect(attempt: Attempt) -> Action {
     }
 }
 
-/// The transport and OAuth both start here, so they reach a server the same way.
+/// Builds the clients for one server on the blocking pool, from one read of `ca_file`.
+/// Without one, each build loads the system roots on Linux, which is disk work too.
 ///
 /// We read `ca_file` here and not while parsing the config, so a disabled server with a
 /// missing bundle still shows as disabled.
-fn client_builder(ca_file: Option<&Path>) -> Result<ClientBuilder, String> {
-    let builder = Client::builder().user_agent(CLIENT_NAME);
-    let Some(path) = ca_file else {
-        return Ok(builder);
-    };
+pub(super) async fn build_clients<T: Send + 'static>(
+    ca_file: Option<&Path>,
+    build: impl FnOnce(Option<&[Certificate]>) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let ca_file = ca_file.map(Path::to_path_buf);
+    blocking(move || {
+        let certs = ca_file.as_deref().map(read_ca_file).transpose()?;
+        build(certs.as_deref())
+    })
+    .await
+}
+
+fn read_ca_file(path: &Path) -> Result<Vec<Certificate>, String> {
     let unreadable = |e: &dyn Error| format!("ca_file '{}': {e}", path.display());
     let pem = fs::read(path).map_err(|e| unreadable(&e))?;
-    let certs = Certificate::from_pem_bundle(&pem).map_err(|e| unreadable(&e))?;
-    Ok(builder.tls_certs_only(certs))
+    Certificate::from_pem_bundle(&pem).map_err(|e| unreadable(&e))
+}
+
+/// The transport and OAuth both start here, so they reach a server the same way.
+fn client_builder(certs: Option<&[Certificate]>) -> ClientBuilder {
+    let builder = Client::builder().user_agent(CLIENT_NAME);
+    match certs {
+        Some(certs) => builder.tls_certs_only(certs.iter().cloned()),
+        None => with_system_trust(builder),
+    }
 }
 
 fn header_map(
@@ -447,14 +487,11 @@ fn header_map(
     headers: &HashMap<String, String>,
 ) -> Result<HashMap<HeaderName, HeaderValue>, String> {
     let mut map = HashMap::with_capacity(headers.len());
-    for (name, value) in headers {
-        let invalid = |e: &dyn Error| format!("header '{name}': {e}");
-        let header = HeaderName::try_from(name.as_str()).map_err(|e| invalid(&e))?;
-        let value = HeaderValue::try_from(value.as_str()).map_err(|e| invalid(&e))?;
-        if is_reserved(&header) {
-            warn!(server, header = name, "ignoring a header MCP sets itself");
+    for (name, value) in &parse_headers(headers).map_err(|e| e.to_string())? {
+        if is_reserved(name) {
+            warn!(server, header = %name, "ignoring a header MCP sets itself");
         } else {
-            map.insert(header, value);
+            map.insert(name.clone(), value.clone());
         }
     }
     Ok(map)
@@ -639,6 +676,7 @@ mod tests {
     /// The server is in-process on loopback, so this only has to catch a
     /// client that never gets an answer at all.
     const TIMEOUT: Duration = Duration::from_secs(10);
+    const LISTING_TIMEOUT: Duration = Duration::from_secs(1);
     const SESSION_ID: &str = "session-1";
     const TOOL_TEXT: &str = "hi";
     const FIRST_TOOL: &str = "first";
@@ -647,6 +685,11 @@ mod tests {
     const CONFIG_BEARER: &str = "Bearer from-config";
     const OLD_TOKEN: &str = "old-token";
     const NEW_TOKEN: &str = "new-token";
+    const STORED_REFRESH: &str = "refresh-1";
+    const ROTATED_REFRESH: &str = "refresh-2";
+    /// Keeps the first refresh in flight until the second starts. Too short
+    /// only hides a missing lock, it never fails a working one.
+    const REFRESH_OVERLAP: Duration = Duration::from_millis(200);
     const CHALLENGE: &str =
         r#"Bearer resource_metadata="http://127.0.0.1:1/.well-known/oauth-protected-resource""#;
     const HOUR_MS: u64 = 3_600_000;
@@ -660,6 +703,7 @@ mod tests {
     const AUTH_SERVER_METADATA_PATH: &str = "/.well-known/oauth-authorization-server";
     const SPA_HTML: &str = "<!doctype html><div id=\"app\"></div>";
     const REDIRECT_PATH: &str = "/redirect";
+    const BAD_PEM: &str = "-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n";
 
     struct Request {
         method: String,
@@ -708,7 +752,14 @@ mod tests {
             "access_token": NEW_TOKEN,
             "token_type": "Bearer",
             "expires_in": 3600,
+            "refresh_token": ROTATED_REFRESH,
         }))
+    }
+
+    fn form_values(req: &Request, name: &str) -> impl Iterator<Item = String> {
+        form_urlencoded::parse(req.text.as_bytes())
+            .filter(move |(key, _)| key == name)
+            .map(|(_, value)| value.into_owned())
     }
 
     /// A minimal stateful MCP server with one tool and no SSE stream.
@@ -813,6 +864,7 @@ mod tests {
         ServerConfig {
             name: SERVER.into(),
             timeout: TIMEOUT,
+            startup_timeout: TIMEOUT,
             always_load: false,
             transport: Transport::Http {
                 url: format!("{base}{MCP_PATH}"),
@@ -834,7 +886,7 @@ mod tests {
             server_url: format!("{base}{MCP_PATH}"),
             tokens: Some(OAuthTokens {
                 access: OLD_TOKEN.into(),
-                refresh: "refresh-1".into(),
+                refresh: STORED_REFRESH.into(),
                 expires: now_millis() + lifetime_ms,
                 account_id: None,
             }),
@@ -1178,11 +1230,10 @@ mod tests {
                 if req.path != TOKEN_PATH {
                     return mcp_reply(req);
                 }
-                resources.lock().unwrap().extend(
-                    form_urlencoded::parse(req.text.as_bytes())
-                        .filter(|(key, _)| key == "resource")
-                        .map(|(_, value)| value.into_owned()),
-                );
+                resources
+                    .lock()
+                    .unwrap()
+                    .extend(form_values(req, "resource"));
                 token_reply()
             }
         });
@@ -1237,6 +1288,40 @@ mod tests {
         assert_eq!(saved.tokens.unwrap().access, NEW_TOKEN);
     }
 
+    /// Each connect keeps its own copy of the login, like two maki processes.
+    #[tokio::test]
+    async fn concurrent_refreshes_never_spend_one_refresh_token_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(dir.path().to_path_buf());
+        let spent = Arc::new(Mutex::new(Vec::new()));
+        let base = spawn_server({
+            let spent = Arc::clone(&spent);
+            move |req| {
+                if req.path != TOKEN_PATH {
+                    return mcp_reply(req);
+                }
+                spent
+                    .lock()
+                    .unwrap()
+                    .extend(form_values(req, "refresh_token"));
+                thread::sleep(REFRESH_OVERLAP);
+                token_reply()
+            }
+        });
+        save_mcp_auth(&storage, SERVER, &stored_record(&base, 0)).unwrap();
+
+        let config = http_config(&base, &[]);
+        tokio::try_join!(
+            connect(&config, Some(&storage)),
+            connect(&config, Some(&storage)),
+        )
+        .unwrap();
+
+        let spent = spent.lock().unwrap();
+        let stored_spends = spent.iter().filter(|token| *token == STORED_REFRESH);
+        assert_eq!(stored_spends.count(), 1, "spent {spent:?}");
+    }
+
     #[tokio::test]
     async fn dropped_call_sends_cancelled_to_the_server() {
         let (entered_tx, mut entered_rx) = unbounded_channel();
@@ -1276,6 +1361,36 @@ mod tests {
         drop(release_tx);
     }
 
+    #[test_case("tools/list" ; "tools")]
+    #[test_case("prompts/list" ; "prompts")]
+    #[tokio::test]
+    async fn hung_listing_ends_on_the_startup_timeout(method: &'static str) {
+        let (release_tx, release_rx) = channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let base = spawn_server(move |req| {
+            if req.body["method"] == method {
+                let _ = release_rx.lock().unwrap().recv_timeout(TIMEOUT);
+            }
+            mcp_reply(req)
+        });
+        let mut config = http_config(&base, &[]);
+        config.timeout = Duration::from_millis(HOUR_MS);
+        let mut connection = connect(&config, None).await.unwrap();
+        connection.startup_timeout = LISTING_TIMEOUT;
+
+        let listed = async {
+            connection.list_tools().await?;
+            connection.list_prompts().await
+        }
+        .await;
+
+        let Err(McpError::Timeout { timeout_ms, .. }) = listed else {
+            panic!("expected Timeout, got {listed:?}");
+        };
+        assert_eq!(u128::from(timeout_ms), LISTING_TIMEOUT.as_millis());
+        drop(release_tx);
+    }
+
     #[tokio::test]
     async fn unreachable_server_names_the_cause_without_the_url() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1292,12 +1407,16 @@ mod tests {
         assert!(reason.to_lowercase().contains("connect"), "got: {reason}");
     }
 
-    #[test_case("missing.pem" ; "missing_file")]
-    #[test_case(""            ; "directory")]
+    #[test_case("missing.pem", None          ; "missing_file")]
+    #[test_case("",            None          ; "directory")]
+    #[test_case("bad.pem",     Some(BAD_PEM) ; "bad_pem")]
     #[tokio::test]
-    async fn unreadable_ca_file_fails_the_start(file_name: &str) {
+    async fn unreadable_ca_file_fails_the_start(file_name: &str, contents: Option<&str>) {
         let dir = tempfile::tempdir().unwrap();
         let ca_file = dir.path().join(file_name);
+        if let Some(contents) = contents {
+            fs::write(&ca_file, contents).unwrap();
+        }
         let mut config = http_config("http://127.0.0.1:1", &[]);
         if let Transport::Http { ca_file: slot, .. } = &mut config.transport {
             *slot = Some(ca_file.clone());

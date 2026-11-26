@@ -8,7 +8,10 @@ use std::sync::Arc;
 use std::sync::mpsc::sync_channel;
 use std::thread;
 
-use common::{Chat, Parked, WAIT, call_ctx, done_text, exec, next_task_event, request_move};
+use common::{
+    Chat, Parked, WAIT, call_ctx, done_text, exec, next_event, next_task_event, poll_until,
+    request_move,
+};
 use maki_agent::permissions::PermissionManager;
 use maki_agent::tools::ToolRegistry;
 use maki_agent::{AgentEvent, CancelToken, PermissionsConfig, SessionMailbox, ToolDoneEvent};
@@ -49,11 +52,19 @@ const NOT_RUNNING: &str = "no running background subagent with id";
 const INTERRUPT_OPEN: &str = "<parent-interrupt>";
 const INIT: &str = include_str!("../../plugins/task/init.lua");
 const RUNNER: &str = include_str!("../../plugins/task/runner.lua");
+const BATCH: &str = include_str!("../../plugins/batch/init.lua");
+const BATCH_PLUGIN: &str = "batch";
+const BATCH_TOOL: &str = "batch";
+const SECOND_NAME: &str = "check the logs";
+const LISTED_TASK: &str = "- task (task ";
+const NAMED_SECTION: &str = "## task (task ";
+const NESTED_STOPPED: &str = "Stopped. What it did so far arrives later as the result of task ";
 
 // Mirrors of the runtime's wording.
 const MOVED_AS_ASKED: &str = "Started in the background as asked";
 const AGENT_DENIED: &str = "permission denied: 'agent' not granted";
 const TIMED_OUT: &str = "timed out after";
+const UNATTENDED: &str = "no one can answer a permission prompt";
 const SUBAGENT_SELF_MOVE: &str =
     "background: a subagent's tool call only moves when the user moves it";
 const SUBAGENT_TASK_ID: &str = "toolu_subagent";
@@ -113,7 +124,7 @@ struct Host {
 }
 
 impl Host {
-    fn attached(reg: Arc<ToolRegistry>, host: PluginHost) -> Self {
+    fn attached(reg: Arc<ToolRegistry>, mut host: PluginHost) -> Self {
         let ui = host.take_ui_action_rx().unwrap();
         Self { reg, host, ui }
     }
@@ -297,28 +308,31 @@ fn a_background_task_waiting_for_a_slot_returns_its_receipt_at_once() {
     }
 }
 
-/// A ctx session has an answer channel, so the prompt reaches the user
-/// instead of being denied as nobody's to answer. The subagent dispatches
-/// through the global registry, so the tools live there.
-#[test]
-fn a_background_subagent_asks_for_permission_instead_of_being_denied() {
+/// A ctx session has its own answer channel, so its prompt reaches the user.
+/// One opened inside another subagent is denied instead, because the answer
+/// would go to the outer one. The subagent dispatches through the global
+/// registry, so the tools live there.
+#[test_case(false ; "top_level_session_asks_the_user")]
+#[test_case(true ; "nested_session_is_denied_as_unattended")]
+fn a_subagent_asks_for_permission_only_where_the_answer_comes_back(nested: bool) {
     let reg = Arc::clone(ToolRegistry::global_arc());
     let mut host = Host::task(Arc::clone(&reg));
     host.host.load_source(GUARDED_PLUGIN, GUARDED_SRC).unwrap();
     let chat = Chat::live();
-    let parked = Parked::with_first_turn(
+    let project = TempDir::new().unwrap();
+    let (_run, run_token) = CancelToken::new();
+    let (mut ctx, mut events) = call_ctx(&reg, chat.id, &run_token, CALL_ID);
+    // The rest of `Parked` drops here, and without a release sender no turn
+    // waits.
+    ctx.provider = Parked::with_first_turn(
         RESULT,
         Some(ContentBlock::tool_use(
             GUARDED_CALL_ID,
             GUARDED_TOOL,
             json!({ "target": "x" }),
         )),
-    );
-    parked.release.send(()).unwrap();
-    let project = TempDir::new().unwrap();
-    let (_run, run_token) = CancelToken::new();
-    let (mut ctx, _events) = call_ctx(&reg, chat.id, &run_token, CALL_ID);
-    ctx.provider = Arc::clone(&parked.provider);
+    )
+    .provider;
     ctx.permissions = Arc::new(PermissionManager::new(
         PermissionsConfig::default(),
         project.path().to_owned(),
@@ -327,12 +341,25 @@ fn a_background_subagent_asks_for_permission_instead_of_being_denied() {
     ));
     let (_answer_tx, answer_rx) = unbounded_channel::<String>();
     ctx.user_response_rx = Some(Arc::new(tokio::sync::Mutex::new(answer_rx)));
+    if nested {
+        ctx.task_id = Some(Arc::from(SUBAGENT_TASK_ID));
+    }
 
-    assert!(exec(&reg, TASK_TOOL, task_input(), &ctx).backgrounded);
+    let result = exec(&reg, TASK_TOOL, task_input(), &ctx);
 
-    host.wait_permission_request();
-    host.host.event_handle().cancel_plugin_session(CALL_ID);
-    host.task_done();
+    if nested {
+        let guarded = next_event(&mut events, |event| match event {
+            AgentEvent::ToolDone(done) if done.id == GUARDED_CALL_ID => Some(done),
+            _ => None,
+        });
+        let (reply, failed) = done_text(&guarded);
+        assert!(failed && reply.contains(UNATTENDED), "{reply}");
+    } else {
+        assert!(result.backgrounded);
+        host.wait_permission_request();
+        host.host.event_handle().cancel_plugin_session(CALL_ID);
+        host.task_done();
+    }
 }
 
 /// Moving itself makes the result wake the chat, the price of
@@ -604,4 +631,81 @@ fn a_task_moved_without_allow_background_has_no_message_tool_and_still_reports()
 
     parked.release.send(()).unwrap();
     assert_eq!(done_text(&host.task_done()), (RESULT.to_owned(), false));
+}
+
+/// The model sent its background tasks out in one batch, and the batch moved
+/// as one call. The receipt lists each subagent's id. The batch's id reaches
+/// all of them, a subagent's own id reaches just that one, and stopping one
+/// leaves the rest and the batch running. Each result, early or in the final
+/// reply, names the id the receipt gave it.
+#[test]
+fn the_tasks_of_a_moved_batch_are_reached_by_the_batchs_id_or_their_own() {
+    let mut host = Host::task(Arc::new(ToolRegistry::new()));
+    host.host
+        .load_source_with_permissions(BATCH_PLUGIN, BATCH, PluginPermissions::trusted())
+        .unwrap();
+    let chat = Chat::live();
+    let parked = Parked::new(RESULT);
+    let (_run, run_token) = CancelToken::new();
+    let (mut ctx, _events) = call_ctx(&host.reg, chat.id, &run_token, CALL_ID);
+    ctx.provider = Arc::clone(&parked.provider);
+    let tasks = [NAME, SECOND_NAME].map(|name| {
+        json!({
+            "tool": TASK_TOOL,
+            "parameters": { "description": name, "prompt": PROMPT, "background": true },
+        })
+    });
+
+    let result = exec(&host.reg, BATCH_TOOL, json!({ "tool_calls": tasks }), &ctx);
+
+    assert!(result.backgrounded);
+    let (receipt, _) = done_text(&result);
+    let ids: Vec<&str> = receipt
+        .lines()
+        .filter_map(|line| line.strip_prefix(LISTED_TASK)?.split_once(')'))
+        .map(|(id, _)| id)
+        .collect();
+    let [first, second] = ids[..] else {
+        panic!("the receipt lists both tasks:\n{receipt}");
+    };
+    for _ in &tasks {
+        parked.wait_started();
+    }
+
+    let (sent, failed) = message(&host, chat.id, CALL_ID, false);
+    assert!(
+        !failed && sent.contains(NAME) && sent.contains(SECOND_NAME),
+        "{sent}"
+    );
+    let mut agent = chat.seed.tool_context(CancelToken::none());
+    agent.mailbox = Some(chat.mailbox.clone());
+    assert_eq!(
+        done_text(&exec(&host.reg, STOP_TOOL, json!({ "id": second }), &agent)),
+        (format!("{NESTED_STOPPED}{second}."), false)
+    );
+    assert_refused(&host, chat.id, second);
+    let notices = poll_until("the stopped subagent never reported", || {
+        Some(chat.mailbox.claim_wake()).filter(|notices| !notices.is_empty())
+    });
+    let [notice] = &notices[..] else {
+        panic!("one part notice: {notices:?}");
+    };
+    let notice = notice.first_text_content().unwrap();
+    assert!(
+        notice.contains(second) && !notice.contains(CALL_ID),
+        "the part is named by the id the receipt gave it: {notice}"
+    );
+    assert_eq!(
+        message(&host, chat.id, first, false),
+        (QUEUED.to_owned(), false)
+    );
+
+    // Dropping the release sender lets every turn finish, however many the
+    // queued messages add.
+    drop(parked);
+    let (last, _) = done_text(&host.task_done());
+    assert!(
+        last.contains(&format!("{NAMED_SECTION}{first})")),
+        "the last subagent's section names its id: {last}"
+    );
 }

@@ -23,6 +23,14 @@ local STATUS_MARKERS = {
   cancelled = { "[x]", "todo_cancelled" },
 }
 
+-- The model only sees llm_output; the list itself stays in the chat body.
+local SUMMARY_STATUSES = {
+  { key = "completed", label = "completed" },
+  { key = "in_progress", label = "in progress" },
+  { key = "pending", label = "pending" },
+  { key = "cancelled", label = "cancelled" },
+}
+
 local DESCRIPTION = [[Create or update a structured todo list to track tasks.
 
 **Use after EACH completed step!**
@@ -59,6 +67,21 @@ local function build_lines(items)
     }
   end
   return lines
+end
+
+local function summary(items)
+  local counts = {}
+  for _, item in ipairs(items) do
+    counts[item.status] = (counts[item.status] or 0) + 1
+  end
+  local parts = {}
+  for _, status in ipairs(SUMMARY_STATUSES) do
+    local n = counts[status.key]
+    if n then
+      parts[#parts + 1] = string.format("%d %s", n, status.label)
+    end
+  end
+  return "Todos updated: " .. table.concat(parts, ", ")
 end
 
 -- Shared by handler and restore, so a call looks the same live and reloaded,
@@ -148,6 +171,7 @@ maki.api.register_tool({
             status = {
               type = "string",
               enum = { "pending", "in_progress", "completed", "cancelled" },
+              value_alias = { done = "completed" },
             },
             priority = {
               type = "string",
@@ -191,20 +215,27 @@ maki.api.register_tool({
     if #items == 0 then
       return "Todos cleared"
     end
-    return { llm_output = "", body = list_body(items) }
+    return { llm_output = summary(items), body = list_body(items) }
   end,
 })
 
+-- Answers whether there was a panel to toggle, so a key that tries several
+-- actions can fall through to the next one.
 local function toggle()
   local s = sessions[focused_session]
   if not s or #shown_items(s) == 0 then
-    return
+    return false
   end
   s.hidden = not s.hidden
   sync(focused_session)
+  return true
 end
 
 maki.keymap.set({ "n", "i" }, "<C-t>", toggle, { desc = "Toggle todo panel" })
+
+-- A user's init.lua cannot reach the local above, so this action is the only
+-- way to bind the panel to another key.
+maki.api.register_action("toggle", toggle, { capability = {} })
 
 -- Subagents run inside the parent's turn, so its end clears their lists too.
 maki.api.create_autocmd("TurnEnd", {

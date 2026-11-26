@@ -8,16 +8,16 @@
 //! [`crate::model_registry::discovery_complete`] only ever see this run's
 //! probe.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use maki_config::ModelPolicy;
-use maki_storage::StateDir;
+use maki_storage::{StateDir, blocking};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::task::spawn_blocking;
 use tracing::{debug, warn};
 
-use crate::provider::{ModelBatch, fetch_all_models, provider_available, provider_of};
+use crate::provider::{ModelBatch, ProviderStatus, build_registry, fetch_built, provider_of};
 use crate::providers::custom;
 use crate::spec::ProviderRegistry;
 
@@ -45,10 +45,10 @@ struct ModelsCache {
 /// What the model picker should show right now.
 pub struct ModelList {
     pub specs: Vec<String>,
-    /// Providers that answered live this run. A recent from one of these that
-    /// is missing from `specs` is retired; a recent from any other provider
-    /// may simply have failed its probe.
-    pub live_providers: Vec<String>,
+    /// What each provider that answered this run said. A recent missing from
+    /// `specs` is retired only if its provider is [`ProviderStatus::Live`];
+    /// any other may simply have failed its probe.
+    pub providers: HashMap<String, ProviderStatus>,
     /// Some provider has not answered yet, so the list may still grow.
     pub loading: bool,
 }
@@ -59,7 +59,7 @@ pub struct ModelList {
 struct Listing {
     replayed: Vec<String>,
     live: Vec<String>,
-    live_providers: Vec<String>,
+    providers: HashMap<String, ProviderStatus>,
     /// A provider that cannot be reached warns and falls back to its static
     /// specs, so warnings are how discovery reports a failed probe. Without
     /// this, an empty run reads as "offline" even when the real cause is an
@@ -71,31 +71,22 @@ impl Listing {
     /// Replaces rather than merges, so a model the provider dropped since
     /// last run leaves the picker instead of failing when picked.
     fn add_live(&mut self, batch: &ModelBatch) {
-        self.degraded |= !batch.warnings.is_empty();
-        self.replayed.retain(|old| {
-            !batch
-                .models
-                .iter()
-                .any(|new| provider_of(new) == provider_of(old))
-        });
+        self.degraded |= matches!(batch.status, ProviderStatus::Failed(_));
+        self.replayed
+            .retain(|old| provider_of(old) != batch.provider);
         for spec in &batch.models {
             if !self.live.contains(spec) {
                 self.live.push(spec.clone());
             }
         }
-        if batch.warnings.is_empty() {
-            for provider in &batch.providers {
-                if !self.live_providers.contains(provider) {
-                    self.live_providers.push(provider.clone());
-                }
-            }
-        }
+        self.providers
+            .insert(batch.provider.clone(), batch.status.clone());
     }
 
     fn snapshot(&self) -> ModelList {
         ModelList {
             specs: self.live.iter().chain(&self.replayed).cloned().collect(),
-            live_providers: self.live_providers.clone(),
+            providers: self.providers.clone(),
             loading: true,
         }
     }
@@ -106,7 +97,7 @@ impl Listing {
         self.replayed.clear();
         ModelList {
             specs: self.live,
-            live_providers: self.live_providers,
+            providers: self.providers,
             loading: false,
         }
     }
@@ -118,19 +109,15 @@ fn cache_path() -> Option<PathBuf> {
         .map(|d| d.join(CACHE_FILE))
 }
 
-/// Providers whose credentials resolve right now, sorted.
+/// Providers whose credentials resolve right now, sorted: the registry ones
+/// that `built` names, plus the ones `providers.toml` declares.
 ///
 /// Catalog-backed slugs are deliberately absent: they are available only once
 /// the models.dev catalog has warmed, so folding them in would change the
 /// fingerprint between a cold start and the write at the end of discovery, and
 /// the cache would miss every time.
-fn resolved_providers() -> Vec<String> {
-    let mut slugs: Vec<String> = ProviderRegistry::all()
-        .into_iter()
-        .map(|m| m.slug)
-        .filter(|slug| provider_available(slug))
-        .map(str::to_string)
-        .collect();
+fn resolved_providers<'a>(built: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut slugs: Vec<String> = built.into_iter().map(str::to_string).collect();
     slugs.extend(
         custom::declared_model_specs()
             .iter()
@@ -184,9 +171,9 @@ fn digest(entries: &[(String, Option<String>)]) -> String {
 
 /// Identifies the credentials a discovery was taken under, so a cache written
 /// by another account or by a since-downgraded key is treated as missing.
-fn fingerprint() -> String {
+fn fingerprint<'a>(built: impl IntoIterator<Item = &'a str>) -> String {
     let dir = StateDir::resolve().ok();
-    let entries: Vec<(String, Option<String>)> = resolved_providers()
+    let entries: Vec<(String, Option<String>)> = resolved_providers(built)
         .into_iter()
         .map(|slug| {
             let identity = dir.as_ref().and_then(|d| account_identity(d, &slug));
@@ -196,8 +183,8 @@ fn fingerprint() -> String {
     digest(&entries)
 }
 
-fn load_from(path: &Path) -> Option<ModelsCache> {
-    let bytes = std::fs::read(path).ok()?;
+async fn load_from(path: &Path) -> Option<ModelsCache> {
+    let bytes = tokio::fs::read(path).await.ok()?;
     // A cache that fails to parse (corrupt, or written by an incompatible
     // version) is treated as absent: live discovery rewrites it.
     serde_json::from_slice(&bytes).ok()
@@ -217,8 +204,8 @@ fn store_at(path: &Path, cache: &ModelsCache) {
 /// Last run's specs when this run's credentials wrote them and they are not
 /// past [`MAX_AGE_MS`], empty otherwise. A miss is not an error: live
 /// discovery rewrites the file moments later regardless.
-fn replay(path: &Path, policy: &ModelPolicy, fingerprint: &str, now_ms: u64) -> Vec<String> {
-    let Some(cache) = load_from(path) else {
+async fn replay(path: &Path, policy: &ModelPolicy, fingerprint: &str, now_ms: u64) -> Vec<String> {
+    let Some(cache) = load_from(path).await else {
         return Vec::new();
     };
     if cache.fingerprint != fingerprint {
@@ -243,86 +230,86 @@ fn replay(path: &Path, policy: &ModelPolicy, fingerprint: &str, now_ms: u64) -> 
 /// yesterday's list replaying at every start after a logout or a revoked key.
 /// An empty result from a degraded run is a failed probe, so an existing good
 /// cache survives it for the next start.
-fn store_discovery(path: &Path, listing: &Listing, fingerprint: String, now_ms: u64) {
+async fn store_discovery(path: PathBuf, listing: &Listing, fingerprint: String, now_ms: u64) {
     if listing.live.is_empty() && listing.degraded {
         return;
     }
-    store_at(
-        path,
-        &ModelsCache {
-            fingerprint,
-            written_at: now_ms,
-            specs: listing.live.clone(),
-        },
-    );
-}
-
-/// Like [`fetch_all_models`], but the first `on_update` comes straight from
-/// the on-disk cache. Every call carries the whole list to show, not a delta,
-/// plus the warnings of the batch that changed it. The last call has
-/// `loading` off and holds only this run's live answer.
-/// The specs the last successful discovery left on disk, filtered by `policy`.
-/// A front end that reads the model selector before the network round trip -
-/// an ACP client probing `session/new` - needs this to offer catalog providers
-/// at all, since `available_model_specs` only knows declared manifests.
-pub fn cached_model_specs(policy: &ModelPolicy) -> Vec<String> {
-    let Some(path) = cache_path() else {
-        return Vec::new();
+    let cache = ModelsCache {
+        fingerprint,
+        written_at: now_ms,
+        specs: listing.live.clone(),
     };
-    replay(
-        &path,
-        policy,
-        &fingerprint(),
-        maki_storage::auth::now_millis(),
-    )
+    blocking(move || store_at(&path, &cache)).await;
 }
 
+/// Like [`fetch_all_models`](crate::provider::fetch_all_models), but the
+/// first `on_update` comes straight from the on-disk cache. Every call carries
+/// the whole list to show, not a delta, plus the warning of the batch that
+/// changed it. The last call has `loading` off and holds only this run's live
+/// answer.
 pub async fn fetch_all_models_cached(
     policy: &ModelPolicy,
-    mut on_update: impl FnMut(ModelList, Vec<String>),
+    mut on_update: impl FnMut(ModelList, Option<String>),
 ) {
     let path = cache_path();
-    let fingerprint = spawn_blocking(fingerprint)
-        .await
-        .expect("fingerprint task panicked");
+    let (built, fingerprint) = blocking(|| {
+        let built = build_registry();
+        let fingerprint = fingerprint(built.iter().map(|(spec, _)| spec.slug));
+        (built, fingerprint)
+    })
+    .await;
+    let replayed = match &path {
+        Some(path) => replay(path, policy, &fingerprint, maki_storage::auth::now_millis()).await,
+        None => Vec::new(),
+    };
     let mut listing = Listing {
-        replayed: path
-            .as_deref()
-            .map(|p| replay(p, policy, &fingerprint, maki_storage::auth::now_millis()))
-            .unwrap_or_default(),
+        replayed,
         ..Listing::default()
     };
-    on_update(listing.snapshot(), Vec::new());
+    on_update(listing.snapshot(), None);
 
-    fetch_all_models(
+    fetch_built(
+        built,
         policy,
         |batch| {
             listing.add_live(&batch);
-            on_update(listing.snapshot(), batch.warnings);
+            let warning = match batch.status {
+                ProviderStatus::Failed(warning) => Some(warning),
+                ProviderStatus::Live | ProviderStatus::MissingKey => None,
+            };
+            on_update(listing.snapshot(), warning);
         },
         None,
     )
     .await;
 
-    if let Some(path) = &path {
+    if let Some(path) = path {
         store_discovery(
             path,
             &listing,
             fingerprint,
             maki_storage::auth::now_millis(),
-        );
+        )
+        .await;
     }
-    on_update(listing.finish(), Vec::new());
+    on_update(listing.finish(), None);
 }
 
 #[cfg(test)]
 mod tests {
+    use maki_config::providers::ProvidersConfig;
+    use maki_storage::auth::{ProviderCredentials, save_provider_credentials};
     use test_case::test_case;
 
     use super::*;
+    use crate::test_support::isolated_home;
 
     const FINGERPRINT: &str = "fingerprint-a";
     const NOW: u64 = 1_700_000_000_000;
+    const DECLARED_SLUG: &str = "declared";
+    const DECLARED_DEF: &str = r#"{"protocol":"openai","models":[{"id":"a"},{"id":"b"}]}"#;
+    const ZAI_KEY: (&str, &str) = ("zai", "zai-key");
+    const OPENAI_KEY: (&str, &str) = ("openai", "openai-key");
 
     fn specs(specs: &[&str]) -> Vec<String> {
         specs.iter().map(|s| s.to_string()).collect()
@@ -343,14 +330,11 @@ mod tests {
         (dir, path)
     }
 
-    fn batch(models: &[&str], warnings: &[&str]) -> ModelBatch {
+    fn batch(provider: &str, models: &[&str], status: ProviderStatus) -> ModelBatch {
         ModelBatch {
+            provider: provider.to_string(),
             models: specs(models),
-            providers: models
-                .iter()
-                .map(|spec| provider_of(spec).to_string())
-                .collect(),
-            warnings: specs(warnings),
+            status,
         }
     }
 
@@ -362,26 +346,27 @@ mod tests {
         }
     }
 
-    #[test]
-    fn replay_applies_current_policy() {
+    #[tokio::test]
+    async fn replay_applies_current_policy() {
         let (_dir, path) = cache_file(&["kept/model-a", "banned/model-b", "kept/model-c"]);
         let policy = ModelPolicy::new(&[], &["banned/*".to_string()]).unwrap();
         assert_eq!(
-            replay(&path, &policy, FINGERPRINT, NOW),
+            replay(&path, &policy, FINGERPRINT, NOW).await,
             ["kept/model-a", "kept/model-c"]
         );
     }
 
     #[test_case("fingerprint-b", NOW                  ; "foreign_fingerprint")]
     #[test_case(FINGERPRINT,     NOW + MAX_AGE_MS + 1 ; "past_max_age")]
-    fn replay_misses(fingerprint: &str, now_ms: u64) {
+    #[tokio::test]
+    async fn replay_misses(fingerprint: &str, now_ms: u64) {
         let (_dir, path) = cache_file(&["old/model"]);
         let policy = ModelPolicy::default();
         assert_eq!(
-            replay(&path, &policy, FINGERPRINT, NOW + MAX_AGE_MS),
+            replay(&path, &policy, FINGERPRINT, NOW + MAX_AGE_MS).await,
             ["old/model"]
         );
-        assert!(replay(&path, &policy, fingerprint, now_ms).is_empty());
+        assert!(replay(&path, &policy, fingerprint, now_ms).await.is_empty());
     }
 
     #[test]
@@ -390,7 +375,7 @@ mod tests {
             replayed: specs(&["a/removed", "a/kept", "b/cached"]),
             ..Listing::default()
         };
-        listing.add_live(&batch(&["a/kept", "a/new"], &[]));
+        listing.add_live(&batch("a", &["a/kept", "a/new"], ProviderStatus::Live));
         let shown = listing.snapshot();
         assert!(shown.loading);
         assert_eq!(shown.specs, ["a/kept", "a/new", "b/cached"]);
@@ -402,33 +387,71 @@ mod tests {
             ["a/kept", "a/new"],
             "a provider that never answered live must not keep its cached specs"
         );
-        assert_eq!(done.live_providers, ["a"]);
+        assert_eq!(
+            done.providers,
+            HashMap::from([("a".to_string(), ProviderStatus::Live)])
+        );
     }
 
-    /// A probe that fell back to static specs says nothing about which models
-    /// the provider still serves, so its recents must not look retired.
+    /// A keyless provider answers with no models, and that still clears what
+    /// the cache said about it.
     #[test]
-    fn only_a_clean_batch_marks_its_providers_live() {
-        let mut listing = Listing::default();
-        listing.add_live(&batch(&["a/fallback"], &["A: timeout"]));
-        listing.add_live(&batch(&["b/live"], &[]));
-        assert_eq!(listing.finish().live_providers, ["b"]);
+    fn a_missing_key_clears_that_providers_cached_specs() {
+        let mut listing = Listing {
+            replayed: specs(&["a/cached", "b/cached"]),
+            ..Listing::default()
+        };
+        listing.add_live(&batch("a", &[], ProviderStatus::MissingKey));
+        let shown = listing.snapshot();
+        assert_eq!(shown.specs, ["b/cached"]);
+        assert_eq!(shown.providers["a"], ProviderStatus::MissingKey);
     }
 
     #[test_case(&[],            true,  &["good/model"] ; "degraded_empty_keeps_cache")]
     #[test_case(&[],            false, &[]             ; "authenticated_empty_is_recorded")]
     #[test_case(&["new/model"], false, &["new/model"]  ; "non_empty_rewrites_cache")]
-    fn store_discovery_cases(live: &[&str], degraded: bool, expected: &[&str]) {
+    #[tokio::test]
+    async fn store_discovery_cases(live: &[&str], degraded: bool, expected: &[&str]) {
         let (_dir, path) = cache_file(&["good/model"]);
         store_discovery(
-            &path,
+            path.clone(),
             &listing(live, degraded),
             FINGERPRINT.to_string(),
             NOW,
-        );
-        let cache = load_from(&path).unwrap();
+        )
+        .await;
+        let cache = load_from(&path).await.unwrap();
         assert_eq!(cache.specs, expected);
         assert_eq!(cache.fingerprint, FINGERPRINT);
+    }
+
+    #[test]
+    fn fingerprint_digests_built_and_declared_slugs_sorted() {
+        let _home = isolated_home();
+        let dir = StateDir::resolve().unwrap();
+        for (slug, api_key) in [ZAI_KEY, OPENAI_KEY] {
+            let creds = ProviderCredentials {
+                api_key: api_key.to_string(),
+                host: None,
+            };
+            save_provider_credentials(&dir, slug, &creds).unwrap();
+        }
+        let mut config = ProvidersConfig::default();
+        config.upsert(
+            DECLARED_SLUG.to_string(),
+            serde_json::from_str(DECLARED_DEF).unwrap(),
+        );
+        config.save().unwrap();
+
+        let identified = |(slug, key): (&str, &str)| (slug.to_string(), Some(key.to_string()));
+        assert_eq!(
+            fingerprint([ZAI_KEY.0, OPENAI_KEY.0]),
+            digest(&[
+                (DECLARED_SLUG.to_string(), None),
+                identified(OPENAI_KEY),
+                identified(ZAI_KEY),
+            ])
+        );
     }
 
     #[test]
@@ -444,12 +467,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn corrupt_cache_loads_as_none() {
+    #[tokio::test]
+    async fn corrupt_cache_loads_as_none() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(CACHE_FILE);
         std::fs::write(&path, b"{ not json").unwrap();
-        assert!(load_from(&path).is_none());
-        assert!(load_from(&dir.path().join("missing.json")).is_none());
+        assert!(load_from(&path).await.is_none());
+        assert!(load_from(&dir.path().join("missing.json")).await.is_none());
+        assert!(
+            replay(&path, &ModelPolicy::default(), FINGERPRINT, NOW)
+                .await
+                .is_empty()
+        );
     }
 }

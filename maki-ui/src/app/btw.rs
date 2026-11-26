@@ -1,32 +1,203 @@
 use std::sync::Arc;
 
-use maki_agent::btw::{BTW_EVENT_CAPACITY, BtwRequest};
-use maki_providers::Model;
+use maki_agent::HistorySnapshot;
 use maki_providers::provider::Provider;
+use maki_providers::{Message, Model, ProviderEvent, RequestOptions};
 use maki_storage::id::SessionRef;
-use tokio::sync::mpsc::channel;
+use maki_storage::sessions::SessionTools;
+use serde_json::Value;
+use tokio::sync::mpsc::{Sender, channel, unbounded_channel};
+use tokio::task::spawn_blocking;
+
+use crate::components::btw_modal::BtwEvent;
 
 use super::App;
 
+const BTW_REMINDER: &str = "<system-reminder>\nThis is a side question. Answer it directly in a \
+single response.\n- You have NO tools: you cannot read files, run commands, or take any action.\n\
+- One-off response: there are no follow-up turns.\n- Answer ONLY from the existing conversation \
+context.\n- Never say \"Let me...\", \"I'll now...\", or promise any action.\n- If you don't know, \
+say so; do not offer to look it up.\n</system-reminder>";
+
+const BTW_FALLBACK_SYSTEM: &str = "You are a helpful coding assistant. Answer concisely \
+from the conversation context.";
+
+const NO_TOOLS: Value = Value::Array(Vec::new());
+const BTW_EVENT_CAPACITY: usize = 64;
+
+/// The reminder leads so the model treats the question as a quick aside, not a task to act on.
+fn btw_question(question: &str) -> Message {
+    Message::user(format!("{BTW_REMINDER}\n\n{question}"))
+}
+
+/// The tools ride along only for the cache; the reminder keeps the model off
+/// them. When it reaches for one anyway, say so instead of showing half an answer.
+fn reached_for_tool(name: &str) -> String {
+    format!(
+        "The model tried to call `{name}`, but a side question has no tools. Ask it another way, \
+         or send it as a normal message."
+    )
+}
+
 impl App {
+    /// Building the request deep-copies the transcript, megabytes on a long
+    /// session, so the loop only opens the modal and the copy runs on the
+    /// blocking pool.
     pub(crate) fn start_btw(
         &mut self,
         question: String,
         provider: Arc<dyn Provider>,
         model: Model,
     ) {
-        let snapshot = self.shared_history.as_ref().map(|h| h.load_full());
-        let request = BtwRequest::new(
-            snapshot.as_deref(),
-            &question,
-            provider,
-            model,
-            self.request_options(),
-            SessionRef::from(self.state.session.id),
-        );
         let (tx, rx) = channel(BTW_EVENT_CAPACITY);
         self.open_prompt(|app| app.btw_modal.open(&question, rx));
-        tokio::spawn(request.run(tx));
+        let snapshot = self.shared_history.as_ref().map(|h| h.load_full());
+        let opts = self.request_options();
+        let session_id = SessionRef::from(self.state.session.id);
+        let build = move || {
+            BtwRequest::new(
+                snapshot.as_deref(),
+                &question,
+                provider,
+                model,
+                opts,
+                session_id,
+            )
+        };
+        tokio::spawn(async move {
+            match spawn_blocking(build).await {
+                Ok(request) => request.run(tx).await,
+                Err(e) => {
+                    let _ = tx.send(BtwEvent::Error(e.to_string())).await;
+                }
+            }
+        });
+    }
+}
+
+struct BtwRequest {
+    provider: Arc<dyn Provider>,
+    model: Model,
+    system: String,
+    tools: Arc<Value>,
+    messages: Vec<Message>,
+    opts: RequestOptions,
+    session_id: SessionRef,
+}
+
+impl BtwRequest {
+    fn new(
+        snapshot: Option<&HistorySnapshot>,
+        question: &str,
+        provider: Arc<dyn Provider>,
+        model: Model,
+        session_opts: RequestOptions,
+        session_id: SessionRef,
+    ) -> Self {
+        // The mirror is verbatim, so mid-turn it can end on an open tool call.
+        // Providers reject that, so close them off on our own copy.
+        let mut messages = snapshot
+            .map(|s| Vec::clone(&s.messages))
+            .unwrap_or_default();
+        maki_agent::close_dangling_tool_calls(&mut messages, maki_agent::UNAVAILABLE_RESULT);
+        messages.push(btw_question(question));
+        // The session's own prompt, so the side question reads the transcript
+        // under the instructions it was written under.
+        let system = snapshot
+            .and_then(|s| s.frame.as_ref())
+            .and_then(|f| f.prefix())
+            .unwrap_or(BTW_FALLBACK_SYSTEM)
+            .to_owned();
+        // Anthropic keys its cache on tools, system, then messages under one
+        // thinking setting, so the request repeats the session's tools and
+        // thinking (`tool_choice: none` would void it). A resumed session has
+        // no wire before its first run, and a switched model has no cache to
+        // hit and may reject the old wire. Either way the transcript's
+        // thinking signatures are bound to a prefix this request cannot
+        // rebuild. With thinking off the API would ignore them, but some
+        // models cannot turn it off, so the signatures go and the reasoning
+        // text stays.
+        let fitted = snapshot
+            .and_then(|s| s.tools.as_ref())
+            .filter(|tools| tools.model == model.spec());
+        let (tools, opts) = match fitted {
+            Some(SessionTools { wire, .. }) => (Arc::clone(wire), session_opts),
+            None => {
+                maki_agent::unbind_thinking(&mut messages);
+                (Arc::new(NO_TOOLS), RequestOptions::default())
+            }
+        };
+        Self {
+            opts: opts.clamped(&model),
+            provider,
+            model,
+            system,
+            tools,
+            messages,
+            session_id,
+        }
+    }
+
+    async fn run(self, btw_tx: Sender<BtwEvent>) {
+        let (event_tx, mut event_rx) = unbounded_channel();
+        let messages = maki_providers::adapt_images_for_model(&self.model, &self.messages).await;
+
+        // The pinned future outlives the stream, so the sender is dropped by
+        // hand or `forward` never sees the channel close.
+        let stream = async {
+            let result = self
+                .provider
+                .stream_message(
+                    &self.model,
+                    &messages,
+                    &self.system,
+                    &self.tools,
+                    &event_tx,
+                    self.opts,
+                    Some(&self.session_id),
+                )
+                .await;
+            drop(event_tx);
+            result
+        };
+
+        // False when it stopped early, on a tool call or a closed modal, so the
+        // stream's outcome never reaches the modal.
+        let forward = async {
+            while let Some(event) = event_rx.recv().await {
+                let event = match event {
+                    ProviderEvent::TextDelta { text } => BtwEvent::TextDelta(text),
+                    ProviderEvent::ThinkingDelta { text } => BtwEvent::ThinkingDelta(text),
+                    ProviderEvent::ToolUseStart { name, .. } => {
+                        let _ = btw_tx.send(BtwEvent::Error(reached_for_tool(&name))).await;
+                        return false;
+                    }
+                    ProviderEvent::PromptProgress { .. } => continue,
+                };
+                if btw_tx.send(event).await.is_err() {
+                    return false;
+                }
+            }
+            true
+        };
+
+        // The channel only closes once `stream` is done, so `forward` ending
+        // first means it stopped early, and returning cancels the request
+        // instead of streaming for nobody.
+        tokio::pin!(stream, forward);
+        let result = tokio::select! {
+            biased;
+            result = &mut stream => result,
+            _ = &mut forward => return,
+        };
+        if forward.await {
+            let _ = btw_tx
+                .send(match result {
+                    Ok(_) => BtwEvent::Done,
+                    Err(e) => BtwEvent::Error(e.to_string()),
+                })
+                .await;
+        }
     }
 }
 
@@ -36,8 +207,6 @@ mod tests {
     use crate::app::tests::test_app;
     use crate::components::test_model;
     use arc_swap::ArcSwap;
-    use maki_agent::HistorySnapshot;
-    use maki_agent::btw::{BTW_FALLBACK_SYSTEM, NO_TOOLS};
     use maki_agent::prompt::{PromptId, Slot};
     use maki_agent::tools::ToolRegistry;
     use maki_lua::PluginHost;
@@ -46,19 +215,20 @@ mod tests {
         AgentError, ContentBlock, Effort, ModelInfo, Role, StopReason, StreamResponse,
         ThinkingConfig, TokenUsage,
     };
-    use maki_providers::{Message, ProviderEvent, RequestOptions};
     use maki_storage::frame::{PromptFacts, StoredFrame};
-    use maki_storage::sessions::SessionTools;
-    use serde_json::Value;
     use serde_json::json;
+    use std::iter;
     use test_case::test_case;
-    use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+    use tokio::sync::mpsc::UnboundedSender;
 
     const Q: &str = "why sqlite?";
     const FRAME_POLICY: &str = "Use the active conversation policy.";
+    const ANSWER: &str = "Let me check.";
     const OTHER_MODEL: &str = "anthropic/other-model";
     const THOUGHT: &str = "sqlite needs no server";
     const SIGNATURE: &str = "bound-to-the-old-prefix";
+    const CALL_ID: &str = "t1";
+    const TOOL: &str = "read";
 
     struct Recorded {
         messages: Vec<Message>,
@@ -119,6 +289,7 @@ mod tests {
         ContentBlock::Thinking {
             thinking: THOUGHT.into(),
             signature: signature.map(Into::into),
+            reasoning_id: None,
         }
     }
 
@@ -197,5 +368,72 @@ mod tests {
         assert_eq!(sent.tools, tools);
         assert_eq!(sent.opts.thinking, thinking);
         assert_eq!(sent.messages[0].content, [thought(signature)]);
+    }
+
+    #[tokio::test]
+    async fn side_question_closes_a_dangling_tool_call() {
+        let calling = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(CALL_ID, TOOL, Value::Null)],
+            ..Default::default()
+        };
+        let mut app = test_app();
+        app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(vec![
+            calling,
+        ]))));
+        let sent = ask(&mut app).await;
+        let closed = ContentBlock::tool_result(CALL_ID, maki_agent::UNAVAILABLE_RESULT, true);
+        assert_eq!(sent.messages[1].content, [closed]);
+        assert_eq!(sent.messages[2], btw_question(Q));
+    }
+
+    /// `Done` once never came: the provider's sender outlived the stream, so
+    /// the modal spun forever.
+    #[test_case(None, BtwEvent::Done ; "stream_end_is_done")]
+    #[test_case(Some("read"), BtwEvent::Error(reached_for_tool("read")) ; "tool_call_is_a_note")]
+    #[tokio::test]
+    async fn forwards_every_delta_then_stops_the_modal(tool: Option<&str>, last: BtwEvent) {
+        let (tx, mut rx) = channel(BTW_EVENT_CAPACITY);
+        let mut script = vec![ProviderEvent::TextDelta {
+            text: ANSWER.into(),
+        }];
+        script.extend(tool.map(|name| ProviderEvent::ToolUseStart {
+            id: "t1".into(),
+            name: name.into(),
+        }));
+        let provider = FakeProvider {
+            sent: unbounded_channel().0,
+            script,
+        };
+        BtwRequest {
+            provider: Arc::new(provider),
+            model: test_model(),
+            system: FRAME_POLICY.into(),
+            tools: Arc::new(NO_TOOLS),
+            messages: vec![btw_question(Q)],
+            opts: RequestOptions::default(),
+            session_id: SessionRef::generate(),
+        }
+        .run(tx)
+        .await;
+        let events: Vec<BtwEvent> = iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(events, [BtwEvent::TextDelta(ANSWER.into()), last]);
+    }
+
+    fn user_text(msg: &Message) -> String {
+        msg.content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn injects_reminder_before_question() {
+        let text = user_text(&btw_question(Q));
+        assert!(text.starts_with(BTW_REMINDER), "reminder leads the message");
+        assert!(text.ends_with(Q), "question trails the message");
     }
 }

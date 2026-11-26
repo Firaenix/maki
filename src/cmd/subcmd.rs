@@ -12,7 +12,7 @@ use maki_config::providers::{
     ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
     resolve_base_url, resolve_default_model, resolve_display_name, resolve_login_url, slugify,
 };
-use maki_providers::provider::fetch_all_models;
+use maki_providers::provider::{ProviderStatus, fetch_all_models};
 use maki_providers::spec::Owner;
 use maki_providers::{ProviderData, catalog_providers};
 use maki_providers::{copilot_auth, openai_auth, plugin, xai_auth};
@@ -20,7 +20,7 @@ use maki_storage::StateDir;
 use maki_storage::auth::ProviderCredentials;
 use maki_storage::auth::{
     delete_plugin_auth, delete_provider_credentials, load_plugin_auth, load_provider_credentials,
-    load_tokens, lock_credentials, save_provider_credentials,
+    load_tokens, lock_credentials_async, save_provider_credentials,
 };
 use maki_storage::model::persist_model;
 use maki_storage::stdin;
@@ -48,7 +48,7 @@ pub async fn auth_login(provider: Option<&str>, storage: &StateDir) -> Result<()
                 && ProvidersConfig::load().get(&slug).is_none()
                 && let Some(provider_data) = maki_providers::catalog_provider(&slug).await
             {
-                login_catalog_provider(&provider_data, storage).await?;
+                login_catalog_provider(provider_data, storage).await?;
             } else {
                 login_provider(&slug, storage).await?;
             }
@@ -174,7 +174,7 @@ async fn catalog_slugs() -> Vec<String> {
     catalog_providers()
         .await
         .into_iter()
-        .map(|provider| provider.slug)
+        .map(|provider| provider.slug.clone())
         .collect()
 }
 
@@ -196,7 +196,7 @@ struct LoginRow {
 enum LoginTarget {
     Provider(String),
     /// A models.dev provider, which logs in through its catalog entry.
-    Catalog(Box<ProviderData>),
+    Catalog(&'static ProviderData),
     Custom,
 }
 
@@ -250,12 +250,11 @@ async fn login_interactive(storage: &StateDir) -> Result<()> {
         rows.push(LoginRow::provider(mark(saved(slug)), slug, display));
     }
     for provider in catalog_providers().await {
-        let (slug, display) = (provider.slug.clone(), provider.display_name.clone());
         rows.push(LoginRow::new(
-            mark(saved(&slug)),
-            &slug,
-            &display,
-            LoginTarget::Catalog(Box::new(provider)),
+            mark(saved(&provider.slug)),
+            &provider.slug,
+            &provider.display_name,
+            LoginTarget::Catalog(provider),
         ));
     }
     rows.push(LoginRow {
@@ -282,7 +281,7 @@ async fn login_interactive(storage: &StateDir) -> Result<()> {
     };
     match row.target {
         LoginTarget::Provider(slug) => login_provider(&slug, storage).await,
-        LoginTarget::Catalog(provider) => login_catalog_provider(&provider, storage).await,
+        LoginTarget::Catalog(provider) => login_catalog_provider(provider, storage).await,
         LoginTarget::Custom => login_custom(storage).await,
     }
 }
@@ -476,7 +475,7 @@ pub async fn auth_logout(provider: &str, storage: &StateDir) -> Result<()> {
             let removed_key =
                 delete_provider_credentials(storage, &slug).context("delete credentials")?;
             let removed_login = {
-                let _lock = lock_credentials(storage, &slug);
+                let _lock = lock_credentials_async(storage, &slug).await;
                 delete_plugin_auth(storage, &slug).context("delete plugin login")?
             };
             if removed_key {
@@ -628,7 +627,10 @@ pub async fn models(
     let mut refresh_failure = None;
     if refresh {
         match maki_providers::refresh_catalog().await {
-            Ok(()) => eprintln!("models.dev catalog has been refreshed"),
+            Ok(true) => eprintln!("models.dev catalog has been refreshed"),
+            Ok(false) => eprintln!(
+                "models.dev cache has been refreshed; plugins had already loaded the catalog, so the next run lists the new one"
+            ),
             Err(e) => refresh_failure = Some(e),
         }
     }
@@ -639,7 +641,7 @@ pub async fn models(
             for model in batch.models {
                 println!("{model}");
             }
-            for warning in batch.warnings {
+            if let ProviderStatus::Failed(warning) = batch.status {
                 eprintln!("warning: {warning}");
             }
         },
@@ -764,7 +766,7 @@ pub async fn prompt(
             workflow: false,
             mcp: false,
         };
-        let defs = reg.definitions(&vars, &ctx, true);
+        let defs = reg.described_definitions(&vars, &ctx, true, true).await;
         if names {
             for name in defs
                 .as_array()

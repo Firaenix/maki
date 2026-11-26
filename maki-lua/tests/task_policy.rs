@@ -63,7 +63,7 @@ const SECOND_CALL_ID: &str = "toolu_second";
 const MOVED_RECEIPT: &str = "Subagent parked";
 const WAITING_FOR_SLOT: &str = "waiting for a free subagent slot";
 /// Mirrors the task plugin's `FOREGROUND_NOTE` wording.
-const FOREGROUND_NOTE_HEAD: &str = "Could not start in the background (";
+const FOREGROUND_NOTE_HEAD: &str = "[Could not start in the background (";
 const FOREGROUND_NOTE_TAIL: &str = "Ran in the foreground.";
 
 const SCENARIO_PLAIN: &str = "plain";
@@ -812,7 +812,7 @@ fn reply_text(done: ToolDoneEvent) -> String {
 fn a_moved_task_keeps_its_slot_and_the_next_task_waits_visibly() {
     let mut opts = serde_json::Map::new();
     opts.insert("max_concurrent".into(), json!(1));
-    let (reg, host) = load_task_host_with_opts(opts);
+    let (reg, mut host) = load_task_host_with_opts(opts);
     let mut ui = host.take_ui_action_rx().unwrap();
     let chat = Chat::live();
     let (_run_trigger, run) = CancelToken::new();

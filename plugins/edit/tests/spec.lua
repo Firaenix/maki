@@ -17,9 +17,32 @@ case("exact_match", function()
   has(result, R)
 end)
 
+case("only_span_fuzzy_matches_are_reported_as_approximate", function()
+  local _, _, exact = fr.replace("fn foo() {}", "fn foo() {}", R, false)
+  eq(exact, false)
+  local _, _, collapsed = fr.replace("let   x  =   1;", "let x = 1;", R, false)
+  eq(collapsed, false)
+  local _, _, indented = fr.replace("    fn f() {}", "fn f() {}", R, false)
+  eq(indented, false)
+  local _, _, escaped = fr.replace('let s = "hello\nworld";', 'let s = "hello\\nworld";', R, false)
+  eq(escaped, false)
+  local _, _, anchored = fr.replace(
+    "fn h() {\n    validate();\n    process();\n    save();\n    log();\n    respond();\n}",
+    "fn h() {\n    validate();\n    WRONG();\n    save();\n    log();\n    respond();\n}",
+    R,
+    false
+  )
+  eq(anchored, true)
+end)
+
 case("trimmed_boundary", function()
   local result = fr.replace("fn foo() {}", "\nfn foo() {}\n", R, false)
   has(result, R)
+end)
+
+case("boundary_trimmed_edits_keep_their_indentation", function()
+  local result = fr.replace("foo:\n  bar\nbaz", "\nfoo:\n  bar\n", "\nfoo:\n  qux\n", false)
+  eq(result, "\nfoo:\n  qux\n\nbaz")
 end)
 
 case("different_indentation", function()
@@ -158,20 +181,20 @@ case("escaped_tab", function()
   has(result, R)
 end)
 
-case("block_anchor_fuzzy_middle", function()
-  local result = fr.replace(
+case("a_middle_that_is_half_stale_is_no_match", function()
+  local _, err = fr.replace(
     "fn test() {\n    let x = 1;\n    let y = 2;\n}",
     "fn test() {\n    let x = 99;\n    let y = 2;\n}",
     R,
     false
   )
-  has(result, R)
+  eq(err, NO_MATCH)
 end)
 
 case("context_aware_partial_middle", function()
   local result = fr.replace(
-    "fn h() {\n    validate();\n    process();\n    save();\n    respond();\n}",
-    "fn h() {\n    validate();\n    WRONG();\n    save();\n    respond();\n}",
+    "fn h() {\n    validate();\n    process();\n    save();\n    log();\n    respond();\n}",
+    "fn h() {\n    validate();\n    WRONG();\n    save();\n    log();\n    respond();\n}",
     R,
     false
   )
@@ -190,7 +213,7 @@ case("ambiguous_multiple_matches", function()
   eq(err, MULTIPLE_MATCHES)
 end)
 
-case("block_anchor_picks_best_among_multiple", function()
+case("context_aware_skips_the_span_with_a_stale_middle", function()
   local content = "fn a() {\n    unrelated();\n}\nfn a() {\n    target();\n}"
   local result = fr.replace(content, "fn a() {\n    target();\n}", R, false)
   has(result, R)
@@ -208,7 +231,7 @@ case("strip_common_indent_skips_blank_lines", function()
   has(result, R)
 end)
 
-case("block_anchor_no_panic_short_content", function()
+case("content_shorter_than_the_old_string_is_no_match", function()
   local search = "fn test() {\n    body();\n}"
   for _, content in ipairs({
     "aaa\nbbb\nccc\nfn test() {",
@@ -217,7 +240,42 @@ case("block_anchor_no_panic_short_content", function()
   }) do
     local result, err = fr.replace(content, search, "x", false)
     eq(result, nil)
+    eq(err, NO_MATCH)
   end
+end)
+
+-- A stale old_string whose last line is a lone `}` used to anchor onto the
+-- first `}` after its first line, splicing the whole new_string into that
+-- short span and leaving the block's tail duplicated behind.
+case("a_stale_block_end_does_not_anchor_a_shorter_span", function()
+  local content = table.concat({
+    "impl Widget {",
+    "    fn tick(&mut self) {",
+    "        let counter = self.ticks;",
+    "        if counter > 0 {",
+    "            return;",
+    "        }",
+    "        self.turn(counter);",
+    "    }",
+    "}",
+    "",
+  }, "\n")
+  local search = table.concat({
+    "    fn tick(&mut self) {",
+    "        let counter = self.ticks;",
+    "        if counter > 0 {",
+    "            return;",
+    "        }",
+    "        self.turn(counter + self.spool());",
+    "    }",
+    "",
+    "    fn stop(&mut self) {",
+    "        self.motor.halt();",
+    "    }",
+  }, "\n")
+  local result, err = fr.replace(content, search, R, false)
+  eq(result, nil)
+  eq(err, NO_MATCH)
 end)
 
 case("escape_normalized_also_fixes_new_string", function()
@@ -358,6 +416,63 @@ case("replace_lines_range_replace_and_delete", function()
   has(e2, "out of range")
   local _, e3 = replace_lines(content, 3, 2, "x")
   has(e3, "out of range")
+end)
+
+local shift_note = require("edit_helpers").shift_note
+
+case("shift_note_says_how_far_the_lines_below_moved", function()
+  local content = "aaa\nbbb\nccc\nddd\n"
+  eq(shift_note(content, "aaa\nXXX\nYYY\nZZZ\nccc\nddd\n"), "lines after 2 shifted by +2")
+  eq(shift_note(content, "aaa\nddd\n"), "lines after 3 shifted by -2")
+  eq(shift_note(content, "TOP\naaa\nbbb\nccc\nddd\n"), "lines after 0 shifted by +1")
+  eq(shift_note("a\r\nb\r\nc\r\n", "a\r\nc\r\n"), "lines after 2 shifted by -1")
+end)
+
+case("shift_note_is_silent_when_no_line_below_moved", function()
+  local content = "aaa\nbbb\nccc\n"
+  eq(shift_note(content, "aaa\nXXX\nccc\n"), nil)
+  eq(shift_note(content, "aaa\nbbb\nccc\nddd\n"), nil)
+  eq(shift_note(content, "aaa\n"), nil)
+end)
+
+local STALE_MSG = "line numbers are stale"
+
+case("replace_lines_accepts_the_expected_first_line", function()
+  local content = "aaa\n  bbb\n\nddd\n"
+  eq(replace_lines(content, 2, 2, "XXX", "bbb"), "aaa\nXXX\n\nddd\n")
+  eq(replace_lines(content, 2, 2, "XXX", "\tbbb  "), "aaa\nXXX\n\nddd\n")
+  eq(replace_lines(content, 3, 3, "XXX", ""), "aaa\n  bbb\nXXX\nddd\n")
+end)
+
+case("replace_lines_accepts_a_line_as_read_cut_it", function()
+  local content = "aaa\n  a long line that read cut short\nccc\n"
+  eq(replace_lines(content, 2, 2, "XXX", "a long line..."), "aaa\nXXX\nccc\n")
+
+  local _, other_line = replace_lines(content, 1, 1, "XXX", "a long line...")
+  has(other_line, "at line 2")
+end)
+
+case("replace_lines_refuses_stale_line_numbers", function()
+  local content = "aaa\nbbb\nccc\nbbb\nddd\n"
+
+  local r1, shifted_down = replace_lines(content, 1, 1, "XXX", "bbb")
+  eq(r1, nil)
+  has(shifted_down, STALE_MSG)
+  has(shifted_down, 'line 1 is "aaa", not "bbb"')
+  has(shifted_down, "at line 2")
+
+  local _, nearest_wins = replace_lines(content, 5, 5, "XXX", "bbb")
+  has(nearest_wins, "at line 4")
+
+  local _, gone = replace_lines(content, 1, 1, "XXX", "zzz")
+  has(gone, STALE_MSG)
+  has(gone, "read the file again")
+
+  local _, blank = replace_lines("aaa\n\n", 1, 1, "XXX", "")
+  has(blank, "read the file again")
+
+  local _, range_first = replace_lines(content, 9, 9, "XXX", "bbb")
+  has(range_first, "out of range")
 end)
 
 case("replace_lines_insert_mode", function()

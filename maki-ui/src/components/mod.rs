@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use maki_agent::AgentInput;
 use maki_agent::{BufferSnapshot, TaskEnd, ToolDoneEvent, ToolInput, ToolOutput};
-use maki_lua::{PackCommand, PackPlan};
+use maki_lua::{ChatItemStatus, PackCommand, PackPlan};
 use maki_providers::{ImageSource, Message, ModelTier};
 use ratatui::Frame;
 use ratatui::buffer::{Buffer, CellWidth};
@@ -320,6 +320,8 @@ pub enum Action {
     Compact(Option<String>),
     ToggleMcp(String, bool),
     OpenEditor(PathBuf),
+    /// A URL to open in the user's browser, e.g. a provider's keys page.
+    OpenUrl(String),
     EditInputInEditor,
     Btw(String),
     PreparePack(PackCommand),
@@ -560,12 +562,23 @@ pub struct ToolRole {
     pub name: Arc<str>,
 }
 
+/// An item a plugin owns, e.g. a job it started. It is not a tool call: it
+/// outlives the turn that started it, so a turn settling or the user
+/// pressing Esc leaves it alone.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginItemRole {
+    pub id: String,
+    pub status: ChatItemStatus,
+    pub name: Arc<str>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum DisplayRole {
     User,
     Assistant,
     Thinking,
     Tool(Box<ToolRole>),
+    PluginItem(Box<PluginItemRole>),
     Error,
     Done,
     /// One dim line about what the host told the model on the user's behalf.
@@ -582,7 +595,7 @@ impl DisplayRole {
 }
 
 #[cfg(test)]
-use maki_providers::ModelPricing;
+use maki_providers::{FactSources, ModelPricing};
 
 #[cfg(test)]
 pub(crate) const TEST_CONTEXT_WINDOW: u32 = 200_000;
@@ -608,6 +621,7 @@ pub(crate) fn test_model() -> maki_providers::Model {
         discovered_free: false,
         max_output_tokens: Some(8192),
         turn_output_tokens: None,
+        sources: FactSources::default(),
         context_window: TEST_CONTEXT_WINDOW,
         thinking_fields: None,
     }

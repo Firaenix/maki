@@ -7,7 +7,7 @@
 use std::fmt::Display;
 
 use maki_agent::{AgentEvent, DoneReason, Envelope};
-use maki_providers::TokenUsage;
+use maki_providers::{Message, TokenUsage};
 use serde::Serialize;
 use serde_json::Value;
 use strum::{EnumDiscriminants, EnumString, IntoStaticStr, VariantArray};
@@ -15,6 +15,10 @@ use strum::{EnumDiscriminants, EnumString, IntoStaticStr, VariantArray};
 use crate::EventHandle;
 
 const SESSION_ID: &str = "session_id";
+
+/// Where a `TurnComplete` reply lands, in the payload and in
+/// [`HostEventKind::fields`] alike.
+pub(crate) const MESSAGE_KEY: &str = "message";
 
 /// Every event the host fires, one variant each, and [`EventHandle::fire`]
 /// takes nothing else. Each field lands in the payload, so
@@ -40,6 +44,20 @@ pub enum HostEvent<'a> {
         input: Option<&'a Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
+    },
+    TurnComplete {
+        /// Beside the payload JSON, which would drop its nulls and inline
+        /// base64 for every image. The Lua thread builds the table plugins know.
+        #[serde(skip)]
+        message: &'a Message,
+        /// Absent when the host does not know the gauge.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context_size: Option<u32>,
+        context_window: u32,
+        /// The task id of the subagent that ran the turn, so a listener can
+        /// tell whose context it is watching. Absent for the main session.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<&'a str>,
     },
     AutoCompacting {
         context_size: u32,
@@ -78,6 +96,8 @@ pub enum HostEvent<'a> {
     SessionStatusChanged {
         title: &'a str,
         status: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        attention: Option<String>,
         focused: bool,
     },
     SessionTitleChanged {
@@ -101,6 +121,20 @@ pub enum HostEvent<'a> {
     },
     TaskFocusChanged {
         id: &'a str,
+    },
+    JobStart {
+        id: u32,
+        plugin: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<&'a str>,
+        command: &'a str,
+        shared: bool,
+    },
+    JobExit {
+        id: u32,
+        plugin: &'a str,
+        exit_code: i32,
+        shared: bool,
     },
     ModelChanged {
         model: Value,
@@ -158,6 +192,15 @@ impl HostEvent<'_> {
         }
         data
     }
+
+    /// The reply the Lua thread sets under [`MESSAGE_KEY`]. No other event
+    /// carries one.
+    pub(crate) fn lua_message(&self) -> Option<&Message> {
+        match self {
+            Self::TurnComplete { message, .. } => Some(message),
+            _ => None,
+        }
+    }
 }
 
 /// The keys of one host event's payload, sorted by whether they are
@@ -186,6 +229,7 @@ impl HostEventKind {
                 &["tool_id", "tool", "is_error", "bytes", "duration_ms"],
             ),
             Self::AutoCompacting => (&[], &["context_size", "context_window"]),
+            Self::TurnComplete => (&[MESSAGE_KEY], &["context_size", "context_window", "id"]),
             Self::CompactionDone => (
                 &["summary"],
                 &[
@@ -211,12 +255,14 @@ impl HostEventKind {
             Self::SessionReset => (&[], &[]),
             Self::SessionEnd => (&[], &["reason", "deadline_ms"]),
             Self::SessionFocusChanged => (&[], &["previous_session_id"]),
-            Self::SessionStatusChanged => (&[], &["title", "status", "focused"]),
+            Self::SessionStatusChanged => (&[], &["title", "status", "attention", "focused"]),
             Self::SessionTitleChanged => (&[], &["title", "focused"]),
             Self::SessionCwdChanged => (&[], &["cwd"]),
             Self::TaskStatusChanged => (&[], &["id", "name", "status", "plugin"]),
             Self::TaskStopped => (&[], &["id", "plugin"]),
             Self::TaskFocusChanged => (&[], &["id"]),
+            Self::JobStart => (&["command"], &["id", "plugin", "name", "shared"]),
+            Self::JobExit => (&[], &["id", "plugin", "exit_code", "shared"]),
             Self::ModelChanged => (&[], &["model", "previous_spec"]),
             Self::InputChanged => (
                 &["text"],
@@ -241,26 +287,31 @@ pub fn host_event_fields(event: &str) -> Option<EventFields> {
     event.parse().ok().map(HostEventKind::fields)
 }
 
-pub fn dispatch(
-    handle: &EventHandle,
-    session_id: &dyn Display,
-    envelope: &Envelope,
-    subagent_bounded: bool,
-) {
-    if let Some(event) = host_event_for(&envelope.event, subagent_bounded) {
+pub fn dispatch(handle: &EventHandle, session_id: &dyn Display, envelope: &Envelope) {
+    let task_id = envelope
+        .subagent
+        .as_ref()
+        .map(|s| s.parent_tool_use_id.as_str());
+    if let Some(event) = host_event_for(&envelope.event, task_id) {
         handle.fire(Some(session_id), event);
     }
 }
 
 /// Subagent envelopes carry the parent's `session_id`, so firing on them too
 /// would double count every budget and every tool the parent already reported,
-/// and a subagent compacting would look like the main context shrank.
+/// and a subagent compacting would look like the main context shrank. The one
+/// exception is `TurnComplete`: it carries the subagent's own gauge, so
+/// context can be watched mid-turn, and `data.id` says whose context it is
+/// (absent for the main session's own turns).
 ///
 /// This runs on every envelope, streaming deltas included, and almost all of
 /// them map to nothing, so the event borrows and only a mapped one pays for
 /// a payload.
-pub fn host_event_for(event: &AgentEvent, subagent_bounded: bool) -> Option<HostEvent<'_>> {
-    if subagent_bounded {
+pub fn host_event_for<'a>(
+    event: &'a AgentEvent,
+    task_id: Option<&'a str>,
+) -> Option<HostEvent<'a>> {
+    if task_id.is_some() && !matches!(event, AgentEvent::TurnComplete(_)) {
         return None;
     }
     match event {
@@ -275,6 +326,12 @@ pub fn host_event_for(event: &AgentEvent, subagent_bounded: bool) -> Option<Host
             bytes: e.output.as_text().len(),
             input: e.call.as_ref().map(|call| &call.input),
             duration_ms: e.call.as_ref().map(|call| call.duration.as_millis() as u64),
+        }),
+        AgentEvent::TurnComplete(e) => Some(HostEvent::TurnComplete {
+            message: &e.message,
+            context_size: e.context_size,
+            context_window: e.context_window,
+            id: task_id,
         }),
         AgentEvent::AutoCompacting {
             context_size,
@@ -324,6 +381,7 @@ fn turn_end_reason(reason: DoneReason) -> Option<&'static str> {
         DoneReason::EndTurn => Some("finished"),
         DoneReason::MaxTokens => Some("max_tokens"),
         DoneReason::MaxTurns => Some("max_turns"),
+        DoneReason::MaxBudget => Some("max_budget"),
         DoneReason::Cancelled => Some("cancelled"),
         DoneReason::Dropped => Some("dropped"),
         DoneReason::Compact => None,
@@ -332,11 +390,14 @@ fn turn_end_reason(reason: DoneReason) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, LazyLock};
 
     use std::time::Duration;
 
-    use maki_agent::{CallRecord, RunTotals, ToolDoneEvent, ToolOutput, ToolStartEvent};
+    use maki_agent::{
+        CallRecord, RunTotals, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
+    };
+    use maki_providers::{ContentBlock, Message, Role};
     use serde_json::json;
     use test_case::test_case;
 
@@ -348,7 +409,7 @@ mod tests {
     const TOOL_MILLIS: u64 = 42;
 
     fn fired(event: &AgentEvent) -> Option<(&'static str, Value)> {
-        host_event_for(event, false).map(|e| (e.name(), e.payload(Some(&SESSION))))
+        host_event_for(event, None).map(|e| (e.name(), e.payload(Some(&SESSION))))
     }
 
     fn done(reason: DoneReason) -> AgentEvent {
@@ -365,6 +426,18 @@ mod tests {
             num_turns: 4,
             reason,
         }
+    }
+
+    fn turn_complete(message: Message, context_size: Option<u32>) -> AgentEvent {
+        AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+            message,
+            usage: TokenUsage::default(),
+            model: "m".into(),
+            cost: None,
+            subsidised_list_cost: None,
+            context_size,
+            context_window: 200_000,
+        }))
     }
 
     fn tool_done() -> AgentEvent {
@@ -405,6 +478,7 @@ mod tests {
                 output: None,
             })),
             tool_done(),
+            turn_complete(no_reply(), Some(150_000)),
             AgentEvent::AutoCompacting {
                 context_size: 1,
                 context_window: 2,
@@ -428,6 +502,7 @@ mod tests {
     #[test_case(DoneReason::EndTurn, Some("finished") ; "finished")]
     #[test_case(DoneReason::MaxTokens, Some("max_tokens") ; "max_tokens")]
     #[test_case(DoneReason::MaxTurns, Some("max_turns") ; "max_turns")]
+    #[test_case(DoneReason::MaxBudget, Some("max_budget") ; "max_budget")]
     #[test_case(DoneReason::Cancelled, Some("cancelled") ; "cancelled")]
     #[test_case(DoneReason::Dropped, Some("dropped") ; "dropped")]
     #[test_case(DoneReason::Compact, None ; "manual_compact_is_not_a_turn")]
@@ -462,6 +537,23 @@ mod tests {
 
     const SAMPLE_TEXT: &str = "some text";
 
+    /// A message the model could actually return, so a fixture never pins a
+    /// payload the agent cannot produce.
+    fn no_reply() -> Message {
+        Message {
+            role: Role::Assistant,
+            ..Default::default()
+        }
+    }
+
+    static SAMPLE_MESSAGE: LazyLock<Message> = LazyLock::new(|| Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::Text {
+            text: SAMPLE_TEXT.into(),
+        }],
+        ..Default::default()
+    });
+
     /// One of each event with every optional field set, so the payload shows
     /// every key the event can carry. The match is exhaustive, so a new event
     /// does not compile until it is sampled here.
@@ -484,6 +576,12 @@ mod tests {
             HostEventKind::AutoCompacting => HostEvent::AutoCompacting {
                 context_size: 0,
                 context_window: 0,
+            },
+            HostEventKind::TurnComplete => HostEvent::TurnComplete {
+                message: &SAMPLE_MESSAGE,
+                context_size: Some(0),
+                context_window: 0,
+                id: Some(SAMPLE_TEXT),
             },
             HostEventKind::CompactionDone => HostEvent::CompactionDone {
                 context_size_before: 0,
@@ -515,6 +613,7 @@ mod tests {
             HostEventKind::SessionStatusChanged => HostEvent::SessionStatusChanged {
                 title: SAMPLE_TEXT,
                 status: SAMPLE_TEXT,
+                attention: Some(SAMPLE_TEXT.into()),
                 focused: true,
             },
             HostEventKind::SessionTitleChanged => HostEvent::SessionTitleChanged {
@@ -533,6 +632,19 @@ mod tests {
                 plugin: Some(SAMPLE_TEXT),
             },
             HostEventKind::TaskFocusChanged => HostEvent::TaskFocusChanged { id: SAMPLE_TEXT },
+            HostEventKind::JobStart => HostEvent::JobStart {
+                id: 0,
+                plugin: SAMPLE_TEXT,
+                name: Some(SAMPLE_TEXT),
+                command: SAMPLE_TEXT,
+                shared: true,
+            },
+            HostEventKind::JobExit => HostEvent::JobExit {
+                id: 0,
+                plugin: SAMPLE_TEXT,
+                exit_code: 0,
+                shared: true,
+            },
             HostEventKind::ModelChanged => HostEvent::ModelChanged {
                 model: json!({}),
                 previous_spec: SAMPLE_TEXT.into(),
@@ -594,12 +706,58 @@ mod tests {
     }
 
     #[test]
-    fn subagent_envelopes_fire_nothing() {
+    fn turn_complete_carries_the_run_gauge() {
+        let data = fired(&turn_complete(no_reply(), Some(150_000)))
+            .expect("TurnComplete fires")
+            .1;
+        assert_eq!(data["context_size"], 150_000);
+        assert_eq!(data["context_window"], 200_000);
+        assert!(
+            data.get("id").is_none(),
+            "the main session has no task to answer"
+        );
+    }
+
+    /// The reply is not JSON: only the Lua thread can build the table a
+    /// plugin expects, so it travels beside the payload.
+    #[test]
+    fn turn_complete_sends_its_reply_beside_the_payload() {
+        let event = turn_complete(SAMPLE_MESSAGE.clone(), Some(150_000));
+        let fired = host_event_for(&event, None).expect("TurnComplete fires");
+        assert_eq!(fired.lua_message(), Some(&*SAMPLE_MESSAGE));
+        assert!(
+            fired.payload(Some(&SESSION)).get(MESSAGE_KEY).is_none(),
+            "a serialized reply would drop nulls and inline base64"
+        );
+    }
+
+    #[test]
+    fn turn_complete_omits_an_unknown_gauge() {
+        let data = fired(&turn_complete(no_reply(), None))
+            .expect("TurnComplete fires")
+            .1;
+        assert!(
+            data.get("context_size").is_none(),
+            "an unknown gauge is absent, not zero"
+        );
+    }
+
+    #[test]
+    fn subagent_envelopes_fire_only_turn_complete() {
         for event in every_event() {
-            assert!(
-                host_event_for(&event, true).is_none(),
+            assert_eq!(
+                host_event_for(&event, Some("toolu_sub")).is_some(),
+                matches!(event, AgentEvent::TurnComplete(_)),
                 "{event:?} leaked from a subagent"
             );
         }
+    }
+
+    #[test]
+    fn subagent_turn_complete_carries_its_reply() {
+        let event = turn_complete(SAMPLE_MESSAGE.clone(), Some(150_000));
+        let fired = host_event_for(&event, Some("toolu_sub")).expect("TurnComplete fires");
+        assert_eq!(fired.payload(Some(&SESSION))["id"], "toolu_sub");
+        assert_eq!(fired.lua_message(), Some(&*SAMPLE_MESSAGE));
     }
 }

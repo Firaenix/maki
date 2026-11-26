@@ -61,7 +61,7 @@ declare maki: {
   },
   fn: {
     jobstart: @checked (cmd: any, opts: any) -> (number?, string?),
-    jobstop: @checked (job_id: number) -> (),
+    jobstop: @checked (job_id: number, session: string?) -> (),
     jobforget: @checked (job_id: number) -> (),
     jobwait: @checked (job_id: number, timeout_ms: number?) -> (any, string?),
     jobinfo: @checked (job_id: number) -> (any, string?),
@@ -95,7 +95,8 @@ declare maki: {
     rm: @checked (path: string, opts: any) -> (true?, string?),
     mkdir: @checked (path: string, opts: any) -> (true?, string?),
     glob: @checked (pattern: any, opts: any) -> (any, string?),
-    grep: @checked (pattern: string, opts: any) -> (any, string?),
+    grep: @checked (pattern: string, opts: any) -> (any, string?, any),
+    grep_count: @checked (pattern: string, opts: any) -> (any, string?),
     fuzzy_files: @checked (opts: any) -> (any, string?),
   },
   image: {
@@ -144,6 +145,7 @@ declare maki: {
   provider: {
     register: @checked (spec: any) -> (),
     is_selected: @checked (slug: string) -> (boolean),
+    usage: @checked (slug: string) -> (any, string?),
     http_error: @checked (res: any) -> (any),
     auth: {
       get: @checked (slug: string) -> (any, string?),
@@ -167,6 +169,7 @@ declare maki: {
     cancel: @checked (opts: any) -> (string?, string?),
     notify: @checked (text: string, opts: any) -> (boolean?, string?),
     set_mode: @checked (mode: string, opts: any) -> (boolean?, string?),
+    request_compact: @checked (opts: any) -> (boolean?, string?),
     set_title: @checked (opts: any) -> (boolean?, string?),
     data_dir: @checked (opts: any) -> (string?, string?),
     answer_permission: @checked (request_id: number, answer: any) -> (boolean?, string?),
@@ -180,7 +183,8 @@ declare maki: {
     messages: @checked (ctx: any, id: string, opts: any) -> (any, string?),
   },
   text: {
-    html_to_markdown: @checked (html: string) -> (string?, string?),
+    html_to_markdown: @checked (html: string, opts: any) -> (string?, string?),
+    html_to_text: @checked (html: string, opts: any) -> (string?, string?),
     to_utf8: @checked (s: string) -> (string),
     fuzzy: @checked (needle: string, haystack: string, opts: any) -> (number?, any),
     fuzzy_list: @checked (needle: string, haystacks: any, opts: any) -> (any),
@@ -218,6 +222,7 @@ declare maki: {
     display_width: @checked (text: string) -> (number),
     truncate_text: @checked (text: string, max_width: number) -> (any),
     set_mode: @checked (mode: string) -> (),
+    set_cursor_shape: @checked (shape: string, opts: any) -> (),
     flash: @checked (msg: string) -> (),
     action: @checked (name: string) -> (boolean?, string?),
     open_editor: @checked (path: string) -> (number),
@@ -229,11 +234,24 @@ declare maki: {
     input_decorate: @checked (opts: any) -> (any, string?),
     input_edit: @checked (opts: any) -> (any, string?),
     input_submit: @checked (opts: any) -> (boolean?, string?),
+    chat_item: @checked (opts: any) -> (),
+    status_segment: @checked (opts: any) -> (),
   },
   uv: {
     cwd: @checked () -> (string?),
     os_homedir: @checked () -> (string?),
     os_getenv: @checked (name: string) -> (string?),
+    gettimeofday: @checked () -> (number, number),
+  },
+  version: {
+    parse: @checked (version: string, opts: any) -> (any, string?),
+    cmp: @checked (v1: any, v2: any) -> (number?, string?),
+    eq: @checked (v1: any, v2: any) -> (boolean?, string?),
+    lt: @checked (v1: any, v2: any) -> (boolean?, string?),
+    le: @checked (v1: any, v2: any) -> (boolean?, string?),
+    gt: @checked (v1: any, v2: any) -> (boolean?, string?),
+    ge: @checked (v1: any, v2: any) -> (boolean?, string?),
+    last: @checked (versions: any) -> (any, string?),
   },
   yaml: {
     encode: @checked (value: any) -> (string?, string?),

@@ -839,18 +839,13 @@ impl PermissionPrompt {
         let mut field = None;
         if *state == PromptState::DenyEditing {
             let (text, cursor_byte, tail_style) = if buffer.value().is_empty() {
-                (DEFAULT_DENY_GUIDANCE, 0, t.tool_dim)
+                (DEFAULT_DENY_GUIDANCE, 0, t.input_placeholder)
             } else {
                 (buffer.value(), buffer.cursor_byte(), Style::default())
             };
             let prefix = vec![Span::raw("  "), Span::styled("guide ", label_style)];
-            let (line, caret) = field_line(
-                prefix,
-                text,
-                cursor_byte,
-                Style::new().reversed(),
-                tail_style,
-            );
+            let (line, caret) =
+                field_line(prefix, text, cursor_byte, tail_style.reversed(), tail_style);
             field = Some(FieldCaret {
                 row: lines.len(),
                 caret,
@@ -1060,7 +1055,7 @@ mod tests {
     const SUB_AGENT: &str = "sub-2";
 
     fn open_with(prompt: &mut PermissionPrompt, project_answers: ProjectAnswers) {
-        prompt.push(
+        let _ = prompt.push(
             MAIN_ID.into(),
             ToolKey::native("bash"),
             vec!["execute".into()],
@@ -1072,7 +1067,7 @@ mod tests {
     }
 
     fn push_subagent_ask(prompt: &mut PermissionPrompt) {
-        prompt.push(
+        let _ = prompt.push(
             SUB_ID.into(),
             ToolKey::native("read"),
             vec!["/tmp/x".into()],
@@ -1116,7 +1111,7 @@ mod tests {
         crate::highlight::warmup();
         let mut prompt = PermissionPrompt::new();
         let script = "for f in *.rs; do\n  echo \"$f\"\ndone";
-        prompt.push(
+        let _ = prompt.push(
             MAIN_ID.into(),
             ToolKey::native("bash"),
             vec![script.into()],
@@ -1135,7 +1130,7 @@ mod tests {
     #[test]
     fn non_bash_scope_stays_one_row() {
         let mut prompt = PermissionPrompt::new();
-        prompt.push(
+        let _ = prompt.push(
             MAIN_ID.into(),
             ToolKey::native("read"),
             vec!["a\nb".into()],
@@ -1217,7 +1212,7 @@ mod tests {
     #[test]
     fn wildcard_tool_key_opens() {
         let mut prompt = PermissionPrompt::new();
-        prompt.push(
+        let _ = prompt.push(
             MAIN_ID.into(),
             ToolKey::Wildcard,
             vec![],
@@ -1356,7 +1351,7 @@ mod tests {
     #[test_case(None ; "without_reason")]
     fn why_row_follows_reason(reason: Option<&str>) {
         let mut prompt = PermissionPrompt::new();
-        prompt.push(
+        let _ = prompt.push(
             MAIN_ID.into(),
             ToolKey::native("bash"),
             vec!["execute".into()],
@@ -1379,82 +1374,8 @@ mod tests {
         assert_eq!(why_row.as_deref(), reason);
     }
 
-    fn queue_main_and_subagent() -> (PermissionPrompt, u64, u64) {
-        let mut prompt = PermissionPrompt::new();
-        let main = prompt.push(
-            MAIN_ID.into(),
-            ToolKey::native("bash"),
-            vec!["execute".into()],
-            None,
-            ProjectAnswers::Saved,
-            None,
-            None,
-        );
-        let sub = prompt.push(
-            SUB_ID.into(),
-            ToolKey::native("read"),
-            vec!["/tmp/x".into()],
-            Some(SUB_AGENT.into()),
-            ProjectAnswers::Saved,
-            None,
-            None,
-        );
-        (prompt, main, sub)
-    }
-
-    #[test]
-    fn answer_by_handle_settles_a_queued_ask_and_leaves_the_front() {
-        let (mut prompt, _, sub) = queue_main_and_subagent();
-        let answered = prompt
-            .answer_by_handle(sub, PermissionAnswer::AllowOnce)
-            .unwrap();
-        assert_eq!(
-            (answered.id.as_str(), answered.subagent_id.as_deref()),
-            (SUB_ID, Some(SUB_AGENT))
-        );
-        let front = prompt.handle_key(key(KeyCode::Char('y'))).unwrap();
-        assert_eq!(front.id, MAIN_ID, "the ask on screen is still the user's");
-    }
-
-    #[test]
-    fn answer_by_handle_on_the_front_resets_what_the_user_was_typing() {
-        let (mut prompt, main, sub) = queue_main_and_subagent();
-        prompt.handle_key(key(KeyCode::Char('n')));
-        assert_eq!(prompt.state, PromptState::DenyEditing);
-        prompt
-            .answer_by_handle(main, PermissionAnswer::Deny)
-            .unwrap();
-        assert_eq!(prompt.state, PromptState::Normal);
-        assert_eq!(prompt.handles(), vec![sub]);
-    }
-
-    #[test]
-    fn the_second_answer_to_one_ask_loses() {
-        let (mut prompt, main, _) = queue_main_and_subagent();
-        prompt.handle_key(key(KeyCode::Char('y'))).unwrap();
-        assert!(
-            prompt
-                .answer_by_handle(main, PermissionAnswer::Deny)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn handles_are_unique_across_prompts() {
-        let (_, first, _) = queue_main_and_subagent();
-        let (_, second, _) = queue_main_and_subagent();
-        assert_ne!(first, second, "two sessions must never share a handle");
-    }
-
-    #[test]
-    fn drop_subagent_reports_the_asks_it_dropped() {
-        let (mut prompt, main, sub) = queue_main_and_subagent();
-        assert_eq!(prompt.drop_subagent(SUB_AGENT), vec![sub]);
-        assert_eq!(prompt.handles(), vec![main]);
-    }
-
     fn push_bash(prompt: &mut PermissionPrompt, command: &str) {
-        prompt.push(
+        let _ = prompt.push(
             MAIN_ID.into(),
             ToolKey::native("bash"),
             vec![command.into()],
@@ -1626,7 +1547,7 @@ mod tests {
     }
 
     fn push_preview(prompt: &mut PermissionPrompt, tool: &str, preview: PermissionPreview) {
-        prompt.push(
+        let _ = prompt.push(
             MAIN_ID.into(),
             ToolKey::native(tool),
             vec![preview.path().to_owned()],
@@ -1763,5 +1684,79 @@ mod tests {
         open_with(&mut prompt, ProjectAnswers::Saved);
         prompt.handle_key(press);
         assert_eq!(prompt.expanded, expands);
+    }
+
+    fn queue_main_and_subagent() -> (PermissionPrompt, u64, u64) {
+        let mut prompt = PermissionPrompt::new();
+        let main = prompt.push(
+            MAIN_ID.into(),
+            ToolKey::native("bash"),
+            vec!["execute".into()],
+            None,
+            ProjectAnswers::Saved,
+            None,
+            None,
+        );
+        let sub = prompt.push(
+            SUB_ID.into(),
+            ToolKey::native("read"),
+            vec!["/tmp/x".into()],
+            Some(SUB_AGENT.into()),
+            ProjectAnswers::Saved,
+            None,
+            None,
+        );
+        (prompt, main, sub)
+    }
+
+    #[test]
+    fn answer_by_handle_settles_a_queued_ask_and_leaves_the_front() {
+        let (mut prompt, _, sub) = queue_main_and_subagent();
+        let answered = prompt
+            .answer_by_handle(sub, PermissionAnswer::AllowOnce)
+            .unwrap();
+        assert_eq!(
+            (answered.id.as_str(), answered.subagent_id.as_deref()),
+            (SUB_ID, Some(SUB_AGENT))
+        );
+        let front = prompt.handle_key(key(KeyCode::Char('y'))).unwrap();
+        assert_eq!(front.id, MAIN_ID, "the ask on screen is still the user's");
+    }
+
+    #[test]
+    fn answer_by_handle_on_the_front_resets_what_the_user_was_typing() {
+        let (mut prompt, main, sub) = queue_main_and_subagent();
+        prompt.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(prompt.state, PromptState::DenyEditing);
+        prompt
+            .answer_by_handle(main, PermissionAnswer::Deny)
+            .unwrap();
+        assert_eq!(prompt.state, PromptState::Normal);
+        assert_eq!(prompt.handles(), vec![sub]);
+    }
+
+    #[test]
+    fn the_second_answer_to_one_ask_loses() {
+        let (mut prompt, main, _) = queue_main_and_subagent();
+        prompt.handle_key(key(KeyCode::Char('y'))).unwrap();
+        assert!(
+            prompt
+                .answer_by_handle(main, PermissionAnswer::Deny)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn handles_are_unique_across_prompts() {
+        let (_, first, _) = queue_main_and_subagent();
+        let (_, second, _) = queue_main_and_subagent();
+        assert_ne!(first, second, "two sessions must never share a handle");
+    }
+
+    #[test]
+    fn drop_subagent_reports_the_asks_it_dropped() {
+        let (mut prompt, main, sub) = queue_main_and_subagent();
+        assert_eq!(prompt.drop_subagent(SUB_AGENT), vec![sub]);
+        assert_eq!(prompt.handles(), vec![main]);
     }
 }

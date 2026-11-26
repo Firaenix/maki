@@ -1,12 +1,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::io::BufReader;
+use std::io::Result as IoResult;
 use std::mem;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
-use std::thread;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
@@ -15,18 +14,26 @@ use maki_providers::{shell_command, strip_provider_keys};
 use maki_storage::id::MakiId;
 use mlua::{Function, Lua, RegistryKey, Result as LuaResult};
 use shell_words::join as shell_join;
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::process::Command as AsyncCommand;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::{
     Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, TryAcquireError, watch,
 };
+use tokio::task::JoinHandle;
 
-use crate::api::fs::{Line, MAX_READ_BYTES, expand_tilde, next_line};
+use crate::agent_autocmd::HostEvent;
+use crate::api::fs::{Line, LineCutter, MAX_READ_BYTES, expand_tilde};
+use crate::loader::EventHandle;
 use crate::plugin_permissions::Ceiling;
 use crate::plugin_status::{ErrorSeam, record_callback_error};
 use crate::runtime::{Narrowed, strip_traceback, with_jobs};
 
 const DEFAULT_TAIL: usize = 20;
 pub(crate) const MAX_TAIL_LINES: usize = 1024;
+const SHARED_SCOPE_ERR: &str = "jobstart: shared requires a session scope";
+/// The wait thread reports unreapable children as -1; a killed job reuses it.
+const JOB_KILLED_EXIT_CODE: i32 = -1;
 const MAX_COMPLETED_SESSION_JOBS: usize = 256;
 
 const READER_BUF_SIZE: usize = 8 * 1024;
@@ -41,6 +48,7 @@ const JOB_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 const JOB_QUEUE_RESUME: u32 = JOB_QUEUE_BYTES as u32 / 2;
 const STDOUT_STREAM: &str = "stdout";
 const STDERR_STREAM: &str = "stderr";
+const NO_PID_ERR: &str = "the spawned job has no pid";
 
 /// `agent.shell`, set once from config at startup. Jobs get built far away
 /// from any config, on whatever Lua thread runs the plugin, so they read it here.
@@ -48,6 +56,51 @@ static SHELL: LazyLock<ArcSwap<ShellPreference>> = LazyLock::new(ArcSwap::defaul
 
 pub fn set_shell_preference(shell: ShellPreference) {
     SHELL.store(Arc::new(shell));
+}
+
+/// The `JobStart` event for a session-owned job, or `None` for the transient
+/// task and plugin jobs the autocmds skip.
+fn job_started_event<'a>(
+    job_id: u32,
+    owner: &'a JobOwner,
+    name: &'a Option<String>,
+    command: &'a str,
+    shared: bool,
+) -> Option<(&'a MakiId, HostEvent<'a>)> {
+    let JobOwner::Session { session, plugin } = owner else {
+        return None;
+    };
+    Some((
+        session,
+        HostEvent::JobStart {
+            id: job_id,
+            plugin,
+            name: name.as_deref(),
+            command,
+            shared,
+        },
+    ))
+}
+
+/// The `JobExit` counterpart, same ownership rule.
+fn job_exit_event<'a>(
+    job_id: u32,
+    owner: &'a JobOwner,
+    code: i32,
+    shared: bool,
+) -> Option<(&'a MakiId, HostEvent<'a>)> {
+    let JobOwner::Session { session, plugin } = owner else {
+        return None;
+    };
+    Some((
+        session,
+        HostEvent::JobExit {
+            id: job_id,
+            plugin,
+            exit_code: code,
+            shared,
+        },
+    ))
 }
 
 #[derive(Clone)]
@@ -105,10 +158,10 @@ impl JobCommand {
 }
 
 pub(crate) enum Redirect {
-    /// Piped to a reader thread, so callbacks and tails see the lines.
+    /// Piped to a reader, so callbacks and tails see the lines.
     Capture,
     Discard,
-    /// The child appends to the file on its own: no reader thread, no events,
+    /// The child appends to the file on its own: no reader, no events,
     /// no tail.
     File(PathBuf),
 }
@@ -139,6 +192,9 @@ pub(crate) struct JobSpec {
     pub on_stdout: Option<RegistryKey>,
     pub on_stderr: Option<RegistryKey>,
     pub on_exit: Option<RegistryKey>,
+    /// Other plugins may list and stop this job, so it can appear in a job
+    /// picker it does not own. Session scope only.
+    pub shared: bool,
     /// The [`Ceiling`] the job was started under, which its callbacks run
     /// under too.
     pub ceiling: Option<Ceiling>,
@@ -160,6 +216,7 @@ impl JobSpec {
             on_stdout: None,
             on_stderr: None,
             on_exit: None,
+            shared: false,
             ceiling: None,
             max_line_bytes: MAX_READ_BYTES,
         }
@@ -177,6 +234,9 @@ struct JobMeta {
     on_stdout: Option<RegistryKey>,
     on_stderr: Option<RegistryKey>,
     on_exit: Option<RegistryKey>,
+    /// Session jobs only: lets [`JobStore::list`] answer plugins other than
+    /// the owner.
+    shared: bool,
     ceiling: Option<Ceiling>,
     /// Locked while a `jobwait` holds it through its [`WaitLease`], which keeps
     /// the pumps off the job until the lease drops.
@@ -190,7 +250,7 @@ struct JobMeta {
     /// nothing ever reaches the tail there and an empty tail is no evidence
     /// the job stayed quiet.
     dropped_output: bool,
-    /// Set by the wait thread the moment the child is reaped, which is well
+    /// Set by the job's task the moment the child is reaped, which is well
     /// before `exit_code`. Read by [`kill_job`].
     reaped: Arc<AtomicBool>,
     exit_code: Option<i32>,
@@ -207,6 +267,20 @@ impl JobMeta {
             JobOwner::Session { session, .. } => Some(session),
             _ => None,
         }
+    }
+
+    /// Listed by plugins other than the owner. A session filter always has to
+    /// name the job's own session, so sharing never reaches past it.
+    fn shared_in(&self, session: Option<MakiId>) -> bool {
+        self.shared && session.is_some_and(|s| self.session() == Some(s))
+    }
+
+    fn lifecycle_started(&self, job_id: u32) -> Option<(&MakiId, HostEvent<'_>)> {
+        job_started_event(job_id, &self.owner, &self.name, &self.command, self.shared)
+    }
+
+    fn lifecycle_exit(&self, job_id: u32, code: i32) -> Option<(&MakiId, HostEvent<'_>)> {
+        job_exit_event(job_id, &self.owner, code, self.shared)
     }
 
     /// Owning plugin of a session job. Other owners drop their job on exit, so
@@ -281,16 +355,20 @@ pub(crate) struct JobStore {
     changed: watch::Sender<()>,
     /// Tasks a [`JobReaper`] reported, reaped on the next access.
     ended: Arc<Mutex<Vec<u64>>>,
+    /// Where the `JobStart` / `JobExit` autocmds go, the same request channel
+    /// every other host autocmd rides.
+    events: Option<EventHandle>,
 }
 
 impl JobStore {
-    pub fn new() -> Self {
+    pub fn new(events: Option<EventHandle>) -> Self {
         Self {
             jobs: HashMap::new(),
             next_id: 1,
             scan_cursor: 0,
             changed: watch::Sender::new(()),
             ended: Arc::default(),
+            events,
         }
     }
 
@@ -325,6 +403,9 @@ impl JobStore {
     }
 
     pub fn start(&mut self, spec: JobSpec) -> Result<u32, String> {
+        if spec.shared && !matches!(spec.owner, JobOwner::Session { .. }) {
+            return Err(SHARED_SCOPE_ERR.to_string());
+        }
         let JobSpec {
             owner,
             cmd,
@@ -336,6 +417,7 @@ impl JobStore {
             on_stdout,
             on_stderr,
             on_exit,
+            shared,
             ceiling,
             max_line_bytes,
         } = spec;
@@ -369,62 +451,40 @@ impl JobStore {
             }
         }
 
-        let mut child = command.spawn().map_err(|e| e.to_string())?;
-        let pid = child.id();
+        let mut child = AsyncCommand::from(command)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let pid = child.id().ok_or(NO_PID_ERR)?;
         let id = self.next_id;
         self.next_id += 1;
 
-        // The owner exists before any thread does, so a failed spawn below
-        // still closes the queue on a reader that is already waiting on it.
         let (mut sender, events, queue) = job_queue(self.changed.clone());
-
-        macro_rules! spawn_reader {
-            ($stream:expr, $name:expr, $variant:ident) => {
-                if let Some(stream) = $stream {
-                    let mut sender = sender.clone();
-                    Some(
-                        thread::Builder::new()
-                            .name($name.into())
-                            .spawn(move || {
-                                let mut reader = BufReader::with_capacity(READER_BUF_SIZE, stream);
-                                while let Ok(Some(line)) =
-                                    next_line(&mut reader, Some(max_line_bytes), true)
-                                {
-                                    if !sender.send(JobEvent::$variant(line)) {
-                                        break;
-                                    }
-                                }
-                            })
-                            .map_err(|e| e.to_string())?,
-                    )
-                } else {
-                    None
-                }
-            };
-        }
-        let stdout_handle = spawn_reader!(child.stdout.take(), "job-stdout", Stdout);
-        let stderr_handle = spawn_reader!(child.stderr.take(), "job-stderr", Stderr);
-
+        let readers = [
+            child
+                .stdout
+                .take()
+                .map(|out| sender.spawn_reader(out, max_line_bytes, JobEvent::Stdout)),
+            child
+                .stderr
+                .take()
+                .map(|err| sender.spawn_reader(err, max_line_bytes, JobEvent::Stderr)),
+        ];
         let reaped = Arc::new(AtomicBool::new(false));
         let wait_reaped = Arc::clone(&reaped);
-        thread::Builder::new()
-            .name("job-wait".into())
-            .spawn(move || {
-                // Reaping frees the pid, and that pid is the process group
-                // `kill_job` signals. The readers only return once every
-                // descendant dropped the pipes, so joining them first keeps a
-                // kill target around for as long as the job is really alive.
-                if let Some(h) = stdout_handle {
-                    let _ = h.join();
+        tokio::spawn(async move {
+            // Reaping frees the pid, and that pid is the process group
+            // `kill_job` signals. The readers only return once every
+            // descendant dropped the pipes, so awaiting them first keeps a
+            // kill target around for as long as the job is really alive.
+            for reader in readers.into_iter().flatten() {
+                if let Ok(Err(error)) = reader.await {
+                    tracing::warn!(job_id = id, pid, %error, "job output reader failed");
                 }
-                if let Some(h) = stderr_handle {
-                    let _ = h.join();
-                }
-                let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-                wait_reaped.store(true, Ordering::Relaxed);
-                sender.send(JobEvent::Exit(code));
-            })
-            .map_err(|e| e.to_string())?;
+            }
+            let code = child.wait().await.map_or(-1, |s| s.code().unwrap_or(-1));
+            wait_reaped.store(true, Ordering::Relaxed);
+            sender.send(JobEvent::Exit(code)).await;
+        });
 
         self.jobs.insert(
             id,
@@ -432,6 +492,7 @@ impl JobStore {
                 owner,
                 command: cmd.display(),
                 name,
+                shared,
                 pid,
                 started: Instant::now(),
                 on_stdout,
@@ -453,6 +514,9 @@ impl JobStore {
                 replay_exit: None,
             },
         );
+
+        let notice = self.jobs.get(&id).and_then(|job| job.lifecycle_started(id));
+        self.emit_lifecycle(notice);
 
         Ok(id)
     }
@@ -565,15 +629,21 @@ impl JobStore {
     /// Session-owned jobs stay inspectable after exit. Task/plugin jobs are
     /// removed the way they always were.
     pub fn complete(&mut self, lua: &Lua, job_id: u32, code: i32) {
-        let Some(job) = self.jobs.get_mut(&job_id) else {
-            return;
-        };
         // A replayed exit reaches here a second time: the job is already
         // booked, only the callbacks the replay just used need releasing.
-        if job.exit_code.is_some() {
-            drop_callbacks(lua, job);
+        if self
+            .jobs
+            .get(&job_id)
+            .is_none_or(|job| job.exit_code.is_some())
+        {
+            if let Some(job) = self.jobs.get_mut(&job_id) {
+                drop_callbacks(lua, job);
+            }
             return;
         }
+        let notice = self.jobs[&job_id].lifecycle_exit(job_id, code);
+        self.emit_lifecycle(notice);
+        let job = self.jobs.get_mut(&job_id).expect("the job is still here");
         job.exit_code = Some(code);
         job.elapsed_secs = Some(job.started.elapsed().as_secs());
         let session_plugin = job.session_plugin().cloned();
@@ -685,7 +755,9 @@ impl JobStore {
 
     /// List jobs this plugin can see. Task and plugin jobs leave the map on
     /// exit; session-owned jobs stay so exited ids stay findable. Tails live
-    /// on `snapshot` / `jobinfo`.
+    /// on `snapshot` / `jobinfo`. A session filter only ever widens to the
+    /// session's shared jobs, so a plugin still never reads another's
+    /// private command lines.
     pub fn list(
         &self,
         session: Option<MakiId>,
@@ -694,7 +766,7 @@ impl JobStore {
     ) -> Vec<JobSnapshot> {
         self.jobs
             .iter()
-            .filter(|(_, job)| job.can_access(task_id, plugin))
+            .filter(|(_, job)| job.can_access(task_id, plugin) || job.shared_in(session))
             .filter(|(_, job)| session.is_none_or(|s| job.session() == Some(s)))
             .map(|(&id, job)| JobSnapshot::from_job(id, job, false))
             .collect()
@@ -711,11 +783,32 @@ impl JobStore {
         self.remove(lua, job_id, false);
     }
 
-    pub fn kill(&mut self, job_id: u32, task_id: Option<u64>, plugin: &str) {
-        if let Some(job) = self.jobs.get(&job_id)
-            && job.can_access(task_id, plugin)
-        {
-            kill_job(job);
+    /// A plugin may stop another plugin's shared job only by naming the job's
+    /// session, the same match [`Self::list`] uses to show it. A job this
+    /// plugin owns needs no session, but a session it does name must still be
+    /// the job's own, so an id from another session cannot be stopped by
+    /// accident.
+    pub fn kill(
+        &mut self,
+        job_id: u32,
+        task_id: Option<u64>,
+        plugin: &str,
+        session: Option<MakiId>,
+    ) {
+        if let Some(job) = self.jobs.get(&job_id) {
+            let owned = job.can_access(task_id, plugin)
+                && session.is_none_or(|s| job.session().is_none_or(|js| js == s));
+            if owned || job.shared_in(session) {
+                kill_job(job);
+            }
+        }
+    }
+
+    /// Fires the `JobStart` / `JobExit` autocmd a lifecycle notice carries,
+    /// the way every other host event goes out.
+    fn emit_lifecycle(&self, notice: Option<(&MakiId, HostEvent<'_>)>) {
+        if let (Some(events), Some((session, event))) = (&self.events, notice) {
+            events.fire(Some(session), event);
         }
     }
 
@@ -737,7 +830,16 @@ impl JobStore {
 
     fn remove(&mut self, lua: &Lua, job_id: u32, kill: bool) {
         if let Some(job) = self.jobs.remove(&job_id) {
-            if kill {
+            // A killed or forgotten job never runs [`Self::complete`], so the
+            // autocmd pair would be left without a close; already-booked exits
+            // were reported there.
+            if job.exit_code.is_none() {
+                if kill {
+                    kill_job(&job);
+                }
+                let notice = job.lifecycle_exit(job_id, JOB_KILLED_EXIT_CODE);
+                self.emit_lifecycle(notice);
+            } else if kill {
                 kill_job(&job);
             }
             for key in [job.on_stdout, job.on_stderr, job.on_exit]
@@ -972,7 +1074,7 @@ struct JobEventSender {
     reserve: Option<OwnedSemaphorePermit>,
 }
 
-/// Each reader thread starts without a reserve: permits are per reader.
+/// Each reader starts without a reserve: permits are per reader.
 impl Clone for JobEventSender {
     fn clone(&self) -> Self {
         Self {
@@ -986,7 +1088,7 @@ impl Clone for JobEventSender {
 
 impl JobEventSender {
     /// Returns false once the job is gone, so the reader can stop.
-    fn send(&mut self, event: JobEvent) -> bool {
+    async fn send(&mut self, event: JobEvent) -> bool {
         let cost = permits(&event);
         loop {
             if let Some(spent) = self
@@ -1014,8 +1116,9 @@ impl JobEventSender {
             // back first: kept through the park, it plus the other reader's
             // idle run could leave the pool one line short of a run for good.
             self.reserve = None;
-            if let Ok(run) =
-                Arc::clone(&self.queue.bytes).blocking_acquire_many_owned(JOB_QUEUE_RESUME)
+            if let Ok(run) = Arc::clone(&self.queue.bytes)
+                .acquire_many_owned(JOB_QUEUE_RESUME)
+                .await
             {
                 self.reserve = Some(run);
             }
@@ -1025,10 +1128,42 @@ impl JobEventSender {
             .inspect(|()| self.changed.send_replace(()))
             .is_ok()
     }
+
+    /// A reader of its own that sends the lines of a piped {stream} as
+    /// {event}s until it ends or the job is gone.
+    fn spawn_reader(
+        &self,
+        stream: impl AsyncRead + Unpin + Send + 'static,
+        max_line_bytes: u64,
+        event: fn(Line) -> JobEvent,
+    ) -> JoinHandle<IoResult<()>> {
+        let mut sender = self.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::with_capacity(READER_BUF_SIZE, stream);
+            let mut cutter = LineCutter::new(Some(max_line_bytes), true);
+            loop {
+                let buf = reader.fill_buf().await?;
+                let line = if buf.is_empty() {
+                    let Some(last) = cutter.finish()? else {
+                        return Ok(());
+                    };
+                    last
+                } else {
+                    let (consumed, line) = cutter.feed(buf)?;
+                    reader.consume(consumed);
+                    let Some(line) = line else { continue };
+                    line
+                };
+                if !sender.send(event(line)).await {
+                    return Ok(());
+                }
+            }
+        })
+    }
 }
 
 /// Signalling a reaped pid would hit whoever the kernel handed it to next, so
-/// skip the jobs the wait thread already reaped. Until then the child is a
+/// skip the jobs their task already reaped. Until then the child is a
 /// zombie, and a zombie group leader keeps its pid and pgid off the free list,
 /// so the group is still the right target. The flag carries no data of its
 /// own, hence `Relaxed`.
@@ -1106,9 +1241,12 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::api::fs::LINE_CUT_MARKER;
+    use crate::runtime::Request;
     use crate::test_support::runtime;
     use futures::FutureExt;
+    use std::thread;
     use std::time::Duration;
+    use tokio::sync::mpsc::unbounded_channel;
     use tokio::time::timeout;
 
     const TEST_PLUGIN: &str = "test-plugin";
@@ -1154,7 +1292,7 @@ mod tests {
     }
 
     fn make_store() -> JobStore {
-        JobStore::new()
+        JobStore::new(None)
     }
 
     fn next_plugin_event(store: &mut JobStore) -> Option<(u32, JobEvent)> {
@@ -1192,6 +1330,7 @@ mod tests {
             on_stdout,
             on_stderr: None,
             on_exit,
+            shared: false,
             ceiling: None,
             events,
             _queue: queue,
@@ -1206,10 +1345,14 @@ mod tests {
         }
     }
 
+    /// `start` spawns the job's tasks onto the runtime it is called in.
+    fn start_job(store: &mut JobStore, spec: JobSpec) -> u32 {
+        let _runtime = runtime().enter();
+        store.start(spec).unwrap()
+    }
+
     fn start_echo(store: &mut JobStore) -> u32 {
-        store
-            .start(JobSpec::new(task_owner(1), "echo hello"))
-            .unwrap()
+        start_job(store, JobSpec::new(task_owner(1), "echo hello"))
     }
 
     #[cfg(unix)]
@@ -1237,9 +1380,7 @@ mod tests {
     #[test]
     fn dropping_the_store_kills_its_jobs() {
         let mut store = make_store();
-        let id = store
-            .start(JobSpec::new(task_owner(1), "sleep 30"))
-            .expect("job started");
+        let id = start_job(&mut store, JobSpec::new(task_owner(1), "sleep 30"));
         let pid = store.jobs[&id].pid;
         assert!(group_alive(pid), "job should be running before the drop");
 
@@ -1269,9 +1410,7 @@ mod tests {
         let over = MAX_READ_BYTES + 1;
         let mut store = make_store();
         let cmd = format!("head -c {over} /dev/zero | tr '\\0' x");
-        let id = store
-            .start(JobSpec::new(task_owner(1), cmd.as_str()))
-            .unwrap();
+        let id = start_job(&mut store, JobSpec::new(task_owner(1), cmd.as_str()));
 
         let events = collect_until_exit(id, || store.next_event(&task_owner(1)));
 
@@ -1307,9 +1446,76 @@ mod tests {
     #[test]
     fn unknown_job_operations_are_noops() {
         let mut store = make_store();
-        store.kill(999, Some(1), TEST_PLUGIN);
+        store.kill(999, Some(1), TEST_PLUGIN, None);
         assert!(store.lease_events(999, Some(1), TEST_PLUGIN).is_none());
         assert!(store.callback_key(999, &JobEvent::Exit(0)).is_none());
+    }
+
+    #[test]
+    fn a_session_job_reports_its_normal_exit_to_autocmds() {
+        let (tx, mut rx) = unbounded_channel();
+        let events = EventHandle::probed_for_test(tx);
+        let mut store = JobStore::new(Some(events));
+        let lua = Lua::new();
+        let session = MakiId::generate();
+        let id = start_job(
+            &mut store,
+            JobSpec::new(session_owner(session), "echo hello"),
+        );
+        let start = loop {
+            match rx.try_recv() {
+                Ok(Request::FireAutocmd { event, data, .. }) if event == "JobStart" => break data,
+                Ok(_) => continue,
+                Err(_) => panic!("a session job must fire JobStart"),
+            }
+        };
+        assert_eq!(start["shared"], false);
+
+        store.complete(&lua, id, 0);
+
+        let data = loop {
+            match rx.try_recv() {
+                Ok(Request::FireAutocmd { event, data, .. }) if event == "JobExit" => break data,
+                Ok(_) => continue,
+                Err(_) => panic!("a normal exit must fire JobExit"),
+            }
+        };
+        assert_eq!(data["id"], id);
+        assert_eq!(data["exit_code"], 0);
+        assert_eq!(data["session_id"], session.to_string());
+        assert_eq!(data["plugin"], TEST_PLUGIN);
+        assert_eq!(data["shared"], false);
+    }
+
+    #[test]
+    fn a_shared_session_job_reports_shared_on_both_events() {
+        let (tx, mut rx) = unbounded_channel();
+        let events = EventHandle::probed_for_test(tx);
+        let mut store = JobStore::new(Some(events));
+        let lua = Lua::new();
+        let session = MakiId::generate();
+        let mut spec = JobSpec::new(session_owner(session), "echo hello");
+        spec.shared = true;
+        let id = start_job(&mut store, spec);
+
+        let start = loop {
+            match rx.try_recv() {
+                Ok(Request::FireAutocmd { event, data, .. }) if event == "JobStart" => break data,
+                Ok(_) => continue,
+                Err(_) => panic!("a session job must fire JobStart"),
+            }
+        };
+        assert_eq!(start["shared"], true);
+
+        store.complete(&lua, id, 0);
+        let exit = loop {
+            match rx.try_recv() {
+                Ok(Request::FireAutocmd { event, data, .. }) if event == "JobExit" => break data,
+                Ok(_) => continue,
+                Err(_) => panic!("a normal exit must fire JobExit"),
+            }
+        };
+        assert_eq!(exit["shared"], true);
     }
 
     #[test]
@@ -1336,9 +1542,7 @@ mod tests {
     #[test]
     fn plugin_owner_can_be_accessed_only_by_its_plugin() {
         let mut store = make_store();
-        let id = store
-            .start(JobSpec::new(plugin_owner(), "echo hello"))
-            .unwrap();
+        let id = start_job(&mut store, JobSpec::new(plugin_owner(), "echo hello"));
 
         assert!(store.lease_events(id, Some(1), "other-plugin").is_none());
         assert!(store.lease_events(id, None, TEST_PLUGIN).is_some());
@@ -1349,15 +1553,57 @@ mod tests {
     fn kill_requires_owner_access() {
         let lua = Lua::new();
         let mut store = make_store();
-        let id = store
-            .start(JobSpec::new(task_owner(1), "sleep 30"))
-            .unwrap();
+        let id = start_job(&mut store, JobSpec::new(task_owner(1), "sleep 30"));
         let pid = store.jobs[&id].pid;
 
-        store.kill(id, Some(2), TEST_PLUGIN);
+        store.kill(id, Some(2), TEST_PLUGIN, None);
         assert!(group_alive(pid));
 
-        store.kill(id, Some(1), TEST_PLUGIN);
+        store.kill(id, Some(1), TEST_PLUGIN, None);
+        assert!(wait_for_group_exit(pid));
+        store.finish(&lua, id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopping_a_shared_job_requires_its_session() {
+        let lua = Lua::new();
+        let mut store = make_store();
+        let session = MakiId::generate();
+        let other_session = MakiId::generate();
+        let mut spec = JobSpec::new(
+            JobOwner::Session {
+                session,
+                plugin: "owner".into(),
+            },
+            "sleep 30",
+        );
+        spec.shared = true;
+        let id = start_job(&mut store, spec);
+        let pid = store.jobs[&id].pid;
+
+        store.kill(id, None, "watcher", Some(other_session));
+        assert!(group_alive(pid), "another session must not stop the job");
+        store.kill(id, None, "watcher", None);
+        assert!(group_alive(pid), "an unnamed session must not stop the job");
+        store.kill(id, None, "watcher", Some(session));
+        assert!(wait_for_group_exit(pid));
+        store.finish(&lua, id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn naming_a_session_still_checks_an_owned_job() {
+        let lua = Lua::new();
+        let mut store = make_store();
+        let session = MakiId::generate();
+        let other_session = MakiId::generate();
+        let id = start_job(&mut store, JobSpec::new(session_owner(session), "sleep 30"));
+        let pid = store.jobs[&id].pid;
+
+        store.kill(id, None, TEST_PLUGIN, Some(other_session));
+        assert!(group_alive(pid), "a named session must match the owned job");
+        store.kill(id, None, TEST_PLUGIN, Some(session));
         assert!(wait_for_group_exit(pid));
         store.finish(&lua, id);
     }
@@ -1369,10 +1615,8 @@ mod tests {
         let mut store = make_store();
         let task = task_owner(1);
         let plugin = plugin_owner();
-        let task_id = store.start(JobSpec::new(task.clone(), "sleep 30")).unwrap();
-        let plugin_id = store
-            .start(JobSpec::new(plugin.clone(), "sleep 30"))
-            .unwrap();
+        let task_id = start_job(&mut store, JobSpec::new(task.clone(), "sleep 30"));
+        let plugin_id = start_job(&mut store, JobSpec::new(plugin.clone(), "sleep 30"));
         let task_pid = store.jobs[&task_id].pid;
         let plugin_pid = store.jobs[&plugin_id].pid;
 
@@ -1429,9 +1673,7 @@ mod tests {
     fn next_event_filters_by_owner() {
         let mut store = make_store();
         let id = start_echo(&mut store);
-        let plugin_id = store
-            .start(JobSpec::new(plugin_owner(), "echo plugin"))
-            .unwrap();
+        let plugin_id = start_job(&mut store, JobSpec::new(plugin_owner(), "echo plugin"));
 
         let task_events = collect_until_exit(id, || store.next_event(&task_owner(1)));
         assert!(task_events.iter().all(|(job_id, _)| *job_id != plugin_id));
@@ -1459,7 +1701,10 @@ mod tests {
         for id in [1, 2] {
             let (mut sender, events, queue) = job_queue(store.changed.clone());
             for _ in 0..QUEUED_PER_JOB {
-                sender.send(JobEvent::Stdout("spam".into()));
+                assert_eq!(
+                    sender.send(JobEvent::Stdout("spam".into())).now_or_never(),
+                    Some(true)
+                );
             }
             let mut job = stub_job(task_owner(1), None, None);
             job.events = events;
@@ -1477,6 +1722,7 @@ mod tests {
     #[tokio::test]
     async fn exit_cleanup_runs_before_a_failing_callback() {
         let lua = Lua::new();
+        lua.set_app_data(JobStore::new(None));
         let callback = lua
             .create_function(|_, ()| Err::<(), _>(mlua::Error::runtime("callback failed")))
             .unwrap();
@@ -1552,9 +1798,7 @@ mod tests {
         let lua = Lua::new();
         let mut store = make_store();
         let task = start_echo(&mut store);
-        let plugin = store
-            .start(JobSpec::new(plugin_owner(), "echo plugin"))
-            .unwrap();
+        let plugin = start_job(&mut store, JobSpec::new(plugin_owner(), "echo plugin"));
 
         let from_task: Vec<u32> = store
             .list(None, Some(1), TEST_PLUGIN)
@@ -1591,9 +1835,10 @@ mod tests {
             plugin: Arc::from(TEST_PLUGIN),
         };
         let mut store = make_store();
-        let id = store
-            .start(JobSpec::new(owner.clone(), "echo hi; echo err >&2; exit 3"))
-            .unwrap();
+        let id = start_job(
+            &mut store,
+            JobSpec::new(owner.clone(), "echo hi; echo err >&2; exit 3"),
+        );
         store.set_tail(id, Some(5));
 
         store.detach_plugin_callbacks(&lua, TEST_PLUGIN);
@@ -1630,12 +1875,8 @@ mod tests {
         let a = MakiId::generate();
         let b = MakiId::generate();
         let mut store = make_store();
-        let first = store
-            .start(JobSpec::new(session_owner(a), "sleep 30"))
-            .unwrap();
-        let second = store
-            .start(JobSpec::new(session_owner(b), "sleep 30"))
-            .unwrap();
+        let first = start_job(&mut store, JobSpec::new(session_owner(a), "sleep 30"));
+        let second = start_job(&mut store, JobSpec::new(session_owner(b), "sleep 30"));
         store.kill_session(&lua, a);
         assert!(store.snapshot(first, None, TEST_PLUGIN).is_none());
         assert!(store.snapshot(second, None, TEST_PLUGIN).is_some());
@@ -1722,13 +1963,14 @@ mod tests {
         let path = dir.path().join("job.log");
         std::fs::write(&path, EXISTING).unwrap();
         let mut store = make_store();
-        let id = store
-            .start(JobSpec {
+        let id = start_job(
+            &mut store,
+            JobSpec {
                 stdout: Redirect::File(path.clone()),
                 stderr: Redirect::Discard,
                 ..JobSpec::new(task_owner(1), "echo hi; echo err >&2")
-            })
-            .unwrap();
+            },
+        );
 
         for (_, event) in collect_until_exit(id, || store.next_event(&task_owner(1))) {
             store.record_event(id, &event);
@@ -1828,7 +2070,10 @@ mod tests {
         let mut woke = || changed.changed().now_or_never().is_some();
         assert!(!woke(), "subscribing is not a change");
 
-        sender.send(JobEvent::Stdout("line".into()));
+        assert_eq!(
+            sender.send(JobEvent::Stdout("line".into())).now_or_never(),
+            Some(true)
+        );
         assert!(woke(), "a queued event");
 
         let lease = store.lease_events(1, None, TEST_PLUGIN).unwrap();
@@ -2036,9 +2281,10 @@ mod tests {
         let lua = Lua::new();
         let session = MakiId::generate();
         let mut store = make_store();
-        let id = store
-            .start(JobSpec::new(session_owner(session), "sleep 0.1"))
-            .unwrap();
+        let id = start_job(
+            &mut store,
+            JobSpec::new(session_owner(session), "sleep 0.1"),
+        );
         for (_, event) in collect_until_exit(id, || next_plugin_event(&mut store)) {
             store.record_event(id, &event);
         }
@@ -2047,7 +2293,7 @@ mod tests {
             "{EXIT_WITHOUT_REAP}"
         );
         store.complete(&lua, id, 0);
-        store.kill(id, None, TEST_PLUGIN);
+        store.kill(id, None, TEST_PLUGIN, None);
         let snap = store
             .snapshot(id, None, TEST_PLUGIN)
             .expect("exited session job must stay inspectable");
@@ -2088,17 +2334,17 @@ mod tests {
     /// A parked reader keeps the run it waited for, so a line may never cost
     /// more than the run left to the other reader. Capped, a line longer than
     /// the whole queue still gets through past a reader holding a run idle.
-    #[test]
-    fn a_long_line_fits_past_an_idle_reserve() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_long_line_fits_past_an_idle_reserve() {
         let store = make_store();
         let (mut small, events, _queue) = job_queue(store.changed.clone());
         let line = || JobEvent::Stdout("0".repeat(PARKED_LINE_BYTES).as_str().into());
         let lines = JOB_QUEUE_BYTES / permits(&line()) as usize;
         for _ in 0..lines {
-            assert!(small.send(line()));
+            assert!(small.send(line()).await);
         }
         let mut long = small.clone();
-        let small = thread::spawn(move || (small.send(line()), small));
+        let small = tokio::spawn(async move { (small.send(line()).await, small) });
         // A parked reader's owned acquire holds a clone of the semaphore.
         wait_until("the small reader parked", || {
             Arc::strong_count(&events.queue.bytes) == 2
@@ -2106,39 +2352,44 @@ mod tests {
         for _ in 0..=lines {
             assert!(matches!(next_within(&events), Some(JobEvent::Stdout(_))));
         }
-        let (sent, _idle_reserve) = small.join().unwrap();
+        let (sent, _idle_reserve) = small.await.unwrap();
         assert!(sent);
 
-        let long = thread::spawn(move || {
+        let long = tokio::spawn(async move {
             long.send(JobEvent::Stderr(
                 "0".repeat(JOB_QUEUE_BYTES).as_str().into(),
             ))
+            .await
         });
         assert!(matches!(next_within(&events), Some(JobEvent::Stderr(_))));
-        assert!(long.join().unwrap());
+        assert!(long.await.unwrap());
     }
 
     /// The other reader holds a run idle after one short line. A flooding
     /// reader that parks again must not count its leftover against the run
     /// it waits for, or the pool stays a few bytes short of one for good.
-    #[test]
-    fn a_parked_reader_drops_its_leftover() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_parked_reader_drops_its_leftover() {
         let store = make_store();
         let (mut fill, events, _queue) = job_queue(store.changed.clone());
         let line = || JobEvent::Stdout("0".repeat(PARKED_LINE_BYTES).as_str().into());
         let lines = JOB_QUEUE_BYTES / permits(&line()) as usize;
         for _ in 0..lines {
-            assert!(fill.send(line()));
+            assert!(fill.send(line()).await);
         }
         // A line sized to the spare, so even a short one parks.
         let spare = events.queue.bytes.available_permits();
         let overhead = permits(&JobEvent::Stdout("".into())) as usize;
-        assert!(fill.send(JobEvent::Stdout(
-            "0".repeat(spare - overhead).as_str().into()
-        )));
+        assert!(
+            fill.send(JobEvent::Stdout(
+                "0".repeat(spare - overhead).as_str().into()
+            ))
+            .await
+        );
         assert_eq!(events.queue.bytes.available_permits(), 0);
         let mut short = fill.clone();
-        let short = thread::spawn(move || (short.send(JobEvent::Stderr("!".into())), short));
+        let short =
+            tokio::spawn(async move { (short.send(JobEvent::Stderr("!".into())).await, short) });
         wait_until("the short line's reader parked", || {
             Arc::strong_count(&events.queue.bytes) == 2
         });
@@ -2146,15 +2397,19 @@ mod tests {
             assert!(matches!(next_within(&events), Some(JobEvent::Stdout(_))));
         }
         assert!(matches!(next_within(&events), Some(JobEvent::Stderr(_))));
-        let (sent, _idle_run) = short.join().unwrap();
+        let (sent, _idle_run) = short.await.unwrap();
         assert!(sent);
 
         let flood = 3 * lines;
-        let flooder = thread::spawn(move || (0..flood).all(|_| fill.send(line())));
+        let flooder = tokio::spawn(async move {
+            for _ in 0..flood {
+                assert!(fill.send(line()).await);
+            }
+        });
         for _ in 0..flood {
             assert!(matches!(next_within(&events), Some(JobEvent::Stdout(_))));
         }
-        assert!(flooder.join().unwrap());
+        flooder.await.unwrap();
     }
 
     #[cfg(unix)]
@@ -2178,7 +2433,7 @@ mod tests {
         /// Starts {cmd} and waits for its queue to fill, so its readers are
         /// parked on a send.
         fn start_blocked(store: &mut JobStore, owner: JobOwner, cmd: &str) -> u32 {
-            let id = store.start(JobSpec::new(owner, cmd)).unwrap();
+            let id = start_job(store, JobSpec::new(owner, cmd));
             let queue = Arc::clone(&store.jobs[&id].events.queue);
             wait_until(NEVER_FILLED, || is_full(&queue));
             id
@@ -2221,7 +2476,7 @@ mod tests {
 
         /// The leased case is `jobwait` holding the events inside a
         /// callback: nothing drains them, so only closing the job's queue can
-        /// release the readers and the wait thread.
+        /// release the job's task.
         #[test_case::test_case(Teardown::KillTask ; "kill_task")]
         #[test_case::test_case(Teardown::KillPlugin ; "kill_plugin")]
         #[test_case::test_case(Teardown::KillSession ; "kill_session")]
@@ -2263,7 +2518,7 @@ mod tests {
             let cmd = format!("{FLOOD_CMD} & {FLOOD_CMD} >&2");
             let id = start_blocked(&mut store, task_owner(1), &cmd);
 
-            store.kill(id, Some(1), TEST_PLUGIN);
+            store.kill(id, Some(1), TEST_PLUGIN, None);
             let events = collect_until_exit(id, || store.next_event(&task_owner(1)));
 
             let stdout = events
@@ -2285,7 +2540,7 @@ mod tests {
             let mut store = make_store();
             let id = start_blocked(&mut store, task_owner(1), FLOOD_CMD);
 
-            store.kill(id, Some(1), TEST_PLUGIN);
+            store.kill(id, Some(1), TEST_PLUGIN, None);
             let events = collect_until_exit(id, || store.next_event(&task_owner(1)));
 
             let delivered: usize = events.iter().map(|(_, event)| queued_bytes(event)).sum();
@@ -2305,7 +2560,7 @@ mod tests {
                 "a job that has not exited must survive forget"
             );
 
-            store.kill(id, None, TEST_PLUGIN);
+            store.kill(id, None, TEST_PLUGIN, None);
             let events = collect_until_exit(id, || next_plugin_event(&mut store));
             let Some((_, JobEvent::Exit(code))) = events.last() else {
                 panic!("{NEVER_EXITED}");

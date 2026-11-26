@@ -31,11 +31,11 @@ If you pass a prompt (or pipe stdin) without `--print`, the TUI still opens and 
 | `--verbose`, `--output-format` | no | yes | stream only |
 | `--system-prompt`, `--append-system-prompt` | yes | yes | yes |
 | `--session-id`, `--fork-session` | yes | yes | yes |
-| `--max-turns` | error | yes | yes |
+| `--max-turns`, `--max-budget-usd` | error | yes | yes |
 | `--permission-mode` | error | error | yes |
 | `--include-partial-messages` | no | no | yes |
 
-A flag marked error stops Maki before the run starts, so a script cannot think it applied. Subcommands refuse these flags too, except that `maki acp` and `maki prompt system` take `--system-prompt` and `--append-system-prompt`.
+`no` means the flag is ignored. `error` means Maki exits before the run starts. Subcommands reject `--image`, `--max-turns`, `--max-budget-usd`, `--permission-mode` and the system prompt flags, except that [`maki acp`](#maki-acp) and [`maki prompt`](#maki-prompt) take the system prompt flags.
 
 ### Shared flags (detail)
 
@@ -55,16 +55,19 @@ A flag marked error stops Maki before the run starts, so a script cannot think i
 | `--yolo` | Skip permission prompts on gated tools (alias: `--dangerously-skip-permissions`). Deny rules still apply |
 | `--trust` | Load the project's `.maki` config for this run without asking, recording no decision. See [Folder Trust](/docs/folder-trust/#containers-and-ci) |
 | `--exit-on-done` | Exit when the agent finishes (TUI automation wrappers). Waits for running background tasks, bounded by `--background-timeout` |
-| `--background-timeout <SECS>` | How long a run waits for [background tasks](/docs/background-tasks/#headless-sdk-and-acp) after it ends, at most a week. Unset, it is `600` with `--exit-on-done`, and `-p` and SDK mode run with background moves off. `0` turns them off everywhere. Global, so it goes before a subcommand |
+| `--background-timeout <SECS>` | How long a run waits for [background tasks](/docs/background-tasks/#headless-sdk-and-acp) after it ends, at most a week. Unset, moves are off in `-p` and SDK mode, on in ACP, and `--exit-on-done` waits `600`. `0` turns moves off everywhere. Global, so it goes before a subcommand |
 | `--allowed-tools <LIST>` | Comma-separated allow list (PascalCase or snake_case) |
 | `--disallowed-tools <LIST>` | Comma-separated deny list |
 | `--session-id <ID>` | Write this run under a chosen id. Errors if a session already exists under it, unless `-r` / `-c` is continuing that same session |
 | `--fork-session` | Copy the resumed session's history under a new id, leaving the original untouched. See [Sessions](/docs/headless/#sessions) |
 | `--max-turns <N>` | Cap agent turns (`--print` and SDK) |
-| `--system-prompt <TEXT>` | Replace the main agent's system prompt. Project instructions and the built-in prompt are left out. Subagents keep their own prompts |
-| `--append-system-prompt <TEXT>` | Add text after the main agent's system prompt. Subagents do not get it, so put text they need in `AGENTS.local.md`. Pass it again when you resume a session, or the session's prompt is rebuilt without it |
+| `--max-budget-usd <USD>` | Stop the session once its spend, subagents included, reaches this many dollars (`--print` and SDK). The request that crosses the cap finishes; the next one does not start, and the SDK result is `error_max_budget_usd`. A model Maki has no price for never counts toward the cap, and Maki warns once when that happens |
+| `--system-prompt <TEXT>` | Replace the main agent's whole system prompt, so project instructions are dropped too. Subagents keep their own |
+| `--append-system-prompt <TEXT>` | Add text to the end of the main agent's system prompt. Subagents do not get it, so put text they need in `AGENTS.local.md` |
 | `--permission-mode <MODE>` | SDK: `default`, `acceptEdits`, `plan`, or `bypassPermissions` |
 | `--include-partial-messages` | Stream partial deltas in SDK mode |
+
+Pass the system prompt flags again when you resume a session. Other text, or none, rebuilds the prompt and [starts the cache over](/docs/context/#one-prompt-per-session).
 
 ### Tool name lists
 
@@ -191,6 +194,12 @@ maki rollback          # previous version
 
 Uses the same install locations as the install scripts.
 
+Packagers can turn both commands off, along with the startup check for a new version, by setting `MAKI_DISABLE_UPDATE` at build time to anything but empty or `0`. They then exit with an error that points to the package manager.
+
+```bash
+MAKI_DISABLE_UPDATE=1 cargo build --release
+```
+
 ### `maki acp`
 
 ```bash
@@ -223,7 +232,7 @@ maki prompt --tools --names  # tool names only, one per line
 maki --append-system-prompt "..." prompt   # preview with appended text
 ```
 
-Debug helper for inspecting the prompt and tool surface the agent sees. `--plan`, `--system-prompt` and `--append-system-prompt` are rejected on non-system variants, and the last two also with `--tools`.
+Debug helper for inspecting the prompt and tool surface the agent sees. `--plan` works only on the system variant. The system prompt flags also need the system variant, without `--tools`.
 
 ### `maki migrate`
 

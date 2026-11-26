@@ -1,5 +1,6 @@
 mod child_env;
 pub(crate) mod error;
+pub mod headers;
 pub mod http;
 pub(crate) mod image;
 pub(crate) mod manifest;
@@ -14,6 +15,8 @@ pub mod spec;
 /// Tests only, here and in other crates. Always built because a cargo feature
 /// gating it would pass in the workspace build and fail a lone crate.
 pub mod test_support;
+#[cfg(webpki_store)]
+mod tls;
 pub mod tokens;
 pub(crate) mod types;
 
@@ -21,8 +24,8 @@ pub use child_env::{shell_command, strip_provider_keys};
 pub use error::{AgentError, Overflow};
 pub use maki_storage::sessions::add_cost;
 pub use model::{
-    FastPricing, Model, ModelEntry, ModelError, ModelFamily, ModelInfo, ModelPricing, ModelTier,
-    ThinkingOption, ThinkingSupport, TokenUsage, format_tokens,
+    FactSource, FactSources, FastPricing, Model, ModelEntry, ModelError, ModelFamily, ModelInfo,
+    ModelPricing, ModelTier, ThinkingOption, ThinkingSupport, TokenUsage, format_tokens,
 };
 pub use pricing::{model_cost, settle_session};
 pub use providers::catalog::ProviderData;
@@ -30,7 +33,6 @@ pub use providers::catalog::{
     catalog_provider, catalog_provider_if_available, catalog_providers,
     catalog_providers_if_available, refresh_catalog, warm_catalog,
 };
-pub use providers::client_builder;
 pub use providers::copilot::auth as copilot_auth;
 pub use providers::custom;
 pub use providers::openai::auth as openai_auth;
@@ -38,6 +40,7 @@ pub use providers::plugin;
 pub use providers::xai::auth as xai_auth;
 pub use providers::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth};
 pub use providers::{Timeouts, user_agent};
+pub use providers::{client_builder, with_system_trust};
 pub use tokens::{ContextGauge, estimate_message_tokens, estimate_prompt_tokens};
 pub use types::{
     CONTEXT_UPDATE_WITHOUT_FACTS, ContentBlock, DEFER_LOADING_KEY, EMPTY_RESPONSE_MARKER, Effort,
@@ -45,6 +48,7 @@ pub use types::{
     IMAGE_PLACEHOLDER, IMAGE_UNUSABLE_NOTE, ImageMediaType, ImageSource, InputTransformation,
     Message, MessageKind, ModelUsageRow, ProviderEvent, ProviderUsage, RequestOptions, Role,
     StopReason, StreamResponse, THINKING_USAGE, TaskAnswer, TaskEnd, TaskSettled, ThinkingConfig,
-    ThinkingFallback, UNKNOWN_IMAGE_MEDIA_TYPE, UNTYPED_BLOCK, UsageLimit, adapt_images_for_model,
-    dialect, is_deferred_tool, non_empty_tool_result,
+    ThinkingFallback, UNKNOWN_IMAGE_MEDIA_TYPE, UNTYPED_BLOCK, UsageLimit, accept_sent_images,
+    adapt_images_for_model, dialect, forgive_refused_images, is_deferred_tool,
+    non_empty_tool_result, refuse_sent_images,
 };

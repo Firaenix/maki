@@ -20,11 +20,13 @@ pub mod session_snapshot;
 pub use api::action::ActionInfo;
 pub use api::agent::{MCP_HINT, UNDECLARED_REACH, UNPAID_REACH_ERR};
 pub use api::keymap::{
-    InputMode, InputSnapshot, KeybindTicket, KeymapEntry, KeymapReader, KeymapSnapshot,
+    CursorShape, CursorStyle, InputMode, InputSnapshot, KeybindTicket, KeymapEntry, KeymapReader,
+    KeymapSnapshot,
 };
 pub use api::net::set_allowed_private_hosts;
 pub use api::options::{OptionSpec, OptionType, PluginOptionSpecs};
 pub use api::pack::{Declared, PackOp};
+pub use api::provider::fetch_provider_usage;
 pub use api::session::SessionSnapshotFn;
 pub use api::tool::{INERT_WITH_MUTABLE_PATH_ERR, INERT_WITH_SCOPES_ERR, PERMISSION_SHAPE_ERR};
 pub use api::ui::marks::{
@@ -32,12 +34,12 @@ pub use api::ui::marks::{
 };
 pub use api::ui::syntax::{SyntaxDoc, SyntaxEdit, SyntaxIndex, SyntaxInput, SyntaxRule};
 pub use api::util::command::{
-    Anchor, Axis, Border, BuiltinAction, CANCEL_CANCELLED, CANCEL_IDLE, Dimension, Edge,
-    FloatConfig, FloatConfigPatch, HintEntry, HintReader, HintSnapshot, InputDecorate, InputEdit,
-    InputMarks, InputRequest, InputSubmit, LuaCommandInfo, LuaCommandReader, ModelRequest,
-    NO_UI_ERR, PROMPT_QUEUED, PROMPT_STARTED, PlanActionOutcome, PlanFormRow, PlanMenu,
-    PlanRequest, PlanRowAction, SessionRequest, Split, TaskRequest, TextEdit, TitlePos, UiAction,
-    UiReply, WinCommand, WinEvent, WinView,
+    Anchor, Axis, Border, BuiltinAction, CANCEL_CANCELLED, CANCEL_IDLE, ChatItem, ChatItemStatus,
+    Dimension, Edge, FloatConfig, FloatConfigPatch, HintEntry, HintReader, HintSnapshot,
+    InputDecorate, InputEdit, InputMarks, InputRequest, InputSubmit, LuaCommandInfo,
+    LuaCommandReader, ModelRequest, NO_UI_ERR, PROMPT_QUEUED, PROMPT_STARTED, PlanActionOutcome,
+    PlanFormRow, PlanMenu, PlanRequest, PlanRowAction, SegmentEntry, SessionRequest, Split,
+    TaskRequest, TextEdit, TitlePos, UiAction, UiReply, WinCommand, WinEvent, WinView,
 };
 pub use docs::{DocKind, FnDoc, ModuleDoc, ParamDoc, api_docs};
 pub use error::PluginError;
@@ -74,6 +76,7 @@ pub mod test_support {
     use crate::api::keymap::{InputMode, KeymapStore, KeymapWriter, SetOpts};
     use crate::api::util::command::{
         HintEntries, HintReader, HintWriter, LuaCommandInfo, LuaCommandReader, LuaCommandWriter,
+        SegmentEntry,
     };
     pub use crate::api::util::dispatch::MAX_HOOK_DEPTH;
     use crate::key::Key;
@@ -128,8 +131,8 @@ pub mod test_support {
     pub struct HintWriterHandle(HintWriter);
 
     impl HintWriterHandle {
-        pub fn publish(&self, entries: HintEntries) {
-            self.0.publish(entries);
+        pub fn publish(&self, entries: HintEntries, segments: Vec<SegmentEntry>) {
+            self.0.publish(entries, segments);
         }
     }
 
@@ -206,7 +209,7 @@ pub mod test_support {
         /// Next fired autocmd as `(event, data)`, skipping other requests.
         pub fn try_recv_autocmd(&self) -> Option<(String, serde_json::Value)> {
             while let Ok(req) = self.0.lock().unwrap().try_recv() {
-                if let Request::FireAutocmd { event, data } = req {
+                if let Request::FireAutocmd { event, data, .. } = req {
                     return Some((event, data));
                 }
             }
@@ -232,6 +235,7 @@ pub mod test_support {
         let _ = handle.tx.send(Request::FireAutocmd {
             event: event.to_owned(),
             data,
+            message: None,
         });
     }
 

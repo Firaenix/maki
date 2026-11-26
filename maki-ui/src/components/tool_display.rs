@@ -1,7 +1,7 @@
 use super::{BackgroundBadge, BackgroundOutcome, DisplayMessage, ToolStatus};
 
 use super::code_view;
-use crate::animation::{spinner_frame, spinner_str};
+use crate::animation::spinner_str;
 use crate::theme;
 use code_view::RenderLimits;
 use code_view::SectionFlags;
@@ -46,11 +46,13 @@ const BACKGROUND_LOST_LABEL: &str = "lost";
 const SECS_PER_MINUTE: u64 = 60;
 const SECS_PER_HOUR: u64 = 3600;
 const RIGHT_INFO_GAP: &str = "  ";
-pub const TOOL_BODY_INDENT: &str = "  ";
+const ASSISTANT_LABEL: &str = "maki> ";
+const USER_LABEL: &str = "you> ";
+const THINKING_LABEL: &str = "thinking> ";
 pub(crate) const SPINNER_STYLE_NAME: &str = "spinner";
 pub(crate) const SPINNER_STYLE_PREFIX: &str = "spinner:";
 
-const CODE_OUTPUT_DIVIDER: &str = "  ────────────";
+const CODE_OUTPUT_DIVIDER: &str = "────────────";
 const ANNOTATION_SEP: &str = " · ";
 /// Instruction blocks have no tool of their own, so they render under this name.
 const INSTRUCTIONS_TOOL: &str = "load";
@@ -58,18 +60,24 @@ const INSTRUCTIONS_TOOL: &str = "load";
 const UNNAMED_TOOL: &str = "?";
 
 pub struct RoleStyle {
-    pub prefix: &'static str,
+    pub accent: Style,
+    pub label: &'static str,
     pub text_style: Style,
-    pub prefix_style: Style,
     pub use_markdown: bool,
     pub max_line_bytes: Option<usize>,
 }
 
+impl RoleStyle {
+    pub fn label_style(&self) -> Style {
+        self.accent.add_modifier(Modifier::BOLD)
+    }
+}
+
 pub fn assistant_style() -> RoleStyle {
     RoleStyle {
-        prefix: "maki> ",
+        accent: theme::current().assistant_prefix,
+        label: ASSISTANT_LABEL,
         text_style: theme::current().assistant,
-        prefix_style: theme::current().assistant_prefix,
         use_markdown: true,
         max_line_bytes: None,
     }
@@ -77,9 +85,9 @@ pub fn assistant_style() -> RoleStyle {
 
 pub fn user_style() -> RoleStyle {
     RoleStyle {
-        prefix: "you> ",
-        text_style: theme::current().assistant,
-        prefix_style: theme::current().user,
+        accent: theme::current().user,
+        label: USER_LABEL,
+        text_style: theme::current().user_text,
         use_markdown: false,
         max_line_bytes: None,
     }
@@ -87,9 +95,9 @@ pub fn user_style() -> RoleStyle {
 
 pub fn thinking_style() -> RoleStyle {
     RoleStyle {
-        prefix: "thinking> ",
+        accent: theme::current().thinking,
+        label: THINKING_LABEL,
         text_style: theme::current().thinking,
-        prefix_style: theme::current().thinking,
         use_markdown: true,
         max_line_bytes: None,
     }
@@ -97,9 +105,9 @@ pub fn thinking_style() -> RoleStyle {
 
 pub fn error_style() -> RoleStyle {
     RoleStyle {
-        prefix: "",
+        accent: theme::current().tool_error,
+        label: "",
         text_style: theme::current().error,
-        prefix_style: theme::current().tool_error,
         use_markdown: false,
         max_line_bytes: None,
     }
@@ -107,9 +115,9 @@ pub fn error_style() -> RoleStyle {
 
 pub fn notice_style() -> RoleStyle {
     RoleStyle {
-        prefix: "",
+        accent: theme::current().tool_dim,
+        label: "",
         text_style: theme::current().tool_dim,
-        prefix_style: theme::current().tool_dim,
         use_markdown: false,
         max_line_bytes: None,
     }
@@ -117,11 +125,9 @@ pub fn notice_style() -> RoleStyle {
 
 pub fn done_style() -> RoleStyle {
     RoleStyle {
-        prefix: "",
-        text_style: theme::current()
-            .tool_success
-            .add_modifier(ratatui::style::Modifier::BOLD),
-        prefix_style: theme::current().tool_success,
+        accent: theme::current().tool_success,
+        label: "",
+        text_style: theme::current().tool_success.add_modifier(Modifier::BOLD),
         use_markdown: false,
         max_line_bytes: None,
     }
@@ -131,10 +137,11 @@ pub struct ToolLines {
     pub lines: Vec<Line<'static>>,
     pub highlight: Option<HighlightRequest>,
     pub spinner_lines: Vec<(usize, usize)>,
+    pub gutter: Span<'static>,
+    pub gutter_spins: bool,
     /// Index of the first live-buffer snapshot line, recorded in the same
     /// pass that lays out `lines`, so click rows can never drift from them.
     pub snapshot_base: Option<usize>,
-    pub content_indent: &'static str,
     pub truncation: SectionFlags,
     pub elapsed: Option<ElapsedSpan>,
 }
@@ -548,40 +555,12 @@ impl ToolLineBuilder {
         ));
     }
 
-    fn prepend_indicator(&mut self, started_at: Instant) {
-        if self.lines.is_empty() {
-            return;
-        }
-        let (text, style) = match self.indicator {
-            Indicator::InProgress => {
-                let ch = spinner_frame(started_at.elapsed().as_millis());
-                (format!("{ch} "), theme::current().spinner)
-            }
-            finished => (finished_glyph(finished).into(), finished_style(finished)),
-        };
-        for (line, span) in &mut self.spinner_lines {
-            if *line == 0 {
-                *span += 1;
-            }
-        }
-        if matches!(self.indicator, Indicator::InProgress) {
-            self.spinner_lines.push((0, 0));
-        }
-        if let Some(elapsed) = &mut self.elapsed {
-            elapsed.span += 1;
-        }
-        self.lines[0].spans.insert(0, Span::styled(text, style));
-    }
-
     fn push_code_content(&mut self, input: Option<&ToolInput>, output: Option<&ToolOutput>) {
         let content = code_view::render_tool_content(input, output, false, self.limits);
         self.truncation.script |= content.truncation.script;
         self.truncation.output |= content.truncation.output;
         let start = self.lines.len();
-        for mut line in content.lines {
-            line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
-            self.lines.push(line);
-        }
+        self.lines.extend(content.lines);
         self.content_range = (start, self.lines.len());
     }
 
@@ -601,7 +580,7 @@ impl ToolLineBuilder {
             if self.markdown {
                 self.push_markdown_body(text);
             } else {
-                push_text_lines(&mut self.lines, text, TOOL_BODY_INDENT);
+                push_text_lines(&mut self.lines, text);
             }
             self.push_truncation_count(resolved.skipped);
         }
@@ -609,28 +588,23 @@ impl ToolLineBuilder {
 
     fn push_markdown_body(&mut self, text: &str) {
         let style = theme::current().assistant;
-        let indent = TOOL_BODY_INDENT.len() as u16;
         let md_lines = text_to_lines(
             text,
             "",
             style,
             style,
-            self.width.saturating_sub(indent),
+            self.width,
             Some(maki_markdown::render::TOOL_OUTPUT_MAX_LINE_BYTES),
         );
-        for mut line in md_lines {
-            line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
-            self.lines.push(line);
-        }
+        self.lines.extend(md_lines);
     }
 
     fn push_truncation_count(&mut self, skipped: usize) {
         if should_truncate(skipped) {
             self.truncation.output = true;
             let text = truncation_notice(skipped);
-            let mut line = Line::from(Span::styled(text, theme::current().tool_dim));
-            line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
-            self.lines.push(line);
+            self.lines
+                .push(Line::from(Span::styled(text, theme::current().tool_dim)));
         }
     }
 
@@ -639,8 +613,7 @@ impl ToolLineBuilder {
         self.snapshot_base = Some(base);
         let total = snapshot.lines.len();
         let frame = spinner_str(started_at.elapsed().as_millis());
-        let (lines, spinners) =
-            snapshot_to_lines_range(snapshot, TOOL_BODY_INDENT, 0..total, frame, self.indicator);
+        let (lines, spinners) = snapshot_to_lines_range(snapshot, 0..total, frame, self.indicator);
         self.lines.extend(lines);
         self.spinner_lines
             .extend(spinners.into_iter().map(|(line, span)| (base + line, span)));
@@ -648,31 +621,37 @@ impl ToolLineBuilder {
 
     fn finish(
         self,
+        started_at: Instant,
         input: Option<Arc<ToolInput>>,
         output: Option<Arc<ToolOutput>>,
-        content_indent: &'static str,
     ) -> ToolLines {
         let highlight = HighlightRequest::new(self.content_range, input, output, self.limits);
+        let gutter = match self.indicator {
+            Indicator::InProgress => Span::styled(
+                spinner_str(started_at.elapsed().as_millis()),
+                theme::current().spinner,
+            ),
+            finished => Span::styled(finished_glyph(finished), finished_style(finished)),
+        };
         ToolLines {
             lines: self.lines,
             highlight,
             spinner_lines: self.spinner_lines,
+            gutter,
+            gutter_spins: matches!(self.indicator, Indicator::InProgress),
             snapshot_base: self.snapshot_base,
-            content_indent,
             truncation: self.truncation,
             elapsed: self.elapsed,
         }
     }
 }
 
-fn push_text_lines(lines: &mut Vec<Line<'static>>, text: &str, indent: &'static str) {
+fn push_text_lines(lines: &mut Vec<Line<'static>>, text: &str) {
     let style = theme::current().tool;
-    for line in text.lines() {
-        lines.push(Line::from(vec![
-            Span::styled(indent, style),
-            Span::styled(line.to_owned(), style),
-        ]));
-    }
+    lines.extend(
+        text.lines()
+            .map(|line| Line::from(Span::styled(line.to_owned(), style))),
+    );
 }
 
 /// Bakes snapshot spans onto `out`. `"spinner"`-styled spans bake to the
@@ -731,7 +710,6 @@ fn finished_style(indicator: Indicator) -> Style {
 
 fn snapshot_to_lines_range(
     snapshot: &BufferSnapshot,
-    indent: &str,
     range: std::ops::Range<usize>,
     spinner_frame: &'static str,
     indicator: Indicator,
@@ -741,7 +719,7 @@ fn snapshot_to_lines_range(
         .iter()
         .enumerate()
         .map(|(i, sline)| {
-            let mut spans = vec![Span::raw(indent.to_string())];
+            let mut spans = Vec::new();
             bake_spans(
                 &sline.spans,
                 &mut spans,
@@ -823,7 +801,6 @@ pub fn build_tool_lines(
     if let Some(badge) = &msg.background {
         b.push_header(tool_name, header, None, msg.render_header.as_ref());
         b.push_background_annotation(badge);
-        b.prepend_indicator(rctx.started_at);
         if let Some(head) = msg
             .render_snapshot
             .as_ref()
@@ -831,7 +808,7 @@ pub fn build_tool_lines(
         {
             b.push_snapshot(&head, rctx.started_at);
         }
-        return b.finish(None, None, TOOL_BODY_INDENT);
+        return b.finish(rctx.started_at, None, None);
     }
     b.apply_output_format(msg.tool_output.as_deref());
     b.push_header(
@@ -840,7 +817,6 @@ pub fn build_tool_lines(
         msg.annotation.as_deref(),
         msg.render_header.as_ref(),
     );
-    b.prepend_indicator(rctx.started_at);
     let has_snapshot = msg.render_snapshot.is_some();
     b.push_code_content(
         msg.tool_input.as_deref(),
@@ -883,9 +859,9 @@ pub fn build_tool_lines(
         b.push_resolved_output(&resolved);
     }
     b.finish(
+        rctx.started_at,
         msg.tool_input.clone(),
         msg.tool_output.clone(),
-        TOOL_BODY_INDENT,
     )
 }
 
@@ -1036,21 +1012,17 @@ pub fn build_instructions_lines(
         Indicator::Success,
     );
     b.push_header(INSTRUCTIONS_TOOL, header, annotation.as_deref(), None);
-    b.prepend_indicator(Instant::now());
 
     let start = b.lines.len();
     let has_truncation =
         code_view::render_instructions(blocks, &mut b.lines, b.limits.output, false);
     b.truncation.output |= has_truncation;
-    for line in &mut b.lines[start..] {
-        line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
-    }
     b.content_range = (start, b.lines.len());
 
     let output = Arc::new(ToolOutput::Instructions {
         blocks: blocks.to_vec(),
     });
-    b.finish(None, Some(output), TOOL_BODY_INDENT)
+    b.finish(Instant::now(), None, Some(output))
 }
 
 #[cfg(test)]
@@ -1588,8 +1560,24 @@ mod tests {
             &test_rctx(80),
             SectionFlags::default(),
         );
-        // indicator + `tool> ` prefix + "3 tools " sit before the header spinner.
-        assert_eq!(tl.spinner_lines, vec![(0, 3), (0, 0)]);
+        // `tool> ` prefix + "3 tools " sit before the header spinner.
+        assert_eq!(tl.spinner_lines, vec![(0, 2)]);
+        assert!(tl.gutter_spins);
+    }
+
+    #[test_case(ToolStatus::Success, theme::current().tool_success ; "success")]
+    #[test_case(ToolStatus::Error, theme::current().tool_error ; "error")]
+    fn finished_tool_puts_styled_dot_in_gutter(status: ToolStatus, style: Style) {
+        let tl = build_tool_lines(&tool_msg(), status, &test_rctx(80), SectionFlags::default());
+        assert_eq!(tl.gutter, Span::styled(TOOL_INDICATOR, style));
+        assert!(!tl.gutter_spins);
+        assert!(
+            tl.lines[0]
+                .spans
+                .iter()
+                .all(|s| s.content.as_ref() != TOOL_INDICATOR),
+            "header line must not carry the indicator"
+        );
     }
 
     const DENIAL_MSG: &str = "Permission denied: user rejected";
@@ -2160,19 +2148,6 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_to_lines_range_adds_indent_prefix() {
-        let snapshot = make_snapshot(vec![vec![SnapshotSpan {
-            text: "content".into(),
-            style: SpanStyle::Default,
-        }]]);
-        let (lines, _) =
-            snapshot_to_lines_range(&snapshot, ">>", 0..1, "⠋ ", Indicator::InProgress);
-        assert_eq!(lines.len(), 1);
-        let first_span = &lines[0].spans[0];
-        assert_eq!(first_span.content.as_ref(), ">>");
-    }
-
-    #[test]
     fn snapshot_multi_span_line_preserves_order() {
         let snapshot = make_snapshot(vec![vec![
             SnapshotSpan {
@@ -2188,9 +2163,9 @@ mod tests {
                 style: SpanStyle::Default,
             },
         ]]);
-        let (lines, _) = snapshot_to_lines_range(&snapshot, "", 0..1, "⠋ ", Indicator::InProgress);
+        let (lines, _) = snapshot_to_lines_range(&snapshot, 0..1, "⠋ ", Indicator::InProgress);
         let texts: Vec<&str> = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(texts, vec!["", "aaa", "bbb", "ccc"]);
+        assert_eq!(texts, vec!["aaa", "bbb", "ccc"]);
     }
 
     #[test]
@@ -2212,9 +2187,9 @@ mod tests {
             ],
         ]);
         let (lines, spinners) =
-            snapshot_to_lines_range(&snapshot, "", 0..2, "⠹ ", Indicator::InProgress);
-        assert_eq!(spinners, vec![(1, 2)]);
-        assert_eq!(lines[1].spans[2].content.as_ref(), "⠹ ");
+            snapshot_to_lines_range(&snapshot, 0..2, "⠹ ", Indicator::InProgress);
+        assert_eq!(spinners, vec![(1, 1)]);
+        assert_eq!(lines[1].spans[1].content.as_ref(), "⠹ ");
     }
 
     #[test_case(ToolStatus::Success ; "success_bakes_dot")]

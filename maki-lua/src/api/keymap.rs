@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use maki_agent::{SharedBuf, UiWaker};
 use maki_config::Permission;
 use maki_lua_macro::{lua_fn, lua_table};
@@ -57,6 +57,59 @@ impl InputMode {
     }
 }
 
+pub(crate) const UNKNOWN_CURSOR_SHAPE_ERR: &str = "unsupported cursor shape";
+
+/// A cursor shape a plugin asks for with `maki.ui.set_cursor_shape`.
+/// `Default` is whatever the user configured their terminal to draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorShape {
+    Default,
+    Block,
+    Bar,
+    Underline,
+}
+
+impl CursorShape {
+    const ALL: [Self; 4] = [Self::Default, Self::Block, Self::Bar, Self::Underline];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Block => "block",
+            Self::Bar => "bar",
+            Self::Underline => "underline",
+        }
+    }
+
+    pub(crate) fn parse(name: &str) -> LuaResult<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|shape| shape.name() == name)
+            .ok_or_else(|| mlua::Error::runtime(format!("{UNKNOWN_CURSOR_SHAPE_ERR}: {name}")))
+    }
+}
+
+/// `blink` means nothing for `Default`, which keeps the terminal's own blink.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CursorStyle {
+    pub shape: CursorShape,
+    pub blink: bool,
+}
+
+impl CursorStyle {
+    pub const DEFAULT: Self = Self {
+        shape: CursorShape::Default,
+        blink: false,
+    };
+
+    pub(crate) fn new(shape: CursorShape, blink: bool) -> Self {
+        Self {
+            shape,
+            blink: blink && shape != CursorShape::Default,
+        }
+    }
+}
+
 /// The mode lives on two threads. A plugin picks it with `set_mode` on the
 /// Lua thread, but only the UI knows if the chat input has the keyboard.
 /// Each half is stored the moment it changes, so `maki.fn.mode()` right after
@@ -66,12 +119,19 @@ impl InputMode {
 pub(crate) struct ModeState {
     normal: AtomicBool,
     input_focused: AtomicBool,
+    /// None until a plugin sets a cursor shape. It never goes back to None: once
+    /// a shape was sent, the terminal has to be told to restore its own.
+    cursor: ArcSwapOption<CursorStyle>,
 }
 
 impl ModeState {
     pub(crate) fn set(&self, mode: InputMode) {
         self.normal
             .store(mode == InputMode::Normal, Ordering::Release);
+    }
+
+    fn set_cursor(&self, style: CursorStyle) {
+        self.cursor.store(Some(Arc::new(style)));
     }
 
     pub(crate) fn get(&self) -> InputMode {
@@ -239,7 +299,6 @@ impl KeymapEntry {
 #[derive(Clone, Default)]
 pub struct KeymapSnapshot {
     pub entries: Vec<KeymapEntry>,
-    pub generation: u64,
 }
 
 #[derive(Clone)]
@@ -273,6 +332,12 @@ impl KeymapReader {
         self.mode.get()
     }
 
+    /// The cursor shape a plugin asked for, or None if none ever did, so the
+    /// terminal is never sent a shape the user did not opt into.
+    pub fn cursor_style(&self) -> Option<CursorStyle> {
+        self.mode.cursor.load().as_deref().cloned()
+    }
+
     /// Hands {key} to the binding on it in {mode} and reports whether it was
     /// taken. With {buffer}, only the bindings set for that buffer are asked,
     /// which the host does for each window showing one before it asks the
@@ -304,7 +369,6 @@ impl KeymapReader {
 
 pub(crate) struct KeymapWriter {
     store: Arc<ArcSwap<KeymapSnapshot>>,
-    generation: AtomicU64,
     pub(crate) mode: Arc<ModeState>,
     actions: Arc<ArcSwap<Vec<ActionInfo>>>,
 }
@@ -317,7 +381,6 @@ impl KeymapWriter {
         (
             Self {
                 store: Arc::clone(&inner),
-                generation: AtomicU64::new(0),
                 mode: Arc::clone(&mode),
                 actions: Arc::clone(&actions),
             },
@@ -334,11 +397,7 @@ impl KeymapWriter {
     }
 
     pub fn publish(&self, entries: Vec<KeymapEntry>) {
-        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        self.store.store(Arc::new(KeymapSnapshot {
-            entries,
-            generation,
-        }));
+        self.store.store(Arc::new(KeymapSnapshot { entries }));
     }
 }
 
@@ -372,6 +431,8 @@ pub(crate) struct KeymapStore {
     plugins: HashMap<Arc<str>, Arc<AtomicBool>>,
     /// The plugin that last switched the input to normal mode.
     normal_owner: Option<Arc<str>>,
+    /// The plugin that last set a cursor shape other than the default.
+    cursor_owner: Option<Arc<str>>,
 }
 
 impl KeymapStore {
@@ -380,6 +441,7 @@ impl KeymapStore {
             bindings: Vec::new(),
             plugins: HashMap::new(),
             normal_owner: None,
+            cursor_owner: None,
         }
     }
 
@@ -602,6 +664,42 @@ pub(crate) fn release_mode(lua: &Lua, plugin: &str) {
     });
     if owned {
         apply_mode(lua, InputMode::Insert);
+    }
+}
+
+fn apply_cursor(lua: &Lua, style: CursorStyle) {
+    if let Some(writer) = lua.app_data_ref::<KeymapWriter>() {
+        writer.mode.set_cursor(style);
+    }
+    if let Some(waker) = lua.app_data_ref::<UiWaker>() {
+        waker.wake();
+    }
+}
+
+/// What `maki.ui.set_cursor_shape` does for {plugin}, which then owns the
+/// shape until anyone sets it again. Dropped for an unloaded plugin, for the
+/// same reason as [`switch_mode`].
+pub(crate) fn switch_cursor(lua: &Lua, style: CursorStyle, plugin: &Arc<str>) {
+    if !plugin_loaded(lua, plugin) {
+        tracing::debug!(shape = style.shape.name(), plugin = %plugin, "cursor shape dropped: plugin unloaded");
+        return;
+    }
+    if let Some(mut store) = lua.app_data_mut::<KeymapStore>() {
+        store.cursor_owner = (style != CursorStyle::DEFAULT).then(|| Arc::clone(plugin));
+    }
+    apply_cursor(lua, style);
+}
+
+/// Gives the terminal its own cursor back if {plugin} set the shape.
+pub(crate) fn release_cursor(lua: &Lua, plugin: &str) {
+    let owned = lua.app_data_mut::<KeymapStore>().is_some_and(|mut store| {
+        store
+            .cursor_owner
+            .take_if(|owner| owner.as_ref() == plugin)
+            .is_some()
+    });
+    if owned {
+        apply_cursor(lua, CursorStyle::DEFAULT);
     }
 }
 
@@ -889,11 +987,15 @@ lua_table! {
     /// current mode.
     ///
     /// 1. `<C-c>` and `<C-z>`, which no binding can take. `<C-z>` suspends
-    ///    here, and `<C-c>` still goes to step 2 first.
-    /// 2. The focused window, then Maki's modals and prompts, then Maki's
-    ///    pickers. They take every key, except the plan form and the `/`
-    ///    command list, which pass on the keys they do not use. The focused
-    ///    window runs its buffer's bindings, then its `win:recv`.
+    ///    here, and `<C-c>` still goes to step 2 first. An open permission
+    ///    prompt takes `<C-c>` even under the focused floating window, so it
+    ///    can always be denied.
+    /// 2. Maki's alerts, then the focused floating window, then Maki's
+    ///    prompts and modals, then the focused split, then Maki's pickers.
+    ///    They take every key, except the plan form and the `/` command list,
+    ///    which pass on the keys they do not use. The focused window runs its
+    ///    buffer's bindings, then its `win:recv`. A hidden focused window, or
+    ///    one sized to nothing, takes no keys here.
     /// 3. Windows on screen, front first: each one's buffer bindings, then
     ///    the keys it claimed with the `keys` option of `maki.ui.open_win`.
     /// 4. `<Esc>` while the agent runs, in either mode. Maki takes it, and a
@@ -951,11 +1053,6 @@ lua_table! {
     /// Key strings in a plugin and every module it `require`s are checked at
     /// load. Each invalid one is logged with its file and line, and the status
     /// bar shows a summary, so a typo shows up at startup.
-    ///
-    /// Upgrading from older versions: `win:recv` used to deliver `"enter"`,
-    /// `"esc"`, `"ctrl+n"` and `"shift+tab"`. These now arrive as `<CR>`,
-    /// `<Esc>`, `<C-n>` and `<S-Tab>`, and the load check flags the old
-    /// spellings.
     "maki.keymap" => pub(crate) fn create_keymap_table(plugin: Arc<str>, grants: PluginPermissions), DOCS [
         set(plugin, grants), del(plugin), normalize,
     ]
@@ -1149,7 +1246,6 @@ mod tests {
 
         let snap = reader.load();
         assert_eq!(snap.entries.len(), 1);
-        assert_eq!(snap.generation, 1);
     }
 
     /// The key is consumed the moment `dispatch` says it was claimed, so a

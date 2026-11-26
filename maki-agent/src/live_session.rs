@@ -33,6 +33,16 @@ const UNATTENDED_RUN_ID: u64 = 0;
 static LIVE_SESSIONS: LazyLock<Mutex<HashMap<MakiId, Weak<LiveSession>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Subagent mailboxes by task id, so a plugin that only sees the id in an
+/// event can reach one. The session that opened the task guards it.
+static LIVE_TASKS: LazyLock<Mutex<HashMap<String, TaskEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+struct TaskEntry {
+    parent: MakiId,
+    mailbox: SessionMailbox,
+}
+
 /// Every frontend registers the mailbox, but only an interactive agent loop
 /// publishes a seed. The seed is held weakly, so it dies with its loop. The
 /// mailbox lives on through a respawn, because the new loop registers before
@@ -55,9 +65,17 @@ struct LiveSession {
 struct Mailbox {
     pending: VecDeque<Message>,
     wake: bool,
+    /// Compaction a plugin queued. Notice drains leave it alone.
+    compact: Option<CompactRequest>,
     outstanding: Vec<String>,
     /// No run reads it again, so it takes no new receipts.
     closed: bool,
+}
+
+/// A compaction a plugin queued through `maki.session.request_compact`.
+#[derive(Debug)]
+pub struct CompactRequest {
+    pub instructions: Option<String>,
 }
 
 /// How a notice names a task: its tool, plus the call's summary when that
@@ -283,8 +301,14 @@ fn answering(answer: TaskAnswer, text: String, display: Option<&str>, markdown: 
 }
 
 #[derive(Debug, Error)]
-#[error("session not live: {0}")]
-pub struct MailboxError(MakiId);
+pub enum MailboxError {
+    #[error("session not live: {0}")]
+    Session(MakiId),
+    #[error("no live subagent with id {0}")]
+    Task(String),
+    #[error("a compaction is already pending")]
+    AlreadyPending,
+}
 
 #[derive(Clone)]
 pub struct SessionMailbox {
@@ -356,12 +380,96 @@ impl SessionMailbox {
         Ok(())
     }
 
+    /// Like [`Self::notify`], for the subagent behind `task_id`.
+    pub fn notify_task(
+        session_id: MakiId,
+        task_id: &str,
+        text: String,
+        display: Option<&str>,
+        wake: bool,
+    ) -> Result<(), MailboxError> {
+        let tasks = lock(&LIVE_TASKS);
+        let entry = tasks
+            .get(task_id)
+            .filter(|entry| entry.parent == session_id)
+            .ok_or_else(|| MailboxError::Task(task_id.to_owned()))?;
+        entry
+            .mailbox
+            .change(|state| state.push(observation(text, display), wake));
+        Ok(())
+    }
+
+    /// Makes `task_id` reachable through [`Self::notify_task`].
+    pub fn track_task(&self, task_id: &str, parent: MakiId) {
+        lock(&LIVE_TASKS).insert(
+            task_id.to_owned(),
+            TaskEntry {
+                parent,
+                mailbox: self.clone(),
+            },
+        );
+    }
+
+    /// Drops the entry only while it is this mailbox's: siblings can share a task id.
+    pub fn untrack_task(&self, task_id: &str) {
+        let mut tasks = lock(&LIVE_TASKS);
+        if tasks
+            .get(task_id)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.mailbox.live, &self.live))
+        {
+            tasks.remove(task_id);
+        }
+    }
+
+    /// Queues a compaction for `session_id`. A running agent applies it
+    /// between turns, an idle one at the start of its next run. While one
+    /// sits unclaimed, a repeat request fails.
+    pub fn request_compact(
+        session_id: MakiId,
+        instructions: Option<String>,
+    ) -> Result<(), MailboxError> {
+        Self::open(session_id)?.queue_compact(CompactRequest { instructions })
+    }
+
+    /// [`Self::request_compact`] for a live subagent of `session_id`, whose
+    /// own run then claims it.
+    pub fn request_compact_task(
+        session_id: MakiId,
+        task_id: &str,
+        instructions: Option<String>,
+    ) -> Result<(), MailboxError> {
+        let tasks = lock(&LIVE_TASKS);
+        let entry = tasks
+            .get(task_id)
+            .filter(|entry| entry.parent == session_id)
+            .ok_or_else(|| MailboxError::Task(task_id.to_owned()))?;
+        entry.mailbox.queue_compact(CompactRequest { instructions })
+    }
+
+    fn queue_compact(&self, request: CompactRequest) -> Result<(), MailboxError> {
+        let mut mailbox = lock(&self.live.mailbox);
+        if mailbox.closed {
+            return Err(MailboxError::Session(self.session_id));
+        }
+        if mailbox.compact.is_some() {
+            return Err(MailboxError::AlreadyPending);
+        }
+        mailbox.compact = Some(request);
+        Ok(())
+    }
+
+    /// Takes the pending compaction request. One taker wins, so a host and
+    /// a run cannot compact twice.
+    pub fn take_compact(&self) -> Option<CompactRequest> {
+        lock(&self.live.mailbox).compact.take()
+    }
+
     /// The mailbox of a live session, never a new one.
     pub fn open(session_id: MakiId) -> Result<Self, MailboxError> {
         let mut sessions = lock(&LIVE_SESSIONS);
         let Some(live) = sessions.get(&session_id).and_then(Weak::upgrade) else {
             sessions.remove(&session_id);
-            return Err(MailboxError(session_id));
+            return Err(MailboxError::Session(session_id));
         };
         Ok(Self { session_id, live })
     }
@@ -649,7 +757,7 @@ impl AgentSeed {
     /// that is gone can't say it isn't planning, so that is a no too.
     pub fn background_write_block(chat: MakiId) -> Option<String> {
         let Some(seed) = Self::live(chat) else {
-            return Some(MailboxError(chat).to_string());
+            return Some(MailboxError::Session(chat).to_string());
         };
         let (_, planning) = *lock(&seed.chat_settings);
         planning.then(|| BACKGROUND_PLAN_WRITE_DENIED.to_owned())
@@ -696,7 +804,7 @@ mod tests {
 
     use super::*;
     use crate::tools::FileKey;
-    use crate::tools::test_support::{future_mtime, stub_seed};
+    use crate::tools::test_support::{foreign_edit, stub_seed};
 
     const CHAT_OPTS: RequestOptions = RequestOptions {
         thinking: ThinkingConfig::Adaptive,
@@ -705,6 +813,7 @@ mod tests {
     const PLAN_FILE: &str = "/tmp/plan.md";
     const EDITED_FILE: &str = "foo.rs";
     const NOTICE_BODY: &str = "child finished";
+    const COMPACT_INSTRUCTIONS: &str = "keep the open questions";
     const LABEL_HEAD: &str = "Background agent finished:";
     const WIDE_CHAR: &str = "é";
 
@@ -1198,6 +1307,76 @@ mod tests {
     }
 
     #[test]
+    fn notify_task_reaches_the_subagent_mailbox() {
+        let parent = MakiId::generate();
+        let task_id = MakiId::generate().to_string();
+        let subagent = SessionMailbox::register(MakiId::generate());
+        subagent.track_task(&task_id, parent);
+
+        SessionMailbox::notify_task(parent, &task_id, NOTICE_BODY.into(), None, false).unwrap();
+
+        assert_eq!(text(&subagent.drain().remove(0)), NOTICE_BODY);
+        subagent.untrack_task(&task_id);
+    }
+
+    #[test]
+    fn untracking_a_shared_task_id_keeps_the_newer_mailbox() {
+        let parent = MakiId::generate();
+        let task_id = MakiId::generate().to_string();
+        let older = SessionMailbox::register(MakiId::generate());
+        older.track_task(&task_id, parent);
+        let newer = SessionMailbox::register(MakiId::generate());
+        newer.track_task(&task_id, parent);
+
+        older.untrack_task(&task_id);
+        SessionMailbox::notify_task(parent, &task_id, NOTICE_BODY.into(), None, false).unwrap();
+
+        assert_eq!(text(&newer.drain().remove(0)), NOTICE_BODY);
+        assert!(older.drain().is_empty());
+        newer.untrack_task(&task_id);
+    }
+
+    #[test_case(false ; "never tracked")]
+    #[test_case(true ; "untracked")]
+    fn notify_task_rejects_a_task_it_cannot_reach(tracked: bool) {
+        let parent = MakiId::generate();
+        let task_id = MakiId::generate().to_string();
+        if tracked {
+            let subagent = SessionMailbox::register(MakiId::generate());
+            subagent.track_task(&task_id, parent);
+            subagent.untrack_task(&task_id);
+        }
+
+        let error = SessionMailbox::notify_task(parent, &task_id, NOTICE_BODY.into(), None, false)
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            MailboxError::Task(task_id.clone()).to_string()
+        );
+    }
+
+    #[test]
+    fn notify_task_rejects_a_task_of_another_session() {
+        let parent = MakiId::generate();
+        let task_id = MakiId::generate().to_string();
+        let subagent = SessionMailbox::register(MakiId::generate());
+        subagent.track_task(&task_id, parent);
+
+        let stranger = SessionMailbox::notify_task(
+            MakiId::generate(),
+            &task_id,
+            NOTICE_BODY.into(),
+            None,
+            false,
+        );
+
+        assert!(stranger.is_err());
+        assert!(subagent.drain().is_empty());
+        subagent.untrack_task(&task_id);
+    }
+
+    #[test]
     fn seed_is_live_only_while_its_owner_holds_it() {
         let id = MakiId::generate();
         let mailbox = SessionMailbox::register(id);
@@ -1266,7 +1445,7 @@ mod tests {
         drop(seed);
         assert_eq!(
             AgentSeed::background_write_block(id),
-            Some(MailboxError(id).to_string())
+            Some(MailboxError::Session(id).to_string())
         );
     }
 
@@ -1285,7 +1464,7 @@ mod tests {
         let background = old.tool_context(CancelToken::none());
 
         old.file_access.record_read(&key);
-        future_mtime(&path);
+        foreign_edit(&path);
         background.file_access.record_read(&key);
         assert!(old.file_access.check_before_edit(&key).is_err());
 
@@ -1299,5 +1478,70 @@ mod tests {
                 .now_or_never()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn request_compact_queues_one_claimable_request() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        SessionMailbox::request_compact(id, Some(COMPACT_INSTRUCTIONS.to_owned())).unwrap();
+        assert_eq!(
+            mailbox.take_compact().unwrap().instructions.as_deref(),
+            Some(COMPACT_INSTRUCTIONS)
+        );
+        assert!(mailbox.take_compact().is_none());
+    }
+
+    #[test]
+    fn request_compact_rejects_a_second_request_until_claimed() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        SessionMailbox::request_compact(id, None).unwrap();
+        assert!(matches!(
+            SessionMailbox::request_compact(id, Some(COMPACT_INSTRUCTIONS.to_owned())),
+            Err(MailboxError::AlreadyPending)
+        ));
+        mailbox.take_compact().unwrap();
+        SessionMailbox::request_compact(id, Some(COMPACT_INSTRUCTIONS.to_owned())).unwrap();
+        assert_eq!(
+            mailbox.take_compact().unwrap().instructions.as_deref(),
+            Some(COMPACT_INSTRUCTIONS)
+        );
+    }
+
+    #[test]
+    fn request_compact_rejects_a_dead_session() {
+        let missing = MakiId::generate();
+        assert!(matches!(
+            SessionMailbox::request_compact(missing, None),
+            Err(MailboxError::Session(id)) if id == missing
+        ));
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        mailbox.close();
+        assert!(matches!(
+            SessionMailbox::request_compact(id, None),
+            Err(MailboxError::Session(_))
+        ));
+    }
+
+    #[test]
+    fn request_compact_task_reaches_the_subagent_mailbox() {
+        let parent = MakiId::generate();
+        let parent_mailbox = SessionMailbox::register(parent);
+        let task_id = "task-1";
+        let subagent = SessionMailbox::register(MakiId::generate());
+        subagent.track_task(task_id, parent);
+        SessionMailbox::request_compact_task(parent, task_id, Some(COMPACT_INSTRUCTIONS.into()))
+            .unwrap();
+        assert_eq!(
+            subagent.take_compact().unwrap().instructions.as_deref(),
+            Some(COMPACT_INSTRUCTIONS)
+        );
+        assert!(
+            matches!(SessionMailbox::request_compact_task(parent, "untracked", None),
+                Err(MailboxError::Task(t)) if t == "untracked")
+        );
+        parent_mailbox.close();
     }
 }

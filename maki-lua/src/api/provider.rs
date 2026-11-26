@@ -3,7 +3,6 @@ use std::fmt::Display;
 use std::io::{self, IsTerminal, Write};
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
@@ -12,10 +11,10 @@ use maki_agent::cancel::CancelToken;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::AgentError;
 use maki_providers::plugin::{self, Hook, ProviderDecl, ProviderHooks, Registration};
-use maki_providers::provider::BoxFuture;
+use maki_providers::provider::{BoxFuture, Provider};
 use maki_storage::StateDir;
 use maki_storage::auth::{
-    delete_plugin_auth, load_plugin_auth, lock_credentials, save_plugin_auth,
+    delete_plugin_auth, load_plugin_auth_async, lock_credentials_async, save_plugin_auth,
 };
 use maki_storage::stdin;
 use mlua::{
@@ -29,9 +28,11 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::task::spawn_blocking;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 use crate::api::Owner;
 use crate::api::net::{self, NetError, ResponseData};
+use crate::api::util::command::{UiAction, ui_json_roundtrip};
 use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json, lua_to_json_within};
 use crate::api::util::pair::{Pair, try_pair};
 use crate::plugin_permissions::{NetEgress, OwnedSlugs, Permission, PluginPermissions};
@@ -200,12 +201,14 @@ impl Drop for LuaHookKeys {
     /// the existing way back there; a callback handed over already cancelled is
     /// the dispatcher's path for releasing a key without running it.
     fn drop(&mut self) {
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
         for (_, func) in std::mem::take(&mut self.keys) {
             let _ = self.release.send(DeferredCallback {
                 func,
                 delay: Duration::ZERO,
                 plugin: Arc::clone(&self.plugin),
-                cancel: Arc::new(AtomicBool::new(true)),
+                cancel: cancelled.clone(),
                 ceiling: None,
             });
         }
@@ -424,8 +427,12 @@ fn hook_ctx(lua: &Lua, keys: &LuaHookKeys, terminal: bool) -> LuaResult<Table> {
         add_stdio(lua, &ctx)?;
     }
     let base_url = plugin::effective_base_url(&keys.slug);
-    let headers = plugin::resolved_auth(&keys.slug)
-        .map(|auth| auth.headers)
+    let headers: Vec<(String, String)> = plugin::resolved_auth(&keys.slug)
+        .map(|auth| {
+            auth.headers()
+                .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                .collect()
+        })
         .unwrap_or_default();
     ctx.set(SLUG, keys.slug.as_str())?;
     ctx.set(BASE_URL, base_url.as_deref())?;
@@ -644,6 +651,77 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
     Ok(owner.granted_providers.contains(&slug))
 }
 
+/// The provider's own usage limits, the data behind `/usage`. A limit carries
+/// a provider label, a used percentage, its reset time in epoch milliseconds
+/// and a free-form detail. `plan` and `by_model_today` come back when the
+/// provider reports them.
+///
+/// With a UI attached the answer comes from a live session using that slug,
+/// the instance `/usage` reads, so a key rotated after a 429 is the one
+/// reported. Headless drivers build a fresh provider from the slug instead,
+/// which starts at the first key.
+///
+/// A provider with no usage endpoint answers nil and an error, as does a
+/// failed fetch. The call fetches live data, so a plugin that polls should
+/// space its calls out.
+///
+/// @param slug string Provider name, such as `"zai"`.
+/// @return (table|nil, string|nil) Usage, or nil and an error string.
+/// @example
+/// local usage, err = maki.provider.usage("zai")
+/// if usage then
+///   for _, limit in ipairs(usage.limits or {}) do
+///     maki.log.info(limit.label .. " " .. tostring(limit.percentage) .. "%")
+///   end
+/// end
+#[lua_fn]
+async fn usage(
+    lua: Lua,
+    #[ctx] tx: Option<UnboundedSender<UiAction>>,
+    slug: String,
+) -> LuaResult<Pair<LuaValue>> {
+    if let Some(tx) = tx.as_ref() {
+        return ui_json_roundtrip(&lua, Some(tx), |reply_tx| UiAction::ProviderUsage {
+            slug: slug.clone(),
+            reply_tx,
+        })
+        .await;
+    }
+    let lookup = slug.clone();
+    let provider = try_pair!(
+        maki_storage::blocking(move || {
+            maki_providers::provider::provider_for_slug(
+                &lookup,
+                maki_providers::Timeouts::default(),
+            )
+        })
+        .await
+        .map_err(|e| e.user_message())
+    );
+    let value = try_pair!(fetch_provider_usage(provider.as_ref(), &slug).await);
+    Ok((Some(json_to_lua(&lua, &value)?), None))
+}
+
+/// The one usage fetch, with the same error mapping and JSON shape whether it
+/// answers a headless call, a UI roundtrip or a test host.
+pub fn fetch_provider_usage<'a>(
+    provider: &'a dyn Provider,
+    slug: &'a str,
+) -> BoxFuture<'a, Result<Value, String>> {
+    Box::pin(async move {
+        let usage = provider
+            .fetch_usage()
+            .await
+            .map_err(|e| e.user_message())?
+            .ok_or_else(|| format!("{slug} does not report usage"))?;
+        usage_value(&usage)
+    })
+}
+
+fn usage_value(usage: &maki_providers::ProviderUsage) -> Result<Value, String> {
+    serde_json::to_value(usage).map_err(|e| e.to_string())
+}
+
 /// Register a provider this plugin implements. Its models are addressed as
 /// `<slug>/<model>` and appear in the model picker and in `/model`.
 ///
@@ -668,7 +746,8 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
 ///           then the declared `base_url`, nil when none is set. Build URLs
 ///           from it so side calls follow a user who points the slug at a
 ///           gateway.
-///   `ctx.headers` (table) The headers every request to the slug carries.
+///   `ctx.headers` (table) The headers every request to the slug carries,
+///           under lowercase names.
 ///   `ctx.get_json(target)` (function) A GET with `ctx.headers`. A `target`
 ///           starting with `/` is appended to `ctx.base_url`, an absolute URL
 ///           is used as is. Never retried. Returns the decoded body, or nil
@@ -725,7 +804,10 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
 ///           the model table when `models` is empty.
 ///   `system_prefix` (string) Text prepended to the system prompt. The
 ///           `google` codec refuses it.
-///   `openai` (table) Options for `codec = "openai"`, all optional:
+///   `openai` (table) Options for the `"openai"` and `"openai-responses"`
+///           codecs, all optional. The responses codec takes only
+///           thinking options (without `field`) and `thinking_overrides`,
+///           and refuses the rest:
 ///     `max_tokens_field` (string) Body field carrying the output cap.
 ///             Defaults to `max_tokens`.
 ///     `include_stream_usage` (boolean) Ask for usage on the stream.
@@ -739,21 +821,30 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
 ///               `"prefer-high"`, `"high-only"`, `"glm"`, `"deepseek"`,
 ///               `"anthropic-adaptive"`, `"gemini"`, `"tensorx"`, `"grok"`
 ///               or `"ollama"`.
+///       `effort` (table) Replaces `dialect`'s levels and off switch for
+///               every model, with the same fields as a model row's
+///               `effort`. A row's own `effort` wins over it.
 ///       `field` (string) Body path for the effort. Dots nest, e.g.
 ///               `"reasoning.effort"`. Defaults to `reasoning_effort`.
 ///       `requires_support` (boolean) Send effort only to models that
 ///               support thinking. Defaults to `false`.
-///     `headers` (table) Sent with every request. A header the credentials
-///             set wins. `host`, `content-length`, `transfer-encoding` and
-///             `connection` are refused.
+///     `headers` (table) Sent with every request. They replace headers
+///             maki sets, and a header the credentials set wins. `host`,
+///             `content-length`, `transfer-encoding` and `connection` are
+///             refused.
 ///     `extra_body` (table) Merged into every request body.
 ///     `thinking_overrides` (table) Model id prefix to `"no"`, `"yes"` or
 ///             `"required"`, overriding the model table. Longest prefix wins.
 ///   `session_id` (table) Sends the session id with every request, as
 ///           `{ headers = { "x-affinity" } }`,
-///           `{ body_field = "prompt_cache_key" }`, or both at once. A
+///           `{ body_field = "prompt_cache_key" }`, or both. A
 ///           listed header replaces one the credentials set. The `google`
 ///           codec refuses it.
+///   `replay_reasoning` (boolean) Sends past assistant reasoning back as
+///           `reasoning` input items, so a follow-up keeps what the model
+///           worked out earlier. Only `codec = "openai-responses"` accepts
+///           it, and only a provider that takes plaintext reasoning back
+///           should set it. Defaults to `false`.
 ///   `models` (table) Static model rows, read once at registration. They
 ///            describe models and add to the runtime list. See
 ///            [model rows](/docs/providers/#model-rows).
@@ -763,17 +854,19 @@ fn is_selected(_lua: &Lua, #[ctx] owner: crate::api::Owner, slug: String) -> Lua
 ///            on the newest credentials, or `"reload"` to re-read stored
 ///            credentials after a login or another maki process changed them.
 ///            Spend a refresh token only on `"refresh"`.
-///            Omitting `base_url` keeps the current one.
+///            Omitting `base_url` keeps the current one. A returned header
+///            replaces one maki or `openai.headers` sets.
 ///   `list_models` (function) `function(ctx)` returning model rows for a
 ///            catalogue only known at runtime. Without it, the provider
 ///            lists what its codec or base lists. Rows carry `id`,
 ///            `context_window`, `max_output_tokens`, `pricing`,
 ///            `supports_thinking`, `supports_vision` and `tier`, plus two
 ///            optional fields. `extra` is any JSON value, handed back to
-///            `build_body` as `opts.model_info`. `effort` narrows the
-///            `openai.thinking` dialect for this model: `supported` lists the
-///            effort names the provider accepts, and `send_off` is `true` to
-///            send `"none"` for off or `false` to send nothing.
+///            `build_body` as `opts.model_info`. `effort` replaces the
+///            `openai.thinking` levels and off switch for this model:
+///            `supported` lists the effort names the provider accepts, and
+///            `send_off` is `true` to send `"none"` for off or `false` to send
+///            nothing.
 ///   `build_body` (function) `function(ctx, body, model, opts)` returning
 ///            the body to send. `opts.thinking` is the rendered effort level,
 ///            nil when thinking is off. `openai` codecs only.
@@ -954,39 +1047,42 @@ fn http_error(_lua: &Lua, res: Table) -> LuaResult<ProviderError> {
 /// Read the credentials this plugin stored for one of its providers. Returns
 /// nil when nothing was stored yet, for example before the first login.
 ///
+/// Reading the store yields, so this fails in a callback that cannot yield,
+/// like a `table.sort` comparator or a metamethod.
+///
 /// @param slug string A provider slug this plugin registered.
 /// @return (table?, string?) The stored credentials, or nil plus an error.
 /// @example
 /// local creds = maki.provider.auth.get("acme")
 /// if creds then print(creds.access_token) end
 #[lua_fn]
-fn get(lua: &Lua, #[ctx] slugs: OwnedSlugs, slug: String) -> LuaResult<Pair<Table>> {
+async fn get(lua: Lua, #[ctx] slugs: OwnedSlugs, slug: String) -> LuaResult<Pair<Table>> {
     owned(&slugs, &slug)?;
     let dir = try_pair!(StateDir::resolve());
-    let Some(data) = load_plugin_auth(&dir, &slug) else {
+    let Some(data) = load_plugin_auth_async(&dir, &slug).await else {
         return Ok((None, None));
     };
-    match json_to_lua(lua, &Value::Object(data))? {
+    match json_to_lua(&lua, &Value::Object(data))? {
         LuaValue::Table(table) => Ok((Some(table), None)),
         _ => Ok((None, None)),
     }
 }
 
-/// Every change to the credential store, off the plugin host's thread.
+/// Every change to the credential store.
 ///
-/// [`lock_credentials`] waits on a file lock another maki process may hold, and
-/// the host is single threaded: waiting for it here would stall every tool
-/// call, timer and provider hook in this process behind one plugin's token
-/// rotation. The common case takes no file lock at all, because the host
-/// already holds this slug while its hook runs and the lock lets it back in,
-/// so the write costs one hop off the thread and back.
+/// [`lock_credentials_async`] may wait on a file lock another maki process
+/// holds. It waits on the timer, so the single-threaded host goes on serving
+/// every other tool call, timer and provider hook meanwhile. The write itself
+/// runs off the host's thread and takes the guard along, so a call dropped
+/// mid-write still finishes it under the lock.
 async fn write_credentials(
     slug: String,
     write: impl FnOnce(&StateDir, &str) -> Result<(), String> + Send + 'static,
 ) -> Result<(), String> {
+    let dir = StateDir::resolve().map_err(|e| e.to_string())?;
+    let lock = lock_credentials_async(&dir, &slug).await;
     spawn_blocking(move || {
-        let dir = StateDir::resolve().map_err(|e| e.to_string())?;
-        let _lock = lock_credentials(&dir, &slug);
+        let _lock = lock;
         write(&dir, &slug)
     })
     .await
@@ -1084,9 +1180,10 @@ lua_table! {
     ///   models = { { prefixes = { "acme-large" }, tier = "strong" } },
     /// })
     /// ```
-    "maki.provider" => pub(crate) fn create_provider_table(perms: &PluginPermissions, owner: crate::api::Owner, egress: NetEgress, grants: PluginPermissions), DOCS [
+    "maki.provider" => pub(crate) fn create_provider_table(perms: &PluginPermissions, owner: crate::api::Owner, egress: NetEgress, grants: PluginPermissions, tx: Option<UnboundedSender<UiAction>>), DOCS [
         register(perms, owner, egress, grants),
         is_selected(owner),
+        usage(tx),
         http_error,
     ]
 }
@@ -1100,9 +1197,10 @@ pub(crate) fn create_provider_namespace(
     permissions: &PluginPermissions,
     owner: Owner,
     egress: NetEgress,
+    tx: Option<UnboundedSender<UiAction>>,
 ) -> LuaResult<Table> {
     let owned = egress.owned();
-    let provider = create_provider_table(lua, permissions, owner, egress, permissions.clone())?;
+    let provider = create_provider_table(lua, permissions, owner, egress, permissions.clone(), tx)?;
     provider.set("auth", create_auth_table(lua, owned)?)?;
     Ok(provider)
 }
@@ -1111,6 +1209,7 @@ pub(crate) fn create_provider_namespace(
 mod tests {
     use maki_providers::ProviderUsage;
     use maki_providers::plugin::DeclAuthority;
+    use maki_providers::test_support::isolated_home;
     use serde_json::json;
     use test_case::test_case;
     use tokio::sync::mpsc::unbounded_channel;
@@ -1141,6 +1240,8 @@ mod tests {
     const UNAUTHORIZED: u16 = 401;
     const RATE_LIMITED: u16 = 429;
     const HOOK_ERROR: &str = "balance unavailable";
+    const TOKEN_FIELD: &str = "token";
+    const STORED_TOKEN: &str = "stored";
     const HOOK_NEVER_CALLED: &str = "the hook call never reached the host";
 
     fn keys_from(
@@ -1174,6 +1275,39 @@ mod tests {
         for slot in HookSlot::ALL {
             assert_eq!(hook_slot(slot.spec().name), Some(slot));
         }
+    }
+
+    #[test]
+    fn usage_table_carries_the_limits_and_plan() {
+        let lua = Lua::new();
+        let usage = maki_providers::ProviderUsage {
+            plan: Some("lite".into()),
+            by_model_today: vec![maki_providers::ModelUsageRow {
+                model: "glm-5".into(),
+                input_tokens: 100,
+                output_tokens: 50,
+                total_tokens: 150,
+                spend_microdollars: 250_000,
+            }],
+            limits: vec![maki_providers::UsageLimit {
+                label: "5-hour".into(),
+                percentage: Some(42),
+                reset_at: Some(1_800_000_000_000),
+                detail: None,
+            }],
+        };
+
+        let value = json_to_lua(&lua, &usage_value(&usage).unwrap()).unwrap();
+        let json = lua_to_json(&lua, &value).unwrap();
+        assert_eq!(json["plan"], json!("lite"));
+        assert_eq!(json["by_model_today"][0]["model"], json!("glm-5"));
+        assert_eq!(
+            json["by_model_today"][0]["spend_microdollars"],
+            json!(250_000)
+        );
+        assert_eq!(json["limits"][0]["label"], json!("5-hour"));
+        assert_eq!(json["limits"][0]["percentage"], json!(42));
+        assert_eq!(json["limits"][0]["reset_at"], json!(1_800_000_000_000u64));
     }
 
     /// `build_body(ctx, body, model, opts)`: the fields the signature names
@@ -1428,11 +1562,13 @@ mod tests {
     #[test_case("set", OTHER_SLUG, true ; "set_refuses_a_foreign_slug")]
     #[test_case("clear", OTHER_SLUG, true ; "clear_refuses_a_foreign_slug")]
     #[test_case("get", SLUG_NAME, false ; "an_owned_slug_gets_through")]
-    fn auth_calls_are_scoped_to_the_slugs_the_plugin_registered(
+    #[tokio::test]
+    async fn auth_calls_are_scoped_to_the_slugs_the_plugin_registered(
         call: &str,
         slug: &str,
         refused: bool,
     ) {
+        let _home = isolated_home();
         let lua = Lua::new();
         lua.globals()
             .set("auth", auth_table(&lua, &[SLUG_NAME]))
@@ -1440,11 +1576,38 @@ mod tests {
 
         let error = lua
             .load(format!(r#"auth.{call}("{slug}", {{}})"#))
-            .exec()
+            .exec_async()
+            .await
             .err()
             .map(|e| e.to_string())
             .unwrap_or_default();
         assert_eq!(error.contains(NOT_OWNED), refused, "{error}");
+    }
+
+    #[test_case(None ; "nothing_stored_is_nil")]
+    #[test_case(Some(STORED_TOKEN) ; "a_stored_table_comes_back")]
+    #[tokio::test]
+    async fn get_reads_what_the_slug_has_stored(token: Option<&str>) {
+        let _home = isolated_home();
+        let lua = Lua::new();
+        let auth = auth_table(&lua, &[SLUG_NAME]);
+        if let Some(token) = token {
+            let credentials = lua.create_table_from([(TOKEN_FIELD, token)]).unwrap();
+            let set: Function = auth.get("set").unwrap();
+            set.call_async::<bool>((SLUG_NAME, credentials))
+                .await
+                .unwrap();
+        }
+        let get: Function = auth.get("get").unwrap();
+
+        let (stored, error) = get
+            .call_async::<(Option<Table>, Option<String>)>(SLUG_NAME)
+            .await
+            .unwrap();
+
+        assert_eq!(error, None);
+        let read = stored.map(|table| table.get::<String>(TOKEN_FIELD).unwrap());
+        assert_eq!(read.as_deref(), token);
     }
 
     /// Decodes `{ slug = ..., <fields> }` the way `register` does, before any
@@ -1545,6 +1708,7 @@ mod tests {
             },
             NetEgress::default(),
             grants,
+            None,
         )
         .unwrap();
         lua.globals().set("provider", table).unwrap();

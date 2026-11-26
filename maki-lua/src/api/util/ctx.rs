@@ -1,6 +1,6 @@
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use maki_agent::agent::tool_dispatch::silent_mutation_check;
@@ -181,7 +181,7 @@ pub(crate) struct LuaCtx {
     /// What the plugin owning the tool was granted, stamped by the runtime
     /// right before its handler runs. `None` reads as nothing granted.
     pub(crate) grants: Option<PluginPermissions>,
-    pub(crate) finish_tx: Option<oneshot::Sender<ToolCallReply>>,
+    pub(crate) finish_tx: Mutex<Option<oneshot::Sender<ToolCallReply>>>,
 }
 
 enum Caps {
@@ -191,7 +191,7 @@ enum Caps {
     /// `start` runs before permission checks: it reads config and publishes
     /// previews, but dispatching tools is structurally impossible.
     Start {
-        config: AgentConfig,
+        config: Box<AgentConfig>,
         workflow: bool,
         audience: ToolAudience,
         output_mode: ToolOutputMode,
@@ -222,7 +222,7 @@ impl LuaCtx {
             session_id: ctx.session_id.clone(),
             task_id: ctx.task_id.clone(),
             grants: None,
-            finish_tx: None,
+            finish_tx: Mutex::default(),
         }
     }
 
@@ -239,7 +239,7 @@ impl LuaCtx {
         Self::new(
             ctx,
             Caps::Start {
-                config: ctx.config.clone(),
+                config: Box::new(ctx.config.clone()),
                 workflow: ctx.workflow,
                 audience: ctx.audience,
                 output_mode: ctx.output_mode,
@@ -258,7 +258,7 @@ impl LuaCtx {
             session_id: ctx.session_id,
             task_id: ctx.task_id,
             grants: None,
-            finish_tx: None,
+            finish_tx: Mutex::default(),
         }
     }
 
@@ -573,11 +573,20 @@ impl UserData for LuaCtx {
             };
             let tool: String = part.get("tool")?;
             let name: Option<String> = part.opt("name")?;
+            let task: Option<String> = part.opt("task")?;
             let output: String = part.opt("output")?.unwrap_or_default();
             let failed = part.opt_bool("is_error").unwrap_or(false);
             let markdown = extract_format(&part) == LuaOutputFormat::Markdown;
             let label = TaskLabel::new(&tool, name.as_deref());
-            if !BackgroundTasks::of(lua).report_part(&home.id, &label, failed, &output, markdown) {
+            let reported = BackgroundTasks::of(lua).report_part(
+                &home.id,
+                task.as_deref(),
+                &label,
+                failed,
+                &output,
+                markdown,
+            );
+            if !reported {
                 return Ok(err_pair(NO_PART_NOW_MSG));
             }
             Ok((Some(true), None))
@@ -616,13 +625,17 @@ impl UserData for LuaCtx {
         // The matching check before a write is not exposed: the dispatcher
         // runs it under the file lock for every tool declaring `mutable_path`,
         // and a handler-side copy would race its own sibling.
-        methods.add_method("record_read", |_, this, path: String| {
+        //
+        // Off the VM thread, because recording hashes the file and grep
+        // records every file it matched.
+        methods.add_async_method("record_read", |_, this, path: String| async move {
             let Some(agent) = this.agent() else {
                 return Ok(this.cap_err_pair("record_read"));
             };
-            agent
-                .file_access
-                .record_read(&FileKey::new(Path::new(&path)));
+            let file_access = Arc::clone(&agent.file_access);
+            spawn_blocking(move || file_access.record_read(&FileKey::new(Path::new(&path))))
+                .await
+                .map_err(mlua::Error::external)?;
             Ok((Some(true), None))
         });
 
@@ -647,10 +660,6 @@ impl UserData for LuaCtx {
                 let loaded = agent.loaded_instructions.clone();
                 let call = agent.call_instructions.clone();
                 let files = Arc::clone(&agent.instruction_files);
-                // Nothing may hold the ctx borrow across the wait: a cancel
-                // hook firing meanwhile needs `ctx:finish`, which takes it
-                // mutably.
-                drop(this);
                 let blocks = spawn_blocking(move || {
                     let cwd = std::env::current_dir().unwrap_or_default();
                     let abs = resolve_abs_with_cwd(dir_path, &cwd);
@@ -669,12 +678,14 @@ impl UserData for LuaCtx {
             }))
         });
 
-        methods.add_method_mut("finish", |lua, this, val: LuaValue| {
+        methods.add_method("finish", |lua, this, val: LuaValue| {
             if !matches!(this.caps, Caps::Handler { .. }) {
                 return Ok(this.cap_err_pair("finish"));
             }
             let tx = this
                 .finish_tx
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
                 .take()
                 .ok_or_else(|| mlua::Error::runtime("ctx:finish() already called"))?;
 
@@ -719,6 +730,7 @@ mod tests {
     /// Arbitrary ids are rejected: `SessionRef` parses base58 or a uuid.
     const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
     const SUBAGENT_TASK_ID: &str = "toolu_task";
+    const FINISH_REPLY: &str = "partial output";
     const MAIN_TEXT: &str = "main chat";
     const SUBAGENT_TEXT: &str = "subagent chat";
     const ANSWER: &str = "on it";
@@ -755,6 +767,25 @@ mod tests {
         ctx.local_tools = Arc::new(tools);
         ctx.live_sink = Some(unbounded_channel().0);
         ctx
+    }
+
+    #[test]
+    fn finish_replies_while_the_ctx_is_borrowed() {
+        let lua = Lua::new();
+        let mut ctx = LuaCtx::handler(&populated_ctx());
+        let (finish_tx, mut finish_rx) = oneshot::channel();
+        ctx.finish_tx = Mutex::new(Some(finish_tx));
+        let ctx = lua.create_userdata(ctx).unwrap();
+        let held = ctx.borrow::<LuaCtx>().unwrap();
+
+        let (finished, error): Pair<bool> = lua
+            .load("local ctx, reply = ... return ctx:finish(reply)")
+            .call((&ctx, FINISH_REPLY))
+            .unwrap();
+        drop(held);
+
+        assert_eq!((finished, error), (Some(true), None));
+        assert!(finish_rx.try_recv().is_ok());
     }
 
     #[test]

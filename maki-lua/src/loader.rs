@@ -264,10 +264,11 @@ pub(crate) fn lib_dir() -> &'static Dir<'static> {
         .dir
 }
 
-static BUNDLED_DIRS: LazyLock<&'static [&'static Dir<'static>]> = LazyLock::new(|| {
-    let dirs: Vec<&'static Dir<'static>> = BUNDLED_PLUGINS.iter().map(|p| &p.dir).collect();
-    Vec::leak(dirs)
-});
+pub(crate) fn bundled_source(rel_path: &str) -> Option<&'static str> {
+    BUNDLED_PLUGINS
+        .iter()
+        .find_map(|p| p.dir.get_file(rel_path).and_then(File::contents_utf8))
+}
 
 /// A package's entrypoints: every `plugin/*.lua`, sorted by filename so load
 /// order is deterministic across machines.
@@ -364,7 +365,6 @@ impl PluginHost {
         let plugin_rules = Arc::new(PluginRuleStore::default());
         let lua = runtime::spawn(
             Arc::clone(&registry),
-            *BUNDLED_DIRS,
             interaction,
             jit,
             Arc::clone(&plugin_rules),
@@ -1091,8 +1091,8 @@ impl PluginHost {
     /// own. `None` once taken. The loop closes it when it stops draining, before
     /// teardown runs `SessionEnd`, so a handler is turned away at the send
     /// instead of parking on a reply that never comes.
-    pub fn take_ui_action_rx(&self) -> Option<UnboundedReceiver<UiAction>> {
-        self.inner.ui_action_rx.lock().unwrap().take()
+    pub fn take_ui_action_rx(&mut self) -> Option<UnboundedReceiver<UiAction>> {
+        self.inner.ui_action_rx.take()
     }
 
     /// Rings when a plugin changes a window or what one shows.
@@ -1174,19 +1174,22 @@ impl EventHandle {
     }
 
     /// Asks the `ui.plan_form*` chains what to draw for a draft that just
-    /// landed, starting from the {rows} the host proposes. The receiver
-    /// answers `None` when a layer took the form over, and disconnects when
-    /// the host is gone, which leaves the caller the built-in form.
+    /// landed, starting from the {rows} the host proposes. The menu answers
+    /// with {request} as its generation. The receiver answers `None` when a
+    /// layer took the form over, and disconnects when the host is gone, which
+    /// leaves the caller the built-in form.
     pub fn open_plan_form(
         &self,
         path: String,
         session: String,
+        request: u64,
         rows: Vec<PlanFormRow>,
     ) -> oneshot::Receiver<Option<PlanMenu>> {
         let (reply, rx) = oneshot::channel();
         let _ = self.prio_tx.send(Request::OpenPlanForm {
             path,
             session,
+            request,
             rows,
             reply,
         });
@@ -1251,6 +1254,7 @@ impl EventHandle {
             .await
             .map_err(|_| PACK_STATE_UNAVAILABLE.to_owned())?;
         let installed = crate::pack::installed_names()
+            .await
             .ok_or_else(|| "could not read the package lockfile".to_owned())?;
 
         Ok(crate::pack::PackContext::new(declared, installed, active))
@@ -1333,6 +1337,7 @@ impl EventHandle {
         let _ = self.tx.send(Request::FireAutocmd {
             event: event.name().to_owned(),
             data: event.payload(session_id),
+            message: event.lua_message().cloned(),
         });
     }
 
@@ -1417,10 +1422,13 @@ impl EventHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::keymap::{InputMode, InputSnapshot, TAKEN_ERR};
+    use crate::api::keymap::{
+        CursorShape, CursorStyle, InputMode, InputSnapshot, TAKEN_ERR, UNKNOWN_CURSOR_SHAPE_ERR,
+    };
     use crate::api::util::command::{
         BuiltinAction, InputRequest, LuaCommandInfo, LuaCommandWriter, PLUGIN_LOADING_ERR,
     };
+    use crate::api::util::convert::UNKNOWN_FIELD_ERR;
     use crate::key::{Key, PASTE};
     use crate::key_lint::{MODE_WARNING, UPGRADE_DOCS};
     use crate::plugin_permissions::{Permission, PluginReach, denied_error};
@@ -1477,6 +1485,37 @@ mod tests {
         assert!(host.load_source("late", "return {}").is_err());
         host.begin_shutdown();
         assert!(host.load_source("later", "return {}").is_err());
+    }
+
+    struct RuntimeProbe(SyncSender<bool>);
+
+    impl Drop for RuntimeProbe {
+        fn drop(&mut self) {
+            let _ = self.0.send(Handle::try_current().is_ok());
+        }
+    }
+
+    /// The session snapshot slot is the one Rust value a test can hand the
+    /// VM, and it drops with the VM. Loading the builtins is a round trip on
+    /// the lane the slot request takes, so the slot is set before the
+    /// priority-lane `Shutdown`; it also checks that no bundled plugin keeps
+    /// the VM open past the host.
+    #[test]
+    fn the_vm_closes_inside_the_runtime_when_the_host_drops() {
+        let (seen_tx, seen_rx) = sync_channel(1);
+        let probe = RuntimeProbe(seen_tx);
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.event_handle()
+            .install_session_snapshot(Box::new(move |_| {
+                let _ = &probe;
+                Ok(serde_json::Value::Null)
+            }));
+        host.load_builtins(&PluginsConfig::from_plugins(HashMap::new()))
+            .unwrap();
+
+        drop(host);
+
+        assert_eq!(seen_rx.recv(), Ok(true));
     }
 
     /// Regression for the exit drain in `runtime::spawn`. An `EventHandle`
@@ -1667,7 +1706,7 @@ mod tests {
     /// Waits for {presses} keybind handlers to report done, then checks that
     /// one of them registered {FIRED_COMMAND}, which is how a test on this
     /// side of the channel sees that a handler ran.
-    fn assert_fired_after(host: &PluginHost, presses: usize) {
+    fn assert_fired_after(host: &mut PluginHost, presses: usize) {
         let mut ui = host.take_ui_action_rx().unwrap();
         for _ in 0..presses {
             while !matches!(
@@ -1689,7 +1728,7 @@ mod tests {
     /// side effect. Unit tests only cover the pieces in isolation.
     #[test]
     fn keybind_callback_runs_end_to_end() {
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
             "kb",
             &format!(
@@ -1723,7 +1762,7 @@ mod tests {
         assert!(reader.dispatch(key, InputMode::Normal, None, |ticket| {
             handle.run_keybind_callback(ticket)
         }));
-        assert_fired_after(&host, 1);
+        assert_fired_after(&mut host, 1);
     }
 
     const VIM_PLUGIN: &str = "vim";
@@ -1734,7 +1773,7 @@ mod tests {
     /// is visible inside the handler that made it.
     #[test]
     fn a_vim_style_plugin_switches_modes() {
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
             VIM_PLUGIN,
             r#"
@@ -1813,6 +1852,56 @@ mod tests {
         assert_eq!(reader.sync_mode(true), InputMode::Insert);
     }
 
+    const BLINKING_BAR: CursorStyle = CursorStyle {
+        shape: CursorShape::Bar,
+        blink: true,
+    };
+
+    /// No shape is sent before a plugin asks, so the terminal keeps the one
+    /// the user configured.
+    #[test_case("", None ; "never_set")]
+    #[test_case(r#"maki.ui.set_cursor_shape("bar", { blink = true })"#, Some(BLINKING_BAR) ; "bar_blinking")]
+    #[test_case(r#"maki.ui.set_cursor_shape("block")"#, Some(CursorStyle { shape: CursorShape::Block, blink: false }) ; "block_steady_by_default")]
+    #[test_case(r#"maki.ui.set_cursor_shape("default", { blink = true })"#, Some(CursorStyle::DEFAULT) ; "default_keeps_the_terminal_blink")]
+    fn cursor_shape_is_what_the_plugin_set(source: &str, expected: Option<CursorStyle>) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(VIM_PLUGIN, source).unwrap();
+        assert_eq!(host.keymap_reader().cursor_style(), expected);
+    }
+
+    #[test_case(r#"maki.ui.set_cursor_shape("beam")"#, UNKNOWN_CURSOR_SHAPE_ERR ; "unknown_shape")]
+    #[test_case(r#"maki.ui.set_cursor_shape("bar", { blinks = true })"#, UNKNOWN_FIELD_ERR ; "unknown_option")]
+    fn cursor_shape_throws_on_bad_arguments(source: &str, expected: &str) {
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let err = host
+            .load_source(VIM_PLUGIN, source)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(expected), "{err}");
+        assert_eq!(host.keymap_reader().cursor_style(), None);
+    }
+
+    /// Like normal mode, a shape goes with the plugin that set it, and the
+    /// terminal gets its own cursor back. Another plugin going away leaves it.
+    #[test_case(unload_vim ; "unloaded")]
+    #[test_case(reload_vim ; "reloaded")]
+    fn cursor_shape_goes_with_the_plugin_that_set_it(teardown: fn(&PluginHost)) {
+        const OTHER_PLUGIN: &str = "other";
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.load_source(OTHER_PLUGIN, "").unwrap();
+        host.load_source(
+            VIM_PLUGIN,
+            r#"maki.ui.set_cursor_shape("bar", { blink = true })"#,
+        )
+        .unwrap();
+        let reader = host.keymap_reader();
+        host.unload(OTHER_PLUGIN).unwrap();
+        assert_eq!(reader.cursor_style(), Some(BLINKING_BAR));
+
+        teardown(&host);
+        assert_eq!(reader.cursor_style(), Some(CursorStyle::DEFAULT));
+    }
+
     const PARKED_COMMAND: &str = "/park";
     const PARKED_DONE: &str = "parked done";
     const PARKED_NEVER_RAN: &str = "the command never parked on the UI";
@@ -1824,7 +1913,7 @@ mod tests {
     /// could not be typed in again.
     #[test]
     fn a_mode_switch_from_an_unloaded_plugin_is_dropped() {
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
             VIM_PLUGIN,
             &format!(
@@ -1878,7 +1967,7 @@ mod tests {
         const VERSION: u64 = 7;
         const TEXT: &str = "ab";
         const TAB: &str = "<Tab>";
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
             "accept",
             r#"
@@ -1943,7 +2032,7 @@ mod tests {
     #[test]
     fn fallback_asks_once_and_only_while_the_handler_runs() {
         const PASTED: &str = "pasted";
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
             "fallback",
             r#"
@@ -2024,7 +2113,7 @@ mod tests {
     #[test_case(&["session_read"] => "true" ; "with_session_read")]
     #[test_case(&[] => "false" ; "without_session_read")]
     fn a_typing_key_on_a_buffer_needs_session_read(granted: &[&str]) -> String {
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source_with_permissions(
             "popup",
             r#"
@@ -2060,7 +2149,7 @@ mod tests {
     fn a_key_handler_sees_the_draft_only_with_session_read(granted: &[&str]) -> String {
         const PASTED: &str = "pasted";
         const SHORTCUT: &str = "<C-g>";
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source_with_permissions(
             "peek",
             r#"
@@ -2156,7 +2245,7 @@ mod tests {
     /// What the host owes is that the raise wedges nothing.
     #[test]
     fn a_keybind_that_raises_leaves_the_plugin_dispatching() {
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         host.load_source(
             "kb",
             &format!(
@@ -2194,7 +2283,7 @@ mod tests {
         assert!(run('g'));
         assert!(run('h'));
 
-        assert_fired_after(&host, 2);
+        assert_fired_after(&mut host, 2);
     }
 
     /// Unloading has to take the bindings with it, or a `/reload` leaves keys
@@ -3040,7 +3129,7 @@ mod tests {
     /// A callback the load scheduled runs later and gets its answer.
     #[test]
     fn a_ui_roundtrip_fails_fast_while_its_plugin_loads() {
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         let mut ui = host.take_ui_action_rx().unwrap();
         host.load_source("early_ui", UI_CALLS_AT_LOAD).unwrap();
         let mut next = || loop {

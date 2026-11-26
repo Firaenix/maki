@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use maki_agent::{SessionControl, SessionMailbox};
+use maki_agent::SessionMailbox;
 use maki_lua_macro::{lua_fn, lua_table};
 use maki_providers::RequestOptions;
 use maki_storage::id::MakiId;
@@ -23,9 +23,9 @@ use crate::runtime::{CANCEL_ABANDON_AFTER, is_user_action};
 const USER_ACTION_ERR: &str = "stopping a task requires a user command or keybind";
 const TASK_ID_ERR: &str = "stop(ctx, id): id must be a string";
 const STOP_OPTS_ERR: &str = "stop(id, opts): opts must be a table";
-pub(crate) const NO_RUNNING_SUBAGENT: &str = "no running background subagent with id";
 const LAST_KEY: &str = "last";
 const NAME_KEY: &str = "name";
+const NAMES_SEP: &str = ", ";
 
 async fn roundtrip(
     lua: Lua,
@@ -114,11 +114,14 @@ async fn remove(
 /// background task (a command or subagent) that the calling agent moved,
 /// which is allowed because the tool call belongs to a turn the user started.
 /// A subagent stopped this way ends its pending `:prompt()` with
-/// `"stopped by parent agent"`. It waits up to 5 seconds for the final reply
-/// and returns it, and the agent gets no notice of the end. A late reply
-/// returns no `output`, and the result reaches the agent later as a quiet
-/// notice. A task another agent moved, a finished task or an unknown id
-/// returns an error that names the agent's running task ids.
+/// `"stopped by parent agent"`.
+///
+/// It waits up to 5 seconds for the final reply and returns it, and the agent
+/// gets no notice of the end. A later reply reaches the agent as a quiet
+/// notice instead. A subagent nested in a moved call, like a `task` in a
+/// `batch`, stops alone and returns at once, because that call's result
+/// reports what it did. A task another agent moved, a finished task or an
+/// unknown id returns an error that lists the agent's running tasks.
 ///
 /// @param id string|LuaCtx Task id, as returned by `list()`. Or the handler's
 ///   ctx, for the model's stop.
@@ -127,9 +130,9 @@ async fn remove(
 ///   rather than stopping a task with the same id in the other session. With a
 ///   ctx: the background task id.
 /// @return (boolean|table|nil, string|nil) true on success, or nil and an
-///   error. With a ctx, success is `{name, output?}`. `name` is the task's
-///   name in `/tasks`, and `output` is the final reply, missing when it was
-///   late.
+///   error. With a ctx, success is `{name, output?, parent?}`: the task's
+///   name in `/tasks`, the final reply unless it was late, and the id of the
+///   call a nested subagent ran in.
 /// @example
 /// local _, err = maki.task.stop(task.id, { session = task.session })
 /// -- in a tool handler
@@ -175,23 +178,6 @@ fn asker(ctx: &LuaCtx, method: &str) -> Result<Option<MakiId>, String> {
     Ok(agent.mailbox.as_ref().map(SessionMailbox::session_id))
 }
 
-/// The live subagent `id` that the agent behind `ctx` reaches, and its name.
-fn reached_subagent(
-    lua: &Lua,
-    ctx: &LuaCtx,
-    method: &str,
-    id: &str,
-) -> Result<(Arc<SessionControl>, String), String> {
-    let asker = asker(ctx, method)?;
-    BackgroundTasks::of(lua)
-        .subagent(asker, id)
-        .ok_or_else(|| not_running(id))
-}
-
-fn not_running(id: &str) -> String {
-    format!("{NO_RUNNING_SUBAGENT} {id}")
-}
-
 /// Messages a background subagent that the calling agent moved, the way the
 /// `task_message` tool does. The subagent reads it as an interrupt from its
 /// parent once its current turn ends, and one still waiting for a slot reads
@@ -203,17 +189,18 @@ fn not_running(id: &str) -> String {
 /// carries on with its history intact. With no turn running the message
 /// waits like any other.
 ///
-/// An agent reaches the subagents it moved, and those nested in a call it
-/// moved, until they end. Like `stop(ctx, id)`, it never reaches what
-/// another agent moved.
+/// {id} can also name a subagent nested in a call the agent moved, like a
+/// `task` in a `batch`. The id of the call itself messages every subagent
+/// still running in it.
 ///
 /// @param ctx LuaCtx The tool handler's ctx.
 /// @param id string Task id, from its receipt.
 /// @param text string The message.
 /// @param opts table? Optional fields:
 ///   `interrupt` (boolean?) - cut its current turn short. Default: `false`.
-/// @return (table|nil, string|nil) `{name}`, the task's name in `/tasks`, or
-///   nil and `"no running background subagent with id <id>"`.
+/// @return (table|nil, string|nil) `{name}`, the task's name in `/tasks`
+///   (comma-separated when it reached several), or nil and
+///   `"no running background subagent with id <id>; running: ..."`.
 /// @example
 /// local sent, err = maki.task.send(ctx, input.id, input.message)
 /// if not sent then return { llm_output = err, is_error = true } end
@@ -227,27 +214,26 @@ async fn send(
     opts: Option<Table>,
 ) -> LuaResult<Pair<Table>> {
     let delivery = delivery(opts.as_ref());
-    let (control, name) = try_pair!(reached_subagent(&lua, &ctx, "maki.task.send", &id));
+    let asker = try_pair!(asker(&ctx, "maki.task.send"));
     // A sent message never picks the run's settings, so these are inert.
-    let input = plugin_input(text, RequestOptions::default());
-    if control.send(input, delivery).is_err() {
-        return Ok(err_pair(not_running(&id)));
-    }
+    let input = || plugin_input(text.clone(), RequestOptions::default());
+    let names = try_pair!(BackgroundTasks::of(&lua).send(asker, &id, input, delivery));
     let sent = lua.create_table()?;
-    sent.set(NAME_KEY, name)?;
+    sent.set(NAME_KEY, names.join(NAMES_SEP))?;
     Ok((Some(sent), None))
 }
 
 /// Reads the transcript of a background subagent that the calling agent
 /// moved, oldest first, while it works. The messages have the shape
-/// `maki.session.messages` returns. It reaches what `send(ctx, id)` does.
-/// Works without an interactive UI.
+/// `maki.session.messages` returns. It takes the ids `send(ctx, id)` takes,
+/// except the id of a call, since it reads one subagent. Works without an
+/// interactive UI.
 ///
 /// @param ctx LuaCtx The tool handler's ctx.
 /// @param id string Task id, from its receipt.
 /// @param opts table? `last` (integer?) only the newest `last` messages.
 /// @return (table|nil, string|nil) Array of messages, or nil and
-///   `"no running background subagent with id <id>"`.
+///   `"no running background subagent with id <id>; running: ..."`.
 /// @example
 /// local msgs = maki.task.messages(ctx, input.id, { last = 1 })
 /// local last = msgs and msgs[1]
@@ -265,8 +251,9 @@ async fn messages(
         .map(|opts| opts.opt::<usize>(LAST_KEY))
         .transpose()?
         .flatten();
-    let (control, _) = try_pair!(reached_subagent(&lua, &ctx, "maki.task.messages", &id));
+    let asker = try_pair!(asker(&ctx, "maki.task.messages"));
     drop(ctx);
+    let control = try_pair!(BackgroundTasks::of(&lua).subagent(asker, &id));
     let history = Arc::clone(&control.transcript().load().messages);
     Ok((
         Some(newest_messages_table(&lua, &history, last).await?),
@@ -291,6 +278,7 @@ lua_table! {
 mod tests {
     use super::*;
     use crate::api::util::command::{NO_UI_ERR, UiReply};
+    use crate::api::util::fake_picker::{DOWN, ESC, PAGE_DOWN, UP, load_picker};
     use mlua::Table;
     use serde_json::json;
     use std::thread::JoinHandle;
@@ -313,6 +301,7 @@ mod tests {
     const ERROR_STATUS: &str = "error";
     const NIL_STATUS: &str = "nil";
     const CHAT_SESSION: &str = "chat-session";
+    const JOB_ID: u32 = 7;
     const UNKNOWN_TASK_ERR: &str = "unknown task: toolu_01";
     const NO_REQUEST_ERR: &str = "expected a task request";
     const LIST_CALL: &str = "return task.list()";
@@ -328,6 +317,14 @@ mod tests {
         end
         return table.concat(ids, ','), table.concat(statuses, ','), tasks[1].name
     ";
+    const CTRL_S: &str = "<C-s>";
+    /// In `TASK_NAME` but not in the main chat's name.
+    const VIM_UP: &str = "k";
+    const TASK_NAME: &str = "work";
+    const OLDEST_ID: &str = "toolu_04";
+    const MIDDLE_ID: &str = "toolu_05";
+    const NEWEST_ID: &str = "toolu_06";
+    const SPAWN_ORDER: [&str; 3] = [OLDEST_ID, MIDDLE_ID, NEWEST_ID];
 
     fn lua_with_task(tx: Option<UnboundedSender<UiAction>>) -> Lua {
         let lua = Lua::new();
@@ -509,7 +506,7 @@ mod tests {
     #[test_case(None ; "stopped")]
     #[test_case(Some(UNKNOWN_TASK_ERR) ; "refused")]
     fn tasks_picker_stops_the_selected_row_and_refreshes(stop_error: Option<&str>) {
-        let lua = picker_lua(stop_error);
+        let lua = picker_lua(stop_error, &[DOWN, CTRL_S, ESC], &[TASK_ID], false);
         lua.load("open_tasks()").exec().unwrap();
 
         let globals = lua.globals();
@@ -525,32 +522,71 @@ mod tests {
         );
     }
 
+    /// Rows are main, then the running tasks newest first, and Ctrl+S stops
+    /// whatever the keys left selected. `k` would move up with vim keys, but
+    /// here the filter takes it. It hides main, so the newest task is left
+    /// selected.
+    #[test_case(&[DOWN], NEWEST_ID ; "down_from_main_selects_the_next_row")]
+    #[test_case(&[UP], OLDEST_ID ; "up_from_the_first_row_wraps_to_the_last")]
+    #[test_case(&[PAGE_DOWN], OLDEST_ID ; "page_down_clamps_to_the_last_row")]
+    #[test_case(&[VIM_UP], NEWEST_ID ; "a_letter_filters_instead_of_moving")]
+    fn tasks_picker_keys_move_the_selection(moves: &[&str], selected: &str) {
+        let keys: Vec<&str> = moves.iter().copied().chain([CTRL_S, ESC, ESC]).collect();
+        let lua = picker_lua(None, &keys, &SPAWN_ORDER, false);
+        lua.load("open_tasks()").exec().unwrap();
+
+        assert_eq!(lua.globals().get::<String>("stopped_id").unwrap(), selected);
+    }
+
+    /// A shared job is listed and stopped by the picker even though another
+    /// plugin started it, and stopping a job never touches the task path.
+    #[test]
+    fn tasks_picker_stops_a_listed_job() {
+        let lua = picker_lua(None, &[DOWN, DOWN, CTRL_S, ESC], &[TASK_ID], true);
+        lua.load("open_tasks()").exec().unwrap();
+
+        let globals = lua.globals();
+        assert_eq!(globals.get::<u32>("stopped_job").unwrap(), JOB_ID);
+        assert!(
+            globals
+                .get::<Option<String>>("stopped_id")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(globals.get::<u32>("list_calls").unwrap(), 2);
+    }
+
     /// Runs `plugins/task/picker.lua` against a fake `maki` that lists the main
-    /// chat and one task, then presses Down, Ctrl+S and Esc.
-    fn picker_lua(stop_error: Option<&str>) -> Lua {
+    /// chat, then {task_ids} in spawn order and, when {with_job}, one shared
+    /// job, and presses {keys}.
+    fn picker_lua(
+        stop_error: Option<&str>,
+        keys: &[&str],
+        task_ids: &[&str],
+        with_job: bool,
+    ) -> Lua {
         let lua = Lua::new();
         let globals = lua.globals();
-        globals.set("task_id", TASK_ID).unwrap();
+        globals
+            .set(
+                "task_ids",
+                lua.create_sequence_from(task_ids.iter().copied()).unwrap(),
+            )
+            .unwrap();
+        globals.set("task_name", TASK_NAME).unwrap();
         globals.set("chat_session", CHAT_SESSION).unwrap();
         globals.set("stop_error", stop_error).unwrap();
-        lua.load(
+        globals.set("with_job", with_job).unwrap();
+        load_picker(
+            &lua,
+            keys,
             r#"
-            local modules = {}
-            function require(name) return assert(modules[name], name) end
-            function install_module(name, source) modules[name] = assert(loadstring(source))() end
-            local keys = {'<Down>', '<C-s>', '<Esc>'}
-            local tasks = {
-                {id = 'main', session = chat_session, name = 'chat', focused = true},
-                {id = task_id, session = chat_session, name = 'work', status = 'working'},
-            }
-            list_calls = 0
-            local win = {width = 80, height = 20}
-            function win:set_config(_) end
-            function win:set_cursor(_) end
-            function win:close() end
-            function win:recv(_)
-                return {type = 'key', key = assert(table.remove(keys, 1), 'picker did not close')}
+            local tasks = {{id = 'main', session = chat_session, name = 'chat', focused = true}}
+            for _, id in ipairs(task_ids) do
+                tasks[#tasks + 1] = {id = id, session = chat_session, name = task_name, status = 'working'}
             end
+            local jobs = with_job and {{id = 7, command = 'cargo test', status = 'running'}} or {{}}
+            list_calls = 0
             maki = {
                 task = {
                     list = function() list_calls = list_calls + 1; return tasks end,
@@ -561,9 +597,14 @@ mod tests {
                         return true
                     end,
                 },
+                session = {current = function() return chat_session end},
+                fn = {
+                    joblist = function(_) return jobs end,
+                    jobstop = function(id) stopped_job = id end,
+                },
                 ui = {
                     buf = function() return {set_lines = function() end} end,
-                    open_win = function() return win end,
+                    open_win = function() return fake_win(picker_keys) end,
                     display_width = function(s) return #s end,
                     flash = function(s) flashed = s end,
                 },
@@ -574,33 +615,12 @@ mod tests {
                 keymap = {set = function() end},
             }
         "#,
-        )
-        .exec()
-        .unwrap();
-        let install: mlua::Function = globals.get("install_module").unwrap();
-        for (name, source) in [
-            (
-                "maki.text_input",
-                include_str!("../../../plugins/lib/maki/text_input.lua"),
-            ),
-            (
-                "maki.color",
-                include_str!("../../../plugins/lib/maki/color.lua"),
-            ),
-            (
-                "maki.list_picker",
-                include_str!("../../../plugins/lib/maki/list_picker.lua"),
-            ),
-            (
+            &[(
                 "picker_rows",
                 include_str!("../../../plugins/task/picker_rows.lua"),
-            ),
-        ] {
-            install.call::<()>((name, source)).unwrap();
-        }
-        lua.load(include_str!("../../../plugins/task/picker.lua"))
-            .exec()
-            .unwrap();
+            )],
+            include_str!("../../../plugins/task/picker.lua"),
+        );
         lua
     }
 }

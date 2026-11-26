@@ -16,15 +16,15 @@ use maki_agent::{
 };
 use maki_lua::EventHandle;
 use maki_providers::{AgentError, ContextGauge, Model};
+use maki_storage::blocking;
 use tokio::sync::Mutex;
-use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::task::spawn_blocking;
+use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 use tracing::error;
 
 use super::run_cancels::RunCancels;
 use super::shared_queue::{self, Compaction, QueueReceiver, QueueRun};
 
-fn base_tools(
+async fn base_tools(
     vars: &Vars,
     model: &Model,
     config: &AgentConfig,
@@ -40,6 +40,7 @@ fn base_tools(
         workflow,
         has_mcp,
     )
+    .await
 }
 
 /// The loop's side of everything it shares with its `AgentHandles`.
@@ -48,6 +49,7 @@ pub(super) struct LoopEnds {
     pub(super) agent_tx: UnboundedSender<Envelope>,
     pub(super) answer_rx: UnboundedReceiver<String>,
     pub(super) queue: Arc<QueueReceiver>,
+    pub(super) notify_rx: Receiver<()>,
     pub(super) cancels: Arc<RunCancels>,
     pub(super) mailbox: SessionMailbox,
     pub(super) subagent_cancels: Arc<CancelMap<String>>,
@@ -67,6 +69,7 @@ pub(super) struct AgentLoop {
     agent_tx: UnboundedSender<Envelope>,
     answer_rx: Arc<Mutex<UnboundedReceiver<String>>>,
     queue: Arc<QueueReceiver>,
+    notify_rx: Receiver<()>,
     mailbox: SessionMailbox,
     lua_handle: EventHandle,
     subagent_cancels: Arc<CancelMap<String>>,
@@ -82,6 +85,7 @@ impl AgentLoop {
             agent_tx,
             answer_rx,
             queue,
+            notify_rx,
             cancels,
             mailbox,
             subagent_cancels,
@@ -102,6 +106,7 @@ impl AgentLoop {
             agent_tx,
             answer_rx: Arc::new(Mutex::new(answer_rx)),
             queue,
+            notify_rx,
             mailbox,
             lua_handle,
             subagent_cancels,
@@ -114,7 +119,7 @@ impl AgentLoop {
             return;
         }
 
-        while let Some(()) = self.queue.recv_notify().await {
+        while self.notify_rx.recv().await.is_some() {
             let mut last_run_id = None;
             while let Some(mut run) = self.queue.pop_run() {
                 let Some(run_id) = run.drop_cancelled(self.cancels.min_run_id()) else {
@@ -159,7 +164,8 @@ impl AgentLoop {
         let event_tx = EventSender::new(self.agent_tx.clone(), run_id);
         match run {
             QueueRun::Compact(compaction) => {
-                self.do_compact(&event_tx, &compaction, cancel).await?;
+                self.do_compact(&event_tx, &compaction, cancel, ledger)
+                    .await?;
             }
             QueueRun::Messages(messages) => {
                 let inputs = messages
@@ -218,15 +224,21 @@ impl AgentLoop {
                 .collect_prompt_slots(Some(self.seed.session_id.as_str()))
                 .await,
         );
-        let vars = self.vars.clone();
-        let instructions = self.instructions.text.clone();
-        let slots = Arc::clone(&prompt_slots);
-        let config = self.seed.config.clone();
         let has_mcp = self.seed.mcp.is_some();
-        let host_prompt = Arc::clone(&self.host_prompt);
+        let spec = Arc::new((
+            self.vars.clone(),
+            self.instructions.text.clone(),
+            Arc::clone(&prompt_slots),
+            self.seed.config.clone(),
+            Arc::clone(&self.host_prompt),
+        ));
         let context: RunContextBuilder = Arc::new(move |model, workflow| {
-            let tools = base_tools(&vars, model, &config, has_mcp, workflow);
-            host_prompt.context(&vars, &instructions, &slots, model, tools)
+            let (spec, model) = (Arc::clone(&spec), model.clone());
+            Box::pin(async move {
+                let (vars, instructions, slots, config, host_prompt) = &*spec;
+                let tools = base_tools(vars, &model, config, has_mcp, workflow).await;
+                host_prompt.context(vars, instructions, slots, &model, tools)
+            })
         });
         (context, prompt_slots)
     }
@@ -236,6 +248,7 @@ impl AgentLoop {
         event_tx: &EventSender,
         compaction: &Compaction,
         cancel: &CancelToken,
+        ledger: &RunLedger,
     ) -> Result<DoneReason, AgentError> {
         let (context, _) = self.context_builder().await;
         let slot = self.seed.model_slot.load();
@@ -246,9 +259,6 @@ impl AgentLoop {
             &self.seed.model_policy,
         )
         .await;
-        // The summary goes out under a fresh frame for the session's own model,
-        // so the gauge and `/btw` read the prompt the next run sends.
-        let next = context(&slot.model, compaction.workflow);
         let hooks = AgentHooks {
             registry: ToolRegistry::global(),
             session_id: Some(&self.seed.session_id),
@@ -262,13 +272,16 @@ impl AgentLoop {
             &model,
             &mut self.history,
             &mut self.gauge,
-            next,
+            &context,
+            compaction.workflow,
             self.seed.mcp.as_ref(),
             event_tx,
             &hooks,
             &self.seed.config,
             compaction.instructions.as_deref(),
             self.seed.timeouts.retry,
+            compaction.reason,
+            ledger,
         )
         .await
     }
@@ -282,7 +295,12 @@ impl AgentLoop {
     ) -> Result<DoneReason, AgentError> {
         let (context, prompt_slots) = self.context_builder().await;
 
-        maki_agent::expand_mcp_prompt(self.seed.mcp.as_deref(), &mut input).await?;
+        if let Some(ref prompt_ref) = input.prompt {
+            let mcp = self.seed.mcp.as_deref();
+            input
+                .preamble
+                .extend(McpHandle::prompt_preamble(mcp, prompt_ref).await?);
+        }
 
         // Read after the awaits above, not before: a switch can land while the
         // run is still starting up, and the frame and the request both have to
@@ -336,9 +354,7 @@ impl AgentLoop {
     async fn reload_instructions(&mut self) {
         let cwd = self.vars.apply("{cwd}").into_owned();
         let config = self.seed.config.instructions.clone();
-        self.instructions = spawn_blocking(move || agent::load_instructions(&cwd, &config))
-            .await
-            .expect("instructions load task panicked");
+        self.instructions = blocking(move || agent::load_instructions(&cwd, &config)).await;
         // Background sessions started from the seed read its list, so it has
         // to follow every reload, the startup one included.
         self.seed

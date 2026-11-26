@@ -10,6 +10,8 @@
 -- Module names are shared across bundled plugins, hence the prefix: a plain
 -- `picker` would collide with the one the task plugin ships.
 
+local ListNav = require("maki.list_nav")
+
 local M = {}
 
 local PICKED = "● "
@@ -33,6 +35,9 @@ local DIGIT = "^%d$"
 -- heard of gets nothing rather than invented prose.
 local MODE_NOTES = { off = "no reasoning", adaptive = "model decides" }
 local SENDS_PREFIX = "sends "
+-- The step keys walk the effort levels only. Switching a mode on or off stays a
+-- choice made in the picker.
+local MODES = { off = true, adaptive = true }
 
 local STYLE_NAME = "item"
 local STYLE_NAME_PICKED = "bold"
@@ -142,18 +147,6 @@ local function place(state, i)
   end
 end
 
--- Skips the blank spacers, and stops at either end instead of wrapping.
-local function move(state, delta)
-  local i = state.cursor + delta
-  while state.rows[i] do
-    if selectable(state.rows[i]) then
-      place(state, i)
-      return
-    end
-    i = i + delta
-  end
-end
-
 local function editor_key(state, key)
   if key:match(DIGIT) then
     if #state.custom < MAX_DIGITS then
@@ -177,10 +170,6 @@ function M.handle_key(state, key)
   end
   if key:match(DIGIT) then
     state.cursor, state.custom, state.editing = state.custom_row, key, true
-  elseif key == "<Up>" or key == "k" then
-    move(state, -1)
-  elseif key == "<Down>" or key == "j" then
-    move(state, 1)
   elseif key == "<CR>" then
     -- An empty custom row has nothing to send yet, so Enter starts typing
     -- instead of committing.
@@ -191,6 +180,17 @@ function M.handle_key(state, key)
     end
   elseif key == "<Esc>" or key == "<C-c>" then
     return "cancel"
+  else
+    ListNav.handle_key(key, state.cursor, {
+      count = #state.rows,
+      keys = ListNav.VIM_KEYS,
+      wrap = false,
+      selectable = function(i)
+        return selectable(state.rows[i])
+      end,
+    }, function(i)
+      place(state, i)
+    end)
   end
 end
 
@@ -198,6 +198,32 @@ function M.click(state, row)
   if state.rows[row] and selectable(state.rows[row]) then
     place(state, row)
     state.editing = false
+  end
+end
+
+local function sent(option)
+  return option.sends or option.name
+end
+
+-- The level one row past the one {model} sends, toward {delta}: what moving
+-- the picker's cursor that way and pressing Enter would store. Rows that go out
+-- as the same level are skipped, so every step changes the request. Nil at
+-- either end, or when the session is not on an effort level.
+function M.step(model, delta)
+  local levels = {}
+  for _, option in ipairs(model.thinking_options) do
+    if not MODES[option.name] then
+      levels[#levels + 1] = option
+    end
+  end
+  for i, option in ipairs(levels) do
+    if option.name == model.thinking_shown then
+      local target = i + delta
+      while levels[target] and sent(levels[target]) == sent(option) do
+        target = target + delta
+      end
+      return levels[target] and levels[target].name
+    end
   end
 end
 

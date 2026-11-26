@@ -7,11 +7,11 @@ local HIGHLIGHT_CONTEXT_LINES = 200
 local DESCRIPTION = [[Read a file. Returns contents with line numbers (1-indexed).
 
 - Supports absolute, relative, and ~/ paths.
-- **offset** and **limit** are required. Use offset=1 to read from the first line.
+- **limit** is required. **offset** defaults to 1.
 - Use limit=0 to read until the end of file (capped at 2000 lines).
+- A negative offset counts from the end: offset=-20 with limit=0 reads the last 20 lines.
 - Use the **index** tool or **grep** tool first to find the offset and limit.
 - Only read the sections you actually need.
-- Use `wc -l` to check total number of lines before reading to decide a reasonable limit.
 - Use truncation hints (e.g. "truncated lines X-Y") to continue with the correct offset.
 - Do not reread the same range (same file and same offset).
 - Prefer grep to locate content instead of scanning full files.
@@ -105,8 +105,28 @@ local function build_file_view(lines, start_line, total_lines, path, ctx, prefix
   return buf
 end
 
+-- A negative offset counts back from the last line, so the file is counted
+-- first. One past the start of the file still means line 1, like `tail`.
+local function first_line(path, offset, ctx)
+  offset = math.floor(offset)
+  if offset >= 0 then
+    return math.max(offset, 1)
+  end
+  local page, err = maki.fs.read_lines(path, {
+    limit = 1,
+    max_line_bytes = output_limits.line_bytes(opts, ctx),
+  })
+  if not page then
+    return nil, err
+  end
+  return math.max(page.total + offset + 1, 1)
+end
+
 local function read_file(path, offset, limit, ctx)
-  local start = math.max(math.floor(offset), 1)
+  local start, start_err = first_line(path, offset, ctx)
+  if not start then
+    return { llm_output = "read error: " .. tostring(start_err), is_error = true }
+  end
   local max_output_lines = output_limits.resolve(opts, ctx)
   local max_lines = limit > 0 and limit or nil
   if max_output_lines then
@@ -177,13 +197,13 @@ maki.api.register_tool({
       },
       offset = {
         type = "integer",
-        description = "Line number to start from (1-indexed). Use 1 for the first line.",
-        required = true,
+        description = "Line number to start from (1-indexed, default 1). Negative counts from the end: -20 starts at the 20th line from the end.",
       },
       limit = {
         type = "integer",
         description = "Max number of lines to read. Use 0 to read until end of file (capped at 2000 lines).",
         required = true,
+        hint = "Pass limit. Use limit=0 to read the whole file, capped at 2000 lines.",
       },
     },
   },
@@ -192,7 +212,7 @@ maki.api.register_tool({
     local buf = maki.ui.buf()
     local s = shorten_path(input.path or "")
     local start = input.offset or 1
-    if input.limit and input.limit > 0 then
+    if start > 0 and input.limit and input.limit > 0 then
       s = s .. ":" .. start .. "-" .. (start + input.limit - 1)
     else
       s = s .. ":" .. start
@@ -245,6 +265,6 @@ maki.api.register_tool({
     if meta.is_dir then
       return { llm_output = "error: path is a directory, use the list tool instead", is_error = true }
     end
-    return read_file(path, input.offset, input.limit, ctx)
+    return read_file(path, input.offset or 1, input.limit, ctx)
   end,
 })

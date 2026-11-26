@@ -24,6 +24,7 @@ Maki uses these messages:
 - `Authentication required` when authentication needs attention.
 - `Question requested` for a question prompt.
 - `Plan ready` when a plan is ready.
+- `Package changes to review` when a package review waits on you.
 
 Response previews can appear in your operating system's notification history.
 Maki does not include tool arguments, permission scopes, question bodies, plan
@@ -64,40 +65,23 @@ does not reach you over SSH.
 
 ## Program status
 
-Maki also reports the state of your sessions with OSC 7501, the
+Maki also reports the current state to the terminal with OSC 7501, the
 [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status).
-A notification is a one-time alert. Program status always holds the current
-state, so a supported terminal can show it next to the tab while you work
-elsewhere.
+A supported terminal can show it next to the tab, so you can see which tab
+waits on you. Other terminals ignore it.
 
 | State | When |
 | --- | --- |
-| `idle` | No session is working or waiting. |
-| `working` | A session is running a turn or a background task. |
-| `blocked` | A session waits on you. `kind` is `permission`, `question`, or `auth`. A ready plan counts as `permission`. |
-| `done` | A turn finished. The state stays until the next turn starts. |
-| `error` | A turn stopped with an error. The state stays until the next turn starts. |
+| `idle` | Nothing runs or waits. |
+| `working` | A turn or a background task runs. |
+| `blocked` | A permission prompt, question, plan, package review, or login waits on you. |
+| `done` | The last turn finished. |
+| `error` | The last turn stopped with an error. |
 
-With several sessions open, Maki reports the most urgent one, in this order:
-blocked, working, error, done, idle. A tie goes to the focused session. Each
-report names the session by its title. A `blocked` report also says what Maki
-waits for, such as `Permission requested: bash`. Maki cuts the title to 192
-bytes and the message to 2048 bytes, the limits the protocol sets.
+With several sessions open, Maki reports the most urgent one. The status clears
+when Maki exits. With `--exit-on-done` the final `done` or `error` stays.
 
-Maki clears the status when it exits or when you suspend it with `Ctrl+Z`,
-and reports again after `fg`. With `--exit-on-done` the final `done` or
-`error` stays, so the tab still shows how the run ended.
-
-Program status is enabled by default. Terminals without OSC 7501 support
-ignore it. To turn it off:
-
-```lua
-maki.setup({
-  ui = {
-    program_status = false,
-  },
-})
-```
+Set `ui.program_status = false` to turn it off.
 
 ## tmux
 
@@ -109,11 +93,8 @@ set -g allow-passthrough all
 
 Use `allow-passthrough all`, not `allow-passthrough on`. The `on` value permits
 passthrough only while the Maki pane is visible. tmux drops the notification
-or status report after you change to another tmux window.
-
-In tmux and GNU screen, each pane or window reports its own status record.
-Several Maki panes in one terminal do not overwrite each other, and quitting
-one leaves the others in place.
+or status report after you change to another tmux window. Each pane reports
+its own status, so several Maki panes do not overwrite each other.
 
 Focus events are a separate setting:
 
@@ -129,11 +110,24 @@ Add the settings to `~/.tmux.conf`, then reload the file or restart tmux.
 
 ## Other terminal multiplexers
 
-Maki wraps OSC 9 and OSC 7501 for GNU screen. GNU screen does not pass terminal focus
-events to Maki, so Maki does not suppress notifications there. A notification
+Maki wraps OSC 9 and OSC 7501 for GNU screen. GNU screen does not pass terminal
+focus events to Maki, so Maki does not suppress notifications there. A notification
 can appear while the GNU screen window has focus.
 
 Maki sends OSC 9 and OSC 7501 directly through Zellij.
+
+## Herdr
+
+[Herdr](https://herdr.dev) forwards BEL to the terminal you attach from, so
+`auto` uses BEL there. Herdr does not show OSC 9, so `osc9` shows nothing
+inside Herdr.
+
+Herdr tracks Maki panes and plays its own sound when one is blocked or done.
+With both on you can hear two alerts. Set `off` to leave alerts to Herdr, or
+keep `bell` if you want the terminal window flagged too.
+
+Maki detects Herdr from `TERM_PROGRAM=herdr`. Inside tmux or GNU screen started
+in a Herdr pane, Maki talks to that multiplexer instead.
 
 ## Focus on Windows
 

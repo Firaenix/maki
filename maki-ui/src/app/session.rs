@@ -13,7 +13,7 @@ use crate::components::{Action, BackgroundBadge, BackgroundOutcome};
 use crate::text_buffer::Writers;
 use maki_agent::agent::SessionExport;
 use maki_agent::session::SessionHeader;
-use maki_agent::{SessionMailbox, TaskEnd, Transcript};
+use maki_agent::{CompactRequest, SessionMailbox, TaskEnd, Transcript};
 use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::{PluginPermissions, PluginReach, SessionEndReason};
 use maki_providers::{Message, Model, RequestOptions, TokenUsage, estimate_message_tokens};
@@ -506,6 +506,15 @@ impl App {
             .filter(|mailbox| mailbox.session_id() == self.state.session.id)
     }
 
+    /// Takes a plugin's compaction request, but only at quiescence: a live
+    /// run claims it before its next request, and one taker wins.
+    pub(crate) fn take_requested_compact(&self) -> Option<CompactRequest> {
+        if !self.takes_wake() {
+            return None;
+        }
+        self.live_mailbox()?.take_compact()
+    }
+
     /// The one funnel for handing a history over. When the UI installs one the
     /// agent did not give it (rewind, load, new session), the mirror handle
     /// goes away in the same breath, so no later checkpoint can bring the
@@ -655,7 +664,7 @@ impl App {
             }
         };
         // Without this a young session forks into "fork of New session".
-        session.update_title_if_default();
+        session.update_title_if_default(None);
         session.set_title(format!("{FORK_TITLE_PREFIX}{}", session.title));
         vec![Action::OpenFork(Box::new(OpenSession { session, claim }))]
     }
@@ -715,7 +724,7 @@ impl App {
         let measured = self.state.context_size;
         let session = self.state.session_mut();
         let context_size = truncate_to_turn(session, entry.turn_index, measured);
-        session.update_title_if_default();
+        session.update_title_if_default(None);
         self.state.context_size = context_size;
 
         // A tool task still running belongs to a turn that is over.

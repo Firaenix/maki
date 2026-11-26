@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
+use std::iter;
 
 use serde::{Deserialize, Serialize};
 
@@ -9,7 +10,7 @@ use crate::{StateDir, atomic_write};
 const MODEL_FILE: &str = "model";
 const RECENT_FILE: &str = "recent-models";
 const THINKING_FILE: &str = "thinking";
-const COLLAPSED_FILE: &str = "collapsed-providers";
+const EXPANDED_FILE: &str = "expanded-providers";
 const MAX_RECENTS: usize = 6;
 
 pub fn persist_model(dir: &StateDir, spec: &str) {
@@ -36,35 +37,41 @@ pub fn read_thinking(dir: &StateDir) -> Option<StoredThinking> {
     StoredThinking::parse_setting(&raw).ok()
 }
 
-/// Providers folded away in the model picker, by slug. Kept as a sorted set,
-/// so folding and unfolding the same provider leaves the file as it was.
-pub fn read_collapsed_providers(dir: &StateDir) -> BTreeSet<String> {
-    fs::read_to_string(dir.path().join(COLLAPSED_FILE))
+/// Providers the model picker lists unfolded, by slug, since it folds the rest.
+/// Kept as a sorted set, so unfolding and folding the same provider leaves the
+/// file as it was.
+pub fn read_expanded_providers(dir: &StateDir) -> BTreeSet<String> {
+    fs::read_to_string(dir.path().join(EXPANDED_FILE))
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default()
 }
 
-pub fn persist_collapsed_providers(dir: &StateDir, slugs: &BTreeSet<String>) {
+pub fn persist_expanded_providers(dir: &StateDir, slugs: &BTreeSet<String>) {
     if let Ok(json) = serde_json::to_vec_pretty(slugs) {
-        let _ = atomic_write(&dir.path().join(COLLAPSED_FILE), &json);
+        let _ = atomic_write(&dir.path().join(EXPANDED_FILE), &json);
     }
 }
 
 #[derive(Serialize, Deserialize, Default)]
 struct RecentList(Vec<String>);
 
-pub fn push_recent(dir: &StateDir, spec: &str) -> Vec<String> {
-    let mut recents = read_recents(dir);
-    recents.retain(|s| s != spec);
-    recents.insert(0, spec.to_owned());
-    recents.truncate(MAX_RECENTS);
-    write_recents(dir, &recents);
-    recents
+/// Merges onto the list on disk, so picks made by another maki since this one
+/// read it survive.
+pub fn push_recent(dir: &StateDir, spec: &str) {
+    write_recents(dir, &with_recent(&read_recents(dir), spec));
+}
+
+pub fn with_recent(recents: &[String], spec: &str) -> Vec<String> {
+    iter::once(spec)
+        .chain(recents.iter().map(String::as_str).filter(|s| *s != spec))
+        .take(MAX_RECENTS)
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Newest first, so a list written by a launch that predates the migration
-/// does not bury the history it replaced. Identical to `push_recent` for one
+/// does not bury the history it replaced. Identical to `with_recent` for one
 /// spec, applied to a whole list.
 pub fn merge_recents(new: &[String], old: &[String]) -> Vec<String> {
     let mut merged = new.to_vec();
@@ -105,6 +112,9 @@ mod tests {
     use crate::sessions::Effort;
     use tempfile::TempDir;
     use test_case::test_case;
+
+    const OLD_SPEC: &str = "anthropic/claude-sonnet-4";
+    const NEW_SPEC: &str = "openai/gpt-5.4-nano";
 
     #[test]
     fn round_trip() {
@@ -161,22 +171,29 @@ mod tests {
     }
 
     #[test]
-    fn push_recent_dedupes_and_orders_most_recent_first() {
+    fn push_recent_merges_onto_the_list_on_disk() {
         let tmp = TempDir::new().unwrap();
         let dir = StateDir::from_path(tmp.path().to_path_buf());
 
-        push_recent(&dir, "anthropic/claude-sonnet-4");
-        push_recent(&dir, "openai/gpt-5.4-nano");
-        assert_eq!(
-            read_recents(&dir),
-            ["openai/gpt-5.4-nano", "anthropic/claude-sonnet-4"]
-        );
+        push_recent(&dir, OLD_SPEC);
+        push_recent(&dir, NEW_SPEC);
+        assert_eq!(read_recents(&dir), [NEW_SPEC, OLD_SPEC]);
+    }
 
-        push_recent(&dir, "anthropic/claude-sonnet-4");
-        assert_eq!(
-            read_recents(&dir),
-            ["anthropic/claude-sonnet-4", "openai/gpt-5.4-nano"]
-        );
+    #[test_case(&[], NEW_SPEC, &[NEW_SPEC] ; "first pick")]
+    #[test_case(&[OLD_SPEC], NEW_SPEC, &[NEW_SPEC, OLD_SPEC] ; "newest first")]
+    #[test_case(&[NEW_SPEC, OLD_SPEC], OLD_SPEC, &[OLD_SPEC, NEW_SPEC] ; "repeat pick moves up")]
+    fn with_recent_puts_the_pick_first(recents: &[&str], spec: &str, expected: &[&str]) {
+        let recents: Vec<String> = recents.iter().map(|s| s.to_string()).collect();
+        assert_eq!(with_recent(&recents, spec), expected);
+    }
+
+    #[test]
+    fn with_recent_drops_the_oldest_past_the_cap() {
+        let full: Vec<String> = (0..MAX_RECENTS).map(|i| format!("p/model-{i}")).collect();
+        let recents = with_recent(&full, NEW_SPEC);
+        assert_eq!(recents[0], NEW_SPEC);
+        assert_eq!(recents[1..], full[..MAX_RECENTS - 1]);
     }
 
     #[test]
@@ -193,29 +210,6 @@ mod tests {
         let new: Vec<String> = (0..MAX_RECENTS).map(|i| format!("new/{i}")).collect();
         let old: Vec<String> = (0..MAX_RECENTS).map(|i| format!("old/{i}")).collect();
         assert_eq!(merge_recents(&new, &old).len(), MAX_RECENTS);
-    }
-
-    #[test]
-    fn push_recent_caps_at_max() {
-        let tmp = TempDir::new().unwrap();
-        let dir = StateDir::from_path(tmp.path().to_path_buf());
-
-        for i in 0..(MAX_RECENTS + 3) {
-            push_recent(&dir, &format!("p/model-{i}"));
-        }
-        let recents = read_recents(&dir);
-        assert_eq!(recents.len(), MAX_RECENTS);
-        assert_eq!(recents[0], format!("p/model-{}", MAX_RECENTS + 2));
-    }
-
-    #[test]
-    fn push_recent_returns_final_list() {
-        let tmp = TempDir::new().unwrap();
-        let dir = StateDir::from_path(tmp.path().to_path_buf());
-
-        let recents = push_recent(&dir, "a/b");
-        assert_eq!(recents, vec!["a/b".to_string()]);
-        assert_eq!(recents, read_recents(&dir));
     }
 
     #[test]

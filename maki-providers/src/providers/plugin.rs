@@ -9,15 +9,13 @@ use tokio::sync::mpsc::unbounded_channel;
 use arc_swap::ArcSwap;
 use maki_config::host_allowed;
 use maki_config::providers::{Protocol, ProvidersConfig, base_url_override, plan_base_url};
-use maki_storage::StateDir;
-use maki_storage::auth::{lock_credentials, plugin_auth_stamp};
+use maki_storage::auth::{lock_credentials_async, plugin_auth_stamp_async};
 use maki_storage::id::SessionRef;
+use maki_storage::{StateDir, joined};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::oneshot;
-use tokio::task::spawn_blocking;
 use tracing::{debug, warn};
 use url::{Host, Url};
 
@@ -42,6 +40,7 @@ const BUILD_BODY_OPTION: &str = "build_body hook";
 const SYSTEM_PREFIX_OPTION: &str = "system_prefix";
 const OPENAI_OPTION: &str = "openai";
 const SESSION_ID_OPTION: &str = "session_id";
+const REPLAY_REASONING_OPTION: &str = "replay_reasoning";
 const BASE_URL_OPTION: &str = "base_url";
 const HTTPS_SCHEME: &str = "https";
 const HTTP_SCHEME: &str = "http";
@@ -193,6 +192,11 @@ pub struct ProviderDecl {
     pub openai: Option<OpenAiWire>,
     /// Above the codec tables, because every codec but google carries it.
     pub session_id: Option<SessionCarrier>,
+    /// Send past assistant reasoning back as `reasoning` input items. Only
+    /// `codec = "openai-responses"` reads it, and only some providers take
+    /// plaintext reasoning back.
+    #[serde(default)]
+    pub replay_reasoning: bool,
     /// This and the next three describe a model no row or listing covers.
     /// Each falls back to the native provider behind the codec or base. The
     /// two limits also fill in any row that leaves its own out.
@@ -405,13 +409,14 @@ fn honours_build_body(target: Target) -> bool {
 }
 
 /// The `openai` table is the chat codec's own vocabulary. The responses codec
-/// spells neither effort nor extra body the same way, so it is refused there
-/// rather than half honoured.
-fn honours_openai_wire(target: Target) -> bool {
+/// honours only its `thinking` (rendered as the standard `reasoning` block)
+/// and `thinking_overrides`, and refuses a table that sets anything else
+/// rather than half honour it.
+fn honours_openai_wire(target: Target, wire: &OpenAiWire) -> bool {
     match target {
         Target::Codec(Protocol::Openai) => true,
-        Target::Codec(Protocol::OpenaiResponses | Protocol::Anthropic | Protocol::Google)
-        | Target::Base(_) => false,
+        Target::Codec(Protocol::OpenaiResponses) => wire.responses_compatible(),
+        Target::Codec(Protocol::Anthropic | Protocol::Google) | Target::Base(_) => false,
     }
 }
 
@@ -430,6 +435,16 @@ fn honours_session_id(target: Target) -> bool {
     match target {
         Target::Codec(Protocol::Anthropic | Protocol::Openai | Protocol::OpenaiResponses) => true,
         Target::Codec(Protocol::Google) | Target::Base(_) => false,
+    }
+}
+
+/// Only the responses wire takes a `reasoning` input item, and only some
+/// providers accept one in plaintext.
+fn honours_replay_reasoning(target: Target) -> bool {
+    match target {
+        Target::Codec(Protocol::OpenaiResponses) => true,
+        Target::Codec(Protocol::Openai | Protocol::Anthropic | Protocol::Google)
+        | Target::Base(_) => false,
     }
 }
 
@@ -728,11 +743,16 @@ fn target_of(decl: &ProviderDecl, hooks: &ProviderHooks) -> Result<Target, Regis
     if decl.system_prefix.is_some() && !honours_system_prefix(target) {
         return Err(unsupported(SYSTEM_PREFIX_OPTION));
     }
-    if decl.openai.is_some() && !honours_openai_wire(target) {
+    if let Some(wire) = &decl.openai
+        && !honours_openai_wire(target, wire)
+    {
         return Err(unsupported(OPENAI_OPTION));
     }
     if decl.session_id.is_some() && !honours_session_id(target) {
         return Err(unsupported(SESSION_ID_OPTION));
+    }
+    if decl.replay_reasoning && !honours_replay_reasoning(target) {
+        return Err(unsupported(REPLAY_REASONING_OPTION));
     }
     let states_origin =
         decl.base_url.is_some() || decl.plans.iter().any(|plan| plan.base_url.is_some());
@@ -937,6 +957,7 @@ impl AuthState {
     /// env var, and the static credentials, which are the only ones a plugin
     /// without an auth hook ever has. A token a hook already minted stays,
     /// unless the new declaration stopped covering the origin it points at.
+    /// Then it goes even if the new credentials fail to resolve.
     fn redeclare(
         &self,
         slug: &str,
@@ -947,13 +968,23 @@ impl AuthState {
         *self.hosts.lock().unwrap() = hosts.into();
         let mut keys = self.keys.lock().unwrap();
         keys.refresh(slug, api_key_env);
-        let declared = keys.initial_auth(slug, header)?;
+        let declared = keys.initial_auth(slug, header);
         let mut current = self.current.lock().unwrap();
         let undeclared = declared_base_url(slug, current.base_url.clone(), hosts).is_err();
-        if !self.gate.ran() || undeclared {
-            *current = declared;
+        match declared {
+            Ok(declared) => {
+                if !self.gate.ran() || undeclared {
+                    *current = declared;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if undeclared {
+                    *current = ResolvedAuth::withheld();
+                }
+                Err(error)
+            }
         }
-        Ok(())
     }
 
     /// [`Self::mint`] under the cross-process lock: serialised against other
@@ -971,15 +1002,13 @@ impl AuthState {
         hook: &dyn Hook<AuthPurpose, PluginAuth>,
         purpose: AuthPurpose,
     ) -> Result<Recovery, AgentError> {
-        let owned = slug.to_owned();
-        let (_lock, stored) = spawn_blocking(move || match StateDir::resolve() {
+        let (_lock, stored) = match StateDir::resolve() {
             Ok(dir) => (
-                Some(lock_credentials(&dir, &owned)),
-                plugin_auth_stamp(&dir, &owned),
+                Some(lock_credentials_async(&dir, slug).await),
+                plugin_auth_stamp_async(&dir, slug).await,
             ),
             Err(_) => (None, None),
-        })
-        .await?;
+        };
         let purpose = match purpose {
             AuthPurpose::Refresh
                 if self.gate.ran() && *self.store_seen.lock().unwrap() != stored =>
@@ -1008,15 +1037,20 @@ impl AuthState {
             .call(purpose)
             .await?
             .into_resolved(slug, &self.hosts())?;
-        let owned = slug.to_owned();
-        let stamp =
-            spawn_blocking(move || plugin_auth_stamp(&StateDir::resolve().ok()?, &owned)).await?;
+        let stamp = match StateDir::resolve() {
+            Ok(dir) => plugin_auth_stamp_async(&dir, slug).await,
+            Err(_) => None,
+        };
         let mut current = self.current.lock().unwrap();
+        // A reload can narrow the hosts while the stamp is read. Vetted again
+        // under `current`, this either sees the new list or `redeclare`, which
+        // takes `current` after storing it, re-vets what lands here.
+        //
         // A hook that omits base_url keeps the resolved one. Falling back to
         // the provider's default origin would silently repoint the token.
-        if fresh.base_url.is_none() {
-            fresh.base_url = current.base_url.take();
-        }
+        fresh.base_url = declared_base_url(slug, fresh.base_url.take(), &self.hosts())
+            .map_err(|message| AgentError::Config { message })?
+            .or_else(|| current.base_url.take());
         *current = fresh;
         *self.store_seen.lock().unwrap() = stamp;
         Ok(())
@@ -1076,15 +1110,12 @@ impl PluginEntry {
         // that timed out, must neither release the gate and the lock while the
         // hook still holds the token nor drop what the hook minted with it.
         let auth = Arc::clone(&self.auth);
-        let (done, outcome) = oneshot::channel();
-        tokio::spawn(async move {
-            let minted = auth
-                .gate
+        joined(tokio::spawn(async move {
+            auth.gate
                 .single_flight(seen, auth.locked_mint(&slug, hook.as_ref(), purpose))
-                .await;
-            let _ = done.send(minted);
-        });
-        outcome.await.map_err(|_| AgentError::Channel)?
+                .await
+        }))
+        .await
     }
 }
 
@@ -1318,6 +1349,10 @@ impl Provider for PluginProvider {
         })
     }
 
+    fn needs_model_discovery(&self) -> bool {
+        self.inner.needs_model_discovery()
+    }
+
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
         Box::pin(async move {
             let result = self.models().await;
@@ -1423,6 +1458,7 @@ fn codec_options(entry: &PluginEntry, protocol: Protocol) -> CodecOptions {
         system_prefix: decl.system_prefix.clone(),
         openai: decl.openai.clone().unwrap_or_default(),
         session_id: decl.session_id.clone().unwrap_or_default(),
+        replay_reasoning: decl.replay_reasoning,
         build_body: entry
             .hooks
             .build_body
@@ -1667,7 +1703,7 @@ mod tests {
 
     use super::spec::{UNKNOWN_MODEL_CONTEXT_WINDOW, UNKNOWN_MODEL_MAX_OUTPUT};
     use super::*;
-    use crate::model::ModelTier;
+    use crate::model::{FactSource, ModelTier};
     use crate::model_registry;
     use crate::retry::RetryKind;
     use crate::test_support::{Canned, isolated_home, serve};
@@ -1927,7 +1963,9 @@ mod tests {
     }
 
     fn token(entry: &PluginEntry) -> String {
-        entry.auth.current.lock().unwrap().headers[0].1.clone()
+        entry.auth.current.lock().unwrap().header_list()[0]
+            .1
+            .clone()
     }
 
     fn base_url(slug: &str) -> Option<String> {
@@ -2247,7 +2285,7 @@ mod tests {
         };
         let entry = entry(SLUG).unwrap();
         let auth = entry.auth.current.lock().unwrap();
-        assert_eq!(auth.headers, [(header.to_string(), value)]);
+        assert_eq!(auth.header_list(), [(header.to_string(), value)]);
     }
 
     /// Tier defaults are looked up through `default`, like in a curated table.
@@ -3040,6 +3078,23 @@ mod tests {
         assert_eq!(listed.context_window, unlisted.context_window);
     }
 
+    #[test]
+    fn a_row_borrows_capabilities_with_like() {
+        const SLUG: &str = "like-plugin";
+        let mut reg = registration(SLUG);
+        reg.decl.models[0] = serde_json::from_value(serde_json::json!({
+            "prefixes": [MODEL_ID],
+            "like": "zai/glm-5.3",
+        }))
+        .unwrap();
+        register_loaded(reg).unwrap();
+
+        let model = Model::from_spec(&format!("{SLUG}/{MODEL_ID}")).unwrap();
+        assert_eq!(model.family, ModelFamily::Glm);
+        assert_eq!(model.vision_with_source(), (false, FactSource::Like));
+        assert!(!model.supports_tool_examples());
+    }
+
     fn authored_cap(stated: Option<Value>) -> Value {
         let mut authored = serde_json::json!({
             "slug": CAP_SLUG,
@@ -3162,9 +3217,47 @@ mod tests {
         reg.decl.openai = Some(OpenAiWire::default());
     }
 
+    /// A chat-only field of the `openai` table, on the responses codec, which
+    /// honours only `thinking` and `thinking_overrides`.
+    fn openai_wire_chat_field_on_responses(reg: &mut Registration) {
+        reg.decl.codec = Some(Protocol::OpenaiResponses);
+        reg.decl.openai = Some(
+            serde_json::from_value(serde_json::json!({
+                "thinking": { "dialect": "high-only" },
+                "max_tokens_field": "max_output_tokens",
+            }))
+            .unwrap(),
+        );
+    }
+
+    /// The responses pass writes the standard `reasoning` block, so a custom
+    /// effort field would be dropped there.
+    fn openai_wire_custom_effort_field_on_responses(reg: &mut Registration) {
+        reg.decl.codec = Some(Protocol::OpenaiResponses);
+        reg.decl.openai = Some(
+            serde_json::from_value(serde_json::json!({
+                "thinking": { "dialect": "high-only", "field": "custom_effort" },
+            }))
+            .unwrap(),
+        );
+    }
+
     fn session_id_on_google(reg: &mut Registration) {
         reg.decl.codec = Some(Protocol::Google);
         reg.decl.session_id = Some(SessionCarrier::default());
+    }
+
+    fn replay_reasoning_on_chat(reg: &mut Registration) {
+        reg.decl.codec = Some(Protocol::Openai);
+        reg.decl.replay_reasoning = true;
+    }
+
+    #[test]
+    fn replay_reasoning_registers_on_the_responses_codec() {
+        let mut reg = registration("replay-reasoning-plugin");
+        reg.decl.codec = Some(Protocol::OpenaiResponses);
+        reg.decl.replay_reasoning = true;
+        register_loaded(reg).unwrap();
     }
 
     fn system_prefix_on_google(reg: &mut Registration) {
@@ -3208,7 +3301,10 @@ mod tests {
     #[test_case(outside_a_load, |e| matches!(e, RegisterError::Closed(_)) ; "registration_outside_a_load")]
     #[test_case(body_hook_on_anthropic, |e| matches!(e, RegisterError::Unsupported { .. }) ; "build_body_needs_an_openai_codec")]
     #[test_case(openai_wire_on_anthropic, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == OPENAI_OPTION) ; "openai_table_needs_the_openai_codec")]
+    #[test_case(openai_wire_chat_field_on_responses, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == OPENAI_OPTION) ; "responses_codec_refuses_chat_only_fields")]
+    #[test_case(openai_wire_custom_effort_field_on_responses, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == OPENAI_OPTION) ; "responses_codec_refuses_a_custom_effort_field")]
     #[test_case(session_id_on_google, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == SESSION_ID_OPTION) ; "google_carries_no_session_id")]
+    #[test_case(replay_reasoning_on_chat, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == REPLAY_REASONING_OPTION) ; "replay_reasoning_needs_the_responses_codec")]
     #[test_case(system_prefix_on_google, |e| matches!(e, RegisterError::Unsupported { .. }) ; "google_drops_the_system_prefix")]
     #[test_case(system_prefix_on_the_google_base, |e| matches!(e, RegisterError::Unsupported { .. }) ; "so_does_the_google_base")]
     #[test_case(base_url_on_a_base, |e| matches!(e, RegisterError::Unsupported { option, .. } if *option == BASE_URL_OPTION) ; "base_url_needs_a_codec")]
@@ -3461,21 +3557,27 @@ mod tests {
     /// What the per-slug auth cell must and must not carry across a reload: a
     /// slug that has minted nothing takes the fresh declaration, an origin a
     /// hook leased survives as long as the new declaration still covers it,
-    /// and it goes the moment a narrowed host list stops covering it.
+    /// and it goes the moment a narrowed host list stops covering it, even when
+    /// the new credentials fail to resolve.
     ///
     /// The origin is always the hook's. A declared `base_url` is the codec's
     /// last resort and never reaches the auth cell, which is what keeps a
     /// plugin from outranking the user's `<SLUG>_BASE_URL`.
-    #[test_case(false, true, None ; "an_unminted_slug_takes_the_fresh_declaration")]
-    #[test_case(true, true, Some(OTHER_BASE_URL) ; "a_leased_origin_survives_the_reload")]
-    #[test_case(true, false, None ; "narrowing_the_hosts_drops_an_origin_they_no_longer_cover")]
+    #[test_case(false, true, false, None ; "an_unminted_slug_takes_the_fresh_declaration")]
+    #[test_case(true, true, false, Some(OTHER_BASE_URL) ; "a_leased_origin_survives_the_reload")]
+    #[test_case(true, false, false, None ; "narrowing_the_hosts_drops_an_origin_they_no_longer_cover")]
+    #[test_case(true, true, true, Some(OTHER_BASE_URL) ; "a_covered_origin_survives_credentials_that_fail")]
+    #[test_case(true, false, true, None ; "narrowing_the_hosts_drops_an_origin_even_when_the_credentials_fail")]
     #[tokio::test]
     async fn a_reload_re_reads_the_declaration(
         minted: bool,
         still_covered: bool,
+        unresolvable_key: bool,
         expected: Option<&str>,
     ) {
         const SLUG: &str = "redeclare-plugin";
+        const ENV_VAR: &str = "MAKI_TEST_REDECLARE_PLUGIN_KEY";
+        const NO_HEADER_KEY: &str = "sk-\u{1}";
         let declaration = |covers_the_lease: bool| {
             let mut reg = registration(SLUG);
             if covers_the_lease {
@@ -3498,7 +3600,12 @@ mod tests {
             );
         }
 
-        register_loaded(declaration(still_covered)).unwrap();
+        let mut reload = declaration(still_covered);
+        if unresolvable_key {
+            unsafe { std::env::set_var(ENV_VAR, NO_HEADER_KEY) };
+            reload.decl.api_key_env = Some(ENV_VAR.to_string());
+        }
+        register_loaded(reload).unwrap();
 
         assert_eq!(base_url(SLUG).as_deref(), expected);
     }

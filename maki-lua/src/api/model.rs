@@ -5,8 +5,9 @@
 use std::fmt::Display;
 
 use maki_lua_macro::{lua_fn, lua_table};
-use maki_providers::{Model, ModelTier, model_registry};
-use mlua::{Error as LuaError, Lua, Result as LuaResult, Table, Value};
+use maki_providers::provider::adjust_model;
+use maki_providers::{Model, ModelTier, Timeouts, model_registry};
+use mlua::{Error as LuaError, Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::api::util::command::{ModelRequest, UiAction, ui_json_roundtrip};
@@ -41,10 +42,25 @@ fn model_info_table(lua: &Lua, model: &Model) -> LuaResult<Table> {
     tbl.set("provider", model.provider.to_string())?;
     tbl.set("provider_display", model.provider_display_name())?;
     tbl.set("tier", model.tier.to_string())?;
+    tbl.set("family", lua.to_value(&model.family)?)?;
     tbl.set("context_window", model.context_window)?;
     if let Some(max) = model.max_output_tokens {
         tbl.set("max_output_tokens", max)?;
     }
+    let (thinking, thinking_source) = model.thinking_with_source();
+    let (vision, vision_source) = model.vision_with_source();
+    tbl.set("supports_thinking", thinking)?;
+    tbl.set("supports_vision", vision)?;
+    let sources = lua.create_table()?;
+    sources.set("context_window", model.sources.context_window.as_str())?;
+    sources.set(
+        "max_output_tokens",
+        model.sources.max_output_tokens.as_str(),
+    )?;
+    sources.set("pricing", model.sources.pricing.as_str())?;
+    sources.set("thinking", thinking_source.as_str())?;
+    sources.set("vision", vision_source.as_str())?;
+    tbl.set("sources", sources)?;
     // `None` writes nil, which is the third state: a plugin reads false as
     // "metered" and nil as "we never learned a price".
     tbl.set("free", model.free())?;
@@ -70,16 +86,28 @@ fn model_info_table(lua: &Lua, model: &Model) -> LuaResult<Table> {
 }
 
 /// Resolve a model spec to everything maki knows about it: identity, tier,
-/// context window, and the price table the session would be billed by --
+/// limits, capabilities, and the price table the session would be billed by --
 /// including rates resolved from provider config or the bundled catalog
 /// (e.g. subsidised custom providers), which the provider's own /v1/models
-/// endpoint may never report. Purely local -- no UI round-trip, no network
-/// -- so it also works from slash commands and headless embeddings.
+/// endpoint may never report. The provider's own adjustments apply, as they do
+/// for a session. Purely local -- no UI round-trip, no network -- so it also
+/// works from slash commands and headless embeddings.
 ///
 /// @param spec string `"provider/id"`, as listed by `available()`.
 /// @return (table|nil, string|nil) `{spec, id, provider, provider_display,
-///   tier, subsidised_by?, context_window, max_output_tokens?, free?,
-///   pricing?}`, or nil and an error.
+///   tier, family, subsidised_by?, context_window, max_output_tokens?, free?,
+///   supports_thinking, supports_vision, pricing?, sources}`, or nil and an
+///   error.
+///
+///   `family` is `"generic"`, `"claude"`, `"gpt"`, `"gemini"`, `"glm"` or
+///   `"synthetic"`.
+///
+///   `sources` names what decided each fact, as
+///   `{context_window, max_output_tokens, pricing, thinking, vision}`. Each is
+///   `"config"` (`providers.toml`), `"discovery"` (the provider's live model
+///   list), `"table"` (a curated or plugin model row), `"like"` (the row a
+///   `like` names), `"catalog"` (models.dev) or `"default"` (nothing described
+///   the model, so a provider or family default applies).
 ///
 ///   `free` has three states: `true` when the model is known to cost nothing,
 ///   `false` when it is metered, and nil when no source ever quoted a rate.
@@ -98,20 +126,27 @@ fn model_info_table(lua: &Lua, model: &Model) -> LuaResult<Table> {
 #[lua_fn]
 fn info(lua: &Lua, spec: String) -> LuaResult<Pair<Table>> {
     match Model::from_spec(&spec) {
-        Ok(model) => Ok((Some(model_info_table(lua, &model)?), None)),
+        Ok(mut model) => {
+            // A provider that cannot be built here leaves the model as resolved.
+            let _ = adjust_model(&mut model, Timeouts::default());
+            Ok((Some(model_info_table(lua, &model)?), None))
+        }
         Err(e) => Ok(err_pair(e)),
     }
 }
 
 /// The model maki uses for a tier, the same one a subagent asking for that
-/// tier gets: user's pick from the `/model` picker for that tier (whatever
-/// provider it names), else the curated or `providers.toml`-declared default
-/// within `provider`, else any provider. `assigned` tells a pick apart from a
-/// default. Pass `provider` to prefer its models, the way subagents prefer the
-/// session's provider.
+/// tier gets. The first match wins:
+///
+/// 1. The user's pick for that tier in the `/model` picker, from any provider.
+/// 2. The tier default within `provider`, curated or set in `providers.toml`.
+/// 3. The tier default of any provider.
+///
+/// `assigned` tells a pick apart from a default. Pass `provider` the way
+/// subagents pass the session's provider.
 ///
 /// Resolving a models.dev model can wait for that catalog to download, so
-/// like `get`, this can't run in a callback that must not yield.
+/// like `get`, this cannot run in a callback that must not yield.
 ///
 /// @param name string `"weak"`, `"medium"`, `"strong"`, or `"compaction"`.
 /// @param provider string|nil Provider slug to resolve within first.
@@ -283,10 +318,9 @@ mod tests {
     use super::*;
     use crate::api::util::command::{NO_UI_ERR, UI_DROPPED_ERR, UiReply};
     use crate::api::util::convert::lua_to_json;
+    use maki_providers::model::FACT_SOURCE_TABLE;
     use maki_providers::model_registry;
-    use maki_storage::StateDir;
     use serde_json::{Value as Json, json};
-    use tempfile::TempDir;
     use test_case::test_case;
     use tokio::sync::mpsc::UnboundedSender;
     use tokio::sync::mpsc::unbounded_channel;
@@ -297,18 +331,14 @@ mod tests {
 
     /// Assignments live in a process-global registry, so a test that needs one
     /// writes it and hands back the pair used to clear it afterwards. `unset`
-    /// only removes a matching spec, hence the spec is returned with the dir.
+    /// only removes a matching spec, hence the spec is returned with the tier.
     fn assign_tier(spec: &str, tier: ModelTier) -> (Lua, ModelTier, String) {
-        let dir = TempDir::new().unwrap();
-        let storage = StateDir::from_path(dir.path().to_path_buf());
-        model_registry::set_and_persist(spec.into(), tier, &storage);
+        model_registry::set(spec.into(), tier);
         (lua_with_model(None), tier, spec.into())
     }
 
     fn clear_tier(tier: ModelTier, spec: String) {
-        let dir = TempDir::new().unwrap();
-        let storage = StateDir::from_path(dir.path().to_path_buf());
-        model_registry::unset_and_persist(&spec, tier, &storage);
+        model_registry::unset(&spec, tier);
     }
 
     fn lua_with_model(tx: Option<UnboundedSender<UiAction>>) -> Lua {
@@ -427,6 +457,18 @@ mod tests {
         assert!(val["pricing"]["output"].as_f64().unwrap() > 0.0);
         assert_eq!(val["subsidised_by"], Json::Null);
         assert_eq!(val["free"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn info_names_what_decided_each_fact() {
+        let lua = lua_with_model(None);
+        let (val, err) = eval(&lua, "return model.info('anthropic/claude-sonnet-4-5')").await;
+        assert_eq!(err, None);
+        assert_eq!(val["family"], json!("claude"));
+        assert_eq!(val["supports_vision"], json!(true));
+        for fact in ["context_window", "max_output_tokens", "pricing", "vision"] {
+            assert_eq!(val["sources"][fact], json!(FACT_SOURCE_TABLE), "{fact}");
+        }
     }
 
     /// The three states have to read apart: a known `$0`, a metered model, and

@@ -205,7 +205,7 @@ impl RequestTools {
     /// The one place a run's tool array is built. Host exclusions (a client
     /// that cannot service `question`) go through here and nowhere else, so
     /// the array and the filter always agree on them.
-    pub fn build(
+    pub async fn build(
         registry: &ToolRegistry,
         vars: &crate::template::Vars,
         model: &Model,
@@ -215,13 +215,14 @@ impl RequestTools {
         mcp: bool,
     ) -> Self {
         Self::build_with_background(registry, vars, model, config, excluded, workflow, mcp, true)
+            .await
     }
 
     /// [`Self::build`] for a session whose `background` is known: when it is
     /// off, tools and parameters that only exist to move a call to the
     /// background stay out of the array for the whole session.
     #[allow(clippy::too_many_arguments)]
-    pub fn build_with_background(
+    pub async fn build_with_background(
         registry: &ToolRegistry,
         vars: &crate::template::Vars,
         model: &Model,
@@ -238,13 +239,11 @@ impl RequestTools {
             workflow,
             mcp,
         };
+        let definitions = registry
+            .described_definitions(vars, &ctx, model.supports_tool_examples(), background)
+            .await;
         Self {
-            definitions: registry.definitions_with_background(
-                vars,
-                &ctx,
-                model.supports_tool_examples(),
-                background,
-            ),
+            definitions,
             filter: Arc::new(filter),
         }
     }
@@ -494,13 +493,12 @@ pub fn resolve_search_path(path: Option<&str>) -> Result<String, String> {
     }
 }
 
-static CWD: LazyLock<Option<PathBuf>> = LazyLock::new(|| env::current_dir().ok());
 static HOME: LazyLock<Option<PathBuf>> = LazyLock::new(maki_storage::paths::home);
 
 pub(crate) fn relative_path(path: &str) -> String {
     let p = Path::new(path);
-    if let Some(cwd) = CWD.as_deref()
-        && let Ok(rel) = p.strip_prefix(cwd)
+    if let Ok(cwd) = env::current_dir()
+        && let Ok(rel) = p.strip_prefix(&cwd)
     {
         return format_rel("", ".", rel);
     }
@@ -725,6 +723,8 @@ pub fn cli_tool_ctx() -> ToolContext {
 
 pub mod test_support {
     use std::borrow::Cow;
+    #[cfg(test)]
+    use std::io::Write;
 
     use arc_swap::ArcSwap;
     use maki_providers::Timeouts;
@@ -919,9 +919,20 @@ pub mod test_support {
         ctx
     }
 
-    /// Plays someone else's edit. It pushes the mtime ahead instead of writing
-    /// again, because two writes close together can share one mtime on
-    /// filesystems with coarse timestamps.
+    /// Plays someone else's edit. It pushes the mtime ahead as well, because
+    /// two writes close together can share one mtime on filesystems with
+    /// coarse timestamps.
+    #[cfg(test)]
+    pub(crate) fn foreign_edit(path: &Path) {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .and_then(|mut file| file.write_all(b"foreign"))
+            .unwrap();
+        future_mtime(path);
+    }
+
+    /// Plays a rewrite that leaves the content as it was.
     #[cfg(test)]
     pub(crate) fn future_mtime(path: &Path) {
         fs::File::options()
@@ -1035,7 +1046,7 @@ mod tests {
 
         let mut params = grep::GrepParams::new("hello".into());
         params.path = Some(dir_str.clone());
-        let (_, entries) = grep::grep_search(params).unwrap();
+        let entries = grep::grep_search(params).unwrap().entries;
         let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
         assert!(paths.contains(&"a.txt"));
         assert!(paths.contains(&"b.rs"));
@@ -1044,13 +1055,13 @@ mod tests {
         let mut params = grep::GrepParams::new("hello".into());
         params.path = Some(dir_str.clone());
         params.include = Some("*.rs".into());
-        let (_, entries) = grep::grep_search(params).unwrap();
+        let entries = grep::grep_search(params).unwrap().entries;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path, "b.rs");
 
         let mut params = grep::GrepParams::new("zzzznotfound".into());
         params.path = Some(dir_str);
-        let (_, entries) = grep::grep_search(params).unwrap();
+        let entries = grep::grep_search(params).unwrap().entries;
         assert!(entries.is_empty());
     }
 
@@ -1062,7 +1073,7 @@ mod tests {
 
         let mut params = grep::GrepParams::new("fn main".into());
         params.path = Some(file.to_string_lossy().into());
-        let (_, entries) = grep::grep_search(params).unwrap();
+        let entries = grep::grep_search(params).unwrap().entries;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path, "demo.rs");
     }
@@ -1083,7 +1094,7 @@ mod tests {
 
         let mut params = grep::GrepParams::new("(?s)foo.*\\n}".into());
         params.path = Some(dir.path().to_string_lossy().into());
-        let (_, entries) = grep::grep_search(params).unwrap();
+        let entries = grep::grep_search(params).unwrap().entries;
         assert_eq!(entries.len(), 1);
         let lines = &entries[0].groups[0].lines;
         assert!(lines.iter().any(|l| l.text.contains("foo") && l.is_match));
@@ -1102,7 +1113,7 @@ mod tests {
         params.path = Some(dir.path().to_string_lossy().into());
         params.context_before = 1;
         params.context_after = 1;
-        let (_, entries) = grep::grep_search(params).unwrap();
+        let entries = grep::grep_search(params).unwrap().entries;
         assert_eq!(entries[0].groups.len(), 2);
 
         let g0 = &entries[0].groups[0].lines;
@@ -1132,7 +1143,7 @@ mod tests {
             let mut params = grep::GrepParams::new("needle".into());
             params.path = Some(path_str.clone());
             params.limit = 1000;
-            let (_, entries) = grep::grep_search(params).unwrap();
+            let entries = grep::grep_search(params).unwrap().entries;
 
             let flat: Vec<(String, usize, bool)> = entries
                 .iter()
@@ -1151,21 +1162,36 @@ mod tests {
         }
     }
 
-    #[test]
-    fn grep_search_limit_truncates_groups_after_sort() {
+    #[test_case(10, 1, 3, Some((7, 7)) ; "drops_whole_files")]
+    #[test_case(1,  5, 3, Some((2, 1)) ; "cuts_inside_a_file")]
+    #[test_case(2,  2, 4, None         ; "exact_fit_omits_nothing")]
+    fn grep_search_limit_reports_what_it_cut(
+        files: u32,
+        hits_per_file: usize,
+        limit: usize,
+        expected: Option<(usize, usize)>,
+    ) {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
-        for i in 0..10u32 {
-            fs::write(root.join(format!("m_{i}.rs")), "hit\n").unwrap();
+        for i in 0..files {
+            fs::write(
+                root.join(format!("m_{i}.rs")),
+                "hit\n".repeat(hits_per_file),
+            )
+            .unwrap();
         }
 
         let mut params = grep::GrepParams::new("hit".into());
         params.path = Some(root.to_string_lossy().into());
-        params.limit = 3;
-        let (_, entries) = grep::grep_search(params).unwrap();
+        params.limit = limit;
+        let results = grep::grep_search(params).unwrap();
 
-        let total_groups: usize = entries.iter().map(|e| e.groups.len()).sum();
-        assert_eq!(total_groups, 3);
+        let total_groups: usize = results.entries.iter().map(|e| e.groups.len()).sum();
+        assert_eq!(total_groups, limit);
+        assert_eq!(
+            results.omitted,
+            expected.map(|(groups, files)| grep::Omitted { groups, files })
+        );
     }
 
     #[test]

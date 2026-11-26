@@ -1,4 +1,4 @@
-use super::segment;
+use super::segment::{self, GUTTER_COLS};
 use super::*;
 use crate::chat::{DONE_TEXT, ERROR_TEXT};
 use crate::components::scrollbar::SCROLLBAR_THUMB;
@@ -16,7 +16,7 @@ use maki_config::DEFAULT_THINKING_LINES;
 use maki_markdown::render::CODE_BAR;
 use maki_providers::ImageMediaType;
 use ratatui::backend::TestBackend;
-use ratatui::style::Modifier;
+use ratatui::style::{Color, Modifier};
 use std::collections::HashSet;
 use std::ops::Range;
 use std::time::Duration;
@@ -834,15 +834,15 @@ fn search_text_instruction_segment_indexes_its_own_blocks() {
 #[test_case("    indented\n# not a heading" ; "indentation_and_hash")]
 fn user_message_shows_as_typed(text: &str) {
     let message = DisplayMessage::new(DisplayRole::User, text.into());
-    let rows: Vec<String> = build_message_lines(&message, VIEW_WIDTH)
+    let rows: Vec<String> = build_message_lines(&message, &user_style(), VIEW_WIDTH, VIEW_WIDTH)
         .iter()
         .map(|row| row.to_string())
         .collect();
-    assert_eq!(rows.join("\n"), format!("{}{text}", user_style().prefix));
+    assert_eq!(rows.join("\n"), format!("{}{text}", user_style().label));
 }
 
 #[test]
-fn search_text_includes_role_prefix() {
+fn search_text_includes_role_label() {
     let md = "# Heading\n\nSome **bold** text";
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.push(DisplayMessage::new(DisplayRole::User, "hello".into()));
@@ -1048,6 +1048,70 @@ fn tool_start_upgrades_pending_in_place() {
     assert_eq!(panel.messages[0].annotation.as_deref(), Some("note"));
 }
 
+fn chat_item(
+    id: &str,
+    label: &str,
+    title: &str,
+    status: ChatItemStatus,
+    detail: Option<&str>,
+) -> ChatItem {
+    ChatItem {
+        id: id.into(),
+        label: label.into(),
+        title: title.into(),
+        status,
+        detail: detail.map(str::to_owned),
+    }
+}
+
+/// A closing call carries the label and, without a detail, the new title, so a
+/// finished row never keeps its stale progress text or its old label.
+#[test]
+fn a_closed_plugin_item_updates_label_and_text() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.plugin_item_start(&chat_item(
+        "job-1",
+        "monitor",
+        "cargo test",
+        ChatItemStatus::Running,
+        None,
+    ));
+    panel.plugin_item_finish(&chat_item(
+        "job-1",
+        "ci",
+        "cargo test done",
+        ChatItemStatus::Done,
+        None,
+    ));
+
+    assert_eq!(panel.messages.len(), 1);
+    let DisplayRole::PluginItem(role) = &panel.messages[0].role else {
+        panic!("expected a plugin item row");
+    };
+    assert_eq!(role.status, ChatItemStatus::Done);
+    assert_eq!(&*role.name, "ci", "the label follows the closing call");
+    assert_eq!(
+        panel.messages[0].text, "cargo test done",
+        "the title replaces the progress text without a detail"
+    );
+
+    panel.plugin_item_finish(&chat_item(
+        "job-1",
+        "ci",
+        "cargo test done",
+        ChatItemStatus::Failed,
+        Some("exit 1"),
+    ));
+    let DisplayRole::PluginItem(role) = &panel.messages[0].role else {
+        panic!("expected a plugin item row");
+    };
+    assert_eq!(role.status, ChatItemStatus::Failed);
+    assert_eq!(
+        panel.messages[0].text, "exit 1",
+        "a detail wins over the title"
+    );
+}
+
 #[test]
 fn stream_reset_clears_streaming_and_fails_tools() {
     let mut panel = panel_with_tools(&[("t1", "bash")]);
@@ -1062,8 +1126,6 @@ fn stream_reset_clears_streaming_and_fails_tools() {
     assert_eq!(panel.in_progress_count(), 0);
     assert_eq!(msg_status(&panel, "t1"), ToolStatus::Error);
 }
-
-const MAKI_PREFIX_LEN: u16 = 6;
 
 /// Selections live per segment, so the tests that think in document rows
 /// convert through the same walker the panel uses.
@@ -1108,7 +1170,7 @@ fn panel_with_msgs(texts: &[&str], width: u16, height: u16) -> MessagesPanel {
 fn extract_partial_column_selection() {
     let panel = panel_with_msgs(&["Hello world"], 80, 24);
     let area = Rect::new(0, 0, 80, 24);
-    let world_start = MAKI_PREFIX_LEN + "Hello ".len() as u16;
+    let world_start = (assistant_style().label.len() + "Hello ".len()) as u16;
     let sel = make_sel(&panel, area, (0, world_start), (0, world_start + 4));
     let text = panel.extract_selection_text(&sel, area);
     assert_eq!(text, "world");
@@ -1151,7 +1213,8 @@ fn extract_mixed_fully_enclosed_and_partial() {
     let panel = panel_with_msgs(&["full segment", "partial here"], 80, 24);
     let area = Rect::new(0, 0, 80, 24);
     let seg1_start = seg_start_row(&panel, 2);
-    let sel = make_sel(&panel, area, (0, 0), (seg1_start, MAKI_PREFIX_LEN + 6));
+    let partial_end = (assistant_style().label.len() + "partial".len() - 1) as u16;
+    let sel = make_sel(&panel, area, (0, 0), (seg1_start, partial_end));
     let text = panel.extract_selection_text(&sel, area);
     assert!(text.contains("full segment"));
     assert!(text.contains("partial"));
@@ -1167,8 +1230,8 @@ fn extract_partial_col_symmetric(msgs: &[&str], expect_start: &str, expect_end: 
     render(&mut panel, 80, 24);
     let total = panel.layout().total_rows();
     let area = Rect::new(0, 0, 80, 24);
-    let down = make_sel(&panel, area, (0, MAKI_PREFIX_LEN), (total - 1, 79));
-    let up = make_sel(&panel, area, (total - 1, 79), (0, MAKI_PREFIX_LEN));
+    let down = make_sel(&panel, area, (0, 0), (total - 1, 79));
+    let up = make_sel(&panel, area, (total - 1, 79), (0, 0));
     let text_down = panel.extract_selection_text(&down, area);
     let text_up = panel.extract_selection_text(&up, area);
     assert!(text_down.contains(expect_start));
@@ -2204,7 +2267,7 @@ fn step(n: usize) -> String {
 fn collapsed_header(line_count: usize) -> String {
     format!(
         "{}{TRUNCATION_PREFIX} ({line_count} lines)",
-        thinking_style().prefix
+        thinking_style().label
     )
 }
 
@@ -2844,17 +2907,63 @@ const FOLLOW_UP_TEXT: &str = "and then deploy";
 const STALE_BUBBLE_MSG: &str = "the superseded bubble must disappear from the viewport";
 const UNTOUCHED_MSG: &str = "a rejected replace must leave the transcript untouched";
 
-fn style_of(terminal: &ratatui::Terminal<TestBackend>, text: &str) -> Style {
+fn row_of(terminal: &ratatui::Terminal<TestBackend>, text: &str) -> u16 {
     let buf = terminal.backend().buffer();
     for y in 0..buf.area.height {
         let row: String = (0..buf.area.width)
             .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol()))
             .collect();
-        if let Some(col) = row.find(text) {
-            return buf.cell((col as u16, y)).unwrap().style();
+        if row.contains(text) {
+            return y;
         }
     }
     panic!("{text} was never rendered");
+}
+
+fn style_of(terminal: &ratatui::Terminal<TestBackend>, text: &str) -> Style {
+    let buf = terminal.backend().buffer();
+    let y = row_of(terminal, text);
+    let row: String = (0..buf.area.width)
+        .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol()))
+        .collect();
+    let col = row.find(text).expect("row_of found the text");
+    buf.cell((col as u16, y)).unwrap().style()
+}
+
+const USER_BG_THEME: &str = r##"
+[palette]
+background = "#000000"
+surface = "#1d2021"
+assistant_fg = "#111111"
+user_fg = "#eeeeee"
+[ui]
+assistant = { fg = "assistant_fg" }
+user_text = { fg = "user_fg" }
+user_bg = { bg = "surface" }
+"##;
+
+#[test]
+fn user_message_uses_user_bg_and_user_text() {
+    crate::theme::set(Theme::from_toml(USER_BG_THEME).unwrap());
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        "hello\nworld".into(),
+    ));
+    panel.push(DisplayMessage::new(DisplayRole::Assistant, "reply".into()));
+    let terminal = render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
+    let buf = terminal.backend().buffer();
+    let user_bg = Color::Rgb(0x1d, 0x20, 0x21);
+    let user_fg = Color::Rgb(0xee, 0xee, 0xee);
+    let assistant_fg = Color::Rgb(0x11, 0x11, 0x11);
+    for row in [row_of(&terminal, "hello"), row_of(&terminal, "world")] {
+        assert_eq!(buf.cell((0, row)).unwrap().bg, user_bg);
+        assert_eq!(buf.cell((VIEW_WIDTH - 2, row)).unwrap().bg, user_bg);
+    }
+    assert_eq!(style_of(&terminal, "hello").fg, Some(user_fg));
+    assert_eq!(style_of(&terminal, "reply").fg, Some(assistant_fg));
+    let reply_row = row_of(&terminal, "reply");
+    assert_ne!(buf.cell((VIEW_WIDTH - 2, reply_row)).unwrap().bg, user_bg);
 }
 
 /// `Chat::mark_finished` corrects a bubble long after it was drawn, with the
@@ -3053,7 +3162,7 @@ fn selection_survives_a_resize() {
 
     let wide = Rect::new(0, 0, 80, 24);
     let mut sel = Selection::start(
-        first_row_of(&panel, ALPHA, MAKI_PREFIX_LEN),
+        first_row_of(&panel, ALPHA, GUTTER_COLS),
         wide,
         SelectionZone::Messages,
     );
@@ -3098,11 +3207,15 @@ fn header_line<'a>(panel: &'a MessagesPanel, id: &str) -> &'a Line<'static> {
     &panel.cache.get(index).unwrap().lines()[0]
 }
 
+fn header_gutter(panel: &MessagesPanel, id: &str) -> Span<'static> {
+    let index = panel.cache.find_by_tool_id(id).unwrap();
+    panel.cache.get(index).unwrap().gutter.clone().unwrap()
+}
+
 fn header_text(panel: &MessagesPanel, id: &str) -> String {
     header_line(panel, id)
         .spans
         .iter()
-        .skip(1)
         .map(|span| span.content.as_ref())
         .collect()
 }
@@ -3136,7 +3249,7 @@ fn movable_hint_is_right_aligned_and_never_shifts_header(width: u16, shown: bool
     assert_eq!(movable_header == plain_header, !shown);
     assert_eq!(movable_header.ends_with(MOVABLE_HINT), shown);
     let hint_end = hint_columns(header_line(&movable, MOVABLE_ID)).map(|cols| cols.end);
-    assert_eq!(hint_end, shown.then_some(width - 2));
+    assert_eq!(hint_end, shown.then_some(width - GUTTER_COLS - 2));
 }
 
 #[test]
@@ -3151,8 +3264,8 @@ fn movable_hint_disappears_after_tool_done() {
     assert!(!panel.messages[0].movable);
 }
 
-/// The hint's columns are the panel's own, so a panel that does not start
-/// at the screen's left edge shifts them by its offset.
+/// The hint's columns are the body's own, so the panel's offset and the
+/// gutter both shift them.
 #[test]
 fn clicking_the_hint_counts_from_the_panels_left_edge() {
     const PANEL_X: u16 = 4;
@@ -3163,15 +3276,16 @@ fn clicking_the_hint_counts_from_the_panels_left_edge() {
         x: PANEL_X,
         ..view_area()
     };
+    let offset = PANEL_X + GUTTER_COLS;
 
     for col in [cols.start, cols.end - 1] {
         assert_eq!(
-            panel.handle_click(0, col + PANEL_X, area),
+            panel.handle_click(0, col + offset, area),
             ClickOutcome::MoveCall(MOVABLE_ID.into())
         );
     }
     assert_eq!(
-        panel.handle_click(0, cols.start + PANEL_X - 1, area),
+        panel.handle_click(0, cols.start + offset - 1, area),
         ClickOutcome::None
     );
 }
@@ -3271,7 +3385,7 @@ fn badge_outcome_switches_indicator(
     }
     render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
 
-    let indicator = &header_line(&panel, MOVABLE_ID).spans[0];
+    let indicator = header_gutter(&panel, MOVABLE_ID);
     assert_eq!(indicator.content, glyph);
     assert_eq!(indicator.style, style(&theme::current()));
     assert_eq!(
@@ -3329,14 +3443,16 @@ fn a_task_notice_opens_with_its_ending_dot(
     panel.messages[0].task_end = task_end;
     render(&mut panel, VIEW_WIDTH, VIEW_HEIGHT);
 
-    let first = &panel.cache.get(0).unwrap().lines()[0].spans[0];
-    let dot = (first.content == TOOL_INDICATOR).then_some(first.style);
+    let gutter = panel.cache.get(0).unwrap().gutter.clone();
+    let dot = gutter
+        .filter(|gutter| gutter.content == TOOL_INDICATOR)
+        .map(|gutter| gutter.style);
     assert_eq!(dot, style.map(|style| style(&theme::current())));
 }
 
 /// Shell output is not markdown: a diff's `-` lines would turn into bullets.
-#[test_case(false, "- removed line", &format!("{NOTICE_DETAIL_INDENT}- removed line") ; "plain_output_stays_as_written")]
-#[test_case(true, "```\nlet answer = 42;\n```", &format!("{NOTICE_DETAIL_INDENT}{CODE_BAR}let answer = 42;") ; "markdown_reply_renders_its_code_block")]
+#[test_case(false, "- removed line", "- removed line" ; "plain_output_stays_as_written")]
+#[test_case(true, "```\nlet answer = 42;\n```", &format!("{CODE_BAR}let answer = 42;") ; "markdown_reply_renders_its_code_block")]
 fn notice_detail_follows_its_format(markdown: bool, text: &str, expected_row: &str) {
     let detail = NoticeDetail {
         text: text.into(),
@@ -3389,4 +3505,93 @@ fn scrollbar_sits_on_the_theme_window_background() {
             "the scrollbar column must sit on the theme bg, not the terminal's"
         );
     }
+}
+const GUTTER_TEST_WIDTH: u16 = 40;
+const GUTTER_TEST_HEIGHT: u16 = 12;
+const GUTTER_INDENT: &str = "  ";
+const LONG_PROSE: &str = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi";
+
+fn screen_rows(panel: &mut MessagesPanel) -> Vec<String> {
+    let terminal = render(panel, GUTTER_TEST_WIDTH, GUTTER_TEST_HEIGHT);
+    buffer_text(&terminal)
+        .lines()
+        .filter(|row| !row.trim().is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test_case(DisplayRole::User ; "user")]
+#[test_case(DisplayRole::Assistant ; "assistant")]
+#[test_case(DisplayRole::Thinking ; "thinking")]
+#[test_case(DisplayRole::Error ; "error")]
+fn wrapped_prose_starts_flush_left(role: DisplayRole) {
+    let label = message_style(&role).label;
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(role, LONG_PROSE.into()));
+    let rows = screen_rows(&mut panel);
+    assert!(rows.len() > 1, "prose must wrap: {rows:?}");
+    assert!(rows[0].starts_with(&format!("{label}alpha")), "{rows:?}");
+    for row in &rows[1..] {
+        assert!(!row.starts_with(' '), "{rows:?}");
+    }
+}
+
+#[test]
+fn streaming_text_lays_out_like_the_flushed_message() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.streaming_text.set_buffer(LONG_PROSE);
+    let streaming = screen_rows(&mut panel);
+    panel.flush();
+    assert_eq!(screen_rows(&mut panel), streaming);
+}
+
+#[test]
+fn thinking_starting_with_heading_keeps_markdown() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.push(DisplayMessage::new(
+        DisplayRole::Thinking,
+        "# Plan\n- a".into(),
+    ));
+    let terminal = render(&mut panel, GUTTER_TEST_WIDTH, GUTTER_TEST_HEIGHT);
+    let rows: Vec<String> = buffer_text(&terminal).lines().map(str::to_owned).collect();
+    let label = thinking_style().label;
+    assert!(rows[0].starts_with(&format!("{label}Plan")), "{rows:?}");
+    assert!(rows[1].starts_with("• a"), "{rows:?}");
+    let x = rows[0].find("Plan").unwrap() as u16;
+    let cell = terminal.backend().buffer().cell((x, 0)).unwrap();
+    assert_eq!(cell.fg, theme::current().heading.fg.unwrap());
+}
+
+#[test]
+fn tool_output_wraps_behind_the_gutter_and_copies_without_it() {
+    const TOKEN: &str = "abcdefghij";
+    let output = format!("{TOKEN} ").repeat(12);
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(start("t1", BASH_TOOL_NAME));
+    panel.tool_done(ToolDoneEvent {
+        output: Arc::new(ToolOutput::Plain(output.trim_end().into())),
+        ..done("t1")
+    });
+    let rows = screen_rows(&mut panel);
+    let output_rows: Vec<&String> = rows.iter().filter(|r| r.contains(TOKEN)).collect();
+    assert!(output_rows.len() > 1, "output should wrap: {rows:?}");
+    for row in output_rows {
+        assert!(
+            row.starts_with(&format!("{GUTTER_INDENT}{TOKEN}")),
+            "{row:?}"
+        );
+    }
+
+    let area = Rect::new(0, 0, GUTTER_TEST_WIDTH, GUTTER_TEST_HEIGHT);
+    let sel = make_sel(
+        &panel,
+        area,
+        (0, 0),
+        (u32::from(GUTTER_TEST_HEIGHT) - 1, GUTTER_TEST_WIDTH - 1),
+    );
+    let copied = panel.extract_selection_text(&sel, area);
+    assert!(
+        copied.lines().all(|l| !l.starts_with(' ')),
+        "copy kept the gutter: {copied:?}"
+    );
 }

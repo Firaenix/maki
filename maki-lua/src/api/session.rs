@@ -27,8 +27,7 @@ use tokio::task::{spawn_blocking, yield_now};
 
 use crate::api::image::LuaImage;
 use crate::api::util::command::{
-    NO_UI_ERR, SessionHostOnly, SessionRequest, UiAction, ui_json_roundtrip, ui_reachable,
-    ui_roundtrip,
+    NO_UI_ERR, SessionRequest, UiAction, ui_json_roundtrip, ui_reachable, ui_roundtrip,
 };
 use crate::api::util::convert::{TableExt, json_to_lua, json_to_lua_exact, lua_to_json};
 use crate::api::util::image::image_from_table;
@@ -86,8 +85,8 @@ const DOCUMENT_KEYS: [&str; 8] = [
     "facts",
     MESSAGES_KEY,
 ];
-const MAX_PROMPT_IMAGES: usize = 8;
 const ANSWER_DECISION_ERR: &str = "decision must be \"allow\" or \"deny\"";
+const MAX_PROMPT_IMAGES: usize = 8;
 
 /// Rewind and fork put a user turn back in the chat input, and Enter runs it
 /// as if a plugin that could send prompts wrote it. So a turn that runs
@@ -169,8 +168,13 @@ async fn list(lua: Lua, #[ctx] tx: Option<UnboundedSender<UiAction>>) -> LuaResu
 /// Lists the sessions currently running in this UI. Status is "working",
 /// "needs_input", or "idle". Background work a turn moved out keeps the
 /// session "working" until its result is in, with no "idle" in between.
+/// A "needs_input" session has `attention`, text that says what it waits
+/// on, like "Permission requested: bash". The wording can change between
+/// releases, so show it and do not parse it. Other sessions have none.
+/// `resumable` is true once the session has a transcript `maki -r <id>` can
+/// open.
 ///
-/// @return (table|nil, string|nil) Array of `{id, title, status, updated_at, focused}`, or nil and an error.
+/// @return (table|nil, string|nil) Array of `{id, title, status, attention, resumable, updated_at, focused}`, or nil and an error.
 /// @example
 /// local live, err = maki.session.live()
 #[lua_fn]
@@ -331,7 +335,7 @@ async fn session_export(
 
 /// The serde shape, nulls as `maki.NIL`. An image block is built around a
 /// handle on its payload, which is never copied, not even into JSON.
-fn message_table(lua: &Lua, message: &Message) -> LuaResult<Value> {
+pub(crate) fn message_table(lua: &Lua, message: &Message) -> LuaResult<Value> {
     let envelope = message.with_content(Vec::new());
     let json = serde_json::to_value(&envelope).map_err(mlua::Error::external)?;
     let table = lua.unpack::<Table>(json_to_lua_exact(lua, &json)?)?;
@@ -445,9 +449,8 @@ async fn export(
 /// notice that answered one, with `end` one of `"finished"`, `"failed"`,
 /// `"cancelled"` or `"lost"`. `partial` has the same shape and marks a notice
 /// that answered one piece early, like one call of a moved batch, and left
-/// the receipt open. `created_at` is the wall clock, in epoch
-/// milliseconds, when the message was appended, or nil for a message older than
-/// the field, so a reader can tell a real zero gap from an unknown one.
+/// the receipt open. `created_at` is when the message was appended, in epoch
+/// milliseconds, and nil for messages saved before the field existed.
 /// `content` lists blocks:
 ///
 /// ```text
@@ -464,13 +467,7 @@ async fn export(
 /// as its raw table. JSON null is `maki.NIL`.
 ///
 /// A live session is read from memory, unsaved messages included, any other
-/// from disk. Works in the TUI, `maki -p`, sdk mode, and ACP. ACP has no
-/// focused session, so pass `session` there. Hook and event payloads carry
-/// the `session_id` to pass.
-///
-/// `window` reads one archived window instead, as `maki.session.windows`
-/// lists it. Archives never change, so they read the same in every mode and
-/// need no live session.
+/// from disk.
 ///
 /// @param opts table? Options:
 ///   `session` (string?) Session id, live or stored. Defaults to the focused one.
@@ -531,17 +528,15 @@ async fn current(
     Ok(pair(focused_session(&lua, tx.as_ref()).await))
 }
 
-/// This plugin's directory for this session's data, as
-/// `state/sessions/data/<session>/<plugin>/`. Core owns it: the delete that
-/// takes the session takes everything written under it. Not created; make it
-/// with `maki.fs.mkdir` before the first write. A plugin's grants cover it
-/// like any other path.
+/// Returns this plugin's data directory for a session,
+/// `state/sessions/data/<session>/<plugin>/`. Deleting the session deletes
+/// it. The directory may not exist yet, so create it with `maki.fs.mkdir`
+/// before the first write. Writing there needs `fs_write` like any other path.
 ///
-/// The session defaults to the one the calling agent serves, so a tool of
-/// a background tab gets that tab's dir rather than the one on screen, and
-/// to the focused session otherwise.
-///
-/// @param opts table? `session` names another session.
+/// @param opts table? Options:
+///   `session` (string?) Session id. Defaults to the session the calling
+///     agent serves (so a tool in a background tab gets that tab's
+///     directory), else the focused one.
 /// @return (string|nil, string|nil) The directory path, or nil and an error.
 /// @example
 /// local dir, err = maki.session.data_dir()
@@ -581,32 +576,19 @@ async fn data_dir(
     Ok(pair(path))
 }
 
-/// Lists a session's transcript windows, newest first: the current window is
-/// `[1]` and holds the conversation that has not been sealed yet, then the
-/// archived windows from the most recent seal back to the session start,
-/// each labeled with the rewrite that sealed it. A compaction parks the
-/// turns it summarized, a rewind the turns it cut, and both stay readable.
+/// Lists a session's transcript windows, newest first. `[1]` is the current
+/// window. The rest are archives, each sealed by the compaction or rewind
+/// that replaced its turns. Listing reads no transcript, so it stays cheap.
 ///
 /// Each window is:
 /// ```text
 /// {
-///   id = "current" | "<seq>",  -- pass back to `messages`/`subagents`
-///   created_at,                -- when the window began, in Unix seconds: the
-///                              -- session start for the oldest, otherwise the
-///                              -- seal time of the window before it in time;
-///                              -- nil when the session header is missing or
-///                              -- unreadable
+///   id = "current" | "<seq>",  -- pass to `messages` or `subagents`
+///   created_at,                -- when the window began, in Unix seconds,
+///                              -- or nil if unknown
 ///   kind = "current" | "compaction" | "rewind" | "unknown",
 /// }
 /// ```
-///
-/// Listing never parses a transcript, so it stays cheap however long the
-/// session is. `messages` reads one window; `subagents` reads the asked
-/// window and its neighbors.
-///
-/// Works in the TUI, `maki -p`, sdk mode, and ACP. ACP has no focused
-/// session, so pass `session` there. Hook and event payloads carry the
-/// `session_id` to pass.
 ///
 /// @param opts table? Options:
 ///   `session` (string?) Session id, live or stored. Defaults to the focused one.
@@ -643,33 +625,23 @@ async fn windows(
     Ok((Some(windows_table(&lua, &archives, started_at)?), None))
 }
 
-/// Reads the subagent transcripts that belong to one window, in spawn order
-/// where the session recorded it; transcripts with no record come last, by
-/// id. A transcript attaches to the window holding the `tool_use` that
-/// started it. A plugin run beside the chat has no parent `tool_use` and
-/// keeps its records across rewrites, so it attaches to the newest window
-/// that holds them.
+/// Reads the subagent transcripts of one window, in spawn order. A
+/// transcript belongs to the window holding the `tool_use` that started it.
 ///
 /// Each entry is:
 /// ```text
 /// {
-///   id,       -- the `tool_use` id that spawned it, stable in the session
-///   nr,       -- 1-based position in the window's subagent list, not the
-///             -- array index; a rewrite can drop entries, so numbers repeat
-///             -- across windows
+///   id,       -- the `tool_use` id that spawned it, unique in the session
+///   nr,       -- 1-based number in the stored subagent list. Can skip
+///             -- numbers and repeat across windows, so key on `id`
 ///   name,     -- the task description that spawned it, or "subagent"
 ///   messages, -- same shape as `maki.session.messages`
 /// }
 /// ```
 ///
-/// Only what the host stored is visible. The TUI records subagent
-/// transcripts; `maki -p`, the SDK and ACP do not, so `subagents` answers an
-/// empty list for sessions they ran. The current window's transcripts come
-/// from the stored copy too, so they trail the run: a running subagent shows
-/// only the turns saved so far.
-///
-/// ACP has no focused session, so pass `session` there. Hook and event
-/// payloads carry the `session_id` to pass.
+/// Only the TUI stores subagent transcripts. Sessions run by `maki -p`, the
+/// SDK or ACP give an empty list. Transcripts come from disk, so a running
+/// subagent shows only the turns saved so far.
 ///
 /// @param opts table? Options:
 ///   `session` (string?) Session id, live or stored. Defaults to the focused one.
@@ -1118,7 +1090,7 @@ async fn new(
     let opens = prompt.is_some() || focus;
     // Asked once: a UI that detaches after this fails the roundtrip below
     // instead of having an opening call quietly stored.
-    let has_ui = ui_reachable(tx.as_ref()) && lua.app_data_ref::<SessionHostOnly>().is_none();
+    let has_ui = ui_reachable(tx.as_ref());
     if opens && !has_ui {
         return Ok(err_pair(NO_UI_ERR));
     }
@@ -1238,12 +1210,14 @@ async fn cancel(
     roundtrip(lua, tx, SessionRequest::Cancel { id }).await
 }
 
-/// Reports {text} to a live session without creating a user turn. The
-/// observation waits for the session's next agent run.
+/// Reports {text} to a live session or one of its subagents without creating
+/// a user turn. The observation waits for the target's next agent run.
 ///
 /// @param text string What to report. Must not be blank.
 /// @param opts table Options:
 ///   `session` (string) id of a live session.
+///   `task` (string?) send to this live subagent of `session` instead, by
+///     the `data.id` that `TurnComplete` reports.
 ///   `wake` (boolean) start a TUI turn when it next becomes idle (default
 ///     false). Needs the `agent` permission.
 ///   `display` (string?) one-line note for the transcript, shown and saved
@@ -1276,10 +1250,21 @@ fn notify(
         .map(|t| t.opt::<String>("display"))
         .transpose()?
         .flatten();
-    if let Err(error) = SessionMailbox::notify(session_id, text, display.as_deref(), wake) {
-        return Ok(err_pair(error));
+    let task = opts
+        .as_ref()
+        .map(|t| t.opt::<String>("task"))
+        .transpose()?
+        .flatten();
+    let notified = match task {
+        Some(task) => {
+            SessionMailbox::notify_task(session_id, &task, text, display.as_deref(), wake)
+        }
+        None => SessionMailbox::notify(session_id, text, display.as_deref(), wake),
+    };
+    match notified {
+        Ok(()) => Ok((Some(true), None)),
+        Err(error) => Ok(err_pair(error)),
     }
-    Ok((Some(true), None))
 }
 
 /// Switches a live session between plan and build mode. Entering plan mode
@@ -1307,6 +1292,49 @@ async fn set_mode(
         None => None,
     };
     roundtrip(lua, tx, SessionRequest::SetMode { id, mode }).await
+}
+
+/// Asks a live session to compact its history, like `/compact`.
+///
+/// Returns once the request is queued. A running agent compacts before its
+/// next model request. The TUI compacts an idle session right away, and
+/// other hosts wait for its next run. A second request fails until the
+/// first is taken. `agent.compact.before` sees it with reason `requested`
+/// and can still steer or skip it. `"CompactionDone"` reports the result.
+///
+/// @param opts table Options:
+///   session (string) id of a live session.
+///   task (string?) compact this live subagent of `session` instead, by
+///     the `data.id` that `TurnComplete` reports.
+///   instructions (string?) guidance for this one summary, like
+///     `/compact <text>`.
+/// @return (boolean|nil, string|nil) true once queued, or nil and an error.
+/// @example
+/// maki.session.request_compact({
+///   session = ctx:session_id(),
+///   instructions = "keep the failing test names",
+/// })
+#[lua_fn(guard = [Agent, SessionWrite])]
+fn request_compact(_lua: &Lua, opts: Option<Table>) -> LuaResult<Pair<bool>> {
+    let session_id = try_pair!(required_session(opts.as_ref())?);
+    let task = opts
+        .as_ref()
+        .map(|t| t.opt::<String>("task"))
+        .transpose()?
+        .flatten();
+    let instructions = opts
+        .as_ref()
+        .map(|t| t.opt::<String>("instructions"))
+        .transpose()?
+        .flatten();
+    let queued = match task {
+        Some(task) => SessionMailbox::request_compact_task(session_id, &task, instructions),
+        None => SessionMailbox::request_compact(session_id, instructions),
+    };
+    match queued {
+        Ok(()) => Ok((Some(true), None)),
+        Err(error) => Ok(err_pair(error)),
+    }
 }
 
 /// Renames a session, live or stored.
@@ -1395,8 +1423,8 @@ lua_table! {
     /// Without a UI, most functions return `nil, "no interactive UI attached"`.
     /// `current`, `read`, `export`, `messages`, `windows`, `subagents`,
     /// `notify` and `new` without `prompt` or `focus` still work. ACP has no
-    /// focused session, so there `current` fails and the readers need
-    /// `session`.
+    /// focused session, so there `current` fails and the read functions need
+    /// `session`. Hook and event payloads carry it as `session_id`.
     "maki.session" => pub(crate) fn create_session_table(
         tx: Option<UnboundedSender<UiAction>>,
         perms: &PluginPermissions,
@@ -1408,7 +1436,7 @@ lua_table! {
         list(tx), live(tx), current(tx), read(tx), export(perms, tx), messages(perms, tx),
         windows(perms, tx), subagents(perms, tx), focus(tx), delete(perms, tx),
         new(perms, tx, grants), prompt(perms, tx), cancel(perms, tx), notify(perms, grants),
-        set_mode(perms, tx), set_title(perms, tx), data_dir(plugin, tx),
+        set_mode(perms, tx), request_compact(perms), set_title(perms, tx), data_dir(plugin, tx),
         answer_permission(tx, plugin, full_trust),
     ]
 }
@@ -1439,6 +1467,7 @@ mod tests {
     use crate::api::json::create_json_table;
     use crate::api::top::add_top_methods;
     use crate::api::util::command::{CANCEL_CANCELLED, CANCEL_IDLE, PROMPT_QUEUED};
+    use crate::api::util::fake_picker::{DOWN, ESC, PAGE_DOWN, UP, load_picker};
     use crate::plugin_permissions::denied_error;
     use crate::session_snapshot::{MODE_PLAN, STATUS_IDLE, STATUS_STORED};
     use mlua::Value;
@@ -1446,6 +1475,16 @@ mod tests {
     use test_case::test_case;
 
     const FOCUSED_TEXT: &str = "focused";
+    const ENTER: &str = "<CR>";
+    const CTRL_D: &str = "<C-d>";
+    const CTRL_N: &str = "<C-n>";
+    const NEWEST_SESSION: &str = "session-newest";
+    const MIDDLE_SESSION: &str = "session-middle";
+    const OLDEST_SESSION: &str = "session-oldest";
+    const RECENCY_ORDER: [&str; 3] = [NEWEST_SESSION, MIDDLE_SESSION, OLDEST_SESSION];
+    const SESSION_FOCUS: &str = "focus";
+    const SESSION_NEW: &str = "new";
+    const SESSION_DELETE: &str = "delete";
     const TOOL_ID: &str = "toolu_1";
     const TOOL_ID_2: &str = "toolu_2";
     const PLUGIN_ID: &str = "plugin-1";
@@ -1456,6 +1495,8 @@ mod tests {
     const THOUGHT: &str = "let me check";
     const IMAGE_DATA: &str = "iVBORw0KGgo=";
     const TEXT: &str = "hello";
+    const COMPACT_INSTRUCTIONS: &str = "keep tests";
+    const ALREADY_PENDING_ERR: &str = "a compaction is already pending";
     const TITLE: &str = "ported";
     const MODEL: &str = "anthropic/claude-sonnet-4-5";
     const THINKING: &str = "high";
@@ -1645,7 +1686,7 @@ mod tests {
         });
         let (val, err): (String, Option<String>) = lua.load(code).eval_async().await.unwrap();
         assert_eq!(err, None);
-        assert_eq!(val, PROMPT_QUEUED);
+        assert_eq!(val, "queued");
         checker.join().unwrap()
     }
 
@@ -1679,32 +1720,6 @@ mod tests {
                 (ImageMediaType::Webp, IMAGE_DATA)
             ]
         );
-    }
-
-    #[test_case("images = 'x'", "images must be a list" ; "images_not_a_table")]
-    #[test_case("images = { 'x' }", "images[1] must be a table" ; "entry_not_a_table")]
-    #[test_case(
-        "images = { e, { media_type = 'image/bmp', data = 'aGk=' } }",
-        "unsupported images[2] media_type 'image/bmp'" ; "bad_mime")]
-    #[test_case(
-        "images = { { media_type = 'image/png', data = '!!!' } }",
-        "images[1] 'data' is not valid base64" ; "bad_base64")]
-    #[test_case(
-        "images = { { media_type = 'image/png' } }",
-        "images[1] is missing base64 'data'" ; "missing_data")]
-    #[test_case(
-        "images = { e, e, e, e, e, e, e, e, e }",
-        "at most 8 images per prompt, got 9" ; "too_many")]
-    #[tokio::test]
-    async fn prompt_rejects_invalid_images(opts: &str, expected: &str) {
-        let (tx, _rx) = unbounded_channel::<UiAction>();
-        let lua = lua_with_session(Some(tx));
-        let code = format!(
-            "local e = {{ media_type = 'image/png', data = 'aGk=' }}
-             return session.prompt('hi', {{ {opts} }})"
-        );
-        let err = lua.load(code).exec_async().await.unwrap_err();
-        assert!(err.to_string().contains(expected), "got: {err}");
     }
 
     /// Both outcomes are successes a plugin tells apart by the string, so an
@@ -1779,6 +1794,83 @@ mod tests {
         assert!(val);
     }
 
+    #[test_case(r#"return session.request_compact({ session = session_id, instructions = 'keep tests' })"#, Some(COMPACT_INSTRUCTIONS) ; "with_instructions")]
+    #[test_case("return session.request_compact({ session = session_id })", None ; "without_instructions")]
+    fn request_compact_queues_one_claimable_request(code: &str, expected: Option<&str>) {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        let lua = lua_with_session(None);
+        lua.globals().set("session_id", id.to_string()).unwrap();
+
+        let (value, error): (bool, Option<String>) = lua.load(code).eval().unwrap();
+
+        assert!(value);
+        assert_eq!(error, None);
+        assert_eq!(
+            mailbox.take_compact().unwrap().instructions.as_deref(),
+            expected
+        );
+    }
+
+    #[test]
+    fn request_compact_with_a_task_reaches_that_subagent() {
+        let id = MakiId::generate();
+        let task_id = MakiId::generate().to_string();
+        let subagent = SessionMailbox::register(MakiId::generate());
+        subagent.track_task(&task_id, id);
+        let lua = lua_with_session(None);
+        lua.globals().set("session_id", id.to_string()).unwrap();
+        lua.globals().set("task_id", task_id.clone()).unwrap();
+
+        let (value, error): (bool, Option<String>) = lua
+            .load("return session.request_compact({ session = session_id, task = task_id })")
+            .eval()
+            .unwrap();
+
+        assert!(value);
+        assert_eq!(error, None);
+        assert!(
+            subagent
+                .take_compact()
+                .is_some_and(|request| request.instructions.is_none())
+        );
+        subagent.untrack_task(&task_id);
+    }
+
+    #[test]
+    fn request_compact_requires_a_live_session() {
+        let lua = lua_with_session(None);
+        let (_, missing): (Value, Option<String>) =
+            lua.load("return session.request_compact()").eval().unwrap();
+        assert_eq!(missing.as_deref(), Some(SESSION_REQUIRED_ERR));
+
+        let id = MakiId::generate();
+        lua.globals().set("session_id", id.to_string()).unwrap();
+        let (_, not_live): (Value, Option<String>) = lua
+            .load("return session.request_compact({ session = session_id })")
+            .eval()
+            .unwrap();
+        assert_eq!(not_live, Some(format!("session not live: {id}")));
+    }
+
+    #[test]
+    fn request_compact_rejects_a_second_request_while_pending() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        SessionMailbox::request_compact(id, None).unwrap();
+        let lua = lua_with_session(None);
+        lua.globals().set("session_id", id.to_string()).unwrap();
+
+        let (value, error): (Value, Option<String>) = lua
+            .load("return session.request_compact({ session = session_id })")
+            .eval()
+            .unwrap();
+
+        assert_eq!(value, Value::Nil);
+        assert_eq!(error.as_deref(), Some(ALREADY_PENDING_ERR));
+        assert!(mailbox.take_compact().is_some());
+    }
+
     #[test]
     fn notify_is_synchronous_and_queues_an_observation() {
         let id = MakiId::generate();
@@ -1800,6 +1892,29 @@ mod tests {
         assert_eq!(messages[0].first_text_content(), Some("built"));
         assert_eq!(messages[0].display_text, None);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn notify_with_a_task_reaches_that_subagent() {
+        let id = MakiId::generate();
+        let task_id = MakiId::generate().to_string();
+        let subagent = SessionMailbox::register(MakiId::generate());
+        subagent.track_task(&task_id, id);
+        let lua = lua_with_session(None);
+        lua.globals().set("session_id", id.to_string()).unwrap();
+        lua.globals().set("task_id", task_id.clone()).unwrap();
+
+        let (value, error): (bool, Option<String>) = lua
+            .load("return session.notify('built', { session = session_id, task = task_id })")
+            .eval()
+            .unwrap();
+
+        assert!(value);
+        assert_eq!(error, None);
+        let messages = subagent.drain();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].first_text_content(), Some("built"));
+        subagent.untrack_task(&task_id);
     }
 
     #[test_case(" agent-1 finished ", Some("agent-1 finished"); "trimmed")]
@@ -2082,6 +2197,7 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: THOUGHT.into(),
                     signature: Some(SIGNATURE.into()),
+                    reasoning_id: None,
                 },
                 ContentBlock::RedactedThinking {
                     data: SIGNATURE.into(),
@@ -2091,6 +2207,7 @@ mod tests {
                     name: TOOL_NAME.into(),
                     input: json!({ "path": TOOL_PATH, "offset": null, "files": [] }),
                     thought_signature: Some(SIGNATURE.into()),
+                    input_error: None,
                 },
             ]),
             user(vec![ContentBlock::ToolResult {
@@ -2930,5 +3047,85 @@ mod tests {
             .eval_async()
             .await;
         assert!(result.unwrap_err().to_string().contains("table"));
+    }
+
+    /// Rows are newest first, and the fake window is far taller than three
+    /// rows, so a page lands on an end.
+    #[test_case(&[ENTER], SESSION_FOCUS, Some(NEWEST_SESSION) ; "enter_opens_the_first_row")]
+    #[test_case(&[DOWN, ENTER], SESSION_FOCUS, Some(MIDDLE_SESSION) ; "down_moves_one_row")]
+    #[test_case(&[UP, ENTER], SESSION_FOCUS, Some(OLDEST_SESSION) ; "up_from_the_first_row_wraps_to_the_last")]
+    #[test_case(&[PAGE_DOWN, ENTER], SESSION_FOCUS, Some(OLDEST_SESSION) ; "page_down_clamps_to_the_last_row")]
+    #[test_case(&[DOWN, CTRL_D, CTRL_D, ESC], SESSION_DELETE, Some(MIDDLE_SESSION) ; "ctrl_d_twice_deletes_the_selected_row")]
+    #[test_case(&[CTRL_N], SESSION_NEW, None ; "ctrl_n_starts_a_new_session")]
+    fn sessions_picker_keys_act_on_the_selected_row(
+        keys: &[&str],
+        call: &str,
+        target: Option<&str>,
+    ) {
+        let lua = sessions_lua(keys);
+        lua.load("open_sessions()").exec().unwrap();
+
+        let globals = lua.globals();
+        assert_eq!(globals.get::<String>("called").unwrap(), call);
+        assert_eq!(
+            globals
+                .get::<Option<String>>("called_id")
+                .unwrap()
+                .as_deref(),
+            target
+        );
+    }
+
+    /// Runs `plugins/sessions/init.lua` against a fake `maki` whose live
+    /// sessions are `RECENCY_ORDER`, and presses {keys}. The fake records the
+    /// last `maki.session` focus, new or delete as `called` and the session it
+    /// named as `called_id`, and raises on any flash.
+    fn sessions_lua(keys: &[&str]) -> Lua {
+        let lua = Lua::new();
+        lua.globals()
+            .set(
+                "session_ids",
+                lua.create_sequence_from(RECENCY_ORDER).unwrap(),
+            )
+            .unwrap();
+        load_picker(
+            &lua,
+            keys,
+            r#"
+            local sessions = {}
+            for i, id in ipairs(session_ids) do
+                sessions[i] = {id = id, title = id, updated_at = #session_ids - i}
+            end
+            local session = {
+                live = function() return sessions end,
+                list = function() return {} end,
+            }
+            for _, name in ipairs({'focus', 'new', 'delete'}) do
+                session[name] = function(arg)
+                    called, called_id = name, type(arg) == 'string' and arg or nil
+                    return true
+                end
+            end
+            maki = {
+                session = session,
+                async = {run = function(fn) fn() end},
+                ui = {
+                    buf = function() return {set_lines = function() end} end,
+                    open_win = function() return fake_win(picker_keys) end,
+                    flash = error,
+                },
+                api = {
+                    create_autocmd = function() end,
+                    register_command = function(opts)
+                        if opts.name == '/sessions' then open_sessions = opts.handler end
+                    end,
+                },
+                keymap = {set = function() end},
+            }
+        "#,
+            &[],
+            include_str!("../../../plugins/sessions/init.lua"),
+        );
+        lua
     }
 }

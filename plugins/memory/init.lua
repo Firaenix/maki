@@ -14,8 +14,11 @@ local function notify(msg)
   Toast.show(msg, { title = "memory" })
 end
 
-local function memories_path_suffix()
+local function memories_path_suffix(): string?
   local cwd = maki.uv.cwd()
+  if not cwd then
+    return nil
+  end
   local root = maki.fs.root(cwd, ".git") or cwd
   return "projects/" .. helpers.project_id(root) .. "/memories"
 end
@@ -24,10 +27,11 @@ end
 -- them here so the agent can edit notes directly.
 local function register_write_rules()
   local state = maki.env.state_dir()
-  if not state then
+  local suffix = memories_path_suffix()
+  if not state or not suffix then
     return
   end
-  local dir = maki.fs.joinpath(state, memories_path_suffix())
+  local dir = maki.fs.joinpath(state, suffix)
   for _, tool in ipairs(WRITE_TOOLS) do
     -- The edit sub-tools are opt-in, and a rule naming an unregistered tool
     -- is dropped with a warning. Ask first, or a default config logs that
@@ -47,6 +51,9 @@ local function resolve_dir(): string?
   local state = maki.env.state_dir()
   if not state then
     return nil, "cannot resolve state dir"
+  end
+  if not suffix then
+    return nil, "cannot resolve project dir"
   end
   return maki.fs.joinpath(state, suffix)
 end
@@ -96,9 +103,9 @@ local function cmd_read(path, dir, ctx)
   if not file_path then
     return nil, err
   end
-  local content, err = maki.fs.read(file_path)
+  local content, read_err = maki.fs.read(file_path)
   if not content then
-    return nil, "read error: " .. err
+    return nil, "read error: " .. read_err
   end
   local formatted =
     helpers.cap_read_output(helpers.format_read_entry(path, #content, content), helpers.CAP_HINT_REWRITE, ctx)
@@ -123,7 +130,10 @@ local function cmd_write(path, content, tags, dir, ctx)
     return nil, tag_err
   end
   local full = helpers.encode_frontmatter(normalized) .. content
-  maki.fs.mkdir(dir, { parents = true })
+  local _, mkdir_err = maki.fs.mkdir(dir, { parents = true })
+  if mkdir_err then
+    return nil, "write error: " .. mkdir_err
+  end
   local ok, write_err = maki.fs.write(file_path, full)
   if not ok then
     return nil, "write error: " .. tostring(write_err)
@@ -177,6 +187,7 @@ maki.api.register_tool({
       command = {
         type = "string",
         enum = { "list", "read", "write", "delete" },
+        hint = "memory has no search or append. Use list or read with tags to find an entry, then write it back with the new content.",
         description = "- `list`: tag-grouped index, no bodies; optional `tags`.\n"
           .. "- `read`: one body by `path`, or collated bodies by `tags`.\n"
           .. "- `write`: create/overwrite `path` with `content`; optional `tags`.\n"

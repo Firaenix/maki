@@ -162,7 +162,7 @@ impl Transcript {
         base.token_usage = TokenUsage::default();
         match self.title.map(|title| normalize_title(&title)) {
             Some(title) if !title.is_empty() => base.set_title(title),
-            _ => base.update_title_if_default(),
+            _ => base.update_title_if_default(None),
         }
         Ok(base)
     }
@@ -383,6 +383,7 @@ mod tests {
         ContentBlock::Thinking {
             thinking: PROMPT.into(),
             signature: Some(SIGNATURE.into()),
+            reasoning_id: None,
         }
     }
 
@@ -392,6 +393,7 @@ mod tests {
             name: TOOL_NAME.into(),
             input: json!({ "path": null }),
             thought_signature: Some(SIGNATURE.into()),
+            input_error: None,
         }
     }
 

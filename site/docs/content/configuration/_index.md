@@ -79,7 +79,7 @@ All fields are optional. Typos in field names cause an error right away.
 | `program_status` | bool | `true` | - | Report session state (idle, working, blocked, done, error) to the terminal with OSC 7501 |
 | `flash_duration_ms` | u64 | `1500` | - | Duration of flash messages (ms) |
 | `typewriter_ms_per_char` | u64 | `4` | - | Typewriter effect speed (ms/char) |
-| `mouse_scroll_lines` | u32 | `1 on macOS, 3 elsewhere` | 1 | Lines per mouse wheel scroll. Set it to 1 if your terminal runs on a Mac and maki runs remotely (e.g. over SSH) |
+| `mouse_scroll_lines` | u32 | `1 on macOS, 3 elsewhere` | 1 | Lines per mouse wheel scroll. Use 1 when your terminal runs on a Mac and Maki runs remotely, e.g. over SSH |
 | `max_input_lines` | u32 | `20` | 1 | Maximum visible input lines |
 | `thinking_lines` | integer | `3` | - | Collapse model reasoning to its header and last N lines. Click to toggle. 0 shows only the header, -1 never collapses |
 | `clock_format` | String | `system` | - | Clock format for timestamps: "12h", "24h", or "system" (follow the OS preference, 24h when unknown) |
@@ -101,9 +101,19 @@ Available themes: `ayu_dark`, `ayu_light`, `ayu_mirage`, `carbonfox`, `catppucci
 
 You can add your own themes too. Drop a `<name>.toml` file into `themes/` inside your Maki config directory, for example `~/.config/maki/themes/`. If it reuses a built-in name, yours wins.
 
+User messages use `user` for the `you> ` prefix, `user_text` for the body, and `user_bg` for the full-width background behind both. `user_text` defaults to `assistant`, and `user_bg` to no background.
+
+```toml
+# themes/<name>.toml
+[ui]
+user = { fg = "blue" }
+user_text = { fg = "foreground" }
+user_bg = { bg = "#1d2021" }
+```
+
 Diff signs use `diff_old_sign` and `diff_new_sign`, which default to `diff_old` and `diff_new`. These styles are applied after `code_block`, so their properties take precedence. Diff gutters use `diff_old_line_nr` and `diff_new_line_nr`, which default to `diff_line_nr`.
 
-The input caret uses `cursor` when the terminal has focus and `cursor_unfocused` when focus is lost. `cursor_unfocused` defaults to `cursor`, so themes only need it when the two should differ. Terminals that do not report focus events keep the focused caret.
+The chat input uses your terminal's own cursor, in its shape and colors. The search, file, list and login pickers paint their caret with `cursor`.
 
 Themes use 24-bit colors by default, but not every terminal can show them. Maki checks the environment, terminfo, and the terminal itself, and when truecolor is missing it quietly falls back to the closest of the 256 classic terminal colors. If detection gets it wrong, set `MAKI_TRUECOLOR=1` to force truecolor or `MAKI_TRUECOLOR=0` to force the fallback.
 
@@ -287,6 +297,7 @@ maki.setup({
 |-------|------|---------|-----|-------------|
 | `background_log_bytes` | integer | `33554432` | 1024 | Size at which the output log of a command rotates to `.log.1`. A command gets a log once its output outgrows the reply or it moves to the background. Values above 1 GiB count as 1 GiB. |
 | `background_on_timeout` | boolean | `false` | - | Move a command that hits its timeout to the background instead of killing it. Applies to the main agent while background tasks are on; elsewhere the command is killed. |
+| `file_tool_note` | boolean | `false` | - | Start the reply with a note naming the file tool when a plain `cat`, `head`, `tail`, `sed -n`, `grep`, `rg`, `find` or `ls` did what that tool does, so the model stops using bash to read and search files. The command still runs. The note also shows under the command's output. |
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 | `timeout_secs` | integer | `120` | 5 | Kill the command after this many seconds. A call's `timeout` param overrides it. |
@@ -337,6 +348,12 @@ maki.setup({
 |-------|------|---------|-----|-------------|
 | `max_file_size_mb` | integer | `2` | 1 | Refuse to index files larger than this many MB. |
 
+### `plugins.mistral`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `responses_api` | boolean | `false` | - | Use the Responses API (/v1/responses) instead of chat completions (/v1/chat/completions). Off by default while the path is still being tested. |
+
 ### `plugins.read`
 
 | Field | Type | Default | Min | Description |
@@ -373,7 +390,7 @@ maki.setup({
 | `max_output_bytes` | integer | - | - | Override `agent.max_output_bytes` for this tool. |
 | `max_output_lines` | integer | - | - | Override `agent.max_output_lines` for this tool. |
 | `max_response_bytes` | integer | `5242880` | 1024 | Stop reading a response after this many bytes, at most 64 MiB. |
-| `provider` | string | `"exa"` | - | Search backend: "exa" (default), "youcom" (You.com MCP), "kagi" (Kagi MCP, needs KAGI_API_KEY), or "searxng" (self-hosted). |
+| `provider` | string | `"exa"` | - | Search backend: "exa" (default), "youcom" (You.com MCP), "kagi" (Kagi Search API, needs KAGI_API_KEY), or "searxng" (self-hosted). |
 | `searxng_base_url` | string | `""` | - | SearXNG instance URL; falls back to the `SEARXNG_BASE_URL` env var. A LAN instance also needs its host in `net.allowed_private_hosts`. Only this backend accepts websearch's `time_range` (day, week, month, or year); its `num_results` is capped by the instance page size. |
 
 ## Validation

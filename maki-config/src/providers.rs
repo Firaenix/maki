@@ -4,9 +4,10 @@ use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 use std::process;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
 
+use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use tracing::debug;
@@ -155,6 +156,10 @@ pub struct ModelDef {
     pub pricing_fast_input: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing_fast_output: Option<f64>,
+    /// `<slug>/<model>` whose family, vision and tool examples fill the ones
+    /// this row leaves out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub like: Option<String>,
 }
 
 impl ModelDef {
@@ -250,7 +255,8 @@ inventory::collect!(BuiltInProvider);
 
 /// Login rows of Lua plugin providers. They show up at runtime, too late for
 /// `inventory`, so they live here and every lookup checks both.
-static REGISTERED: RwLock<Vec<&'static BuiltInProvider>> = RwLock::new(Vec::new());
+static REGISTERED: LazyLock<ArcSwap<Vec<&'static BuiltInProvider>>> =
+    LazyLock::new(ArcSwap::default);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -270,6 +276,10 @@ pub struct OverrideFields {
     /// url already carries its own path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_prefix: Option<String>,
+    /// `<slug>/<model>` whose family, vision and tool examples this model
+    /// borrows, in place of the row the upstream id would name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub like: Option<String>,
 }
 
 /// Overrides for a single gateway provider (Aperture), keyed by its id (e.g.
@@ -336,8 +346,10 @@ pub struct ProviderDef {
     /// CF-Access-Client-Secret = "${CF_ACCESS_CLIENT_SECRET}"
     /// ```
     ///
-    /// A same-name header (case-insensitive) replaces the built-in auth
-    /// header instead of appending, and keeps winning across key rotations.
+    /// A same-name header (case-insensitive) replaces whatever maki, the
+    /// plugin or the built-in auth would send under that name, and keeps
+    /// winning across key rotations. `anthropic-beta` values are added to the
+    /// betas maki sends rather than replacing them.
     /// An unset or empty variable fails the whole provider so callers see the
     /// missing name instead of a silent 401.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -472,21 +484,18 @@ fn providers_file_path() -> PathBuf {
 }
 
 pub fn set_registered_providers(rows: Vec<&'static BuiltInProvider>) {
-    *REGISTERED.write().unwrap_or_else(|e| e.into_inner()) = rows;
+    REGISTERED.store(Arc::new(rows));
 }
 
 pub fn builtin_provider(slug: &str) -> Option<&'static BuiltInProvider> {
     inventory::iter::<BuiltInProvider>()
         .into_iter()
         .find(|p| p.slug == slug)
-        .or_else(|| {
-            let registered = REGISTERED.read().unwrap_or_else(|e| e.into_inner());
-            registered.iter().copied().find(|p| p.slug == slug)
-        })
+        .or_else(|| REGISTERED.load().iter().copied().find(|p| p.slug == slug))
 }
 
 pub fn all_builtins() -> Vec<&'static BuiltInProvider> {
-    let registered = REGISTERED.read().unwrap_or_else(|e| e.into_inner());
+    let registered = REGISTERED.load();
     inventory::iter::<BuiltInProvider>()
         .chain(registered.iter().copied())
         .collect()
@@ -574,6 +583,9 @@ fn ignored_local_model_fields(models: &[ModelDef]) -> Vec<&'static str> {
     }
     if any(|m| m.supports_vision.is_some()) {
         ignored.push("models.supports_vision");
+    }
+    if any(|m| m.like.is_some()) {
+        ignored.push("models.like");
     }
     if any(|m| m.has_pricing() || m.has_fast_pricing()) {
         ignored.push("models.pricing_*");
@@ -1068,6 +1080,7 @@ tier = "{input}"
             pricing_cache_read: Some(1.0),
             pricing_fast_input: Some(1.0),
             pricing_fast_output: Some(1.0),
+            like: Some("deepseek/deepseek-chat".to_string()),
         };
         assert_eq!(
             ignored_local_model_fields(&[every_field_set]),
@@ -1077,6 +1090,7 @@ tier = "{input}"
                 "models.max_output_tokens",
                 "models.supports_tool_examples",
                 "models.supports_vision",
+                "models.like",
                 "models.pricing_*",
             ]
         );

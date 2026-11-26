@@ -7,17 +7,18 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
-use tokio::task::spawn_blocking;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use maki_config::ModelPolicy;
+use maki_storage::StateDir;
+use maki_storage::blocking;
 use maki_storage::id::SessionRef;
 
 use crate::model::{Model, ModelInfo};
 use crate::model_registry::{discovery_complete, set_known_models};
 use crate::providers::catalog::{
-    available_if_warm, catalog_providers, catalog_providers_if_available, try_create,
+    ProviderData, available_if_warm, catalog_providers_if_available, shared_catalog, try_create,
 };
 use crate::providers::{KeyRotation, Timeouts, custom, plugin};
 use crate::spec::{Owner, ProviderRegistry, ProviderSpec};
@@ -47,6 +48,13 @@ pub trait Provider: Send + Sync {
     /// answer as proof that a model missing from it is retired, and hides that
     /// model from the picker's recents.
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>>;
+
+    /// Whether a provider whose static table covers its models must still be
+    /// listed before the first headless turn, because the account it is
+    /// signed in with serves models, windows or dialects the table cannot know.
+    fn needs_model_discovery(&self) -> bool {
+        false
+    }
 
     /// The context window the server runs `model` with right now. Only a
     /// server that sizes the window when it loads a model can differ from
@@ -96,6 +104,16 @@ pub fn provider_for_slug(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provi
 
 pub fn provider_available(slug: &str) -> bool {
     provider_for_slug(slug, Timeouts::default()).is_ok()
+}
+
+/// [`provider_available`] for a models.dev entry, without building it. A
+/// `providers.toml` entry under the same slug is what [`provider_for_slug`]
+/// builds, so that one is asked the old way.
+fn catalog_entry_available(cat: &ProviderData, state_dir: &StateDir) -> bool {
+    match Owner::of(&cat.slug) {
+        Owner::Custom => provider_available(&cat.slug),
+        _ => cat.catalog_available(state_dir),
+    }
 }
 
 /// Non-blocking variant of [`provider_available`] for offline model discovery:
@@ -170,33 +188,31 @@ pub async fn from_model_async(
 ) -> Result<Box<dyn Provider>, AgentError> {
     let slug = Arc::clone(&model.provider);
     let id = model.id.clone();
-    let provider = spawn_blocking(move || provider_for_slug(&slug, timeouts)).await??;
+    let provider = blocking(move || provider_for_slug(&slug, timeouts)).await?;
     provider.adjust_model(model);
     debug!(provider = %model.provider, model = %id, "provider created");
     Ok(provider)
 }
 
+/// One provider's answer to [`fetch_all_models`].
 pub struct ModelBatch {
+    pub provider: String,
     pub models: Vec<String>,
-    /// The providers this batch covers, independent of `ModelPolicy`: the
-    /// policy filters `models`, but the picker still needs to know which
-    /// providers answered.
-    pub providers: Vec<String>,
-    pub warnings: Vec<String>,
+    pub status: ProviderStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderStatus {
+    /// Listed live, so a model missing from it is gone.
+    Live,
+    /// The listing failed with this warning; any models are a static fallback.
+    Failed(String),
+    /// A `providers.toml` entry with no key to call it with.
+    MissingKey,
 }
 
 pub(crate) fn provider_of(spec: &str) -> &str {
     spec.split_once('/').map_or(spec, |(provider, _)| provider)
-}
-
-fn providers_of(specs: &[String]) -> Vec<String> {
-    let mut providers: Vec<String> = Vec::new();
-    for provider in specs.iter().map(|spec| provider_of(spec)) {
-        if !providers.iter().any(|known| known == provider) {
-            providers.push(provider.to_string());
-        }
-    }
-    providers
 }
 
 /// The offline twin of [`fetch_all_models`]. It never waits for the catalog
@@ -219,7 +235,9 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
             specs.push(spec);
         }
     }
-    if let Some(catalog) = catalog_providers_if_available() {
+    if let Some(catalog) = catalog_providers_if_available()
+        && let Ok(state_dir) = StateDir::resolve()
+    {
         for cat in catalog {
             // Any slug the registry knows was listed above; see
             // `spec::tests::builtins_are_the_native_and_catalog_backed_slugs`.
@@ -228,7 +246,7 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
             {
                 continue;
             }
-            if !provider_available(&cat.slug) {
+            if !cat.catalog_available(&state_dir) {
                 continue;
             }
             for model_id in cat.models.keys() {
@@ -243,7 +261,33 @@ pub fn available_model_specs(policy: &ModelPolicy) -> Vec<String> {
     specs
 }
 
+/// The registry providers whose credentials resolve right now. Each build
+/// reads credential files and `providers.toml`, so this belongs on the
+/// blocking pool, all of it in one job.
+pub(crate) fn build_registry() -> Vec<(&'static ProviderSpec, Box<dyn Provider>)> {
+    let timeouts = Timeouts::default();
+    ProviderRegistry::all()
+        .into_iter()
+        .filter_map(|spec| {
+            provider_for_slug(spec.slug, timeouts)
+                .inspect_err(|_| warn!(provider = spec.slug, "failed to create provider, skipping"))
+                .ok()
+                .map(|provider| (spec, provider))
+        })
+        .collect()
+}
+
 pub async fn fetch_all_models(
+    policy: &ModelPolicy,
+    on_ready: impl FnMut(ModelBatch),
+    on_done: Option<Box<dyn FnOnce() + Send>>,
+) {
+    fetch_built(blocking(build_registry).await, policy, on_ready, on_done).await;
+}
+
+/// [`fetch_all_models`] over registry providers [`build_registry`] built.
+pub(crate) async fn fetch_built(
+    built: Vec<(&'static ProviderSpec, Box<dyn Provider>)>,
     policy: &ModelPolicy,
     mut on_ready: impl FnMut(ModelBatch),
     on_done: Option<Box<dyn FnOnce() + Send>>,
@@ -251,21 +295,13 @@ pub async fn fetch_all_models(
     let (tx, mut rx) = unbounded_channel();
     let timeouts = Timeouts::default();
 
-    for spec in ProviderRegistry::all() {
-        let slug = spec.slug;
-        let Ok(provider) = spawn_blocking(move || provider_for_slug(slug, timeouts))
-            .await
-            .expect("provider construction panicked")
-        else {
-            warn!(provider = slug, "failed to create provider, skipping");
-            continue;
-        };
+    for (spec, provider) in built {
         let tx = tx.clone();
         tokio::spawn(async move {
             let listed = provider.list_models().await;
             let batch = listing_batch(spec, &listed);
             if let Ok(models) = listed {
-                set_known_models(slug, models);
+                set_known_models(spec.slug, models);
             }
             let _ = tx.send(batch);
         });
@@ -273,48 +309,33 @@ pub async fn fetch_all_models(
 
     let tx_catalog = tx.clone();
     tokio::spawn(async move {
-        for cat in catalog_providers().await {
+        let catalog = shared_catalog().await;
+        let available = blocking(|| {
+            let mut providers = catalog.all_providers();
             // No `Owner::Custom` here, unlike `available_model_specs` above:
             // a long-standing asymmetry, changing it is a behaviour change.
-            if ProviderRegistry::get(&cat.slug).is_some()
-                || matches!(Owner::of(&cat.slug), Owner::Plugin)
-            {
-                continue;
-            }
-            if !provider_available(&cat.slug) {
-                continue;
-            }
-            let slug = cat.slug;
+            providers.retain(|cat| {
+                ProviderRegistry::get(&cat.slug).is_none()
+                    && !matches!(Owner::of(&cat.slug), Owner::Plugin)
+                    && catalog_entry_available(cat, &catalog.state_dir)
+            });
+            providers
+        })
+        .await;
+        for cat in available {
+            let slug = cat.slug.clone();
             let models: Vec<String> = cat.models.keys().map(|id| format!("{slug}/{id}")).collect();
             let _ = tx_catalog.send(ModelBatch {
+                provider: slug,
                 models,
-                providers: vec![slug],
-                warnings: Vec::new(),
+                status: ProviderStatus::Live,
             });
         }
     });
 
-    let tx_custom = tx.clone();
-    tokio::spawn(async move {
-        let (declared, declared_providers) = custom::declared_batch();
-        if !declared.is_empty() {
-            let _ = tx_custom.send(ModelBatch {
-                providers: declared_providers,
-                models: declared,
-                warnings: Vec::new(),
-            });
-        }
-        let custom_specs = custom::discover_models(timeouts).await;
-        if !custom_specs.is_empty() {
-            let _ = tx_custom.send(ModelBatch {
-                providers: providers_of(&custom_specs),
-                models: custom_specs,
-                warnings: Vec::new(),
-            });
-        }
-    });
-
-    drop(tx);
+    tokio::spawn(custom::discover_models(timeouts, move |batch| {
+        let _ = tx.send(batch);
+    }));
 
     while let Some(mut batch) = rx.recv().await {
         batch.models.retain(|spec| policy.allows(spec));
@@ -333,7 +354,7 @@ fn listing_batch(spec: &ProviderSpec, listed: &Result<Vec<ModelInfo>, AgentError
             .flat_map(|entry| &entry.prefixes)
             .map(move |prefix| format!("{slug}/{prefix}"))
     };
-    let (models, warnings) = match listed {
+    let (models, status) = match listed {
         Ok(models) => {
             let mut specs: Vec<String> =
                 models.iter().map(|m| format!("{slug}/{}", m.id)).collect();
@@ -344,7 +365,7 @@ fn listing_batch(spec: &ProviderSpec, listed: &Result<Vec<ModelInfo>, AgentError
                     }
                 }
             }
-            (specs, Vec::new())
+            (specs, ProviderStatus::Live)
         }
         Err(
             e @ AgentError::Api {
@@ -352,18 +373,21 @@ fn listing_batch(spec: &ProviderSpec, listed: &Result<Vec<ModelInfo>, AgentError
             },
         ) if spec.catalog_is_authoritative => {
             warn!(provider = slug, error = %e, "failed to list models");
-            (Vec::new(), vec![format!("{}: {e}", spec.display_name)])
+            (
+                Vec::new(),
+                ProviderStatus::Failed(format!("{}: {e}", spec.display_name)),
+            )
         }
         Err(e) => {
             warn!(provider = slug, error = %e, "failed to list models, using static fallback");
             let warning = format!("{}: {e} (using static fallback)", spec.display_name);
-            (curated().collect(), vec![warning])
+            (curated().collect(), ProviderStatus::Failed(warning))
         }
     };
     ModelBatch {
+        provider: slug.to_string(),
         models,
-        providers: vec![slug.to_string()],
-        warnings,
+        status,
     }
 }
 
@@ -373,7 +397,8 @@ fn listing_batch(spec: &ProviderSpec, listed: &Result<Vec<ModelInfo>, AgentError
 /// [`refresh_model`] that reads it back into a model.
 pub async fn discover_provider(model: &Model, provider: &dyn Provider) -> Result<(), AgentError> {
     let Some(spec) = ProviderRegistry::get(&model.provider)
-        .filter(|spec| spec.accepts_arbitrary_models && !discovery_complete(spec.slug))
+        .filter(|spec| !discovery_complete(spec.slug))
+        .filter(|spec| spec.accepts_arbitrary_models || provider.needs_model_discovery())
     else {
         return Ok(());
     };
@@ -416,11 +441,18 @@ async fn remember_models(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, HashMap};
     use std::future::{pending, ready};
 
+    use maki_config::providers::{Protocol, ProviderDef, ProvidersConfig};
+    use maki_storage::auth::{ProviderCredentials, save_provider_credentials};
     use test_case::test_case;
 
     use super::*;
+    use crate::providers::catalog::schema::CatalogProvider as CatalogEntry;
+    use crate::providers::catalog::{catalog_provider_if_available, seed_catalog_for_tests};
+    use crate::providers::opencode::GO_SLUG;
+    use crate::test_support::isolated_home;
 
     const SPEC_WITHOUT_THINKING: &str = "copilot";
     const LANDED_SLUG: &str = "ollama";
@@ -435,10 +467,31 @@ mod tests {
     const NO_ANSWER_KEEPS_LISTING: &str = "no answer keeps the last listing";
     const ROWS_COVER_IT: &str = "a provider its rows fully describe is never listed";
     const WAIT: Duration = Duration::from_millis(10);
+    const CATALOG_SLUG: &str = "acme-catalog";
+    const CATALOG_NPM: &str = "@ai-sdk/openai-compatible";
+    const CATALOG_API_URL: &str = "https://catalog.example/v1";
+    const CATALOG_KEY_ENV: &str = "MAKI_TEST_CATALOG_KEY";
+    const CUSTOM_KEY_ENV: &str = "MAKI_TEST_CUSTOM_KEY";
+    const CUSTOM_BASE_URL: &str = "https://custom.example/v1";
+    const API_KEY: &str = "sk-test";
+    const GATEWAY_HEADER: &str = "X-Gateway";
+    const UNSET_GATEWAY_VAR: &str = "${MAKI_TEST_UNSET_GATEWAY}";
 
     type Listed = Result<Vec<ModelInfo>, AgentError>;
 
-    struct Listing(fn() -> BoxFuture<'static, Listed>);
+    struct Listing {
+        list: fn() -> BoxFuture<'static, Listed>,
+        needs_discovery: bool,
+    }
+
+    impl Listing {
+        fn new(list: fn() -> BoxFuture<'static, Listed>) -> Self {
+            Self {
+                list,
+                needs_discovery: false,
+            }
+        }
+    }
 
     impl Provider for Listing {
         fn stream_message<'a>(
@@ -455,7 +508,11 @@ mod tests {
         }
 
         fn list_models(&self) -> BoxFuture<'_, Listed> {
-            (self.0)()
+            (self.list)()
+        }
+
+        fn needs_model_discovery(&self) -> bool {
+            self.needs_discovery
         }
 
         fn adjust_model(&self, model: &mut Model) {
@@ -493,28 +550,28 @@ mod tests {
         let mut resolved_before_listing = resolve();
         assert!(!model.supports_thinking());
 
-        discover_provider(&model, &Listing(fails))
+        discover_provider(&model, &Listing::new(fails))
             .await
             .unwrap_err();
-        refresh_model(&mut model, &Listing(fails));
+        refresh_model(&mut model, &Listing::new(fails));
         assert!(!model.supports_thinking());
 
-        discover_provider(&model, &Listing(lists_thinking))
+        discover_provider(&model, &Listing::new(lists_thinking))
             .await
             .unwrap();
-        refresh_model(&mut model, &Listing(lists_thinking));
+        refresh_model(&mut model, &Listing::new(lists_thinking));
         assert!(model.supports_thinking());
         assert_eq!(model.context_window, LISTED_WINDOW);
         assert_eq!(model.max_output_tokens, Some(ADJUSTED_MAX_OUTPUT));
 
-        discover_provider(&resolved_before_listing, &Listing(fails))
+        discover_provider(&resolved_before_listing, &Listing::new(fails))
             .await
             .unwrap();
-        refresh_model(&mut resolved_before_listing, &Listing(fails));
+        refresh_model(&mut resolved_before_listing, &Listing::new(fails));
         assert_eq!(resolved_before_listing.context_window, LISTED_WINDOW);
 
         for no_answer in [fails, hangs] {
-            remember_models(SPEC_WITHOUT_THINKING, &Listing(no_answer), WAIT)
+            remember_models(SPEC_WITHOUT_THINKING, &Listing::new(no_answer), WAIT)
                 .await
                 .unwrap_err();
             assert!(resolve().supports_thinking(), "{NO_ANSWER_KEEPS_LISTING}");
@@ -524,9 +581,24 @@ mod tests {
     #[tokio::test]
     async fn rows_that_cover_a_provider_need_no_listing() {
         let model = Model::from_spec(CURATED_SPEC).unwrap();
-        discover_provider(&model, &Listing(must_not_list))
+        discover_provider(&model, &Listing::new(must_not_list))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn curated_provider_can_require_live_discovery() {
+        let mut model = Model::from_spec(&format!("{CURATED_SLUG}/{LISTED_MODEL}")).unwrap();
+        let provider = Listing {
+            list: lists_thinking,
+            needs_discovery: true,
+        };
+
+        discover_provider(&model, &provider).await.unwrap();
+        refresh_model(&mut model, &provider);
+
+        assert_eq!(model.context_window, LISTED_WINDOW);
+        assert_eq!(model.max_output_tokens, Some(ADJUSTED_MAX_OUTPUT));
     }
 
     #[test_case(LANDED_SLUG ; "provider_that_takes_any_model")]
@@ -541,7 +613,7 @@ mod tests {
             }],
         );
 
-        refresh_model(&mut model, &Listing(fails));
+        refresh_model(&mut model, &Listing::new(fails));
 
         assert_eq!(model.context_window, LISTED_WINDOW);
         assert_eq!(model.max_output_tokens, Some(ADJUSTED_MAX_OUTPUT));
@@ -555,7 +627,7 @@ mod tests {
         };
         let mut model = unresolvable.clone();
 
-        refresh_model(&mut model, &Listing(fails));
+        refresh_model(&mut model, &Listing::new(fails));
 
         assert_eq!(model, unresolvable);
     }
@@ -623,6 +695,93 @@ mod tests {
             models.contains(&format!("{slug}/{LISTED_MODEL}")),
             failed_with.is_none()
         );
+    }
+
+    enum CatalogKey {
+        Env,
+        Saved,
+        Nothing,
+        EnvWithBrokenHeaders,
+    }
+
+    fn set_env_key(var: &str) {
+        // SAFETY: Nextest runs each test in its own process.
+        unsafe { std::env::set_var(var, API_KEY) };
+    }
+
+    fn seed_catalog(slug: &str, state_dir: &StateDir) -> &'static ProviderData {
+        let entry = CatalogEntry {
+            name: slug.into(),
+            env: vec![CATALOG_KEY_ENV.into()],
+            npm: CATALOG_NPM.into(),
+            api: Some(CATALOG_API_URL.into()),
+            models: HashMap::new(),
+        };
+        seed_catalog_for_tests(HashMap::from([(slug.into(), entry)]), state_dir.clone());
+        catalog_provider_if_available(slug).unwrap()
+    }
+
+    fn declare(slug: &str, def: ProviderDef) {
+        let mut config = ProvidersConfig::default();
+        config.upsert(slug.into(), def);
+        config.save().unwrap();
+    }
+
+    #[test_case(CATALOG_SLUG, CatalogKey::Env, true ; "env_key")]
+    #[test_case(CATALOG_SLUG, CatalogKey::Saved, true ; "saved_key")]
+    #[test_case(GO_SLUG, CatalogKey::Nothing, true ; "free_tier_without_a_key")]
+    #[test_case(CATALOG_SLUG, CatalogKey::Nothing, false ; "nothing")]
+    #[test_case(CATALOG_SLUG, CatalogKey::EnvWithBrokenHeaders, false ; "broken_headers")]
+    fn catalog_availability_matches_building_the_provider(
+        slug: &str,
+        key: CatalogKey,
+        expected: bool,
+    ) {
+        let _home = isolated_home();
+        let state_dir = StateDir::resolve().unwrap();
+        match key {
+            CatalogKey::Env => set_env_key(CATALOG_KEY_ENV),
+            CatalogKey::Saved => {
+                let creds = ProviderCredentials {
+                    api_key: API_KEY.into(),
+                    host: None,
+                };
+                save_provider_credentials(&state_dir, slug, &creds).unwrap();
+            }
+            CatalogKey::Nothing => {}
+            CatalogKey::EnvWithBrokenHeaders => {
+                set_env_key(CATALOG_KEY_ENV);
+                let def = ProviderDef {
+                    headers: BTreeMap::from([(GATEWAY_HEADER.into(), UNSET_GATEWAY_VAR.into())]),
+                    ..ProviderDef::default()
+                };
+                declare(slug, def);
+            }
+        }
+        let data = seed_catalog(slug, &state_dir);
+
+        assert_eq!(provider_available(slug), expected);
+        assert_eq!(available_if_warm(slug), expected);
+        assert_eq!(data.catalog_available(&state_dir), expected);
+        assert_eq!(catalog_entry_available(data, &state_dir), expected);
+    }
+
+    #[test_case(CUSTOM_KEY_ENV, true ; "custom_key_only")]
+    #[test_case(CATALOG_KEY_ENV, false ; "catalog_key_only")]
+    fn custom_entry_decides_a_catalog_slug_it_declares(key_env: &str, expected: bool) {
+        let _home = isolated_home();
+        set_env_key(key_env);
+        let custom = ProviderDef {
+            protocol: Some(Protocol::Openai),
+            base_url: Some(CUSTOM_BASE_URL.into()),
+            api_key_env: Some(CUSTOM_KEY_ENV.into()),
+            ..ProviderDef::default()
+        };
+        declare(CATALOG_SLUG, custom);
+        let state_dir = StateDir::resolve().unwrap();
+        let data = seed_catalog(CATALOG_SLUG, &state_dir);
+
+        assert_eq!(catalog_entry_available(data, &state_dir), expected);
     }
 
     #[test]

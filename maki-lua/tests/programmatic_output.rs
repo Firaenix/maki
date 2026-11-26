@@ -39,6 +39,11 @@ const TOOLS: &[&str] = &[
     "webfetch",
 ];
 const NO_OUTPUT: &str = "(no output)";
+const GREP_NOTE_TWO_LEFT: &str = "[limit of 1 reached, 2 more match groups from 2 files not shown]";
+const GREP_NOTE_ONE_LEFT: &str = "[limit of 1 reached, 1 more match group from 1 file not shown]";
+const GREP_COUNT_TOTAL: &str = "2 matching lines in 1 file";
+const GREP_COUNT_FILE: &str = "a.rs: 2";
+const GREP_FILES: &[&str] = &["a.rs", "b.toml", "c.md"];
 const MODEL_BYTES: usize = 1024;
 const MODEL_LINES: usize = 8;
 const COMPACT_GLOB_LIMIT: usize = 100;
@@ -48,6 +53,12 @@ const LATIN1_HTML: &[u8] = b"<h1>caf\xe9</h1>";
 const LOSSY_TEXT: &str = "caf\u{fffd}";
 const LOSSY_MARKDOWN: &str = "# caf\u{fffd}";
 const LEGACY_HTML_TYPE: &str = "text/html; charset=ISO-8859-1";
+const HTML_TYPE: &str = "text/html; charset=utf-8";
+const PAGE_BODY: &str = "body";
+const MARKDOWN_TYPE: &str = "text/markdown; charset=utf-8";
+const MARKDOWN_PAGE: &str = "# Title\n\n<b>kept as sent</b>";
+const ACCEPT_MARKDOWN_FIRST: &str = "accept: text/markdown,";
+const SCRIPTED_PAGE: &[u8] = br#"<style>p{}</style><noscript>enable js</noscript><script type="application/json">{"menu":1}</script><p>body</p>"#;
 const LATIN1_E_ACUTE: u8 = 0xe9;
 const BINARY_TYPE: &str = "application/pdf";
 const BINARY_PAYLOAD: &[u8] = b"%PDF-1.7\n\0\x01\x02";
@@ -240,6 +251,35 @@ fn python_grep_preserves_match_and_context_text() {
     )
     .unwrap();
     assert!(!model_output.contains("needle-end"));
+}
+
+#[test_case::test_case(3, 1, GREP_NOTE_TWO_LEFT ; "plural")]
+#[test_case::test_case(2, 1, GREP_NOTE_ONE_LEFT ; "singular")]
+#[test_case::test_case(3, 0, GREP_NOTE_TWO_LEFT ; "zero_limit_still_shows_one")]
+fn grep_tells_the_model_what_the_limit_cut(files: usize, limit: i64, expected: &str) {
+    let (_registry, _host, ctx) = setup();
+    let dir = tempfile::tempdir().unwrap();
+    for name in &GREP_FILES[..files] {
+        fs::write(dir.path().join(name), "needle\n").unwrap();
+    }
+    let input = json!({ "pattern": "needle", "path": dir.path(),
+        "include": "*.{rs,toml,md}", "limit": limit });
+    let model_output = run(&ctx, "grep", input).unwrap();
+    assert!(model_output.ends_with(expected), "{model_output}");
+}
+
+#[test]
+fn grep_count_returns_counts_without_the_matching_lines() {
+    let (_registry, _host, ctx) = setup();
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("a.rs"), "needle one\nhay\nneedle two\n").unwrap();
+    fs::write(dir.path().join("b.rs"), "hay\n").unwrap();
+    let input = json!({ "pattern": "needle", "path": dir.path(), "count": true });
+    let model_output = run(&ctx, "grep", input).unwrap();
+    let (total, files) = model_output.split_once('\n').unwrap();
+    assert_eq!(total, GREP_COUNT_TOTAL);
+    assert!(files.ends_with(GREP_COUNT_FILE), "{model_output}");
+    assert!(!model_output.contains("needle"), "{model_output}");
 }
 
 #[test]
@@ -473,7 +513,7 @@ fn a_write_a_plugin_allowed_inside_python_marks_the_code_execution_row() {
     assert_eq!(marked, [(CALL_ID.to_owned(), PROMPT_PLUGIN.to_owned())]);
 }
 
-fn serve_once(content_type: &str, payload: &[u8]) -> (String, JoinHandle<()>) {
+fn serve_once(content_type: &str, payload: &[u8]) -> (String, JoinHandle<String>) {
     set_allowed_private_hosts(&["127.0.0.1".to_owned()]);
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
@@ -492,6 +532,7 @@ fn serve_once(content_type: &str, payload: &[u8]) -> (String, JoinHandle<()>) {
             request.push(byte[0]);
         }
         stream.write_all(&response).unwrap();
+        String::from_utf8(request).unwrap().to_ascii_lowercase()
     });
     (url, server)
 }
@@ -526,6 +567,25 @@ fn webfetch_decodes_legacy_bytes_for_display(
         output.as_deref().map(str::trim).map_err(String::as_str),
         expected
     );
+}
+
+#[test]
+fn webfetch_markdown_drops_scripts_and_styles() {
+    let (_registry, _host, ctx) = setup();
+    let (url, server) = serve_once(HTML_TYPE, SCRIPTED_PAGE);
+    let output = run(&ctx, "webfetch", json!({ "url": url })).unwrap();
+    server.join().unwrap();
+    assert_eq!(output.trim(), PAGE_BODY);
+}
+
+#[test]
+fn webfetch_markdown_asks_for_markdown_first_and_keeps_it() {
+    let (_registry, _host, ctx) = setup();
+    let (url, server) = serve_once(MARKDOWN_TYPE, MARKDOWN_PAGE.as_bytes());
+    let output = run(&ctx, "webfetch", json!({ "url": url })).unwrap();
+    let request = server.join().unwrap();
+    assert!(request.contains(ACCEPT_MARKDOWN_FIRST), "{request}");
+    assert_eq!(output.trim(), MARKDOWN_PAGE);
 }
 
 #[test_case::test_case("text" ; "stripped_html")]

@@ -1,7 +1,11 @@
 use shell_words::split;
+use std::env;
 use std::io::{Write, stdout};
+use std::panic;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -10,6 +14,7 @@ use color_eyre::Result;
 use crossterm::Command;
 use crossterm::ExecutableCommand;
 use crossterm::clipboard::CopyToClipboard;
+use crossterm::cursor::{SetCursorStyle, Show};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -20,6 +25,8 @@ use crossterm::terminal::{
     self, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use maki_config::NotificationMethod;
+use maki_lua::{CursorShape, CursorStyle};
+use ratatui_image::picker::ProtocolType;
 use tokio::process::Command as ProcessCommand;
 use tokio::time::timeout;
 
@@ -42,6 +49,11 @@ const PROGRAM_STATUS_ID_MAX_LEN: usize = 32;
 const PROGRAM_STATUS_ID_PUNCTUATION: &str = "_.+-";
 const TMUX_PANE_VAR: &str = "TMUX_PANE";
 const SCREEN_WINDOW_VAR: &str = "WINDOW";
+const HERDR_TERM_PROGRAM: &str = "herdr";
+
+static CAPS: LazyLock<TerminalCaps> = LazyLock::new(|| {
+    TerminalCaps::from_env(|key| env::var_os(key).map(|value| value.to_string_lossy().into()))
+});
 
 pub(crate) struct TerminalGuard;
 
@@ -50,7 +62,26 @@ enum TerminalMux {
     Zellij,
     Tmux,
     Screen,
+    Herdr,
     None,
+}
+
+/// Herdr forwards OSC 52 to the client you sit at, even over SSH, and that
+/// client skips a write the native clipboard already made. So both go out
+/// there: the native write covers a client without wl-copy, xclip or xsel on
+/// a terminal that ignores OSC 52.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClipboardRoute {
+    NativeElseOsc52,
+    NativeAndOsc52,
+}
+
+/// What the terminal Maki writes to can do, read once from the environment.
+/// A multiplexer is that terminal, so its entry wins over the one it runs in.
+pub(crate) struct TerminalCaps {
+    mux: TerminalMux,
+    pub(crate) image_protocol: Option<ProtocolType>,
+    pub(crate) clipboard: ClipboardRoute,
 }
 
 #[derive(Default)]
@@ -84,7 +115,7 @@ impl TerminalNotifier {
         let notifier = resolve_notifier(configured, detect_osc9_support).await?;
         Some(Self {
             notifier,
-            mux: TerminalMux::detect(),
+            mux: caps().mux,
         })
     }
 
@@ -102,15 +133,15 @@ impl TerminalNotifier {
 }
 
 async fn detect_osc9_support() -> bool {
-    let term_program = std::env::var("TERM_PROGRAM").ok();
-    let term = std::env::var("TERM").ok();
+    let term_program = env::var("TERM_PROGRAM").ok();
+    let term = env::var("TERM").ok();
     let env = TerminalEnvironment {
         term_program: term_program.as_deref(),
-        wezterm: std::env::var_os("WEZTERM_VERSION").is_some(),
-        iterm: std::env::var_os("ITERM_SESSION_ID").is_some()
-            || std::env::var_os("ITERM_PROFILE").is_some()
-            || std::env::var_os("ITERM_PROFILE_NAME").is_some(),
-        kitty: std::env::var_os("KITTY_WINDOW_ID").is_some(),
+        wezterm: env::var_os("WEZTERM_VERSION").is_some(),
+        iterm: env::var_os("ITERM_SESSION_ID").is_some()
+            || env::var_os("ITERM_PROFILE").is_some()
+            || env::var_os("ITERM_PROFILE_NAME").is_some(),
+        kitty: env::var_os("KITTY_WINDOW_ID").is_some(),
         term: term.as_deref(),
     };
     let tmux = match env.term_program {
@@ -231,7 +262,7 @@ fn window_title_sequence(mux: TerminalMux, title: &str) -> String {
 }
 
 pub(crate) fn set_window_title(title: &str) -> std::io::Result<()> {
-    write_sequence(&window_title_sequence(TerminalMux::detect(), title))
+    write_sequence(&window_title_sequence(caps().mux, title))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,10 +309,10 @@ pub(crate) struct ProgramStatusReporter {
 
 impl ProgramStatusReporter {
     pub(crate) fn new() -> Self {
-        let mux = TerminalMux::detect();
+        let mux = caps().mux;
         Self {
             mux,
-            id: program_status_id(mux, |key| std::env::var(key).ok()),
+            id: program_status_id(mux, |key| env::var(key).ok()),
             last: None,
         }
     }
@@ -318,7 +349,7 @@ fn program_status_id(mux: TerminalMux, var: impl Fn(&str) -> Option<String>) -> 
     let raw = match mux {
         TerminalMux::Tmux => var(TMUX_PANE_VAR)?,
         TerminalMux::Screen => var(SCREEN_WINDOW_VAR)?,
-        TerminalMux::Zellij | TerminalMux::None => return None,
+        TerminalMux::Zellij | TerminalMux::Herdr | TerminalMux::None => return None,
     };
     let id = raw.trim_start_matches('%');
     let valid = !id.is_empty()
@@ -376,7 +407,7 @@ fn push_program_status_text(body: &mut String, key: &str, text: &str, max_bytes:
 }
 
 fn write_mux_sequence(sequence: &str) {
-    let _ = write_sequence(&TerminalMux::detect().wrap_for_mux(sequence.into()));
+    let _ = write_sequence(&caps().mux.wrap_for_mux(sequence.into()));
 }
 
 fn write_sequence(sequence: &str) -> std::io::Result<()> {
@@ -415,14 +446,61 @@ fn desktop_notification(message: &str, reason: &str) {
     });
 }
 
+pub(crate) fn caps() -> &'static TerminalCaps {
+    &CAPS
+}
+
+impl TerminalCaps {
+    /// tmux, GNU screen and Zellij pass no graphics through, so images there
+    /// would paint escape bytes. Herdr draws kitty images placed with unicode
+    /// placeholders, which is what ratatui-image sends, and leaves the cells
+    /// blank on an outer terminal without graphics.
+    fn from_env(get: impl Fn(&str) -> Option<String>) -> Self {
+        let mux = TerminalMux::from_env(&get);
+        let (image_protocol, clipboard) = match mux {
+            TerminalMux::Zellij | TerminalMux::Tmux | TerminalMux::Screen => {
+                (None, ClipboardRoute::NativeElseOsc52)
+            }
+            TerminalMux::Herdr => (Some(ProtocolType::Kitty), ClipboardRoute::NativeAndOsc52),
+            TerminalMux::None => (outer_image_protocol(&get), ClipboardRoute::NativeElseOsc52),
+        };
+        Self {
+            mux,
+            image_protocol,
+            clipboard,
+        }
+    }
+}
+
+/// An allowlist rather than trusting what the terminal advertises: one that
+/// claims graphics it does not have paints escape bytes all over the UI. When
+/// the guess is wrong anyway, `ui.inline_images = false` is the way out. An
+/// unrecognized `TERM_PROGRAM` (some shell configs set it) falls through to
+/// `TERM`, which kitty sets itself and forwards over ssh.
+fn outer_image_protocol(get: impl Fn(&str) -> Option<String>) -> Option<ProtocolType> {
+    match get("TERM_PROGRAM").as_deref() {
+        Some("ghostty" | "kitty") => return Some(ProtocolType::Kitty),
+        Some("iTerm.app" | "WezTerm") => return Some(ProtocolType::Iterm2),
+        _ => {}
+    }
+    match get("TERM").as_deref() {
+        Some("xterm-kitty" | "xterm-ghostty") => Some(ProtocolType::Kitty),
+        _ => None,
+    }
+}
+
 impl TerminalMux {
-    fn detect() -> Self {
-        if std::env::var_os("ZELLIJ").is_some() {
+    /// Herdr scrubs ZELLIJ, TMUX and STY from its panes, so any of them seen
+    /// here belongs to a multiplexer started inside herdr, the one we talk to.
+    fn from_env(get: impl Fn(&str) -> Option<String>) -> Self {
+        if get("ZELLIJ").is_some() {
             Self::Zellij
-        } else if std::env::var_os("TMUX").is_some() {
+        } else if get("TMUX").is_some() {
             Self::Tmux
-        } else if std::env::var_os("STY").is_some() {
+        } else if get("STY").is_some() {
             Self::Screen
+        } else if get("TERM_PROGRAM").as_deref() == Some(HERDR_TERM_PROGRAM) {
+            Self::Herdr
         } else {
             Self::None
         }
@@ -434,7 +512,7 @@ impl TerminalMux {
     // Zellij intercepts OSC52 natively, so we just emit the raw sequence.
     fn wrap_for_mux(&self, sequence: String) -> String {
         match self {
-            Self::Zellij | Self::None => sequence,
+            Self::Zellij | Self::Herdr | Self::None => sequence,
             Self::Tmux => {
                 let escaped = sequence.replace('\u{1b}', "\u{1b}\u{1b}");
                 format!("\u{1b}Ptmux;{escaped}\u{1b}\\")
@@ -448,13 +526,21 @@ impl TerminalMux {
 }
 
 impl TerminalGuard {
-    pub(crate) fn init() -> Result<(Self, ratatui::DefaultTerminal)> {
+    pub(crate) fn init(max_log_bytes: u64) -> Result<(Self, ratatui::DefaultTerminal)> {
         let terminal = ratatui::init();
+        // Runs before the restore hook ratatui::init just chained, so its
+        // errors and the panic message reach the screen.
+        let restore_hook = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            stderr::unmute();
+            restore_hook(info);
+        }));
         write_mux_sequence(PUSH_WINDOW_TITLE_SEQUENCE);
         stdout().execute(EnableBracketedPaste)?;
         stdout().execute(EnableMouseCapture)?;
         enable_focus_change();
         push_keyboard_enhancement();
+        stderr::mute(max_log_bytes);
         Ok((Self, terminal))
     }
 }
@@ -463,6 +549,7 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let started = Instant::now();
         pop_terminal_modes();
+        stderr::unmute();
         ratatui::restore();
         tracing::info!(
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -488,12 +575,37 @@ fn teardown() {
     stdout().flush().ok();
 }
 
+/// Set once a shape was sent. xterm takes the reset for a blinking block, so
+/// a terminal nobody changed the shape of must not be sent one on exit.
+static CURSOR_STYLED: AtomicBool = AtomicBool::new(false);
+
+/// Called where a shape is queued, not where one is picked, since a hidden
+/// cursor is sent none.
+pub(crate) fn mark_cursor_styled() {
+    CURSOR_STYLED.store(true, Ordering::Relaxed);
+}
+
+pub(crate) fn cursor_style(style: CursorStyle) -> SetCursorStyle {
+    match (style.shape, style.blink) {
+        (CursorShape::Default, _) => SetCursorStyle::DefaultUserShape,
+        (CursorShape::Block, false) => SetCursorStyle::SteadyBlock,
+        (CursorShape::Block, true) => SetCursorStyle::BlinkingBlock,
+        (CursorShape::Bar, false) => SetCursorStyle::SteadyBar,
+        (CursorShape::Bar, true) => SetCursorStyle::BlinkingBar,
+        (CursorShape::Underline, false) => SetCursorStyle::SteadyUnderScore,
+        (CursorShape::Underline, true) => SetCursorStyle::BlinkingUnderScore,
+    }
+}
+
 fn pop_terminal_modes() {
     write_mux_sequence(POP_WINDOW_TITLE_SEQUENCE);
     // An error or panic mid-frame leaves the synchronized update open, and the
     // terminal would hold its output until its own timeout.
     stdout().execute(EndSynchronizedUpdate).ok();
-    stdout().execute(crossterm::cursor::Show).ok();
+    if CURSOR_STYLED.load(Ordering::Relaxed) {
+        stdout().execute(SetCursorStyle::DefaultUserShape).ok();
+    }
+    stdout().execute(Show).ok();
     stdout().execute(PopKeyboardEnhancementFlags).ok();
     disable_focus_change();
     stdout().execute(DisableMouseCapture).ok();
@@ -528,6 +640,89 @@ fn disable_focus_change() {
 #[cfg(windows)]
 fn disable_focus_change() {}
 
+/// Once a memory pressure event wakes it up, macOS libmalloc prints
+/// "MallocStackLogging: can't turn off malloc stack logging" inside every
+/// fork(), while the child's fd 2 is still our terminal, so the line lands
+/// right on top of the TUI. Our spawns fork because they need setsid, which
+/// only the fork path gives on stable Rust. So for the TUI's whole life fd 2
+/// writes to a file in the logs dir, where a fatal error still leaves a trace.
+/// It gets the terminal back on exit and panic, and the editor is handed
+/// the terminal directly, so the agent's forks stay out of it too. A redirected
+/// stderr was asked for and is left alone.
+///
+/// Built on every unix so Linux CI checks it, but muting only on macOS, the
+/// one place with noise to hide.
+#[cfg(unix)]
+mod stderr {
+    use std::fs::File;
+    use std::io::{IsTerminal, stderr};
+    use std::os::fd::{AsFd, OwnedFd};
+    use std::process::Stdio;
+    use std::sync::OnceLock;
+
+    use maki_storage::log::open_stderr_log;
+    use maki_storage::paths::logs_dir;
+    use rustix::stdio::dup2_stderr;
+
+    struct Fds {
+        terminal: OwnedFd,
+        log: File,
+    }
+
+    static FDS: OnceLock<Option<Fds>> = OnceLock::new();
+
+    fn open(max_log_bytes: u64) -> Option<Fds> {
+        if !cfg!(target_os = "macos") || !stderr().is_terminal() {
+            return None;
+        }
+        let dir = logs_dir().ok()?;
+        let log = open_stderr_log(&dir, max_log_bytes)
+            .inspect_err(|error| {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    %error,
+                    "cannot open stderr.log, fork noise can reach the TUI"
+                );
+            })
+            .ok()?;
+        let terminal = stderr().as_fd().try_clone_to_owned().ok()?;
+        Some(Fds { terminal, log })
+    }
+
+    pub(super) fn mute(max_log_bytes: u64) {
+        if let Some(fds) = FDS.get_or_init(|| open(max_log_bytes)) {
+            let _ = dup2_stderr(&fds.log);
+        }
+    }
+
+    pub(super) fn unmute() {
+        if let Some(Some(fds)) = FDS.get() {
+            let _ = dup2_stderr(&fds.terminal);
+        }
+    }
+
+    pub(super) fn terminal() -> Stdio {
+        match FDS.get() {
+            Some(Some(fds)) => fds
+                .terminal
+                .try_clone()
+                .map_or_else(|_| Stdio::inherit(), Stdio::from),
+            _ => Stdio::inherit(),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod stderr {
+    use std::process::Stdio;
+
+    pub(super) fn mute(_max_log_bytes: u64) {}
+    pub(super) fn unmute() {}
+    pub(super) fn terminal() -> Stdio {
+        Stdio::inherit()
+    }
+}
+
 fn push_keyboard_enhancement() {
     if let Err(e) = stdout().execute(PushKeyboardEnhancementFlags(
         KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
@@ -557,8 +752,8 @@ pub(crate) fn open_in_editor(
     path: &Path,
     terminal: &mut ratatui::DefaultTerminal,
 ) -> Result<i32, String> {
-    let editor = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
+    let editor = env::var("VISUAL")
+        .or_else(|_| env::var("EDITOR"))
         .map_err(|_| "Set $VISUAL or $EDITOR to open files".to_string())?;
 
     let args = split(&editor).map_err(|e| format!("Failed to parse $VISUAL or $EDITOR: {e}"))?;
@@ -574,7 +769,7 @@ pub(crate) fn open_in_editor(
         .arg(path)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
+        .stderr(stderr::terminal())
         .status();
 
     resume(terminal);
@@ -592,7 +787,7 @@ pub(crate) fn copy_to_clipboard(text: &str) -> Result<(), String> {
     CopyToClipboard::to_clipboard_from(text)
         .write_ansi(&mut sequence)
         .map_err(|e| e.to_string())?;
-    let sequence = TerminalMux::detect().wrap_for_mux(sequence);
+    let sequence = caps().mux.wrap_for_mux(sequence);
     let mut stdout = stdout().lock();
     stdout
         .write_all(sequence.as_bytes())
@@ -691,6 +886,52 @@ mod tests {
             resolve_notifier(NotificationMethod::Auto, async || false).await,
             Some(ResolvedNotifier::Bell)
         );
+    }
+
+    fn env_lookup<'a>(env: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key: &str| {
+            env.iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| (*value).into())
+        }
+    }
+
+    #[test_case(&[("TERM_PROGRAM", HERDR_TERM_PROGRAM)], TerminalMux::Herdr ; "herdr_pane")]
+    #[test_case(&[("TERM_PROGRAM", HERDR_TERM_PROGRAM), ("TMUX", "/tmp/tmux")], TerminalMux::Tmux ; "tmux_inside_herdr")]
+    #[test_case(&[("TERM_PROGRAM", HERDR_TERM_PROGRAM), ("STY", "1.pts")], TerminalMux::Screen ; "screen_inside_herdr")]
+    #[test_case(&[("HERDR_ENV", "1")], TerminalMux::None ; "herdr_env_alone_is_not_a_pane")]
+    #[test_case(&[], TerminalMux::None ; "plain_terminal")]
+    fn mux_from_env(env: &[(&str, &str)], expected: TerminalMux) {
+        assert_eq!(TerminalMux::from_env(env_lookup(env)), expected);
+    }
+
+    #[test_case(&[("TERM_PROGRAM", HERDR_TERM_PROGRAM), ("TERM", "xterm-256color")], Some(ProtocolType::Kitty), ClipboardRoute::NativeAndOsc52 ; "herdr_draws_kitty_and_forwards_osc52")]
+    #[test_case(&[("TERM_PROGRAM", HERDR_TERM_PROGRAM), ("TMUX", "/tmp/tmux")], None, ClipboardRoute::NativeElseOsc52 ; "tmux_inside_herdr_passes_no_graphics")]
+    #[test_case(&[("TERM_PROGRAM", "kitty"), ("TMUX", "/tmp/tmux")], None, ClipboardRoute::NativeElseOsc52 ; "multiplexer_hides_outer_graphics")]
+    #[test_case(&[("TERM_PROGRAM", "kitty"), ("ZELLIJ", "0")], None, ClipboardRoute::NativeElseOsc52 ; "zellij_passes_no_graphics")]
+    #[test_case(&[("TERM_PROGRAM", "iTerm.app")], Some(ProtocolType::Iterm2), ClipboardRoute::NativeElseOsc52 ; "known_terminal")]
+    #[test_case(&[("TERM", "xterm-kitty")], Some(ProtocolType::Kitty), ClipboardRoute::NativeElseOsc52 ; "known_term")]
+    #[test_case(&[("TERM_PROGRAM", "unknown"), ("TERM", "xterm-kitty")], Some(ProtocolType::Kitty), ClipboardRoute::NativeElseOsc52 ; "unsupported_program_falls_back_to_term")]
+    #[test_case(&[("TERM_PROGRAM", "unknown"), ("TERM", "xterm-256color")], None, ClipboardRoute::NativeElseOsc52 ; "unsupported_program_and_term")]
+    #[test_case(&[], None, ClipboardRoute::NativeElseOsc52 ; "missing_env")]
+    fn caps_from_env(
+        env: &[(&str, &str)],
+        image_protocol: Option<ProtocolType>,
+        clipboard: ClipboardRoute,
+    ) {
+        let caps = TerminalCaps::from_env(env_lookup(env));
+        assert_eq!(caps.image_protocol, image_protocol);
+        assert_eq!(caps.clipboard, clipboard);
+    }
+
+    #[test]
+    fn auto_rings_inside_herdr_since_it_drops_osc9() {
+        let herdr = TerminalEnvironment {
+            term_program: Some(HERDR_TERM_PROGRAM),
+            wezterm: true,
+            ..TerminalEnvironment::default()
+        };
+        assert!(!auto_supports_osc9(&herdr, None));
     }
 
     #[test]
@@ -876,12 +1117,10 @@ mod tests {
         assert_eq!(parse_dcs_passthrough(&screen, "\u{1b}P"), OSC9_SEQUENCE);
     }
 
-    #[test]
-    fn none_is_identity() {
-        assert_eq!(
-            TerminalMux::None.wrap_for_mux(OSC52_WITH_ST.to_string()),
-            OSC52_WITH_ST
-        );
+    #[test_case(TerminalMux::None ; "none")]
+    #[test_case(TerminalMux::Herdr ; "herdr_reads_sequences_raw")]
+    fn raw_sequence_is_identity(mux: TerminalMux) {
+        assert_eq!(mux.wrap_for_mux(OSC52_WITH_ST.to_string()), OSC52_WITH_ST);
     }
 
     #[test]

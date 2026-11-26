@@ -8,9 +8,10 @@
 //! it wakes the moment any of them has something and never blocks a worker:
 //! it runs under `block_on` on the main thread.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::future::{pending, ready};
 use std::mem;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -26,8 +27,8 @@ use maki_agent::command::CustomCommand;
 use maki_agent::permissions::PermissionManager;
 use maki_agent::session::Resumed;
 use maki_agent::{
-    AgentConfig, AgentEvent, CancelToken, Envelope, HostPrompt, ImageSource, McpCommand,
-    McpConfigErrors, McpHandle, SessionMailbox, Transcript, UiWaker, mcp,
+    AgentConfig, AgentEvent, CancelToken, CompactReason, Envelope, HostPrompt, ImageSource,
+    McpCommand, McpConfigErrors, McpHandle, SessionMailbox, Transcript, UiWaker, mcp,
 };
 use maki_config::project::TrustState;
 use maki_config::{ModelPolicy, ProjectConfig, UiConfig};
@@ -40,15 +41,17 @@ use maki_lua::{
     CANCEL_CANCELLED, CANCEL_IDLE, EventHandle, HintReader, InputMode, InputRequest,
     InputRulesReader, Key, KeymapReader, LuaCommandReader, ModelRequest, PROMPT_QUEUED,
     PROMPT_STARTED, PackCommand, PackPreparation, PlanRequest, SessionEndReason, SessionRequest,
-    TaskRequest, UiAction, UiReply, WinEvent,
+    TaskRequest, UiAction, UiReply, WinEvent, fetch_provider_usage,
 };
 use maki_providers::Timeouts;
+use maki_providers::model_registry;
 use maki_providers::models_cache::{ModelList, fetch_all_models_cached};
 use maki_providers::provider::{Provider, from_model};
-use maki_providers::{Message, Model};
+use maki_providers::{Message, Model, ModelTier};
 use maki_storage::StateDir;
+use maki_storage::blocking;
 use maki_storage::id::{MakiId, MakiIdParseError, SessionRef};
-use maki_storage::model::persist_model;
+use maki_storage::model::{persist_model, push_recent, read_expanded_providers, read_recents};
 use maki_storage::sessions::normalize_title;
 use ratatui::layout::Rect;
 use serde_json::json;
@@ -57,9 +60,10 @@ use tokio::sync::{Notify, oneshot};
 use tokio::task::coop::unconstrained;
 use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::time::timeout;
-use tokio_util::task::AbortOnDropHandle;
+use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 use tracing::{debug, info, warn};
 
+use crate::agent::model_slots::Landed;
 use crate::agent::{
     AgentDeps, AgentHandles, ModelSlot, ModelSlots, Respawn,
     shared_queue::{Compaction, QueueItem, QueuedInput},
@@ -67,22 +71,25 @@ use crate::agent::{
 use crate::app::mode::Mode;
 use crate::app::shell::{ShellEvent, spawn_shell};
 use crate::app::tasks::TaskWatch;
-use crate::app::{App, Msg, Notification, QueuedMessage, SubmitOutcome, turn_response};
+use crate::app::{
+    App, Attention, Msg, Notification, QueuedMessage, SubmitOutcome, session_has_content,
+    turn_response,
+};
 use crate::appearance::{self, Background};
 use crate::color_compat;
 use crate::components::input::Submission;
 use crate::components::keybindings::key;
+use crate::components::model_picker::PickerMemory;
 use crate::components::usage_modal::UsageFetchState;
 use crate::components::{Action, ExitRequest};
 use crate::decor_worker;
 use crate::input::InputReader;
-use crate::present::present;
+use crate::present::{Caret, present};
 use crate::repaint::{Dirty, IDLE_POLL};
-use crate::theme;
 use crate::{AppSession, OpenSession};
 
 use crate::storage_writer::StorageWriter;
-use crate::terminal::{self, BlockedKind, ProgramState, ProgramStatusReporter};
+use crate::terminal::{self, BlockedKind, ProgramState, ProgramStatusReporter, cursor_style};
 
 /// Max events handled per frame so a flood cannot starve rendering.
 const DRAIN_BUDGET: usize = 256;
@@ -94,6 +101,7 @@ const PACK_BUSY_ERR: &str = "a package command is already running";
 const UNKNOWN_MODE_ERR: &str = "unknown mode; expected \"build\" or \"plan\"";
 const PACK_PANIC_ERR: &str = "the package command stopped unexpectedly";
 const FORKED_MSG: &str = "Forked, {key} to switch back";
+const CWD_GONE_FLASH: &str = "current directory no longer exists. /cd to move elsewhere";
 /// A `/reload` cannot ask the terminal: its input reader owns the tty.
 const RESTART_FOR_BACKGROUND: &str =
     "ui.theme: restart Maki to detect the terminal background, using dark until then";
@@ -128,6 +136,8 @@ pub struct EventLoopParams {
     pub config: AgentConfig,
     pub ui_config: UiConfig,
     pub input_history_size: usize,
+    /// Caps stderr.log, where the TUI sends fd 2.
+    pub max_log_bytes: u64,
     pub permissions: Arc<PermissionManager>,
     pub timeouts: Timeouts,
     pub exit_on_done: bool,
@@ -150,10 +160,13 @@ pub struct EventLoopParams {
     pub host_prompt: HostPrompt,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// A waiting session carries what it waits on, so the two cannot disagree,
+/// and a status diff also sees one prompt follow another with no gap between
+/// them.
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum SessionStatus {
     Working,
-    NeedsInput,
+    NeedsInput(Attention),
     Idle,
 }
 
@@ -166,7 +179,7 @@ enum PendingCompletion {
 struct RunNotificationState {
     response_candidate: Option<String>,
     pending_completion: Option<PendingCompletion>,
-    last_attention: Option<Notification>,
+    last_attention: Option<Attention>,
     outcome: Option<ProgramState>,
 }
 
@@ -225,16 +238,15 @@ impl RunNotificationState {
         )
     }
 
-    fn reconcile(
-        &mut self,
-        attention: Option<Notification>,
-        status: SessionStatus,
-    ) -> Option<Notification> {
-        let settled = attention.is_none() && status == SessionStatus::Idle;
-        let prompt = (attention != self.last_attention)
-            .then(|| attention.clone())
-            .flatten();
-        self.last_attention = attention;
+    fn reconcile(&mut self, status: &SessionStatus) -> Option<Notification> {
+        let settled = *status == SessionStatus::Idle;
+        let attention = status.attention();
+        let prompt = if attention == self.last_attention.as_ref() {
+            None
+        } else {
+            self.last_attention = attention.cloned();
+            attention.cloned().map(Notification::Attention)
+        };
 
         // A turn can end while work goes on, and queued input or a background
         // task may wake the agent again. So the completion waits until the
@@ -255,22 +267,42 @@ impl SessionStatus {
     /// Background work keeps the session working, like the status bar, so a
     /// picker never flashes finished while a result is still to come.
     fn of(app: &App) -> Self {
-        if app.awaiting_input() {
-            Self::NeedsInput
-        } else if app.is_working() {
-            Self::Working
-        } else {
-            Self::Idle
+        match app.attention() {
+            Some(attention) => Self::NeedsInput(attention),
+            None if app.is_working() => Self::Working,
+            None => Self::Idle,
         }
     }
 
-    fn as_str(self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         match self {
             Self::Working => STATUS_WORKING,
-            Self::NeedsInput => STATUS_NEEDS_INPUT,
+            Self::NeedsInput(_) => STATUS_NEEDS_INPUT,
             Self::Idle => STATUS_IDLE,
         }
     }
+
+    fn attention(&self) -> Option<&Attention> {
+        match self {
+            Self::NeedsInput(attention) => Some(attention),
+            Self::Working | Self::Idle => None,
+        }
+    }
+}
+
+/// One entry of `maki.session.live()`.
+fn live_entry(app: &App, focused: bool) -> serde_json::Value {
+    let session = &app.state.session;
+    let status = SessionStatus::of(app);
+    json!({
+        "id": session.id,
+        "title": session.title,
+        "status": status.as_str(),
+        "attention": status.attention().map(Attention::message),
+        "resumable": session_has_content(session),
+        "updated_at": session.updated_at,
+        "focused": focused,
+    })
 }
 
 fn prepend_preamble(preamble: &mut Vec<Message>, mut leading: Vec<Message>) {
@@ -295,11 +327,13 @@ fn select_notification(
     }
 }
 
-fn blocked_kind(attention: Option<&Notification>) -> BlockedKind {
+/// The OSC 7501 kinds stop at permission, question and auth, so the plan
+/// menu passes as a question and the package review as a permission.
+fn blocked_kind(attention: &Attention) -> BlockedKind {
     match attention {
-        Some(Notification::AuthenticationRequired) => BlockedKind::Auth,
-        Some(Notification::QuestionRequested) => BlockedKind::Question,
-        _ => BlockedKind::Permission,
+        Attention::Permission { .. } | Attention::PackReview => BlockedKind::Permission,
+        Attention::Question | Attention::PlanReady => BlockedKind::Question,
+        Attention::Authentication => BlockedKind::Auth,
     }
 }
 
@@ -407,6 +441,22 @@ fn parse_mode(mode: &str) -> Result<Mode, String> {
     }
 }
 
+/// `maki.model.set`'s answer, with whatever model the session is on by now.
+fn apply_settings(
+    app: &mut App,
+    thinking: Option<String>,
+    fast: Option<bool>,
+    persist: bool,
+) -> UiReply {
+    if let Some(thinking) = thinking {
+        app.set_thinking(&thinking, persist)?;
+    }
+    if let Some(fast) = fast {
+        app.set_fast(fast)?;
+    }
+    Ok(app.model_state())
+}
+
 struct SessionRuntime {
     app: App,
     handles: AgentHandles,
@@ -429,16 +479,17 @@ impl SessionRuntime {
     }
 
     fn program_state(&self) -> (ProgramState, Option<String>) {
-        let state = match self.last_status {
-            SessionStatus::NeedsInput => {
-                let attention = self.app.attention();
-                let msg = attention.as_ref().map(Notification::message);
-                return (ProgramState::Blocked(blocked_kind(attention.as_ref())), msg);
-            }
-            SessionStatus::Working => ProgramState::Working,
-            SessionStatus::Idle => self.notifications.outcome.unwrap_or(ProgramState::Idle),
-        };
-        (state, None)
+        match &self.last_status {
+            SessionStatus::NeedsInput(attention) => (
+                ProgramState::Blocked(blocked_kind(attention)),
+                Some(attention.message()),
+            ),
+            SessionStatus::Working => (ProgramState::Working, None),
+            SessionStatus::Idle => (
+                self.notifications.outcome.unwrap_or(ProgramState::Idle),
+                None,
+            ),
+        }
     }
 
     /// New work cancels an `exit_on_done` exit still waiting on its drain.
@@ -470,6 +521,7 @@ struct SpawnCtx {
     mcp_handle: Option<McpHandle>,
     mcp_config_errors: McpConfigErrors,
     available_models: Arc<ArcSwapOption<ModelList>>,
+    picker_memory: Arc<PickerMemory>,
     storage_writer: Arc<StorageWriter>,
     model_policy: Arc<ModelPolicy>,
     trust: TrustState,
@@ -511,6 +563,7 @@ impl SpawnCtx {
             open,
             self.storage.clone(),
             Arc::clone(&self.available_models),
+            Arc::clone(&self.picker_memory),
             handles.mcp_reader(),
             handles.deps.mcp_config_errors.clone(),
             self.lua_command_reader.clone(),
@@ -523,7 +576,6 @@ impl SpawnCtx {
             permissions,
             Arc::clone(&self.custom_commands),
             self.lua_event_handle.clone(),
-            Arc::clone(&self.model_policy),
         );
         app.trust = self.trust.clone();
         handles.apply_to_app(&mut app);
@@ -542,6 +594,28 @@ impl SpawnCtx {
             last_tasks: TaskWatch::default(),
             notifications: RunNotificationState::default(),
             slot: cell,
+        }
+    }
+}
+
+/// A plugin polling a slug needs the live instance whatever tab it is in:
+/// after a failover the original slug may only be served by a background
+/// session. Fresh providers keep headless and no-session answers consistent.
+async fn provider_usage_reply(slots: Vec<Arc<ArcSwap<ModelSlot>>>, slug: String) -> UiReply {
+    let live = slots.iter().find_map(|slot| {
+        let slot = slot.load_full();
+        (slot.model.provider.as_ref() == slug.as_str()).then(|| Arc::clone(&slot.provider))
+    });
+    match live {
+        Some(provider) => fetch_provider_usage(provider.as_ref(), &slug).await,
+        None => {
+            let lookup = slug.clone();
+            let provider = blocking(move || {
+                maki_providers::provider::provider_for_slug(&lookup, Timeouts::default())
+            })
+            .await
+            .map_err(|e| e.user_message())?;
+            fetch_provider_usage(provider.as_ref(), &slug).await
         }
     }
 }
@@ -569,7 +643,142 @@ pub(crate) struct EventLoop<'t> {
     /// second `/packupdate` would otherwise race the first over the same clones
     /// and locks.
     pack: Option<JoinHandle<PackPreparation>>,
+    /// The stored session a focus is reading. One at a time, and none while
+    /// an earlier one waits for its slot, with later requests in
+    /// `queued_focus`, so they land in the order they were made, as they did
+    /// when each one read inline.
+    opening: Option<AbortOnDropHandle<Box<OpenedSession>>>,
+    queued_focus: VecDeque<(MakiId, oneshot::Sender<UiReply>)>,
+    /// Picks and sessions waiting for a slot [`ModelSlots`] is building.
+    waiting: SlotWaiters,
+    /// Writes to sessions no tab has open, which shutdown waits for like it
+    /// waits for the storage writer.
+    stored_writes: TaskTracker,
+    /// Whether the cwd was gone last frame, so the flash shows once per loss.
+    cwd_lost: bool,
     _model_fetch_task: AbortOnDropHandle<()>,
+}
+
+/// A focus that reads a stored session.
+struct PendingFocus {
+    reply_tx: oneshot::Sender<UiReply>,
+    /// The tab focused when it was asked, the only one it may take over.
+    from: MakiId,
+}
+
+/// A stored session a focus read off the loop, for the loop to bring up once
+/// it has a slot for its model.
+struct OpenedSession(PendingFocus, Result<OpenSession, String>);
+
+/// A model picked for the tab named at the time.
+struct Pick {
+    /// The tab's slot cell, which stays the same when `/new` gives the tab
+    /// another session while the build is out.
+    tab: Weak<ArcSwap<ModelSlot>>,
+    origin: PickOrigin,
+}
+
+/// Who hears how a pick went.
+enum PickOrigin {
+    /// The model picker or a login, which flash a failure.
+    Picker,
+    /// `maki.model.set`, whose thinking and fast go on top of the new model
+    /// before it answers. `persist` says whether the spec also becomes the
+    /// default the next `maki` starts on and joins the recent list.
+    Lua {
+        thinking: Option<String>,
+        fast: Option<bool>,
+        persist: bool,
+        reply_tx: oneshot::Sender<UiReply>,
+    },
+}
+
+/// A session `maki.session.new` opens in a tab, which answers with its id.
+struct CreatedSession {
+    open: OpenSession,
+    prompt: Option<String>,
+    focus: bool,
+    reply_tx: oneshot::Sender<UiReply>,
+}
+
+/// What a slot is wanted for.
+enum Wanted {
+    Pick(Pick),
+    Open(PendingFocus, OpenSession),
+    Create(CreatedSession),
+}
+
+struct Waiter {
+    spec: String,
+    built: Option<Result<Arc<ModelSlot>, String>>,
+    wanted: Wanted,
+}
+
+/// Everything waiting for a slot, in the order it asked. A session comes up
+/// as soon as its slot is there. A pick also waits for the picks made before
+/// it, so they apply in order and the last one wins.
+#[derive(Default)]
+struct SlotWaiters(VecDeque<Waiter>);
+
+impl SlotWaiters {
+    fn push(&mut self, slots: &mut ModelSlots, spec: String, wanted: Wanted) {
+        let built = slots.get(&spec).map(Ok);
+        if built.is_none() {
+            slots.request(&spec);
+        }
+        self.0.push_back(Waiter {
+            spec,
+            built,
+            wanted,
+        });
+    }
+
+    fn landed(&mut self, spec: &str, built: &Result<Arc<ModelSlot>, String>) {
+        for waiter in self.0.iter_mut().filter(|waiter| waiter.spec == spec) {
+            waiter.built.get_or_insert_with(|| built.clone());
+        }
+    }
+
+    /// After an invalidate nothing a waiter holds is current, so each asks
+    /// again.
+    fn restart(&mut self, slots: &mut ModelSlots) {
+        for waiter in &mut self.0 {
+            waiter.built = None;
+            slots.request(&waiter.spec);
+        }
+    }
+
+    fn take_ready(&mut self) -> Vec<(Waiter, Result<Arc<ModelSlot>, String>)> {
+        let mut ready = Vec::new();
+        let mut pick_ahead = false;
+        for mut waiter in mem::take(&mut self.0) {
+            let is_pick = matches!(waiter.wanted, Wanted::Pick(_));
+            match waiter.built.take_if(|_| !(is_pick && pick_ahead)) {
+                Some(built) => ready.push((waiter, built)),
+                None => {
+                    pick_ahead |= is_pick;
+                    self.0.push_back(waiter);
+                }
+            }
+        }
+        ready
+    }
+
+    /// The spec `tab` ends up on once its picks have settled: the last one
+    /// made for it.
+    fn pending_pick(&self, tab: &Arc<ArcSwap<ModelSlot>>) -> Option<&str> {
+        let tab = Arc::downgrade(tab);
+        self.0
+            .iter()
+            .rfind(|waiter| matches!(&waiter.wanted, Wanted::Pick(pick) if Weak::ptr_eq(&pick.tab, &tab)))
+            .map(|waiter| waiter.spec.as_str())
+    }
+
+    fn opens_a_session(&self) -> bool {
+        self.0
+            .iter()
+            .any(|waiter| matches!(waiter.wanted, Wanted::Open(..)))
+    }
 }
 
 /// One item from any of the event loop's sources; `None` from `next_wake`
@@ -588,7 +797,10 @@ enum Wake {
     Shell(usize, ShellEvent),
     Warn(String),
     Pack(Box<PackPreparation>),
+    /// `None` when the read panicked, which dropped its reply.
+    SessionOpened(Option<Box<OpenedSession>>),
     ModelsDiscovered,
+    SlotBuilt(Landed),
 }
 
 /// A value from the channel, or never, once it is closed: a closed channel
@@ -617,6 +829,17 @@ async fn pack_done(pack: &mut Option<JoinHandle<PackPreparation>>) -> PackPrepar
         .unwrap_or_else(|_| PackPreparation::failed(PACK_PANIC_ERR.to_owned()));
     *pack = None;
     preparation
+}
+
+/// What a task answered, `None` when it panicked, or never, when none is
+/// running. Cleared only once it answered, like [`pack_done`].
+async fn answered<T>(task: &mut Option<AbortOnDropHandle<T>>) -> Option<T> {
+    let Some(handle) = task else {
+        return pending().await;
+    };
+    let answer = handle.await.ok();
+    *task = None;
+    answer
 }
 
 /// The first agent envelope or shell event from any session.
@@ -664,9 +887,9 @@ fn fetch_models(
     models_fetched: Arc<Notify>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        fetch_all_models_cached(&policy, |list, warnings| {
-            for w in warnings {
-                let _ = warn_tx.send(w);
+        fetch_all_models_cached(&policy, |list, warning| {
+            if let Some(warning) = warning {
+                let _ = warn_tx.send(warning);
             }
             available.store(Some(Arc::new(list)));
         })
@@ -712,6 +935,7 @@ impl<'t> EventLoop<'t> {
             config,
             ui_config,
             input_history_size,
+            max_log_bytes: _,
             permissions,
             timeouts,
             exit_on_done,
@@ -730,8 +954,8 @@ impl<'t> EventLoop<'t> {
             host_prompt,
         } = params;
         // Apply the config theme before the warmup thread spawns, or warmup
-        // could bake the syntax palette from the old theme. Only the
-        // in-memory name is set, so the user's saved pick survives.
+        // could bake the syntax palette from the old theme. It is not
+        // persisted, so the user's saved pick survives.
         if let Some(ref pair) = ui_config.theme {
             let background = appearance::background();
             if pair.follows_background() && background.is_none() {
@@ -739,10 +963,7 @@ impl<'t> EventLoop<'t> {
             }
             let name = pair.name(background == Some(Background::Light));
             match crate::theme::load_by_name(name) {
-                Ok(theme) => {
-                    crate::theme::set_current_name(name);
-                    crate::theme::set(theme);
-                }
+                Ok(theme) => crate::theme::set(theme),
                 Err(e) => startup_warnings.push(format!("config ui.theme: {e}")),
             }
         }
@@ -773,6 +994,11 @@ impl<'t> EventLoop<'t> {
 
         let notifier = terminal::TerminalNotifier::new(ui_config.notifications).await;
         let program_status = ui_config.program_status.then(ProgramStatusReporter::new);
+        let recent_models = read_recents(&storage)
+            .into_iter()
+            .filter(|spec| model_policy.allows(spec))
+            .collect();
+        let picker_memory = PickerMemory::new(recent_models, read_expanded_providers(&storage));
         let ctx = SpawnCtx {
             storage,
             config,
@@ -789,6 +1015,7 @@ impl<'t> EventLoop<'t> {
             mcp_handle,
             mcp_config_errors,
             available_models: bg.available,
+            picker_memory: Arc::new(picker_memory),
             storage_writer,
             model_policy,
             trust,
@@ -850,6 +1077,11 @@ impl<'t> EventLoop<'t> {
             ui_action_rx,
             ui_waker,
             pack: None,
+            opening: None,
+            queued_focus: VecDeque::new(),
+            waiting: SlotWaiters::default(),
+            stored_writes: TaskTracker::new(),
+            cwd_lost: false,
             _model_fetch_task: bg.task,
         })
     }
@@ -861,9 +1093,13 @@ impl<'t> EventLoop<'t> {
     fn paint(&mut self) -> Result<()> {
         let app = &mut self.sessions[self.focused].app;
         present(self.terminal, |frame| {
-            let caret = app.view(frame);
+            let position = app.view(frame);
             color_compat::downgrade_if_needed(frame.buffer_mut());
-            caret
+            position.map(|position| Caret {
+                position,
+                shown: app.shows_terminal_cursor(),
+                style: app.cursor_style().map(cursor_style),
+            })
         })?;
         Ok(())
     }
@@ -970,6 +1206,8 @@ impl<'t> EventLoop<'t> {
             () = decor_worker::wakes().woken() => Wake::Decor,
             Some(warning) = self.warn_rx.recv() => Wake::Warn(warning),
             preparation = pack_done(&mut self.pack) => Wake::Pack(Box::new(preparation)),
+            answer = answered(&mut self.opening) => Wake::SessionOpened(answer),
+            Some(landed) = self.slots.next_built() => Wake::SlotBuilt(landed),
             () = self.models_fetched.notified() => Wake::ModelsDiscovered,
             wake = session_wake(&mut self.sessions) => wake,
         }
@@ -985,7 +1223,9 @@ impl<'t> EventLoop<'t> {
             Wake::Shell(i, event) => self.sessions[i].app.handle_shell_event(event),
             Wake::Warn(warning) => self.focused_app().flash(warning),
             Wake::Pack(preparation) => self.finish_pack(*preparation),
+            Wake::SessionOpened(answer) => self.finish_open(answer),
             Wake::ModelsDiscovered => self.rebuild_models(),
+            Wake::SlotBuilt(landed) => self.land_slot(landed),
         }
         Ok(())
     }
@@ -999,11 +1239,27 @@ impl<'t> EventLoop<'t> {
         }
     }
 
+    /// One `getcwd` a frame, so a deleted directory is reported before it
+    /// surfaces as an unrelated "no such file". The frame that flashes owes a
+    /// paint, or an idle loop lets it expire unseen.
+    fn watch_cwd(&mut self) -> Dirty {
+        let lost = std::env::current_dir().is_err();
+        if lost == self.cwd_lost {
+            return Dirty::NO;
+        }
+        self.cwd_lost = lost;
+        if !lost {
+            return Dirty::NO;
+        }
+        self.focused_app().flash(CWD_GONE_FLASH.into());
+        Dirty::YES
+    }
+
     /// Only the focused session is drawn, so only it can owe a frame; focusing
     /// another is an event, and events always repaint. The rest get
     /// [`App::tick_background`].
     fn tick(&mut self) -> Dirty {
-        let mut dirty = Dirty::NO;
+        let mut dirty = self.watch_cwd();
         // A quit ends the whole process, so each session's double press
         // counts the background tasks of all of them.
         let running: usize = self
@@ -1150,8 +1406,16 @@ impl<'t> EventLoop<'t> {
                 None => self
                     .answer_from_disk(id, reply_tx, |session| Ok(SessionExport::stored(session))),
             },
-            UiAction::Model { req, reply_tx } => {
-                let _ = reply_tx.send(self.handle_model_request(req));
+            UiAction::Model { req, reply_tx } => self.handle_model_request(req, reply_tx),
+            UiAction::ProviderUsage { slug, reply_tx } => {
+                let slots = self
+                    .sessions
+                    .iter()
+                    .map(|rt| Arc::clone(&rt.slot))
+                    .collect();
+                tokio::spawn(async move {
+                    let _ = reply_tx.send(provider_usage_reply(slots, slug).await);
+                });
             }
             UiAction::Input { req, reply_tx } => {
                 let (reply, actions) = self.handle_input_request(req);
@@ -1195,6 +1459,12 @@ impl<'t> EventLoop<'t> {
             UiAction::PluginUnloaded(plugin) => {
                 for rt in &mut self.sessions {
                     rt.app.clear_plugin_marks(&plugin);
+                }
+            }
+            UiAction::ChatItem { session, item } => {
+                // A straggler after `/new` finds no tab and is dropped.
+                if let Some(rt) = self.sessions.iter_mut().find(|rt| rt.id() == session) {
+                    rt.app.handle_chat_item(&item);
                 }
             }
             UiAction::RunCommand {
@@ -1285,7 +1555,8 @@ impl<'t> EventLoop<'t> {
                 Some(&rt.id()),
                 HostEvent::SessionStatusChanged {
                     title: &rt.app.state.session.title,
-                    status: status.as_str(),
+                    status: rt.last_status.as_str(),
+                    attention: rt.last_status.attention().map(Attention::message),
                     focused: i == self.focused,
                 },
             );
@@ -1347,9 +1618,7 @@ impl<'t> EventLoop<'t> {
         };
         let mut selected = None;
         for rt in &mut self.sessions {
-            let candidate = rt
-                .notifications
-                .reconcile(rt.app.attention(), SessionStatus::of(&rt.app));
+            let candidate = rt.notifications.reconcile(&SessionStatus::of(&rt.app));
             selected = select_notification(selected, candidate);
         }
         if let Some(notification) = selected.filter(|n| self.focus.allows(n))
@@ -1429,11 +1698,29 @@ impl<'t> EventLoop<'t> {
     fn start_woken_runs(&mut self) -> Dirty {
         let mut dirty = Dirty::NO;
         for index in 0..self.sessions.len() {
+            if let Some(request) = self.sessions[index].app.take_requested_compact() {
+                self.sessions[index].app.mark_compacting();
+                self.queue_compact(index, request.instructions, CompactReason::Requested);
+                dirty = Dirty::YES;
+            }
             let actions = self.sessions[index].app.start_woken_run();
             dirty |= Dirty::from(!actions.is_empty());
             self.dispatch(index, actions);
         }
         dirty
+    }
+
+    /// Pushes a compaction to the queue, so a mid-run request lands at the
+    /// run's next boundary instead of racing its history.
+    fn queue_compact(&mut self, idx: usize, instructions: Option<String>, reason: CompactReason) {
+        let rt = &mut self.sessions[idx];
+        rt.reset_run_notifications();
+        rt.handles.queue.push(QueueItem::Compact(Compaction {
+            run_id: rt.app.run_id,
+            instructions,
+            reason,
+            workflow: rt.app.state.workflow,
+        }));
     }
 
     /// `List` replies from a background task (the scan can be slow); every
@@ -1489,15 +1776,7 @@ impl<'t> EventLoop<'t> {
                     .sessions
                     .iter()
                     .enumerate()
-                    .map(|(i, rt)| {
-                        json!({
-                            "id": rt.id(),
-                            "title": rt.app.state.session.title,
-                            "status": SessionStatus::of(&rt.app).as_str(),
-                            "updated_at": rt.app.state.session.updated_at,
-                            "focused": i == self.focused,
-                        })
-                    })
+                    .map(|(i, rt)| live_entry(&rt.app, i == self.focused))
                     .collect();
                 let _ = reply_tx.send(Ok(json!(list)));
             }
@@ -1542,12 +1821,12 @@ impl<'t> EventLoop<'t> {
                 };
                 let _ = reply_tx.send(idx.and_then(|idx| self.submit_text(idx, text, images)));
             }
-            SessionRequest::Focus { id } => {
-                let reply = parse_session_id(&id)
-                    .and_then(|id| self.focus_session(id))
-                    .map(|()| json!(true));
-                let _ = reply_tx.send(reply);
-            }
+            SessionRequest::Focus { id } => match parse_session_id(&id) {
+                Ok(id) => self.focus_session(id, reply_tx),
+                Err(e) => {
+                    let _ = reply_tx.send(Err(e));
+                }
+            },
             // Resolved by id like the rest: a plan form row asking for build
             // mode fires for the session whose plan landed, which may be in
             // the background.
@@ -1561,19 +1840,30 @@ impl<'t> EventLoop<'t> {
             }
             SessionRequest::SetTitle { id, title } => {
                 let title = normalize_title(&title);
-                let reply = (|| {
-                    let id = parse_session_id(&id)?;
-                    if let Some(i) = self.position(id) {
-                        self.sessions[i].app.state.session_mut().set_title(title);
-                    } else {
-                        let OpenSession { mut session, claim } =
-                            OpenSession::load(id, &self.ctx.storage).map_err(|e| e.to_string())?;
-                        session.set_title(title);
-                        self.ctx.storage_writer.send(Arc::new(session), claim);
+                let id = match parse_session_id(&id) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        let _ = reply_tx.send(Err(e));
+                        return;
                     }
-                    Ok(json!(true))
-                })();
-                let _ = reply_tx.send(reply);
+                };
+                if let Some(i) = self.position(id) {
+                    self.sessions[i].app.state.session_mut().set_title(title);
+                    let _ = reply_tx.send(Ok(json!(true)));
+                    return;
+                }
+                // No tab has it, so the claim taken here is the only writer.
+                let storage = self.ctx.storage.clone();
+                self.stored_writes.spawn_blocking(move || {
+                    let reply = OpenSession::load(id, &storage)
+                        .and_then(|OpenSession { mut session, claim }| {
+                            session.set_title(title);
+                            claim.persist(&session)
+                        })
+                        .map(|()| json!(true))
+                        .map_err(|e| e.to_string());
+                    let _ = reply_tx.send(reply);
+                });
             }
             SessionRequest::Cancel { id } => {
                 let reply = self.resolve_session_index(id.as_deref()).map(|idx| {
@@ -1637,12 +1927,12 @@ impl<'t> EventLoop<'t> {
 
     /// Lua acts on the session it names, or the focused one, the same target
     /// the model picker writes to.
-    fn handle_model_request(&mut self, req: ModelRequest) -> UiReply {
-        match req {
-            ModelRequest::Get { session } => {
-                let idx = self.resolve_session_index(session.as_deref())?;
-                Ok(self.sessions[idx].app.model_state())
-            }
+    fn handle_model_request(&mut self, req: ModelRequest, reply_tx: oneshot::Sender<UiReply>) {
+        let reply = match req {
+            ModelRequest::Get { session } => match self.resolve_session_index(session.as_deref()) {
+                Ok(idx) => Ok(self.sessions[idx].app.model_state()),
+                Err(e) => Err(e),
+            },
             ModelRequest::Available => {
                 let available = self.ctx.available_models.load();
                 Ok(json!(
@@ -1653,26 +1943,39 @@ impl<'t> EventLoop<'t> {
                 ))
             }
             ModelRequest::Set {
-                spec,
+                spec: Some(spec),
                 thinking,
                 fast,
                 session,
                 persist,
             } => {
-                let idx = self.resolve_session_index(session.as_deref())?;
-                if let Some(spec) = spec {
-                    self.change_model_in(idx, &spec, persist)?;
-                }
-                let app = &mut self.sessions[idx].app;
-                if let Some(thinking) = thinking {
-                    app.set_thinking(&thinking, persist)?;
-                }
-                if let Some(fast) = fast {
-                    app.set_fast(fast)?;
-                }
-                Ok(app.model_state())
+                let idx = match self.resolve_session_index(session.as_deref()) {
+                    Ok(idx) => idx,
+                    Err(e) => {
+                        let _ = reply_tx.send(Err(e));
+                        return;
+                    }
+                };
+                let origin = PickOrigin::Lua {
+                    thinking,
+                    fast,
+                    persist,
+                    reply_tx,
+                };
+                return self.change_model(spec, idx, origin);
             }
-        }
+            ModelRequest::Set {
+                spec: None,
+                thinking,
+                fast,
+                session,
+                persist,
+            } => match self.resolve_session_index(session.as_deref()) {
+                Ok(idx) => apply_settings(&mut self.sessions[idx].app, thinking, fast, persist),
+                Err(e) => Err(e),
+            },
+        };
+        let _ = reply_tx.send(reply);
     }
 
     /// Route a plan-surface request to the session it names, or the focused
@@ -1730,18 +2033,40 @@ impl<'t> EventLoop<'t> {
         };
         if prompt.is_none() && !focus {
             let storage = self.ctx.storage.clone();
-            spawn_blocking(move || {
+            self.stored_writes.spawn_blocking(move || {
                 let reply = open.store(&storage).map(|id| json!(id));
                 let _ = reply_tx.send(reply.map_err(|e| e.to_string()));
             });
             return;
         }
-        // An inherited model's slot is already built and sitting right here.
-        let (slot, fallback) = if inherits_model {
-            (self.sessions[self.focused].slot.load_full(), None)
-        } else {
-            self.slots.get_or_fallback(&open.session.model)
+        let created = CreatedSession {
+            open,
+            prompt,
+            focus,
+            reply_tx,
         };
+        // An inherited model's slot is already built and sitting right here.
+        if inherits_model {
+            let slot = self.sessions[self.focused].slot.load_full();
+            self.show_created(created, slot, None);
+        } else {
+            let spec = created.open.session.model.clone();
+            self.wait_for_slot(spec, Wanted::Create(created));
+        }
+    }
+
+    fn show_created(
+        &mut self,
+        created: CreatedSession,
+        slot: Arc<ModelSlot>,
+        fallback: Option<String>,
+    ) {
+        let CreatedSession {
+            open,
+            prompt,
+            focus,
+            reply_tx,
+        } = created;
         let idx = self.push_runtime(self.ctx.spawn_runtime(open, slot));
         let id = self.sessions[idx].id();
         maki_otel::emit::session_started(maki_otel::emit::START_FRESH, Some(&id.to_string()));
@@ -1857,21 +2182,139 @@ impl<'t> EventLoop<'t> {
         self.sessions.len() - 1
     }
 
-    /// Focus a live session, or bring a stored one up: in place when the
-    /// focused session is a blank idle one (nothing worth keeping), otherwise
-    /// as a new runtime so the session you came from stays live.
-    fn focus_session(&mut self, id: MakiId) -> Result<(), String> {
+    /// Focus a live session, or read a stored one off the loop and bring it up
+    /// once [`Wake::SessionOpened`] lands, see [`Self::show_opened`].
+    fn focus_session(&mut self, id: MakiId, reply_tx: oneshot::Sender<UiReply>) {
+        if self.opening.is_some() || self.waiting.opens_a_session() {
+            self.queued_focus.push_back((id, reply_tx));
+            return;
+        }
         if let Some(i) = self.position(id) {
             self.set_focused(i);
-            return Ok(());
+            let _ = reply_tx.send(Ok(json!(true)));
+            return;
         }
-        // A session another maki owns is refused here, where it costs a flash,
-        // rather than at the first write, after a whole conversation.
-        let open = OpenSession::load(id, &self.ctx.storage)
-            .map_err(|e| format!("Failed to load session: {e}"))?;
-        let (slot, reason) = self.slots.get_or_fallback(&open.session.model);
+        let focus = PendingFocus {
+            reply_tx,
+            from: self.sessions[self.focused].id(),
+        };
+        let storage = self.ctx.storage.clone();
+        self.opening = Some(AbortOnDropHandle::new(tokio::spawn(async move {
+            // A session another maki owns is refused here, where it costs a
+            // flash, rather than at the first write, after a whole conversation.
+            let opened = OpenSession::load_async(id, storage)
+                .await
+                .map_err(|e| format!("Failed to load session: {e}"));
+            Box::new(OpenedSession(focus, opened))
+        })));
+    }
+
+    fn finish_open(&mut self, answer: Option<Box<OpenedSession>>) {
+        match answer.map(|answer| *answer) {
+            Some(OpenedSession(focus, Ok(open))) => {
+                let spec = open.session.model.clone();
+                return self.wait_for_slot(spec, Wanted::Open(focus, open));
+            }
+            Some(OpenedSession(focus, Err(e))) => {
+                let _ = focus.reply_tx.send(Err(e));
+            }
+            None => {}
+        }
+        self.next_focus();
+    }
+
+    /// The focus requests that queued behind a read or a build go next, up to
+    /// the next one that has to wait for one too.
+    fn next_focus(&mut self) {
+        while self.opening.is_none()
+            && !self.waiting.opens_a_session()
+            && let Some((id, reply_tx)) = self.queued_focus.pop_front()
+        {
+            self.focus_session(id, reply_tx);
+        }
+    }
+
+    fn wait_for_slot(&mut self, spec: String, wanted: Wanted) {
+        self.waiting.push(&mut self.slots, spec, wanted);
+        self.settle_waiters();
+    }
+
+    /// A slot that landed goes to whoever waits for it and to every tab on
+    /// its spec, which is how a rebuild reaches them. A tab that picked
+    /// another model in the meantime is on another spec and stays.
+    fn land_slot(&mut self, landed: Landed) {
+        let Some((spec, built)) = self.slots.land(landed) else {
+            return;
+        };
+        let on_spec = |rt: &SessionRuntime| rt.app.state.model.spec() == spec;
+        match &built {
+            Ok(slot) => {
+                for idx in 0..self.sessions.len() {
+                    let rt = &self.sessions[idx];
+                    if on_spec(rt) && !Arc::ptr_eq(&rt.slot.load(), slot) {
+                        self.apply_model(idx, Arc::clone(slot));
+                    }
+                }
+            }
+            Err(error) if self.sessions.iter().any(on_spec) => {
+                warn!(%spec, %error, "keeping the previous model");
+            }
+            Err(_) => {}
+        }
+        self.waiting.landed(&spec, &built);
+        self.settle_waiters();
+    }
+
+    fn settle_waiters(&mut self) {
+        for (Waiter { spec, wanted, .. }, built) in self.waiting.take_ready() {
+            match (wanted, built) {
+                (Wanted::Pick(pick), Ok(slot)) => self.apply_pick(pick, spec, slot),
+                (Wanted::Pick(pick), Err(error)) => self.refuse_pick(pick.origin, error),
+                (Wanted::Open(focus, open), built) => {
+                    let (slot, fallback) = self.session_slot(&spec, built);
+                    self.show_opened(open, focus, slot, fallback);
+                }
+                (Wanted::Create(created), built) => {
+                    let (slot, fallback) = self.session_slot(&spec, built);
+                    self.show_created(created, slot, fallback);
+                }
+            }
+        }
+        for rt in &mut self.sessions {
+            rt.app.picking = self.waiting.pending_pick(&rt.slot).map(str::to_owned);
+        }
+        self.next_focus();
+    }
+
+    /// A session always comes up, on the model the process started on when
+    /// its own would not build.
+    fn session_slot(
+        &self,
+        spec: &str,
+        built: Result<Arc<ModelSlot>, String>,
+    ) -> (Arc<ModelSlot>, Option<String>) {
+        built.map_or_else(
+            |reason| self.slots.fall_back(spec, reason),
+            |slot| (slot, None),
+        )
+    }
+
+    /// In place of the tab the focus was asked from, while it is still focused
+    /// and a blank idle one (nothing worth keeping), otherwise as a new runtime
+    /// so the session you came from stays live. Decided now rather than at the
+    /// request, since the read and the build may have taken a while.
+    fn show_opened(
+        &mut self,
+        open: OpenSession,
+        focus: PendingFocus,
+        slot: Arc<ModelSlot>,
+        fallback: Option<String>,
+    ) {
         let focused = &self.sessions[self.focused];
-        if SessionStatus::of(&focused.app) == SessionStatus::Idle && focused.app.is_blank() {
+        if focused.id() == focus.from
+            && SessionStatus::of(&focused.app) == SessionStatus::Idle
+            && focused.app.is_blank()
+        {
             let idx = self.focused;
             let history = self.sessions[idx]
                 .app
@@ -1882,10 +2325,10 @@ impl<'t> EventLoop<'t> {
             let idx = self.push_runtime(self.ctx.spawn_runtime(open, slot));
             self.set_focused(idx);
         }
-        if let Some(reason) = reason {
+        if let Some(reason) = fallback {
             self.focused_app().flash(reason);
         }
-        Ok(())
+        let _ = focus.reply_tx.send(Ok(json!(true)));
     }
 
     /// Handles one input event plus any leftover produced while coalescing
@@ -1902,22 +2345,14 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    /// Only a real focus report may recolor the caret: resume heuristics and
-    /// stray input prove nothing, and no FocusGained follows $EDITOR or fg.
-    fn sync_cursor(&self) {
-        theme::set_cursor_focused(self.focus != Focus::Unfocused);
-    }
-
     fn translate(&mut self, raw: Event) -> (Option<Msg>, Option<Event>) {
         match raw {
             Event::FocusGained => {
                 self.focus.report(Focus::Focused);
-                self.sync_cursor();
                 (None, None)
             }
             Event::FocusLost => {
                 self.focus.report(Focus::Unfocused);
-                self.sync_cursor();
                 (None, None)
             }
             // The one place the host's view of a keypress is normalized, so
@@ -2039,18 +2474,14 @@ impl<'t> EventLoop<'t> {
     }
 
     /// Discovery landed or a provider was re-authenticated. Invalidating alone
-    /// would leave the tabs on stale providers, so dropping the built slots and
-    /// putting every session back on its own spec is a single step. The cache
-    /// in `ModelSlots` keeps that to one build per spec.
+    /// would leave the tabs on stale providers, so every session's spec builds
+    /// again, one build per spec, and [`Self::land_slot`] moves the tabs over.
     fn rebuild_models(&mut self) {
         self.slots.invalidate();
-        for idx in 0..self.sessions.len() {
-            let spec = self.sessions[idx].app.state.model.spec();
-            match self.slots.try_get(&spec) {
-                Ok(slot) => self.apply_model(idx, slot),
-                Err(error) => warn!(%spec, %error, "keeping the previous model"),
-            }
+        for rt in &self.sessions {
+            self.slots.request(&rt.app.state.model.spec());
         }
+        self.waiting.restart(&mut self.slots);
     }
 
     fn respawn_agent(&mut self, idx: usize, history: Vec<Message>, reason: Respawn) {
@@ -2110,28 +2541,16 @@ impl<'t> EventLoop<'t> {
             }
             Action::RestartAgent(history) => self.respawn_agent(idx, history, Respawn::Restart),
             Action::OpenFork(open) => self.open_fork(idx, *open),
-            Action::ChangeModel(spec) => {
-                if let Err(e) = self.change_model(&spec) {
-                    self.focused_app().flash(e);
-                }
-            }
+            Action::ChangeModel(spec) => self.change_model(spec, self.focused, PickOrigin::Picker),
             Action::RefreshProvider { slug } => self.refresh_provider(slug),
             Action::AssignTier(spec, tier) => {
-                maki_providers::model_registry::set_and_persist(spec, tier, &self.ctx.storage);
+                self.persist_tiers(model_registry::set(spec, tier));
             }
             Action::UnassignTier(spec, tier) => {
-                maki_providers::model_registry::unset_and_persist(&spec, tier, &self.ctx.storage);
+                self.persist_tiers(model_registry::unset(&spec, tier));
             }
             Action::Compact(instructions) => {
-                let rt = &mut self.sessions[idx];
-                rt.reset_run_notifications();
-                let run_id = rt.app.run_id;
-                let workflow = rt.app.state.workflow;
-                rt.handles.queue.push(QueueItem::Compact(Compaction {
-                    run_id,
-                    instructions,
-                    workflow,
-                }));
+                self.queue_compact(idx, instructions, CompactReason::Manual);
             }
             Action::ToggleMcp(server_name, enabled) => {
                 self.sessions[idx].handles.send_mcp(McpCommand::Toggle {
@@ -2158,6 +2577,13 @@ impl<'t> EventLoop<'t> {
             }
             Action::OpenEditor(path) => {
                 self.open_editor(idx, &path);
+            }
+            Action::OpenUrl(url) => {
+                spawn_blocking(move || {
+                    if let Err(e) = open::that_detached(&url) {
+                        warn!(error = %e, url, "failed to open browser");
+                    }
+                });
             }
             Action::EditInputInEditor => {
                 let current_text = self.sessions[idx].app.input_box.buffer.value();
@@ -2193,23 +2619,60 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    /// The one explicit pick, which is why it alone writes the last-used file.
-    /// Opening an old session must not change what the next `maki` starts on.
-    fn change_model(&mut self, spec: &str) -> Result<(), String> {
-        self.change_model_in(self.focused, spec, true)
+    fn change_model(&mut self, spec: String, idx: usize, origin: PickOrigin) {
+        let tab = Arc::downgrade(&self.sessions[idx].slot);
+        self.wait_for_slot(spec, Wanted::Pick(Pick { tab, origin }));
     }
 
-    /// Without {persist} only the tab at {idx} switches: a plugin steering a
-    /// background session from elsewhere is not the user picking a default.
-    fn change_model_in(&mut self, idx: usize, spec: &str, persist: bool) -> Result<(), String> {
-        let slot = self.slots.try_get(spec)?;
+    /// The one explicit pick, which is why it alone writes the last-used file.
+    /// Opening an old session must not change what the next `maki` starts on,
+    /// and neither does a plugin steering a tab with `persist = false`.
+    fn apply_pick(&mut self, pick: Pick, spec: String, slot: Arc<ModelSlot>) {
+        let Some(idx) = self
+            .sessions
+            .iter()
+            .position(|rt| Weak::ptr_eq(&Arc::downgrade(&rt.slot), &pick.tab))
+        else {
+            return self.refuse_pick(pick.origin, NOT_LIVE_ERR.to_owned());
+        };
+        let persist = match &pick.origin {
+            PickOrigin::Picker => true,
+            PickOrigin::Lua { persist, .. } => *persist,
+        };
         let picked = slot.model.spec();
         self.apply_model(idx, slot);
         if persist {
-            self.sessions[idx].app.record_recent_model(spec);
-            persist_model(&self.ctx.storage, &picked);
+            self.ctx
+                .picker_memory
+                .record_recent(&spec, &self.ctx.model_policy);
+            self.ctx.storage_writer.persist(move |dir| {
+                persist_model(dir, &picked);
+                push_recent(dir, &spec);
+            });
         }
-        Ok(())
+        if let PickOrigin::Lua {
+            thinking,
+            fast,
+            reply_tx,
+            ..
+        } = pick.origin
+        {
+            let _ = reply_tx.send(apply_settings(
+                &mut self.sessions[idx].app,
+                thinking,
+                fast,
+                persist,
+            ));
+        }
+    }
+
+    fn refuse_pick(&mut self, origin: PickOrigin, error: String) {
+        match origin {
+            PickOrigin::Picker => self.focused_app().flash(error),
+            PickOrigin::Lua { reply_tx, .. } => {
+                let _ = reply_tx.send(Err(error));
+            }
+        }
     }
 
     /// Prepares a package command as a task.
@@ -2276,10 +2739,15 @@ impl<'t> EventLoop<'t> {
             self.rebuild_models();
         } else if let Some(default_model) =
             maki_config::providers::builtin_provider(&slug).and_then(|b| b.default_model)
-            && let Err(e) = self.change_model(default_model)
         {
-            self.focused_app().flash(e);
+            self.change_model(default_model.to_owned(), self.focused, PickOrigin::Picker);
         }
+    }
+
+    fn persist_tiers(&self, overrides: BTreeMap<ModelTier, String>) {
+        self.ctx
+            .storage_writer
+            .persist(move |dir| model_registry::persist_overrides(dir, &overrides));
     }
 
     async fn shutdown(mut self) -> ShutdownReport {
@@ -2348,6 +2816,13 @@ impl<'t> EventLoop<'t> {
                 Vec::new()
             }
         };
+        self.stored_writes.close();
+        if timeout(AGENT_SHUTDOWN_TIMEOUT, self.stored_writes.wait())
+            .await
+            .is_err()
+        {
+            warn!("stored session writes did not finish within {AGENT_SHUTDOWN_TIMEOUT:?}");
+        }
         let storage_drain_ms = lap();
         info!(
             session_end_ms,
@@ -2380,14 +2855,27 @@ fn scroll_delta(kind: MouseEventKind, lines: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::tests::{MOVED_ID, app_with_moved_call, end_turn};
+    use crate::agent::model_slots::tests::{OTHER_SPEC, STARTUP_SPEC, slots, strict_policy};
+    use crate::app::tests::{
+        MOVED_ID, answer_permission, app_with_moved_call, ask_tool_permission, end_turn,
+        open_question_float, streaming_app, test_app,
+    };
     use crate::components::BackgroundOutcome;
     use maki_agent::DoneReason;
-    use maki_providers::TokenUsage;
+    use maki_providers::provider::BoxFuture;
+    use maki_providers::{
+        AgentError, ModelInfo, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
+        TokenUsage, UsageLimit,
+    };
+    use serde_json::json;
+    use tempfile::TempDir;
     use test_case::test_case;
     use tokio::sync::oneshot;
 
     const OBSERVATION: &str = "failed";
+    const ASKED_TOOL: &str = "bash";
+    const OTHER_TOOL: &str = "write";
+    const USER_TEXT: &str = "hello";
     const SHELL_RESULT: &str = "command finished";
 
     fn done_event() -> AgentEvent {
@@ -2430,6 +2918,61 @@ mod tests {
         assert_eq!(title, expected_title);
     }
 
+    struct QuotaProvider {
+        usage: Option<ProviderUsage>,
+    }
+
+    impl Provider for QuotaProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a serde_json::Value,
+            _: &'a UnboundedSender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
+            let usage = self.usage.clone();
+            Box::pin(async move { Ok(usage) })
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_usage_reply_finds_the_session_running_that_slug() {
+        let provider = QuotaProvider {
+            usage: Some(ProviderUsage {
+                plan: Some("lite".into()),
+                limits: vec![UsageLimit {
+                    label: "rotated key".into(),
+                    percentage: Some(7),
+                    reset_at: None,
+                    detail: None,
+                }],
+                ..Default::default()
+            }),
+        };
+        let model = Model::from_spec("anthropic/claude-opus-4-6").unwrap();
+        let slots = vec![Arc::new(ArcSwap::from_pointee(ModelSlot {
+            model,
+            provider: Arc::new(provider),
+        }))];
+
+        let reply = provider_usage_reply(slots, "anthropic".into())
+            .await
+            .unwrap();
+        assert_eq!(reply["plan"], json!("lite"));
+        assert_eq!(reply["limits"][0]["label"], json!("rotated key"));
+    }
+
     #[test]
     fn outcome_survives_drain_and_clears_on_next_run() {
         let mut state = due_completion();
@@ -2447,12 +2990,12 @@ mod tests {
 
         state.on_done(&done_event());
         assert!(state.waiting_for_drain());
-        assert_eq!(state.reconcile(None, SessionStatus::Idle), None);
+        assert_eq!(state.reconcile(&SessionStatus::Idle), None);
 
         state.on_drain();
         assert!(!state.waiting_for_drain());
         assert_eq!(
-            state.reconcile(None, SessionStatus::Idle),
+            state.reconcile(&SessionStatus::Idle),
             Some(Notification::TurnComplete {
                 response: Some("done".into())
             })
@@ -2463,33 +3006,30 @@ mod tests {
     #[test_case(true, false ; "new_work_drops_it")]
     fn due_completion_waits_while_the_session_works(new_work: bool, fires: bool) {
         let mut state = due_completion();
-        assert_eq!(state.reconcile(None, SessionStatus::Working), None);
+        assert_eq!(state.reconcile(&SessionStatus::Working), None);
 
         if new_work {
             state.on_queue_item_consumed();
         }
 
-        assert_eq!(state.reconcile(None, SessionStatus::Idle).is_some(), fires);
-        assert_eq!(state.reconcile(None, SessionStatus::Idle), None);
+        assert_eq!(state.reconcile(&SessionStatus::Idle).is_some(), fires);
+        assert_eq!(state.reconcile(&SessionStatus::Idle), None);
     }
 
     /// A background task can ask something after the turn ended. The turn
     /// still notifies once the user answers and the work is done.
     #[test]
     fn prompt_wins_over_completion_and_is_not_repeated_unchanged() {
-        let prompt = Notification::QuestionRequested;
+        let waiting = SessionStatus::NeedsInput(Attention::Question);
         let mut state = due_completion();
 
         assert_eq!(
-            state.reconcile(Some(prompt.clone()), SessionStatus::NeedsInput),
-            Some(prompt.clone())
+            state.reconcile(&waiting),
+            Some(Notification::Attention(Attention::Question))
         );
+        assert_eq!(state.reconcile(&waiting), None);
         assert_eq!(
-            state.reconcile(Some(prompt), SessionStatus::NeedsInput),
-            None
-        );
-        assert_eq!(
-            state.reconcile(None, SessionStatus::Idle),
+            state.reconcile(&SessionStatus::Idle),
             Some(Notification::TurnComplete { response: None })
         );
     }
@@ -2503,7 +3043,7 @@ mod tests {
         let completion = Notification::TurnComplete { response: None };
 
         assert_eq!(focus.allows(&completion), completion_fires);
-        assert!(focus.allows(&Notification::QuestionRequested));
+        assert!(focus.allows(&Notification::Attention(Attention::Question)));
     }
 
     fn stale_input() -> Focus {
@@ -2548,8 +3088,8 @@ mod tests {
     #[test]
     fn notification_selection_prefers_priority_then_session_order() {
         let completion = Notification::TurnComplete { response: None };
-        let first_prompt = Notification::QuestionRequested;
-        let second_prompt = Notification::AuthenticationRequired;
+        let first_prompt = Notification::Attention(Attention::Question);
+        let second_prompt = Notification::Attention(Attention::Authentication);
 
         let selected = select_notification(None, Some(completion));
         let selected = select_notification(selected, Some(first_prompt.clone()));
@@ -2584,6 +3124,55 @@ mod tests {
         assert_eq!(SessionStatus::of(&app), SessionStatus::Idle);
     }
 
+    /// The next permission prompt opens the moment one is answered, so the
+    /// session never leaves `needs_input` in between. Only a status that
+    /// names the prompt tells a plugin the session waits on something new.
+    #[test_case(OTHER_TOOL, true ; "another_tool_is_a_new_status")]
+    #[test_case(ASKED_TOOL, false ; "the_same_tool_reads_the_same")]
+    fn a_prompt_right_behind_an_answered_one(next_tool: &str, changed: bool) {
+        let mut app = test_app();
+        ask_tool_permission(&mut app, ASKED_TOOL);
+        let before = SessionStatus::of(&app);
+
+        answer_permission(&mut app);
+        ask_tool_permission(&mut app, next_tool);
+        assert_eq!(SessionStatus::of(&app) != before, changed);
+    }
+
+    /// The question tool asks mid-turn. The user has to hear about it, not
+    /// just see a spinner.
+    #[test]
+    fn a_question_outranks_the_turn_that_asks_it() {
+        let mut app = streaming_app();
+        assert_eq!(SessionStatus::of(&app), SessionStatus::Working);
+        open_question_float(&mut app);
+        assert_eq!(
+            SessionStatus::of(&app),
+            SessionStatus::NeedsInput(Attention::Question)
+        );
+    }
+
+    #[test]
+    fn a_live_entry_names_the_prompt_and_whether_the_session_resumes() {
+        let mut app = test_app();
+        let blank = live_entry(&app, true);
+        assert_eq!(blank["status"], STATUS_IDLE);
+        assert!(blank["attention"].is_null());
+        assert_eq!(blank["resumable"], false);
+
+        app.state
+            .session_mut()
+            .push_message(Message::user(USER_TEXT.into()));
+        ask_tool_permission(&mut app, ASKED_TOOL);
+        let waiting = live_entry(&app, true);
+        let asked = Attention::Permission {
+            tool: Some(ASKED_TOOL.into()),
+        };
+        assert_eq!(waiting["status"], STATUS_NEEDS_INPUT);
+        assert_eq!(waiting["attention"], asked.message());
+        assert_eq!(waiting["resumable"], true);
+    }
+
     const PACK_ANSWER: &str = "prepared";
 
     #[tokio::test]
@@ -2610,5 +3199,189 @@ mod tests {
         answer_tx.send(expected.clone()).unwrap();
         assert_eq!(pack_done(&mut pack).await, expected);
         assert!(pack.is_none());
+    }
+
+    const OPEN_ERROR: &str = "no such session";
+
+    #[tokio::test]
+    async fn a_panicked_open_answers_nothing_and_frees_the_slot() {
+        let mut opening = Some(AbortOnDropHandle::new(tokio::spawn(async {
+            panic!("the read broke")
+        })));
+        assert!(answered(&mut opening).await.is_none());
+        assert!(opening.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_open_wait_keeps_the_read() {
+        let (go_tx, go_rx) = oneshot::channel::<()>();
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        let mut opening = Some(AbortOnDropHandle::new(tokio::spawn(async move {
+            go_rx.await.unwrap();
+            Box::new(OpenedSession(
+                PendingFocus {
+                    reply_tx,
+                    from: MakiId::generate(),
+                },
+                Err(OPEN_ERROR.to_owned()),
+            ))
+        })));
+        tokio::select! {
+            biased;
+            _ = answered(&mut opening) => panic!("the read has not answered yet"),
+            () = ready(()) => {}
+        }
+        assert!(opening.is_some());
+
+        go_tx.send(()).unwrap();
+        let answer = answered(&mut opening).await.unwrap();
+        assert!(matches!(&*answer, OpenedSession(_, Err(e)) if e == OPEN_ERROR));
+        assert!(opening.is_none());
+    }
+
+    const THIRD_SPEC: &str = "opencode/third";
+    const OUT_OF_ORDER: &str = "a pick must wait for the picks made before it";
+    const SESSION_HELD: &str = "a session must not wait for a pick";
+    const NO_STARTUP_SLOT: &str = "the startup spec has a slot from the start";
+    const CREATED_CWD: &str = "/tmp";
+    const NOT_BUILDING: &str = "a waiter with no slot has a build running";
+    const NO_SLOT: &str = "every waiter here gets a slot";
+    const STALE_HELD: &str = "a slot from before an invalidate must not reach a waiter";
+
+    fn pick_for(tab: &Arc<ArcSwap<ModelSlot>>) -> Wanted {
+        Wanted::Pick(Pick {
+            tab: Arc::downgrade(tab),
+            origin: PickOrigin::Picker,
+        })
+    }
+
+    fn created(dir: &TempDir) -> Wanted {
+        let (reply_tx, _reply_rx) = oneshot::channel();
+        let storage = StateDir::from_path(dir.path().to_path_buf());
+        Wanted::Create(CreatedSession {
+            open: OpenSession::fresh(STARTUP_SPEC, CREATED_CWD, &storage),
+            prompt: None,
+            focus: false,
+            reply_tx,
+        })
+    }
+
+    async fn land_next(slots: &mut ModelSlots, waiting: &mut SlotWaiters) {
+        let landed = slots.next_built().await.expect(NOT_BUILDING);
+        if let Some((spec, built)) = slots.land(landed) {
+            waiting.landed(&spec, &built);
+        }
+    }
+
+    fn ready_specs(waiting: &mut SlotWaiters) -> Vec<(String, bool)> {
+        waiting
+            .take_ready()
+            .into_iter()
+            .map(|(waiter, built)| (waiter.spec, built.is_ok()))
+            .collect()
+    }
+
+    #[test_case(ModelPolicy::default(), false, &[(OTHER_SPEC, true), (THIRD_SPEC, true)] ; "two_builds_apply_in_order")]
+    #[test_case(ModelPolicy::default(), false, &[(OTHER_SPEC, true), (STARTUP_SPEC, true)] ; "a_built_spec_waits_behind_a_build")]
+    #[test_case(ModelPolicy::default(), true, &[(OTHER_SPEC, true), (STARTUP_SPEC, true)] ; "a_build_from_before_an_invalidate_runs_again")]
+    #[test_case(strict_policy(), false, &[(OTHER_SPEC, false), (STARTUP_SPEC, true)] ; "a_refused_pick_does_not_hold_up_the_queue")]
+    #[tokio::test]
+    async fn picks_settle_in_the_order_they_were_made(
+        policy: ModelPolicy,
+        invalidate_mid_build: bool,
+        expected: &[(&str, bool)],
+    ) {
+        let mut slots = slots(policy);
+        let tab = Arc::new(ArcSwap::from(
+            slots.get(STARTUP_SPEC).expect(NO_STARTUP_SLOT),
+        ));
+        let mut waiting = SlotWaiters::default();
+        for (spec, _) in expected {
+            waiting.push(&mut slots, (*spec).to_owned(), pick_for(&tab));
+        }
+        assert!(ready_specs(&mut waiting).is_empty(), "{OUT_OF_ORDER}");
+        assert_eq!(
+            waiting.pending_pick(&tab),
+            expected.last().map(|(spec, _)| *spec)
+        );
+        if invalidate_mid_build {
+            slots.invalidate();
+            waiting.restart(&mut slots);
+        }
+
+        let mut settled = Vec::new();
+        while settled.len() < expected.len() {
+            land_next(&mut slots, &mut waiting).await;
+            settled.extend(ready_specs(&mut waiting));
+        }
+
+        let expected: Vec<(String, bool)> = expected
+            .iter()
+            .map(|(spec, built)| ((*spec).to_owned(), *built))
+            .collect();
+        assert_eq!(settled, expected, "{OUT_OF_ORDER}");
+        assert_eq!(waiting.pending_pick(&tab), None);
+    }
+
+    #[tokio::test]
+    async fn a_pick_held_through_an_invalidate_gets_a_slot_built_after_it() {
+        let mut slots = slots(ModelPolicy::default());
+        let before = slots.get(STARTUP_SPEC).expect(NO_STARTUP_SLOT);
+        let tab = Arc::new(ArcSwap::from(Arc::clone(&before)));
+        let mut waiting = SlotWaiters::default();
+        waiting.push(&mut slots, OTHER_SPEC.to_owned(), pick_for(&tab));
+        waiting.push(&mut slots, STARTUP_SPEC.to_owned(), pick_for(&tab));
+        slots.invalidate();
+        waiting.restart(&mut slots);
+
+        let mut settled = Vec::new();
+        while settled.len() < 2 {
+            land_next(&mut slots, &mut waiting).await;
+            settled.extend(waiting.take_ready());
+        }
+        let Some((_, Ok(startup))) = settled.last() else {
+            panic!("{NO_SLOT}");
+        };
+        assert!(!Arc::ptr_eq(startup, &before), "{STALE_HELD}");
+    }
+
+    #[tokio::test]
+    async fn a_session_comes_up_while_an_earlier_pick_still_builds() {
+        let mut slots = slots(ModelPolicy::default());
+        let tab = Arc::new(ArcSwap::from(
+            slots.get(STARTUP_SPEC).expect(NO_STARTUP_SLOT),
+        ));
+        let mut waiting = SlotWaiters::default();
+        waiting.push(&mut slots, OTHER_SPEC.to_owned(), pick_for(&tab));
+        let dir = TempDir::new().unwrap();
+        waiting.push(&mut slots, STARTUP_SPEC.to_owned(), created(&dir));
+
+        assert_eq!(
+            ready_specs(&mut waiting),
+            [(STARTUP_SPEC.to_owned(), true)],
+            "{SESSION_HELD}"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_waiters_on_one_spec_share_its_build() {
+        let mut slots = slots(ModelPolicy::default());
+        let mut waiting = SlotWaiters::default();
+        let dir = TempDir::new().unwrap();
+        waiting.push(&mut slots, OTHER_SPEC.to_owned(), created(&dir));
+        waiting.push(&mut slots, OTHER_SPEC.to_owned(), created(&dir));
+
+        land_next(&mut slots, &mut waiting).await;
+        let ready = waiting.take_ready();
+        assert_eq!(ready.len(), 2);
+        let [(_, Ok(first)), (_, Ok(second))] = &ready[..] else {
+            panic!("{NO_SLOT}");
+        };
+        assert!(Arc::ptr_eq(first, second));
+        assert!(
+            timeout(Duration::ZERO, slots.next_built())
+                .await
+                .is_ok_and(|next| next.is_none())
+        );
     }
 }

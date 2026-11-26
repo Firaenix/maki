@@ -86,8 +86,8 @@ const IS_PARKED_TEXT: &str = "true";
 const MOVED_HEADER: &str = "Still running in the background, each reports back as it finishes:";
 const MOVED_BY_USER: &str = "Moved to the background by the user";
 const MOVED_AS_ASKED: &str = "Started in the background as asked";
-const FOREGROUND_NOTE_HEAD: &str = "Could not start in the background (";
-const FOREGROUND_NOTE_TAIL: &str = "). Ran in the foreground.\n\n";
+const FOREGROUND_NOTE_HEAD: &str = "[Could not start in the background (";
+const FOREGROUND_NOTE_TAIL: &str = "). Ran in the foreground.]\n\n";
 const WAITING_ON_EDIT: &str = "batch is waiting on edit";
 const MARKDOWN_FORMAT: &str = "markdown";
 
@@ -1524,7 +1524,7 @@ impl MovableBatch {
         tool_calls: Value,
         permissions: PluginPermissions,
     ) -> (Self, JoinHandle<ToolDoneEvent>) {
-        let (reg, host) = load_batch_host_as(MOVABLE_CHILD_SRC, permissions);
+        let (reg, mut host) = load_batch_host_as(MOVABLE_CHILD_SRC, permissions);
         let ui = host.take_ui_action_rx().unwrap();
         let Chat { id, mailbox, seed } = Chat::live();
         let (run, run_token) = CancelToken::new();
@@ -1784,7 +1784,11 @@ fn batch_parts_keep_their_place_and_leave_subagents_out() {
         ("2", EDIT_TOOL, PartStatus::Done),
         ("3", "slow", PartStatus::Done),
     ]);
-    assert!(!call.join().expect("batch thread").is_error);
+    let reply = call.join().expect("batch thread").output.as_text();
+    assert!(
+        reply.starts_with(&section(HOOKED_TOOL, "hooked:agent")),
+        "a reply that never moved keeps the plain header restore parses: {reply}"
+    );
 }
 
 /// A stopped batch lists what it cut short as cancelled, and what had

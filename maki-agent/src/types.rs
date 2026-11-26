@@ -2,7 +2,7 @@ use std::any::Any;
 use std::fmt::Write;
 use std::ops::AddAssign;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
@@ -15,12 +15,15 @@ use maki_providers::{
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use strum::Display;
-use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::{Notify, watch};
+use tracing::warn;
 
 use crate::{PermissionPreview, SessionControl};
 
 pub const NO_FILES_FOUND: &str = "No files found";
+const UNPRICED_UNDER_CAP: &str =
+    "maki has no price for this model, so --max-budget-usd does not count its turns";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrepFileEntry {
@@ -615,6 +618,8 @@ pub enum DoneReason {
     EndTurn,
     MaxTokens,
     MaxTurns,
+    /// The session spent its `max_budget_usd`.
+    MaxBudget,
     Cancelled,
     /// A manual `/compact` ended the run, but no user turn ended with it, so
     /// a goal loop should not treat this as a turn boundary.
@@ -642,6 +647,11 @@ pub enum SteerKind {
     MessageDropped,
     /// `agent.stop` kept the run going after the model ended its turn.
     Continued,
+    /// `agent.compact.before` deferred an automatic compaction; the text is
+    /// the nudge that becomes the model's next message.
+    CompactDeferred,
+    /// The layer's post-compaction words from `agent.compact.before`.
+    CompactContinued,
 }
 
 /// Why a session ended, as `SessionEnd` handlers see it in `data.reason`.
@@ -661,7 +671,8 @@ pub enum SessionEndReason {
     /// `/reload` is rebuilding the plugin host. The session carries on in the
     /// next generation, so a handler cleaning up for good wants `Shutdown`.
     Reload,
-    /// An ACP client started or loaded a session over this one.
+    /// An ACP client loaded this session again while it was open, and the
+    /// reload took its place.
     Replaced,
     /// A headless run finished.
     Completed,
@@ -890,10 +901,12 @@ impl UiWaker {
 }
 
 /// Append-only buffer for streaming tool output to the UI. Writers append
-/// under a Mutex, readers get a cheap Arc clone through a [`BufWatch`].
+/// to a watch channel, readers get a cheap Arc clone through a [`BufWatch`].
 pub struct SharedBuf {
-    committed: Mutex<BufferSnapshot>,
-    version: AtomicU64,
+    committed: watch::Sender<BufferSnapshot>,
+    /// Never marks anything seen, so a watch cloned from it sees the buf's
+    /// content once a write happened, and nothing on an untouched buf.
+    unseen: watch::Receiver<BufferSnapshot>,
     /// Only a buffer shown in a plugin window gets one, since the UI reads
     /// those on a tick. A tool body is repainted by the agent events that
     /// carry it.
@@ -908,9 +921,10 @@ pub struct SharedBuf {
 
 impl SharedBuf {
     pub fn new() -> Self {
+        let (committed, unseen) = watch::channel(BufferSnapshot::default());
         Self {
-            committed: Mutex::default(),
-            version: AtomicU64::new(0),
+            committed,
+            unseen,
             waker: OnceLock::new(),
             on_change: Mutex::new(None),
             click: Mutex::new(None),
@@ -969,10 +983,9 @@ impl SharedBuf {
     }
 
     pub fn append(&self, line: SnapshotLine) {
-        let mut guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
-        Arc::make_mut(&mut guard.lines).push(line);
-        drop(guard);
-        self.changed();
+        self.committed
+            .send_modify(|snapshot| Arc::make_mut(&mut snapshot.lines).push(line));
+        self.notify_change();
     }
 
     pub fn set_lines(&self, lines: Vec<SnapshotLine>) {
@@ -981,26 +994,15 @@ impl SharedBuf {
 
     /// See [`BufferSnapshot::head`].
     pub fn set_lines_with_head(&self, lines: Vec<SnapshotLine>, head: usize) {
-        let mut guard = self.committed.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = BufferSnapshot {
+        self.committed.send_replace(BufferSnapshot {
             lines: Arc::new(lines),
             head,
-        };
-        drop(guard);
-        self.changed();
-    }
-
-    fn changed(&self) {
-        self.version.fetch_add(1, Ordering::Release);
+        });
         self.notify_change();
     }
 
     pub fn len(&self) -> usize {
-        self.committed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .lines
-            .len()
+        self.committed.borrow().lines.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1012,10 +1014,7 @@ impl SharedBuf {
     }
 
     pub fn take(&self) -> BufferSnapshot {
-        self.committed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.committed.borrow().clone()
     }
 }
 
@@ -1024,26 +1023,25 @@ impl SharedBuf {
 /// own mark, and one reading never hides a change from the other.
 pub struct BufWatch {
     buf: Arc<SharedBuf>,
-    seen: u64,
+    rx: watch::Receiver<BufferSnapshot>,
 }
 
 impl BufWatch {
     pub fn new(buf: Arc<SharedBuf>) -> Self {
-        Self { buf, seen: 0 }
+        let rx = buf.unseen.clone();
+        Self { buf, rx }
     }
 
     pub fn buf(&self) -> &Arc<SharedBuf> {
         &self.buf
     }
 
-    /// The buf's lines, if they changed since this watch last looked. The
-    /// copy may already hold a later change, which the next look reads again.
+    /// The buf's lines, if they changed since this watch last looked.
     pub fn changed(&mut self) -> Option<BufferSnapshot> {
-        let version = self.buf.version.load(Ordering::Acquire);
-        (version != self.seen).then(|| {
-            self.seen = version;
-            self.buf.take()
-        })
+        self.rx
+            .has_changed()
+            .unwrap_or(false)
+            .then(|| self.rx.borrow_and_update().clone())
     }
 }
 
@@ -1302,9 +1300,32 @@ impl CostTally {
 pub struct RunLedger {
     totals: Mutex<RunTotals>,
     parent: Option<Arc<RunLedger>>,
+    /// The session's dollar cap. Only a root ledger has one: children pass
+    /// their spend up, so the root sees every run, subagent and compaction.
+    cap: Option<f64>,
+    warned_unpriced: AtomicBool,
 }
 
 impl RunLedger {
+    /// A root ledger that stops the session once `limit_usd` is spent.
+    pub fn capped(limit_usd: f64) -> Self {
+        Self {
+            cap: Some(limit_usd),
+            ..Self::default()
+        }
+    }
+
+    /// Whether this ledger or one above it has spent its cap. Spend is booked
+    /// after the fact, so the check sits before each request.
+    pub fn exhausted(&self) -> bool {
+        self.cap
+            .is_some_and(|cap| self.totals().cost.is_some_and(|spent| spent >= cap))
+            || self
+                .parent
+                .as_ref()
+                .is_some_and(|parent| parent.exhausted())
+    }
+
     pub fn child(parent: &Arc<Self>) -> Arc<Self> {
         Self::carrying(parent, RunTotals::default())
     }
@@ -1315,6 +1336,7 @@ impl RunLedger {
         Arc::new(Self {
             totals: Mutex::new(carried),
             parent: Some(Arc::clone(parent)),
+            ..Self::default()
         })
     }
 
@@ -1324,6 +1346,13 @@ impl RunLedger {
             cost,
             list_cost,
         };
+        if self.first_unpriced_turn_under_cap(cost) {
+            warn!(
+                cap_usd = self.cap,
+                "unpriced turn, budget cap cannot count it"
+            );
+            eprintln!("warning: {UNPRICED_UNDER_CAP}");
+        }
         if let Some(parent) = &self.parent {
             parent.add(usage, cost, list_cost);
         }
@@ -1331,6 +1360,10 @@ impl RunLedger {
 
     pub fn totals(&self) -> RunTotals {
         *self.locked()
+    }
+
+    fn first_unpriced_turn_under_cap(&self, cost: Option<f64>) -> bool {
+        self.cap.is_some() && cost.is_none() && !self.warned_unpriced.swap(true, Ordering::Relaxed)
     }
 
     /// A poisoned lock only means another run panicked mid-update. The totals
@@ -1880,16 +1913,14 @@ mod tests {
         assert_eq!(buf.read().len(), 3);
     }
 
-    #[test]
-    fn shared_buf_poisoned_mutex_recovery() {
+    #[test_case(&[],         ""     ; "emptied_buf_reports_the_write")]
+    #[test_case(&["a", "b"], "a\nb" ; "written_buf_shows_its_content")]
+    fn fresh_watch_sees_what_was_written(written: &[&str], expected: &str) {
         let buf = Arc::new(SharedBuf::new());
-        let buf2 = Arc::clone(&buf);
-        let h = std::thread::spawn(move || {
-            let _guard = buf2.committed.lock().unwrap();
-            panic!("intentional poison");
-        });
-        let _ = h.join();
-        buf.append(SnapshotLine { spans: vec![] });
+        buf.set_lines(written.iter().copied().map(line).collect());
+        let mut watch = BufWatch::new(buf);
+        assert_eq!(watch.changed().unwrap().text(), expected);
+        assert!(watch.changed().is_none());
     }
 
     #[test]
@@ -2242,5 +2273,36 @@ mod tests {
             retained.send(AgentEvent::Nudge),
             Err(AgentError::Channel)
         ));
+    }
+
+    #[test]
+    fn capped_ledger_sees_spend_from_every_child() {
+        let root = Arc::new(RunLedger::capped(0.01));
+        let run = RunLedger::child(&root);
+        let subagent = RunLedger::child(&run);
+
+        subagent.add(TokenUsage::default(), Some(0.004), None);
+        assert!(!run.exhausted());
+        subagent.add(TokenUsage::default(), Some(0.007), None);
+        assert!(run.exhausted() && subagent.exhausted() && root.exhausted());
+        assert!(!RunLedger::child(&Arc::default()).exhausted());
+    }
+
+    #[test]
+    fn unpriced_turns_never_exhaust_the_cap_and_warn_once() {
+        let root = Arc::new(RunLedger::capped(0.01));
+        let subagent = RunLedger::child(&root);
+        subagent.add(usage(FIRST_INPUT), None, None);
+
+        assert!(!root.exhausted());
+        assert!(root.warned_unpriced.load(Ordering::Relaxed));
+        assert!(!root.first_unpriced_turn_under_cap(None));
+    }
+
+    #[test_case(None, None ; "uncapped")]
+    #[test_case(Some(0.01), Some(FIRST_COST) ; "priced")]
+    fn only_an_unpriced_turn_under_a_cap_warns(cap: Option<f64>, cost: Option<f64>) {
+        let ledger = cap.map_or_else(RunLedger::default, RunLedger::capped);
+        assert!(!ledger.first_unpriced_turn_under_cap(cost));
     }
 }

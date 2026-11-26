@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::path::Path;
-use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,7 +27,7 @@ use mlua::{
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 use crate::api::image::LuaImage;
 use crate::api::options::{PluginOpts, register_options__doc, register_options__register};
@@ -288,39 +287,43 @@ impl Tool for LuaTool {
         &self.meta.name
     }
 
+    /// Only the Lua thread can answer in place. Every other caller gets the
+    /// static text here and the plugin's own through [`Self::describe`].
     fn description(&self, ctx: &DescriptionContext) -> Cow<'_, str> {
+        self.has_describe_fn
+            .then(|| local_describe(&self.plugin, &self.meta.name, &dctx_json(ctx)))
+            .flatten()
+            .flatten()
+            .map_or(Cow::Borrowed(&self.meta.description), Cow::Owned)
+    }
+
+    fn describe(&self, ctx: &DescriptionContext) -> Option<BoxFuture<'static, Option<String>>> {
         if !self.has_describe_fn {
-            return Cow::Borrowed(&self.meta.description);
+            return None;
         }
-        let dctx = dctx_json(ctx);
-        if let Some(result) = local_describe(&self.plugin, &self.meta.name, &dctx) {
-            return match result {
-                Some(s) => Cow::Owned(s),
-                None => Cow::Borrowed(&self.meta.description),
-            };
-        }
-        let (reply_tx, reply_rx) = sync_channel(1);
-        let sent = self
-            .tx
+        let (reply, answer) = oneshot::channel();
+        let tool = Arc::clone(&self.meta.name);
+        self.tx
             .send(Request::Describe {
                 plugin: Arc::clone(&self.plugin),
-                tool: Arc::clone(&self.meta.name),
-                dctx,
-                reply: reply_tx,
+                tool: Arc::clone(&tool),
+                dctx: dctx_json(ctx),
+                reply,
             })
-            .is_ok();
-        if sent {
-            match reply_rx.recv_timeout(DESCRIBE_TIMEOUT) {
-                Ok(Some(s)) => return Cow::Owned(s),
-                Ok(None) => {}
-                Err(e) => tracing::warn!(
-                    tool = %self.meta.name,
-                    error = %e,
-                    "describe round trip failed; falling back to static description"
-                ),
+            .ok()?;
+        Some(Box::pin(async move {
+            match timeout(DESCRIBE_TIMEOUT, answer).await {
+                Ok(Ok(text)) => text,
+                unanswered => {
+                    tracing::warn!(
+                        %tool,
+                        ?unanswered,
+                        "describe got no answer; falling back to static description"
+                    );
+                    None
+                }
             }
-        }
-        Cow::Borrowed(&self.meta.description)
+        }))
     }
 
     fn schema(&self) -> Value {
@@ -797,6 +800,11 @@ fn register_prompt(
 ///   name            (string)   Required. ASCII identifier, up to 64 chars ([a-zA-Z_][a-zA-Z0-9_]*).
 ///   description     (string)   Required. Non-empty description shown to the model.
 ///   schema          (table)    Required. JSON Schema object describing the tool's input parameters.
+///                              A property can also carry keys the model never sees:
+///                                alias         (string|string[]) Other names the model may send for this property, with the real name winning when both arrive.
+///                                hint          (string)  Appended to the error when this required property is missing or its enum value does not match.
+///                                value_alias   (table)   Enum values the model may send in place of a variant, e.g. `{ done = "completed" }`. Each target must be a variant.
+///                                accept_single (boolean) When this required array of objects is missing, accept its item's fields sent at the parent level and wrap them into a one-item array.
 ///   handler         (function) Required. Called with `(input, ctx)` when the tool is invoked.
 ///                              Must return a string or a table with any of these fields:
 ///                                llm_output  (string)  Result text for the model or the calling code.
@@ -820,7 +828,7 @@ fn register_prompt(
 ///   describe        (function) Optional. Returns a custom description string for the current context.
 ///   examples        (table)    Optional. Array of example input objects for documentation.
 ///   permission_scopes (string|function) Field name in schema (string) or `function(input)` returning a list of path scopes that need write permission. Declaring it is what puts the tool in front of the permission prompt, and it requires `permission`.
-///   permission      (string|table) The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. Pass `{}` when the tool reaches nothing past the conversation it runs in: its handler calls no guarded `maki` function and no other tool. `{}` is the tool form of `capability = {}` on slots and actions, needs no grant, makes the tool free to hand to a session, and cannot go with `permission_scopes` or `mutable_path`. Older maki versions refuse `{}`, so set `min_maki_version`. Leaving `permission` out costs those plugins every permission except `agent` and `input`.
+///   permission      (string|table) The capability the tool reaches: "fs_read", "fs_write", "net", "run", or "env". Your plugin must hold it, and so must any plugin that pre-approves the tool, hooks it, or hands it to a session. Without `permission_scopes` the tool never prompts, the right declaration for read-only tools. Pass `{}` when the handler calls no guarded `maki` function and no other tool. Such a tool needs no grant and is free to hand to a session. It cannot have `permission_scopes` or `mutable_path`, and older maki versions refuse it, so set `min_maki_version`. Leaving `permission` out costs those plugins every permission except `agent` and `input`.
 ///   mutable_path    (string)   Schema field name (type: string) for the primary path the tool writes. Required with `permission = "fs_write"`. Declaring it is what gets the tool, from the dispatcher and never from the handler: serialization of concurrent calls on that file, the stale-read rejection, the plan-mode block, and the permission boundary check.
 ///   start_annotation (string|table) Schema field used to annotate the start header with a count (string) or timeout (`{ field, kind="timeout" }`).
 ///   needs_background (boolean) Offer the tool only to a model that can move a call to the background itself: the main agent of a session where background tasks are on. Default: false. A schema property can set the same key to hide just that (optional) parameter. The choice is made when the session's tool list is built, and a call that names a hidden parameter still validates.
@@ -1190,20 +1198,16 @@ async fn list_commands(
 ///
 /// A function `content` is called before every run. Its first value goes in
 /// the system prompt, and later changes reach the model as a context update
-/// until the next compaction.
+/// until the next compaction. `maki -p`, the SDK and ACP call it once, at
+/// startup.
 ///
 /// @param spec table Hint specification:
 ///   slot    (string)         Required. Aggregate slot name (e.g. "tool_usage", "conventions").
 ///   content (string|function) Required. Static text, or a `function(ctx)` that
-///                            returns a string. Max 1 MiB. `ctx` is
-///                            `{ session_id = "..." }` naming the session whose
-///                            prompt is being built, or nil when there really
-///                            is no session (startup, ACP clients).
-///   prompt  (string|string[]) Optional. Restrict to specific prompt ids
-///                            (e.g. "system"). Entries resolve with the run's
-///                            other prompt slots, so nothing caches them
-///                            across turns. One-shot clients (`maki -p`, the
-///                            SDK, ACP) resolve all hints once at startup.
+///                            returns a string. Max 1 MiB. `ctx.session_id` is
+///                            the session whose prompt is being built. `ctx` is
+///                            nil with no session (startup, ACP).
+///   prompt  (string|string[]) Optional. Restrict to specific prompt ids (e.g. "system").
 /// @return
 /// @example
 /// maki.api.register_prompt_hint({
@@ -1242,7 +1246,7 @@ fn register_prompt_hint(lua: &Lua, #[ctx] plugin: Arc<str>, spec: Table) -> LuaR
 ///
 /// Identity and tone are available in system, research, and general prompts.
 /// Sections target the main agent when `prompt` is omitted. Only identity and
-/// tone accept a function called before every run; it receives `ctx` as in
+/// tone accept a function, called before every run with `ctx` as in
 /// `register_prompt_hint`. Its first value goes in the system prompt. Later
 /// changes reach the main agent as a context update.
 /// Other replacements require static strings.
@@ -1316,10 +1320,7 @@ fn list_plugins(lua: &Lua) -> LuaResult<mlua::Value> {
 /// Each entry has the tool's name, schema, audiences, and an `enabled` flag.
 /// Describe callbacks are not invoked (the static description is used).
 ///
-/// `permission` is what the tool reaches, as a list like `get_slots`
-/// `capability`: `{ "fs_read" }`, `{}` when it reaches nothing, or nil when
-/// it declared none, which costs every permission. A tool registered with
-/// `permission = "fs_read"` reads back as `{ "fs_read" }`.
+/// `permission` is as in `get_tool`.
 ///
 /// @param opts table? Options:
 ///   config (table) Optional config table with a `disabled_tools` string[] field used to compute the `enabled` flag on each entry.
@@ -1368,10 +1369,9 @@ fn get_tools(lua: &Lua, opts: Option<Table>) -> LuaResult<Table> {
 /// `background_params` lists the parameters marked `needs_background`,
 /// which only a session that can move calls to the background sees.
 ///
-/// `permission` is what the tool reaches, as a list like `get_slots`
-/// `capability`: `{ "fs_read" }`, `{}` when it reaches nothing, or nil when
-/// it declared none, which costs every permission. MCP tools and
-/// `tool_search` declare none.
+/// `permission` lists what the tool reaches, shaped like `capability` from
+/// `get_slots`: `{ "fs_read" }`, `{}` for nothing, or nil when the tool
+/// declared none (MCP tools and `tool_search` included).
 ///
 /// @param name string Exact tool name.
 /// @return (table|nil) Tool entry with fields { name, schema, audiences, kind?, permission?, background_params?, header?, restore?, format? }, or nil if not found.
@@ -2220,6 +2220,8 @@ mod tests {
     use crate::runtime::wake_or_fail;
 
     const BACKGROUND_PARAM: &str = "background";
+    const DESCRIBED: &str = "described by the plugin";
+    const NO_DESCRIBE_REQUEST: &str = "describe must ask the host before it is awaited";
 
     #[test_case::test_case(Some(serde_json::json!({ "properties": { "command": {} } })), &[BACKGROUND_PARAM] ; "a_hidden_param")]
     #[test_case::test_case(Some(serde_json::json!({ "properties": { "command": {}, "background": {} } })), &[] ; "offered_everywhere")]
@@ -2247,7 +2249,7 @@ mod tests {
             .collect();
         assert!(
             missing.is_empty(),
-            "seams missing from the doc: {missing:?}"
+            "seams missing from the doc: {missing:?}",
         );
     }
 
@@ -2355,19 +2357,45 @@ mod tests {
         assert_eq!(inv.start_annotation(), expected);
     }
 
+    const DESCRIBE_CTX: DescriptionContext = DescriptionContext {
+        filter: &ToolFilter::All,
+        audience: ToolAudience::MAIN,
+        workflow: false,
+        mcp: false,
+    };
+
     #[test]
     fn describe_falls_back_to_static_description_when_runtime_unavailable() {
-        use maki_agent::tools::ToolFilter;
-
         let mut tool = make_lua_tool(None);
         tool.has_describe_fn = true;
-        let ctx = DescriptionContext {
-            filter: &ToolFilter::All,
-            audience: ToolAudience::MAIN,
-            workflow: false,
-            mcp: false,
+        assert!(tool.describe(&DESCRIBE_CTX).is_none());
+        assert_eq!(tool.description(&DESCRIBE_CTX), "test");
+    }
+
+    type DescribeReply = oneshot::Sender<Option<String>>;
+
+    #[test_case::test_case(|reply| { let _ = reply.send(Some(DESCRIBED.into())); None }, Some(DESCRIBED) ; "answered")]
+    #[test_case::test_case(|_| None, None ; "host_gone")]
+    #[test_case::test_case(Some, None ; "host_never_answers")]
+    #[tokio::test(start_paused = true)]
+    async fn describe_waits_for_the_host(
+        host: fn(DescribeReply) -> Option<DescribeReply>,
+        expected: Option<&str>,
+    ) {
+        let (tx, mut rx) = unbounded_channel();
+        let tool = LuaTool {
+            tx,
+            has_describe_fn: true,
+            ..make_lua_tool(None)
         };
-        assert_eq!(tool.description(&ctx), "test");
+        let asked = tool.describe(&DESCRIBE_CTX).unwrap();
+        let Ok(Request::Describe { reply, .. }) = rx.try_recv() else {
+            panic!("{NO_DESCRIBE_REQUEST}");
+        };
+        let _unanswered = host(reply);
+
+        assert_eq!(asked.await.as_deref(), expected);
+        assert_eq!(tool.description(&DESCRIBE_CTX), "test");
     }
 
     fn make_lua_tool(scopes: Option<PermissionScopeKind>) -> LuaTool {

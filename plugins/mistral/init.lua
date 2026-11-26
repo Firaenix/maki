@@ -99,10 +99,19 @@ local function parse_model(m)
   }
 end
 
+local opts = maki.api.register_options({
+  responses_api = {
+    default = false,
+    type = "boolean",
+    desc = "Use the Responses API (/v1/responses) instead of chat completions (/v1/chat/completions). Off by default while the path is still being tested.",
+  },
+})
+
 maki.provider.register({
   slug = "mistral",
   display_name = "Mistral",
-  codec = "openai",
+  codec = opts.responses_api and "openai-responses" or "openai",
+  replay_reasoning = opts.responses_api,
   base_url = "https://api.mistral.ai/v1",
   api_key_env = "MISTRAL_API_KEY",
   login_url = "https://admin.mistral.ai/organization/api-keys",
@@ -124,7 +133,7 @@ maki.provider.register({
   context_window = 128000,
   aperture = { path_prefix = "/v1" },
   docs = {
-    features = "`/usage` reads the plan and monthly Vibe Code allowance from `/v1/billing/subscription` and `/v1/billing/budget` (the budget needs the `see_org_inference_usage` permission)",
+    features = "`/usage` shows the plan and the monthly Vibe Code allowance. The allowance shows only when the key has the `see_org_inference_usage` permission",
   },
   models = {
     {

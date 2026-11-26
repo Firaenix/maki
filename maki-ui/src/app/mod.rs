@@ -45,7 +45,7 @@ use crate::components::keybindings::key;
 use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::lua_float::FloatManager;
 use crate::components::mcp_picker::{McpPicker, McpPickerAction};
-use crate::components::model_picker::{ModelPicker, ModelPickerAction};
+use crate::components::model_picker::{ModelPicker, ModelPickerAction, PickerMemory};
 use crate::components::pack_review::{PackReview, PackReviewAction};
 use crate::components::permission_prompt::{AnsweredRequest, PermissionPrompt};
 use crate::components::plan_form::{PlanForm, PlanFormAction};
@@ -68,20 +68,21 @@ use maki_agent::{
     AgentEvent, Envelope, McpConfigErrors, McpSnapshotReader, SessionMailbox, SharedBuf,
     SharedMessages, ToolPart,
 };
+use maki_config::UiConfig;
 use maki_config::project::{self, GatedFile, TrustState};
-use maki_config::{ModelPolicy, UiConfig};
 use maki_lua::agent_autocmd::HostEvent;
 use maki_lua::{
-    BuiltinAction, EventHandle, HintReader, HintSnapshot, InputDecorate, InputEdit, InputMarks,
-    InputMode, InputRule, InputRulesReader, InputSnapshot, InputSubmit, Key, KeymapReader,
-    LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, Permission, PluginReach,
-    WinView, is_reserved,
+    BuiltinAction, ChatItem, EventHandle, HintReader, HintSnapshot, InputDecorate, InputEdit,
+    InputMarks, InputMode, InputRule, InputRulesReader, InputSnapshot, InputSubmit, Key,
+    KeymapReader, LuaCommandReader, PLAN_FORM_SLOT_DEADLINE, PLAN_ROW_HANDLER_DEADLINE, Permission,
+    PluginReach, WinView, is_reserved,
 };
 use maki_providers::models_cache::ModelList;
 use maki_providers::{ContentBlock, Message, Model, ThinkingConfig};
 use maki_storage::StateDir;
 use maki_storage::input_history::InputHistory;
-use maki_storage::model::persist_thinking;
+use maki_storage::model::{persist_expanded_providers, persist_thinking};
+use maki_storage::sessions::StoredThinking;
 
 use crate::storage_writer::StorageWriter;
 use ratatui::layout::{Position, Rect};
@@ -169,8 +170,6 @@ pub(crate) const TRUSTED_VACANT_MSG: &str =
 pub(crate) const RESOLVED_BY_USER: &str = "user";
 pub(crate) const RESOLVED_BY_CANCEL: &str = "cancelled";
 const TRUSTED_PREFIX: &str = "Trusted this folder: ";
-const PROVIDER_FOLDED_SUFFIX: &str = ": folded away";
-const PROVIDER_UNFOLDED_SUFFIX: &str = ": unfolded";
 const PACK_CHANGES_DECLINED: &str = "Package changes declined";
 pub(crate) const HELD_KEYS_DROPPED: &str =
     "Dropped the keys typed before a prompt opened, so they could not answer it";
@@ -217,19 +216,23 @@ pub(crate) const UNKNOWN_WRITER: &str = "a plugin";
 /// drifted apart. So a new overlay goes in here, where it answers keys, and the
 /// compiler points at every `match` that has to place it.
 ///
-/// This is not the paint order: the permission prompt is drawn under every
-/// picker, yet answers before them.
+/// This is not the paint order: the permission prompt, pack review and plan
+/// form sit in the bottom panel under every modal, picker and float, yet
+/// answer before the modals and pickers once no alert or focused floating Lua
+/// window holds the keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter)]
 enum KeyboardOwner {
     /// Drawn above everything else, so it answers keys before anything else.
     Alert,
-    /// The focused Lua window takes every key, ahead of maki's own modals and
-    /// the permission prompt: it paints over them, and a window the user
-    /// cannot close is worse than a prompt that waits one `q` longer. An
-    /// unfocused or hidden popup never holds the keyboard.
-    FocusedWindow,
-    /// A tool is blocked on it and it owns the bottom panel, so with the pack
-    /// review also up it goes first. The pack review waits on nothing.
+    /// A focused floating Lua window, drawn under only [`Self::Alert`], so it
+    /// answers before the permission prompt, pack review and plan form. The
+    /// one exception is `<C-c>`, which still denies a permission prompt under
+    /// it, so a plugin that stopped reading keys cannot hang the tool call.
+    /// An unfocused popup never holds the keyboard.
+    FocusedFloat,
+    /// A tool is blocked on it and it owns the bottom panel, hiding the pack
+    /// review and plan form, so after [`Self::FocusedFloat`] it goes before
+    /// both. The pack review waits on nothing.
     Permission,
     PackReview,
     /// Hands `<Tab>` on to the owner under it, see [`PlanFormAction::Passthrough`].
@@ -237,6 +240,11 @@ enum KeyboardOwner {
     Help,
     Usage,
     Btw,
+    /// A focused Lua split. The prompts in the bottom panel answer first: a
+    /// side split sits beside the panel, not over it, and a `below` split is
+    /// taken out of the layout while the panel is up. An unfocused split
+    /// never holds the keyboard.
+    FocusedSplit,
     Search,
     FilePicker,
     Queue,
@@ -417,28 +425,57 @@ impl InputWriter {
     }
 }
 
+/// What a session waits on the user for. The one list of prompts: the
+/// `needs_input` status, the notifier, the OSC 7501 report and the `attention`
+/// plugins read all come from [`App::attention`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Attention {
+    Permission { tool: Option<String> },
+    Authentication,
+    PackReview,
+    PlanReady,
+    Question,
+}
+
+impl Attention {
+    pub(crate) fn reason(&self) -> &'static str {
+        match self {
+            Self::Permission { .. } => "Permission requested",
+            Self::Authentication => "Authentication required",
+            Self::PackReview => "Package review",
+            Self::PlanReady => "Plan ready",
+            Self::Question => "Question requested",
+        }
+    }
+
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::Permission { tool: Some(tool) } => format!("Permission requested: {tool}"),
+            Self::Permission { tool: None } => "Permission requested".into(),
+            Self::Authentication => "Authentication required".into(),
+            Self::PackReview => "Package changes to review".into(),
+            Self::PlanReady => "Plan ready".into(),
+            Self::Question => "Question requested".into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Notification {
     TurnComplete { response: Option<String> },
-    PermissionRequested { tool: Option<String> },
-    AuthenticationRequired,
-    QuestionRequested,
-    PlanReady,
+    Attention(Attention),
     AgentError { message: String },
 }
 impl Notification {
     /// Prompts blocking the agent outrank turn completions.
     pub(crate) fn is_urgent(&self) -> bool {
-        !matches!(self, Self::TurnComplete { .. } | Self::AgentError { .. })
+        matches!(self, Self::Attention(_))
     }
 
     pub(crate) fn reason(&self) -> &'static str {
         match self {
             Self::TurnComplete { .. } => "Turn complete",
-            Self::PermissionRequested { .. } => "Permission requested",
-            Self::AuthenticationRequired => "Authentication required",
-            Self::QuestionRequested => "Question requested",
-            Self::PlanReady => "Plan ready",
+            Self::Attention(attention) => attention.reason(),
             Self::AgentError { .. } => "Agent error",
         }
     }
@@ -448,13 +485,7 @@ impl Notification {
             Self::TurnComplete { response } => response
                 .clone()
                 .unwrap_or_else(|| "Agent turn complete".into()),
-            Self::PermissionRequested { tool: Some(tool) } => {
-                format!("Permission requested: {tool}")
-            }
-            Self::PermissionRequested { tool: None } => "Permission requested".into(),
-            Self::AuthenticationRequired => "Authentication required".into(),
-            Self::QuestionRequested => "Question requested".into(),
-            Self::PlanReady => "Plan ready".into(),
+            Self::Attention(attention) => attention.message(),
             Self::AgentError { message } => message.clone(),
         }
     }
@@ -579,6 +610,10 @@ pub struct App {
     /// was shown, so `/trust` must not cover it and the next start asks.
     pub(crate) trust: TrustState,
     pub(crate) usage_slot: Arc<ArcSwapOption<UsageFetchState>>,
+    /// The model picked for this tab while its provider is still building.
+    /// Until it lands a run starts on the old one, so the status bar shows
+    /// both.
+    pub(crate) picking: Option<String>,
     pub(crate) shared_history: Option<SharedMessages>,
     pub(crate) paste_rx: Vec<oneshot::Receiver<Result<PastedContent, String>>>,
     pub(crate) mouse_paste_rx: Vec<oneshot::Receiver<Option<String>>>,
@@ -587,7 +622,6 @@ pub struct App {
     pub(crate) shell: shell::ShellState,
     pub(crate) ui_config: UiConfig,
     pub(crate) permissions: Arc<PermissionManager>,
-    pub(crate) model_policy: Arc<ModelPolicy>,
     pub(crate) lua_event_handle: EventHandle,
     /// The spec Lua was last told about. Seeded with the live model rather
     /// than the session's stored one: a restored session may name another
@@ -629,6 +663,7 @@ impl App {
         session: OpenSession,
         storage: StateDir,
         available_models: Arc<ArcSwapOption<ModelList>>,
+        picker_memory: Arc<PickerMemory>,
         mcp_reader: McpSnapshotReader,
         mcp_config_errors: McpConfigErrors,
         lua_command_reader: LuaCommandReader,
@@ -641,7 +676,6 @@ impl App {
         permissions: Arc<PermissionManager>,
         custom_commands: Arc<[maki_agent::command::CustomCommand]>,
         lua_event_handle: EventHandle,
-        model_policy: Arc<ModelPolicy>,
     ) -> Self {
         scrollbar::set_enabled(ui_config.scrollbar);
         let state = SessionState::from_session(session, model, &storage);
@@ -659,7 +693,7 @@ impl App {
         input_box
             .buffer
             .set_rules(RuleSet::with_plugins(&input_rules));
-        let mut app = Self {
+        let app = Self {
             chats: vec![Chat::new(
                 state.session.id,
                 None,
@@ -677,7 +711,7 @@ impl App {
                 lua_command_reader,
             ),
             theme_picker: ThemePicker::new(),
-            model_picker: ModelPicker::new(available_models),
+            model_picker: ModelPicker::new(available_models).sharing(picker_memory),
             login_picker: LoginPicker::new(),
             mcp_picker: McpPicker::new(mcp_reader, mcp_config_errors),
             rewind_picker: RewindPicker::new(),
@@ -717,6 +751,7 @@ impl App {
             storage,
             trust: TrustState::Inert,
             usage_slot: Arc::new(ArcSwapOption::empty()),
+            picking: None,
             shared_history: None,
             paste_rx: vec![],
             mouse_paste_rx: vec![],
@@ -725,7 +760,6 @@ impl App {
             shell: shell::ShellState::default(),
             ui_config,
             permissions,
-            model_policy: Arc::clone(&model_policy),
             lua_event_handle,
             announced_model_spec: model.spec(),
             announced_input: InputAt::default(),
@@ -743,14 +777,6 @@ impl App {
             mailbox: None,
             restoring: Arc::new(AtomicBool::new(false)),
         };
-        app.model_picker.set_recents(
-            maki_storage::model::read_recents(&app.storage)
-                .into_iter()
-                .filter(|spec| model_policy.allows(spec))
-                .collect(),
-        );
-        app.model_picker
-            .set_collapsed(maki_storage::model::read_collapsed_providers(&app.storage));
         // The manager arrives forked from the prototype the process was
         // started with, so a tab that resumes or spawns blank runs on
         // `--yolo` until its own meta is read back here.
@@ -802,6 +828,10 @@ impl App {
 
     fn holds_keyboard(&self, owner: KeyboardOwner) -> bool {
         match owner {
+            KeyboardOwner::FocusedFloat => {
+                self.float_mgr.focused_on_screen() && Overlay::is_modal(&self.float_mgr)
+            }
+            KeyboardOwner::FocusedSplit => self.float_mgr.focused_on_screen(),
             KeyboardOwner::PlanForm => self.plan_form_active(),
             KeyboardOwner::Queue => self.queue_focused(),
             KeyboardOwner::Chat => true,
@@ -932,7 +962,7 @@ impl App {
     /// Stores the clamped value rather than the typed one, so the status bar
     /// can never read `off` on a model that is really sending minimal effort.
     ///
-    /// With {persist} the value is also written to disk here, and only here:
+    /// With {persist} the value is also queued for disk here, and only here:
     /// the next run seeds its sessions from it (`SessionDefaults`), the same
     /// way the model is remembered. A clamp on model change is not the user's
     /// choice, so it does not overwrite the file, and neither does a plugin
@@ -954,8 +984,10 @@ impl App {
             .map_err(str::to_owned)?
             .clamped(&self.state.model);
         self.state.pending_thinking = None;
+        let stored = StoredThinking::from(self.state.thinking);
         if persist {
-            persist_thinking(&self.storage, self.state.thinking.into());
+            self.storage_writer
+                .persist(move |dir| persist_thinking(dir, stored));
         }
         Ok(self.state.thinking)
     }
@@ -1224,14 +1256,6 @@ impl App {
         self.announced_input = now;
     }
 
-    pub(crate) fn record_recent_model(&mut self, spec: &str) {
-        let recents = maki_storage::model::push_recent(&self.storage, spec)
-            .into_iter()
-            .filter(|spec| self.model_policy.allows(spec))
-            .collect();
-        self.model_picker.set_recents(recents);
-    }
-
     pub(crate) fn flash(&mut self, msg: String) {
         self.status_bar.flash(msg);
     }
@@ -1240,6 +1264,10 @@ impl App {
     /// shows all of them rather than whichever was reported last.
     pub(crate) fn queue_flash(&mut self, msg: String) {
         self.status_bar.queue_flash(msg);
+    }
+
+    pub(crate) fn handle_chat_item(&mut self, item: &ChatItem) {
+        self.main_chat().apply_chat_item(item);
     }
 
     pub(crate) fn fire_session_event(&self, event: HostEvent<'_>) {
@@ -1524,7 +1552,12 @@ impl App {
                 self.btw_modal.handle_key(key);
                 Some(vec![])
             }
-            KeyboardOwner::FocusedWindow => {
+            KeyboardOwner::FocusedFloat
+                if key::QUIT.matches(key) && self.holds_keyboard(KeyboardOwner::Permission) =>
+            {
+                self.dispatch_to_owner(KeyboardOwner::Permission, key, sight, turn)
+            }
+            KeyboardOwner::FocusedFloat | KeyboardOwner::FocusedSplit => {
                 self.dispatch_focused_window(&Pressed::Key(key, sight), turn);
                 Some(vec![])
             }
@@ -1606,32 +1639,24 @@ impl App {
                     vec![Action::UnassignTier(spec, tier)]
                 }
                 // Saved right here instead of going through an `Action`. A fold
-                // only changes how the picker looks, and the state dir lives here.
-                ModelPickerAction::Collapse(slug, folded) => {
-                    maki_storage::model::persist_collapsed_providers(
-                        &self.storage,
-                        self.model_picker.collapsed_providers(),
-                    );
-                    let suffix = if folded {
-                        PROVIDER_FOLDED_SUFFIX
-                    } else {
-                        PROVIDER_UNFOLDED_SUFFIX
-                    };
-                    self.flash(format!("{slug}{suffix}"));
+                // only changes how the picker looks, and the writer lives here.
+                ModelPickerAction::Folded => {
+                    let slugs = self.model_picker.expanded_providers();
+                    self.storage_writer
+                        .persist(move |dir| persist_expanded_providers(dir, &slugs));
                     vec![]
+                }
+                ModelPickerAction::Login(slug) => {
+                    self.model_picker.close();
+                    let action = self.login_picker.open_for(self.storage.clone(), &slug);
+                    self.handle_login_picker_action(action)
                 }
                 ModelPickerAction::Close => vec![],
             }),
-            KeyboardOwner::LoginPicker => Some(match self.login_picker.handle_key(key) {
-                LoginPickerAction::Consumed => vec![],
-                LoginPickerAction::Close => vec![],
-                LoginPickerAction::Authenticated { model_spec } => {
-                    vec![Action::ChangeModel(model_spec), Action::RefreshModels]
-                }
-                LoginPickerAction::Configured { slug } => {
-                    vec![Action::RefreshProvider { slug }, Action::RefreshModels]
-                }
-            }),
+            KeyboardOwner::LoginPicker => {
+                let action = self.login_picker.handle_key(key);
+                Some(self.handle_login_picker_action(action))
+            }
             KeyboardOwner::McpPicker => Some(match self.mcp_picker.handle_key(key) {
                 McpPickerAction::Consumed => vec![],
                 McpPickerAction::Toggle {
@@ -1660,6 +1685,33 @@ impl App {
                         Some(vec![])
                     }
                 }
+            }
+        }
+    }
+
+    /// Both ways into the login picker — its own keys, and Enter on a model
+    /// picker row — land here, so the keys page always leaves as an `Action`.
+    fn handle_login_picker_action(&mut self, action: LoginPickerAction) -> Vec<Action> {
+        match action {
+            LoginPickerAction::Consumed => vec![],
+            LoginPickerAction::Close => vec![],
+            LoginPickerAction::OpenUrl(url) => vec![Action::OpenUrl(url)],
+            LoginPickerAction::Authenticated {
+                model_spec,
+                slug,
+                url_changed,
+            } => {
+                let mut actions = if url_changed {
+                    vec![Action::RefreshProvider { slug }]
+                } else {
+                    vec![]
+                };
+                actions.push(Action::ChangeModel(model_spec));
+                actions.push(Action::RefreshModels);
+                actions
+            }
+            LoginPickerAction::Configured { slug } => {
+                vec![Action::RefreshProvider { slug }, Action::RefreshModels]
             }
         }
     }
@@ -1843,25 +1895,28 @@ impl App {
     ///    [`Self::update`]. `Ctrl+Z` suspends right here. `Ctrl+C` is not
     ///    answered here: no binding can take it and [`Self::reserved_by_host`]
     ///    skips the global bindings for it, but the modals and a focused
-    ///    window still see it.
+    ///    window still see it. A permission prompt takes it from a focused
+    ///    float over it, so the prompt can always be denied.
     /// 2. [`Self::dispatch_overlay`]: the holder of the keyboard, in
-    ///    [`KeyboardOwner`] order: the alert, then the focused window,
-    ///    [`Self::dispatch_focused_window`], then maki's other modals, prompts
-    ///    and pickers, and for the chat the `/` command list and `<C-t>` on a
-    ///    ready plan.
+    ///    [`KeyboardOwner`] order, which includes the focused window,
+    ///    [`Self::dispatch_focused_window`], and for the chat the `/` command
+    ///    list and `<C-t>` on a ready plan.
     /// 3. Windows on screen, front first, [`Self::dispatch_on_screen_windows`].
     /// 4. `<Esc>` while the agent runs, which [`Self::reserved_by_host`] keeps
     ///    from the global bindings, so it reaches the cancel in step 6.
     /// 5. Global bindings, [`Self::dispatch_binding`] without a buffer.
     /// 6. maki's built-in keys and the chat input, [`Self::handle_builtin_key`].
     ///
-    /// A focused window is above maki's modals and prompts, the permission
-    /// prompt included, because it is the window the user is in and it paints
-    /// over them. An unfocused one is below them because it
-    /// is not: the popup is up while the user works underneath, so a modal
-    /// opened over it outranks it, and its keys come back the moment the
-    /// modal closes. The command palette is one of those overlays, so a
-    /// popup's `<Tab>` or `<CR>` leaves the `/` command being typed alone.
+    /// A focused float is above the overlays opened under it because it is
+    /// the window the user is in. A focused side split sits beside the
+    /// bottom panel and a `below` split leaves the layout while the panel is
+    /// up, so the prompts there answer first. A focused window that is hidden
+    /// or painted nothing holds no keys. An unfocused window is below the
+    /// overlays because it is not where the user is: the popup is up while
+    /// the user works underneath, so a modal opened over it outranks it, and
+    /// its keys come back the moment the modal closes. The command palette is
+    /// one of those overlays, so a popup's `<Tab>` or `<CR>` leaves the `/`
+    /// command being typed alone.
     ///
     /// Every step either answers the key or passes it on untouched, and no key
     /// is ever handed back after the fact, because a keystroke replayed into a
@@ -2517,7 +2572,9 @@ impl App {
     }
 
     /// `None` means the owner has no [`Overlay`] of its own, as for the plan
-    /// form, the queue focus and the chat.
+    /// form, the queue focus and the chat. A focused split shares the window
+    /// manager with [`KeyboardOwner::FocusedFloat`], which alone lists it so
+    /// it is closed and asked once.
     fn overlay(&self, owner: KeyboardOwner) -> Option<&dyn Overlay> {
         Some(match owner {
             KeyboardOwner::Alert => &self.alert_modal,
@@ -2526,7 +2583,7 @@ impl App {
             KeyboardOwner::Help => &self.help_modal,
             KeyboardOwner::Usage => &self.usage_modal,
             KeyboardOwner::Btw => &self.btw_modal,
-            KeyboardOwner::FocusedWindow => &self.float_mgr,
+            KeyboardOwner::FocusedFloat => &self.float_mgr,
             KeyboardOwner::Search => &self.search_modal,
             KeyboardOwner::FilePicker => &self.file_picker,
             KeyboardOwner::RewindPicker => &self.rewind_picker,
@@ -2534,7 +2591,10 @@ impl App {
             KeyboardOwner::ModelPicker => &self.model_picker,
             KeyboardOwner::LoginPicker => &self.login_picker,
             KeyboardOwner::McpPicker => &self.mcp_picker,
-            KeyboardOwner::PlanForm | KeyboardOwner::Queue | KeyboardOwner::Chat => return None,
+            KeyboardOwner::PlanForm
+            | KeyboardOwner::FocusedSplit
+            | KeyboardOwner::Queue
+            | KeyboardOwner::Chat => return None,
         })
     }
 
@@ -2546,7 +2606,7 @@ impl App {
             KeyboardOwner::Help => &mut self.help_modal,
             KeyboardOwner::Usage => &mut self.usage_modal,
             KeyboardOwner::Btw => &mut self.btw_modal,
-            KeyboardOwner::FocusedWindow => &mut self.float_mgr,
+            KeyboardOwner::FocusedFloat => &mut self.float_mgr,
             KeyboardOwner::Search => &mut self.search_modal,
             KeyboardOwner::FilePicker => &mut self.file_picker,
             KeyboardOwner::RewindPicker => &mut self.rewind_picker,
@@ -2554,7 +2614,10 @@ impl App {
             KeyboardOwner::ModelPicker => &mut self.model_picker,
             KeyboardOwner::LoginPicker => &mut self.login_picker,
             KeyboardOwner::McpPicker => &mut self.mcp_picker,
-            KeyboardOwner::PlanForm | KeyboardOwner::Queue | KeyboardOwner::Chat => return None,
+            KeyboardOwner::PlanForm
+            | KeyboardOwner::FocusedSplit
+            | KeyboardOwner::Queue
+            | KeyboardOwner::Chat => return None,
         })
     }
 
@@ -2566,28 +2629,30 @@ impl App {
         self.overlays().any(Overlay::is_open)
     }
 
-    /// True when the agent is parked on user input. Drives the `needs_input`
-    /// session status.
     pub(crate) fn awaiting_input(&self) -> bool {
-        self.permission_prompt.is_open() || self.turn_awaits_auth() || self.float_mgr.needs_input()
+        self.attention().is_some()
     }
 
-    pub(crate) fn attention(&self) -> Option<Notification> {
+    /// The most pressing prompt first. A permission prompt has a tool blocked
+    /// on it, and a plan form only waits once its turn is over, while the
+    /// package review takes the keys as soon as it opens.
+    pub(crate) fn attention(&self) -> Option<Attention> {
         if let Some(tool) = self.permission_prompt.tool() {
             let tool = (!matches!(tool, maki_config::ToolKey::Wildcard))
                 .then(|| normalize_preview(&tool.to_string()))
                 .flatten();
-            return Some(Notification::PermissionRequested { tool });
+            return Some(Attention::Permission { tool });
         }
         if self.turn_awaits_auth() {
-            return Some(Notification::AuthenticationRequired);
+            return Some(Attention::Authentication);
+        }
+        if self.pack_review.is_open() {
+            return Some(Attention::PackReview);
         }
         if self.status != Status::Streaming && self.plan_form_open() {
-            return Some(Notification::PlanReady);
+            return Some(Attention::PlanReady);
         }
-        self.float_mgr
-            .needs_input()
-            .then_some(Notification::QuestionRequested)
+        self.float_mgr.needs_input().then_some(Attention::Question)
     }
 
     pub fn has_modal_overlay(&self) -> bool {
@@ -2808,7 +2873,7 @@ impl App {
             | KeyboardOwner::Btw
             | KeyboardOwner::Queue => {}
             KeyboardOwner::Permission => self.permission_prompt.handle_paste(text),
-            KeyboardOwner::FocusedWindow => {
+            KeyboardOwner::FocusedFloat | KeyboardOwner::FocusedSplit => {
                 self.dispatch_focused_window(&Pressed::Paste(text.to_owned()), turn);
             }
             KeyboardOwner::Search => {

@@ -5,15 +5,18 @@ use std::fs::{File, FileType};
 use std::io::{
     BufRead, BufReader, Error as IoError, ErrorKind, Read, Result as IoResult, Seek, SeekFrom,
 };
+use std::mem;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::UNIX_EPOCH;
 
+use maki_agent::tools::grep::{GrepParams, GrepResults, grep_count, grep_search};
 use maki_agent::{FileQuery, FileReader, Ranked};
 use maki_lua_macro::{lua_fn, lua_table};
 use mlua::{Buffer, Lua, Result as LuaResult, Table, Value};
 use tokio::task::spawn_blocking;
+use tracing::warn;
 
 use crate::agent_autocmd::HostEvent;
 use crate::api::util::convert::{TableExt, bytes_arg};
@@ -221,6 +224,7 @@ fn skip_lines(reader: &mut impl BufRead, n: u64) -> IoResult<u64> {
 }
 
 #[derive(Clone)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 pub(crate) struct Line {
     pub text: String,
     /// Its length before any cut, so a caller can say how much was dropped.
@@ -241,68 +245,101 @@ impl From<&str> for Line {
     }
 }
 
-/// The next line without its `\n` or `\r\n`, or `None` at the end of the file.
-/// A line over `max_bytes` is cut and gets [`LINE_CUT_MARKER`]. This is where
-/// the line is buffered, so `max_bytes` is capped at [`MAX_READ_BYTES`] here
-/// and no caller can ask for more. The rest of it
-/// is skipped without ever landing in memory, which is how a file that is one
-/// 300 MB line still pages fine. Without `max_bytes`, a line over
-/// [`MAX_READ_BYTES`] fails the read. Bytes that are not UTF-8 fail the read,
-/// or become U+FFFD when `lossy`.
-pub(crate) fn next_line(
+/// Cuts lines out of bytes fed in whatever slices a reader has at hand, so a
+/// sync and an async reader cut them alike. A line comes without its `\n` or
+/// `\r\n`. A line over `max_bytes` is cut and gets [`LINE_CUT_MARKER`]. Only
+/// the kept bytes are buffered, so `max_bytes` is capped at [`MAX_READ_BYTES`]
+/// here and no caller can ask for more. The rest of the line is skipped without
+/// ever landing in memory, which is how a file that is one 300 MB line still
+/// pages fine. Without `max_bytes`, a line over [`MAX_READ_BYTES`] fails.
+/// Bytes that are not UTF-8 fail, or become U+FFFD when `lossy`.
+pub(crate) struct LineCutter {
+    /// `None` fails a line instead of cutting it.
+    max_bytes: Option<usize>,
+    lossy: bool,
+    kept: Vec<u8>,
+    /// The current line's bytes so far, kept or skipped.
+    seen: u64,
+    ends_in_cr: bool,
+}
+
+impl LineCutter {
+    pub(crate) fn new(max_bytes: Option<u64>, lossy: bool) -> Self {
+        Self {
+            max_bytes: max_bytes.map(|max| max.min(MAX_READ_BYTES) as usize),
+            lossy,
+            kept: Vec::new(),
+            seen: 0,
+            ends_in_cr: false,
+        }
+    }
+
+    fn keep(&self) -> usize {
+        self.max_bytes.unwrap_or(MAX_READ_BYTES as usize)
+    }
+
+    /// Takes `buf` up to and including its first `\n`, and returns how many
+    /// bytes it took and the line that `\n` ended.
+    pub(crate) fn feed(&mut self, buf: &[u8]) -> IoResult<(usize, Option<Line>)> {
+        let newline = buf.iter().position(|b| *b == b'\n');
+        let rest = newline.map_or(buf, |newline| &buf[..newline]);
+        let room = self.keep().saturating_sub(self.kept.len());
+        self.kept.extend_from_slice(&rest[..room.min(rest.len())]);
+        self.seen += rest.len() as u64;
+        self.ends_in_cr = rest.last().map_or(self.ends_in_cr, |last| *last == b'\r');
+        // Don't wait for a `\n` that `/dev/zero` never sends. One byte past the
+        // cap can still be the `\r` of a `\r\n`, which does not count.
+        if self.max_bytes.is_none() && self.seen > self.keep() as u64 + 1 {
+            return Err(too_large());
+        }
+        match newline {
+            Some(newline) => Ok((newline + 1, Some(self.take()?))),
+            None => Ok((buf.len(), None)),
+        }
+    }
+
+    /// The last line, when the bytes end without a `\n`.
+    pub(crate) fn finish(&mut self) -> IoResult<Option<Line>> {
+        (self.seen > 0).then(|| self.take()).transpose()
+    }
+
+    fn take(&mut self) -> IoResult<Line> {
+        let bytes = self.seen - u64::from(self.ends_in_cr);
+        let mut line = mem::take(&mut self.kept);
+        (self.seen, self.ends_in_cr) = (0, false);
+        if bytes > self.keep() as u64 {
+            if self.max_bytes.is_none() {
+                return Err(too_large());
+            }
+            // An error with no length is a char the cut split in half, so drop what is left of it.
+            let split_char = line
+                .utf8_chunks()
+                .last()
+                .map(|chunk| chunk.invalid())
+                .filter(|tail| std::str::from_utf8(tail).is_err_and(|e| e.error_len().is_none()))
+                .map_or(0, <[u8]>::len);
+            line.truncate(line.len() - split_char);
+            line.extend_from_slice(LINE_CUT_MARKER.as_bytes());
+        } else {
+            line.truncate(bytes as usize);
+        }
+        let text = match String::from_utf8(line) {
+            Ok(text) => text,
+            Err(e) if self.lossy => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+            Err(_) => return Err(non_utf8()),
+        };
+        Ok(Line { text, bytes })
+    }
+}
+
+/// The next line from `reader`, cut by a [`LineCutter`], or `None` at the end
+/// of the file.
+fn next_line(
     reader: &mut impl BufRead,
     max_bytes: Option<u64>,
     lossy: bool,
 ) -> IoResult<Option<Line>> {
-    let keep = max_bytes.map_or(MAX_READ_BYTES, |max| max.min(MAX_READ_BYTES));
-    // The extra 2 bytes let a line of exactly `keep` bytes see its `\r\n`, so it is not cut.
-    let window = keep + 2;
-    let mut line = Vec::new();
-    let read = reader.by_ref().take(window).read_until(b'\n', &mut line)? as u64;
-    if read == 0 {
-        return Ok(None);
-    }
-    let bytes = if line.ends_with(b"\n") || read < window {
-        line.pop_if(|b| *b == b'\n');
-        line.pop_if(|b| *b == b'\r');
-        line.len() as u64
-    } else {
-        let (rest, last) = skip_rest_of_line(reader)?;
-        // Stripped like the `\r` of a line that fits: by the last byte before the newline.
-        let ends_in_cr = if rest == 0 {
-            line.last().copied()
-        } else {
-            last
-        } == Some(b'\r');
-        read + rest - u64::from(ends_in_cr)
-    };
-    if line.len() as u64 > keep {
-        if max_bytes.is_none() {
-            return Err(too_large());
-        }
-        line.truncate(keep as usize);
-        // An error with no length is a char the cut split in half, so drop what is left of it.
-        let split_char = line
-            .utf8_chunks()
-            .last()
-            .map(|chunk| chunk.invalid())
-            .filter(|tail| std::str::from_utf8(tail).is_err_and(|e| e.error_len().is_none()))
-            .map_or(0, <[u8]>::len);
-        line.truncate(line.len() - split_char);
-        line.extend_from_slice(LINE_CUT_MARKER.as_bytes());
-    }
-    let text = match String::from_utf8(line) {
-        Ok(text) => text,
-        Err(e) if lossy => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-        Err(_) => return Err(non_utf8()),
-    };
-    Ok(Some(Line { text, bytes }))
-}
-
-/// Skips to the next `\n` and returns how many bytes came before it, and the
-/// last of them.
-fn skip_rest_of_line(reader: &mut impl BufRead) -> IoResult<(u64, Option<u8>)> {
-    let (mut skipped, mut last) = (0, None);
+    let mut cutter = LineCutter::new(max_bytes, lossy);
     loop {
         let buf = match reader.fill_buf() {
             Ok(buf) => buf,
@@ -310,18 +347,12 @@ fn skip_rest_of_line(reader: &mut impl BufRead) -> IoResult<(u64, Option<u8>)> {
             Err(e) => return Err(e),
         };
         if buf.is_empty() {
-            return Ok((skipped, last));
+            return cutter.finish();
         }
-        let (rest, found) = match buf.iter().position(|b| *b == b'\n') {
-            Some(newline) => (&buf[..newline], true),
-            None => (buf, false),
-        };
-        skipped += rest.len() as u64;
-        last = rest.last().copied().or(last);
-        let consumed = rest.len() + usize::from(found);
+        let (consumed, line) = cutter.feed(buf)?;
         reader.consume(consumed);
-        if found {
-            return Ok((skipped, last));
+        if line.is_some() {
+            return Ok(line);
         }
     }
 }
@@ -748,8 +779,8 @@ fn ext(_lua: &Lua, path: String) -> LuaResult<Option<String>> {
 /// List the contents of the directory at {path}.
 /// Each entry is a two-element array `{name, type}` where type is one of
 /// `"file"`, `"directory"`, `"link"`, or `"unknown"`. Follows symlinks.
-/// `name` is relative to {path}, so with `depth` > 1 nested entries keep
-/// their directory: "d/nested.txt", unambiguous and joinable onto {path}.
+/// `name` is relative to {path}, so nested entries (`depth` > 1) keep their
+/// directory, as in `"tests/lib.rs"`.
 ///
 /// @param path string Directory path.
 /// @param opts table? `depth` (integer, default 1): how many levels deep to recurse.
@@ -1017,12 +1048,17 @@ fn descend(mut base: PathBuf, component: &Component<'_>) -> PathBuf {
 ///
 /// Resolving the path is a realpath per ancestor and one more per `..` left
 /// in the tail, and this runs on the one executor every plugin shares, so it
-/// waits for a blocking thread the way the call it follows did.
+/// waits for a blocking thread the way the call it follows did. By then the
+/// call has landed, so an invalidation that fails is only logged: the index
+/// still catches up on its next walk.
 async fn touched<E>(path: PathBuf, result: Result<(), E>) -> Result<(), E> {
     if result.is_ok() {
-        spawn_blocking(move || maki_agent::invalidate_for(&resolved(&path)))
-            .await
-            .expect("file index invalidation panicked");
+        let invalidated = path.clone();
+        if let Err(error) =
+            spawn_blocking(move || maki_agent::invalidate_for(&resolved(&invalidated))).await
+        {
+            warn!(path = %path.display(), %error, "file index invalidation failed");
+        }
     }
     result
 }
@@ -1116,6 +1152,42 @@ async fn glob(lua: Lua, pattern: Value, opts: Option<Table>) -> LuaResult<Pair<T
     Ok((Some(tbl), None))
 }
 
+/// Count the lines matching a regex {pattern} in each file, without
+/// returning the lines.
+///
+/// @param pattern string Regular expression to search for.
+/// @param opts table? `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`).
+/// @return (table?, string?) Array of `{path, matches}` tables for the files with a match, newest first, or nil plus an error message.
+/// @example
+/// local counts, err = maki.fs.grep_count("TODO", { path = "src" })
+/// if err then return end
+/// for _, file in ipairs(counts) do print(file.path .. ": " .. file.matches) end
+#[lua_fn(guard = FsRead, name = "grep_count")]
+async fn grep_counts(
+    lua: Lua,
+    pattern: String,
+    opts: Option<Table>,
+) -> LuaResult<(Option<Table>, Option<String>)> {
+    let mut params = GrepParams::new(pattern);
+    params.path = opts.as_ref().opt("path")?;
+    params.include = opts.as_ref().opt("include")?;
+    let counts = match spawn_blocking(move || grep_count(&params))
+        .await
+        .map_err(mlua::Error::external)?
+    {
+        Ok(counts) => counts,
+        Err(e) => return Ok((None, Some(e))),
+    };
+    let arr = lua.create_table()?;
+    for (i, file) in counts.iter().enumerate() {
+        let entry = lua.create_table()?;
+        entry.set("path", file.path.to_string_lossy().as_ref())?;
+        entry.set("matches", file.matches)?;
+        arr.set(i + 1, entry)?;
+    }
+    Ok((Some(arr), None))
+}
+
 /// Search file contents for a regex {pattern}. Returns structured matches
 /// grouped by file, similar to ripgrep output.
 ///
@@ -1124,9 +1196,9 @@ async fn glob(lua: Lua, pattern: Value, opts: Option<Table>) -> LuaResult<Pair<T
 ///
 /// @param pattern string Regular expression to search for.
 /// @param opts table? `path` (string): search root. `include` (string): file glob filter (e.g. `"*.rs"`). `context_before` / `context_after` (integer): context lines around matches. `limit` (integer): max match groups. `max_line_bytes` (integer): truncate lines longer than this (0 means unlimited).
-/// @return (table?, string?) Array of `{path, groups}` tables, or nil plus an error message.
+/// @return (table?, string?, table?) Array of `{path, groups}` tables, or nil plus an error message. When `limit` cut results, a third value `{ groups, files }` counts the match groups left out and the files they came from.
 /// @example
-/// local hits, err = maki.fs.grep("TODO", { path = "src", include = "*.rs", limit = 5 })
+/// local hits, err, omitted = maki.fs.grep("TODO", { path = "src", include = "*.rs", limit = 5 })
 /// if err then return end
 /// for _, file in ipairs(hits) do
 ///   for _, g in ipairs(file.groups) do
@@ -1135,9 +1207,14 @@ async fn glob(lua: Lua, pattern: Value, opts: Option<Table>) -> LuaResult<Pair<T
 ///     end
 ///   end
 /// end
+/// if omitted then print(omitted.groups .. " more not shown") end
 #[lua_fn(guard = FsRead)]
-async fn grep(lua: Lua, pattern: String, opts: Option<Table>) -> LuaResult<Pair<Table>> {
-    let mut params = maki_agent::tools::grep::GrepParams::new(pattern);
+async fn grep(
+    lua: Lua,
+    pattern: String,
+    opts: Option<Table>,
+) -> LuaResult<(Option<Table>, Option<String>, Option<Table>)> {
+    let mut params = GrepParams::new(pattern);
     if let Some(ref opts) = opts {
         if let Ok(v) = opts.get::<String>("path") {
             params.path = Some(v);
@@ -1159,11 +1236,18 @@ async fn grep(lua: Lua, pattern: String, opts: Option<Table>) -> LuaResult<Pair<
         }
     }
 
-    let result = spawn_blocking(move || maki_agent::tools::grep::grep_search(params))
+    let result = spawn_blocking(move || grep_search(params))
         .await
         .map_err(mlua::Error::external)?;
 
-    let (base, entries) = try_pair!(result);
+    let GrepResults {
+        base,
+        entries,
+        omitted,
+    } = match result {
+        Ok(results) => results,
+        Err(e) => return Ok((None, Some(e), None)),
+    };
     let arr = lua.create_table()?;
     for (i, entry) in entries.iter().enumerate() {
         let etbl = lua.create_table()?;
@@ -1185,7 +1269,10 @@ async fn grep(lua: Lua, pattern: String, opts: Option<Table>) -> LuaResult<Pair<
         etbl.set("groups", groups_tbl)?;
         arr.set(i + 1, etbl)?;
     }
-    Ok((Some(arr), None))
+    let omitted = omitted
+        .map(|o| lua.create_table_from([("groups", o.groups), ("files", o.files)]))
+        .transpose()?;
+    Ok((Some(arr), None, omitted))
 }
 
 /// Ranked paths asked for more than this at once stop being a completion and
@@ -1485,7 +1572,7 @@ lua_table! {
         read(perms), read_bytes(perms), read_lines(perms), metadata(perms), dirname, basename,
         joinpath, normalize, abspath, parents, root(perms), relpath, ext,
         dir(perms), write(perms), append(perms), atomic_write(perms), rename(perms),
-        rm(perms), mkdir(perms), glob(perms), grep(perms), fuzzy_files(perms, plugin),
+        rm(perms), mkdir(perms), glob(perms), grep(perms), grep_counts(perms), fuzzy_files(perms, plugin),
     ]
 }
 
@@ -1495,6 +1582,7 @@ mod tests {
     #[cfg(unix)]
     use std::io::Write;
     use std::io::repeat;
+    use std::iter;
     use std::sync::mpsc;
     use std::time::{Duration, Instant, SystemTime};
 
@@ -1573,6 +1661,39 @@ mod tests {
         }
     }
 
+    fn cut_in_slices(
+        content: &[u8],
+        max_bytes: Option<u64>,
+        lossy: bool,
+        slice_len: usize,
+    ) -> IoResult<Vec<Line>> {
+        let mut cutter = LineCutter::new(max_bytes, lossy);
+        let mut lines = Vec::new();
+        let mut rest = content;
+        while !rest.is_empty() {
+            let (consumed, line) = cutter.feed(&rest[..slice_len.min(rest.len())])?;
+            rest = &rest[consumed..];
+            lines.extend(line);
+        }
+        lines.extend(cutter.finish()?);
+        Ok(lines)
+    }
+
+    /// The lines `next_line` reads from `content`, once a cutter fed one byte
+    /// at a time and one fed all of it at once cut the same.
+    fn cut_lines(content: &[u8], max_bytes: Option<u64>, lossy: bool) -> Result<Vec<Line>, String> {
+        let mut reader = small_reader(content);
+        let read = iter::from_fn(|| next_line(&mut reader, max_bytes, lossy).transpose())
+            .map(|line| line.map_err(|e| e.to_string()))
+            .collect();
+        for slice_len in [1, usize::MAX] {
+            let cut =
+                cut_in_slices(content, max_bytes, lossy, slice_len).map_err(|e| e.to_string());
+            assert_eq!(cut, read, "fed {slice_len} bytes at a time");
+        }
+        read
+    }
+
     #[test]
     fn next_line_caps_max_bytes_at_the_read_limit() {
         let mut huge_line = BufReader::new(repeat(b'x').take(MAX_READ_BYTES + 1));
@@ -1583,6 +1704,13 @@ mod tests {
             line.text.len() as u64,
             MAX_READ_BYTES + LINE_CUT_MARKER.len() as u64
         );
+    }
+
+    #[test]
+    fn next_line_fails_an_endless_whole_line() {
+        let mut endless = BufReader::new(repeat(b'x'));
+        let err = next_line(&mut endless, None, false).unwrap_err();
+        assert_eq!(err.to_string(), too_large().to_string());
     }
 
     #[test_case("", &[]; "empty")]
@@ -1600,6 +1728,9 @@ mod tests {
             read_line_page(small_reader(content.as_bytes()), &cut_query()).unwrap();
         assert_eq!(lines, expected);
         assert_eq!(total, Some(expected.len() as u64));
+        let cut = cut_lines(content.as_bytes(), Some(CUT), false).unwrap();
+        let texts: Vec<_> = cut.iter().map(|line| line.text.as_str()).collect();
+        assert_eq!(texts, expected);
     }
 
     #[test_case(1, None, &["l1", "l2", "l3", "l4", "l5"]; "whole_file")]
@@ -1643,10 +1774,8 @@ mod tests {
     #[test_case("abcdefgh", 8; "cut_line_at_eof")]
     #[test_case("abc\r\n", 3; "whole_crlf_line")]
     fn next_line_reports_the_uncut_length(content: &str, expected: u64) {
-        let line = next_line(&mut small_reader(content.as_bytes()), Some(4), false)
-            .unwrap()
-            .unwrap();
-        assert_eq!(line.bytes, expected);
+        let lines = cut_lines(content.as_bytes(), Some(4), false).unwrap();
+        assert_eq!(lines[0].bytes, expected);
     }
 
     /// Fails its second read with `Interrupted`, which a reader must retry.
@@ -1682,10 +1811,8 @@ mod tests {
     #[test_case(b"a\xffb\n", "a\u{FFFD}b"; "whole_line")]
     #[test_case(b"\xffa\xc3\xa9b\n", "\u{FFFD}a..."; "cut_through_a_char")]
     fn next_line_lossy_replaces_non_utf8(content: &[u8], expected: &str) {
-        let line = next_line(&mut small_reader(content), Some(3), true)
-            .unwrap()
-            .unwrap();
-        assert_eq!(line.text, expected);
+        let lines = cut_lines(content, Some(3), true).unwrap();
+        assert_eq!(lines[0].text, expected);
     }
 
     #[test_case(b"ok\xff\n"; "inside_the_kept_bytes")]
@@ -1693,6 +1820,8 @@ mod tests {
     fn read_line_page_rejects_non_utf8(content: &[u8]) {
         let err = read_line_page(small_reader(content), &cut_query()).unwrap_err();
         assert_eq!(err.to_string(), NON_UTF8_CONTENT_ERR);
+        let cut_err = cut_lines(content, Some(CUT), false).unwrap_err();
+        assert_eq!(cut_err, NON_UTF8_CONTENT_ERR);
     }
 
     #[test]
@@ -2910,7 +3039,11 @@ mod tests {
         assert!(paths[0].ends_with("inner.rs"));
     }
 
-    async fn grep_call(tbl: &Table, pattern: &str, opts: Table) -> (mlua::Value, mlua::Value) {
+    async fn grep_call(
+        tbl: &Table,
+        pattern: &str,
+        opts: Table,
+    ) -> (mlua::Value, mlua::Value, mlua::Value) {
         let grep: mlua::Function = tbl.get("grep").unwrap();
         grep.call_async((pattern, opts)).await.unwrap()
     }
@@ -2932,8 +3065,9 @@ mod tests {
         // basic match: hits data.txt, skips other.txt
         let opts = lua.create_table().unwrap();
         opts.set("path", tmp.path().to_str().unwrap()).unwrap();
-        let (val, err) = grep_call(&tbl, "line_", opts).await;
+        let (val, err, omitted) = grep_call(&tbl, "line_", opts).await;
         assert_eq!(err, mlua::Value::Nil);
+        assert_eq!(omitted, mlua::Value::Nil);
         let result: Table = mlua::FromLua::from_lua(val, &lua).unwrap();
         assert_eq!(result.len().unwrap(), 1);
         let entry: Table = result.get(1).unwrap();
@@ -2957,7 +3091,7 @@ mod tests {
         opts.set("path", tmp.path().to_str().unwrap()).unwrap();
         opts.set("context_before", 1).unwrap();
         opts.set("context_after", 1).unwrap();
-        let (val, _) = grep_call(&tbl, "line_10", opts).await;
+        let (val, _, _) = grep_call(&tbl, "line_10", opts).await;
         let result: Table = mlua::FromLua::from_lua(val, &lua).unwrap();
         let lines: Table = result
             .get::<Table>(1)
@@ -2995,15 +3129,18 @@ mod tests {
         let opts = lua.create_table().unwrap();
         opts.set("path", tmp.path().to_str().unwrap()).unwrap();
         opts.set("limit", 5).unwrap();
-        let (val, _) = grep_call(&tbl, "line_", opts).await;
+        let (val, _, omitted) = grep_call(&tbl, "line_", opts).await;
         let result: Table = mlua::FromLua::from_lua(val, &lua).unwrap();
         let groups: Table = result.get::<Table>(1).unwrap().get("groups").unwrap();
         assert_eq!(groups.len().unwrap(), 5);
+        let omitted: Table = mlua::FromLua::from_lua(omitted, &lua).unwrap();
+        assert_eq!(omitted.get::<usize>("groups").unwrap(), 15);
+        assert_eq!(omitted.get::<usize>("files").unwrap(), 1);
 
         // no match returns empty table, not error
         let opts = lua.create_table().unwrap();
         opts.set("path", tmp.path().to_str().unwrap()).unwrap();
-        let (val, err) = grep_call(&tbl, "zzz_no_match", opts).await;
+        let (val, err, _) = grep_call(&tbl, "zzz_no_match", opts).await;
         assert_eq!(err, mlua::Value::Nil);
         let result: Table = mlua::FromLua::from_lua(val, &lua).unwrap();
         assert_eq!(result.len().unwrap(), 0);
@@ -3020,7 +3157,7 @@ mod tests {
 
         let opts = lua.create_table().unwrap();
         opts.set("path", tmp.path().to_str().unwrap()).unwrap();
-        let (val, err) = grep_call(&tbl, "[invalid", opts).await;
+        let (val, err, _) = grep_call(&tbl, "[invalid", opts).await;
         assert_eq!(val, mlua::Value::Nil);
         assert!(matches!(err, mlua::Value::String(_)));
     }

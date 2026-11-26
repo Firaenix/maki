@@ -33,7 +33,7 @@ use maki_providers::{
     ThinkingConfig, Timeouts, plugin,
 };
 use maki_storage::StateDir;
-use maki_storage::auth::{load_plugin_auth, lock_plugin_store};
+use maki_storage::auth::{load_plugin_auth, lock_plugin_store_async};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use test_case::test_case;
@@ -63,6 +63,17 @@ const INLINE_PLUGIN: &str = "acme_inline";
 const RESPONSES_SLUG: &str = "acmeresponses";
 const RESPONSES_MODEL: &str = "acme-r1";
 const RESPONSES_MARKER: &str = "responses";
+
+const OVERRIDE_SLUG: &str = "acmeoverride";
+const OVERRIDE_MODEL: &str = "acme-o1";
+/// Headers maki sets on every codec's request, each answered by the auth hook
+/// with a value of its own.
+const OVERRIDDEN_HEADERS: [(&str, &str); 2] = [
+    ("user-agent", "acme-gateway/1.0"),
+    ("content-type", "application/json; charset=utf-8"),
+];
+const REJECTED_SCRIPT: &[Canned] = &[Canned::json(400, r#"{"error":{"message":"rejected"}}"#)];
+const NOTHING_SENT: &str = "the provider never reached the server";
 
 const PARKING_SLUG: &str = "acmeparked";
 const PARKING_HOST: &str = "api.acme.example";
@@ -118,6 +129,7 @@ const NO_CREDENTIALS: &str = "the refresh hook stored no credentials";
 const TEMPDIR_FAILED: &str = "no temporary state directory";
 const IO_FAILED: &str = "the recorded connection broke";
 const NO_TOKEN_LOCK: &str = "the credential lock could not be taken";
+const LOCKED_WRITE_LOST: &str = "the credential write did not land once the lock was released";
 const HOST_THREAD_PARKED: &str =
     "a credential write parked the plugin host, so no other hook could be served";
 
@@ -556,6 +568,58 @@ fn the_responses_codec_applies_the_body_hook_too() {
     assert_eq!(sent[0].json()["acme_marker"], json!(RESPONSES_MARKER));
 }
 
+fn overriding_plugin(codec: &str, base_url: &str) -> String {
+    let headers: String = OVERRIDDEN_HEADERS
+        .iter()
+        .map(|(name, value)| format!(r#"["{name}"] = "{value}", "#))
+        .collect();
+    format!(
+        r#"
+maki.provider.register({{
+  slug = "{OVERRIDE_SLUG}",
+  display_name = "Acme Overrides",
+  codec = "{codec}",
+  base_url = "{base_url}",
+  models = {{ {{ prefixes = {{ "{OVERRIDE_MODEL}" }} }} }},
+  auth = function()
+    return {{ headers = {{ {headers}}} }}
+  end,
+}})
+"#
+    )
+}
+
+/// A header the plugin's credentials name goes out once, with the plugin's
+/// value, whichever codec builds the request. Two copies would leave the
+/// server to guess which one counts (RFC 9110, section 5.3).
+#[test_case("openai" ; "openai")]
+#[test_case("openai-responses" ; "openai_responses")]
+#[test_case("anthropic" ; "anthropic")]
+#[test_case("google" ; "google")]
+fn a_header_the_auth_hook_sets_replaces_makis_own(codec: &str) {
+    let _home = isolated_home();
+    let (base_url, server) = serve(REJECTED_SCRIPT);
+    let host = plugin_host();
+    load_inline(
+        &host,
+        &overriding_plugin(codec, &base_url),
+        LOOPBACK_HOST,
+        &[OVERRIDE_SLUG],
+    );
+    plugin::commit_load();
+
+    let provider = plugin::create(OVERRIDE_SLUG, Timeouts::default()).expect(CREATE_FAILED);
+    let model =
+        Model::from_spec(&format!("{OVERRIDE_SLUG}/{OVERRIDE_MODEL}")).expect(UNKNOWN_MODEL);
+    let _ = stream(provider.as_ref(), &model, ThinkingConfig::Off);
+
+    let sent = server.lock().unwrap();
+    let request = sent.first().expect(NOTHING_SENT);
+    for (name, value) in OVERRIDDEN_HEADERS {
+        assert_eq!(request.headers.values(name), [value], "{name}");
+    }
+}
+
 /// One provider whose `login` runs `body`. The registration is the same every
 /// time, since what these tests vary is only what the hook does once it is
 /// called.
@@ -613,10 +677,9 @@ fn wait_for(path: &Path) {
     }
 }
 
-/// The defect that keeps the credential store off the plugin host's thread:
-/// `lock_credentials` waits on a file lock another maki process may hold, and
-/// the host is single threaded, so waiting for it inline stalls every other
-/// hook, tool call and timer in the process.
+/// `lock_credentials_async` waits on a file lock another maki process may hold,
+/// and the host is single threaded, so a wait that blocked it would stall every
+/// other hook, tool call and timer in the process.
 ///
 /// The lock here is held on a second file descriptor, which is what a second
 /// maki process looks like to `flock`, and the in-process re-entrancy that lets
@@ -641,7 +704,9 @@ fn a_credential_write_does_not_park_the_plugin_host() {
     plugin::commit_load();
 
     let dir = StateDir::resolve().expect(NO_STATE_DIR);
-    let held = lock_plugin_store(&dir, LOCKED_SLUG).expect(NO_TOKEN_LOCK);
+    let held = runtime()
+        .block_on(lock_plugin_store_async(&dir, LOCKED_SLUG))
+        .expect(NO_TOKEN_LOCK);
     let locked = std::thread::spawn(|| runtime().block_on(plugin::login(LOCKED_SLUG)));
     wait_for(&entered);
 
@@ -655,6 +720,8 @@ fn a_credential_write_does_not_park_the_plugin_host() {
     assert!(!done.exists(), "{HOST_THREAD_PARKED}");
     drop(held);
     locked.join().expect(HOOK_THREAD_FAILED).expect(HOOK_FAILED);
+    let stored = load_plugin_auth(&dir, LOCKED_SLUG).expect(LOCKED_WRITE_LOST);
+    assert_eq!(stored[TOKEN_KEY], json!(LOCKED_TOKEN));
 }
 
 /// The hook handles outlive the plugin that registered them: an unload drops

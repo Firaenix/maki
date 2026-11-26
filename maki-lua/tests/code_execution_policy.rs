@@ -25,6 +25,9 @@ const ECHO_PREFIX: &str = "echo:";
 const FAIL_MSG: &str = "fixture blew up";
 const ERROR_PREFIX: &str = "[ERROR] ";
 const GATHER_HINT_SUBSTR: &str = "`gather(...)` keeps the other results";
+const TOOLS_MODULE_HINT_SUBSTR: &str = "There is no `tools` module";
+const ASYNCIO_HINT_SUBSTR: &str = "asyncio here has only";
+const PATHLIB_NAME: &str = "leaf.txt";
 const TASK_PREFIX: &str = "task:";
 const WORKFLOW_NOTE_SUBSTR: &str = "Workflow mode: orchestrate subagents";
 const WF_TASK_GATED_LINE: &str = "Not callable: wf_task";
@@ -177,16 +180,20 @@ fn describe(
     audience: ToolAudience,
     workflow: bool,
 ) -> String {
-    reg.get(CODE_EXECUTION)
+    let asked = reg
+        .get(CODE_EXECUTION)
         .expect("code_execution registered")
         .tool
-        .description(&DescriptionContext {
+        .describe(&DescriptionContext {
             filter,
             audience,
             workflow,
             mcp: false,
         })
-        .into_owned()
+        .expect("code_execution asks its plugin");
+    runtime()
+        .block_on(asked)
+        .expect("the plugin describes code_execution")
 }
 
 fn run_tool(
@@ -453,6 +460,37 @@ fn failed_call_error_names_the_tool_and_hints_only_for_asyncio_gather(code: &str
         "got: {err}"
     );
     assert_eq!(err.contains(GATHER_HINT_SUBSTR), hint, "got: {err}");
+}
+
+#[test_case::test_case("import tools", TOOLS_MODULE_HINT_SUBSTR ; "import_tools")]
+#[test_case::test_case("await tools.interp_echo(msg='hi')", TOOLS_MODULE_HINT_SUBSTR ; "tools_attribute")]
+#[test_case::test_case("await asyncio.wait_for(interp_echo(msg='hi'), 1)", ASYNCIO_HINT_SUBSTR ; "missing_asyncio_api")]
+#[test_case::test_case("from asyncio import wait_for", ASYNCIO_HINT_SUBSTR ; "from_asyncio_import")]
+#[test_case::test_case("asyncio.wait_for(\"No module named 'tools'\")", ASYNCIO_HINT_SUBSTR ; "source_preview_does_not_match")]
+fn a_known_sandbox_mistake_gets_its_hint(code: &str, hint: &str) {
+    let err = run_code(code).expect_err("the mistake must raise");
+    assert!(err.contains(hint), "got: {err}");
+    let other = if hint == TOOLS_MODULE_HINT_SUBSTR {
+        ASYNCIO_HINT_SUBSTR
+    } else {
+        TOOLS_MODULE_HINT_SUBSTR
+    };
+    assert!(!err.contains(other), "got: {err}");
+}
+
+#[test_case::test_case("raise ValueError(\"boom\\nNameError: name 'tools' is not defined\")" ; "tools_name_error")]
+#[test_case::test_case("raise ValueError(\"boom\\nAttributeError: module 'asyncio' has no attribute 'timeout'\")" ; "asyncio_attribute_error")]
+fn an_error_quoted_in_a_longer_message_gets_no_hint(code: &str) {
+    let err = run_code(code).expect_err("the script raises");
+    assert!(!err.contains(TOOLS_MODULE_HINT_SUBSTR), "got: {err}");
+    assert!(!err.contains(ASYNCIO_HINT_SUBSTR), "got: {err}");
+}
+
+#[test]
+fn pathlib_is_preloaded() {
+    let out = run_code(&format!("print(pathlib.Path('dir/{PATHLIB_NAME}').name)"))
+        .expect("pathlib must work without an import");
+    assert!(out.contains(PATHLIB_NAME), "got: {out}");
 }
 
 /// The model counts lines in the code it wrote, so the preamble it never sees

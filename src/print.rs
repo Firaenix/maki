@@ -29,7 +29,6 @@ use maki_lua::session_snapshot::{HeadlessMeta, HeadlessSnapshot, MODE_BUILD};
 use maki_lua::{EventHandle, SessionEndReason};
 use maki_providers::TokenUsage;
 use maki_providers::model::Model;
-use maki_storage::StateDir;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::SessionClaim;
 use serde::Serialize;
@@ -37,6 +36,7 @@ use serde_json::Value;
 
 use crate::interrupt::Interrupt;
 use crate::sdk_mode::NOTICE_SUBTYPE;
+use crate::subagent_tasks::{SubagentTasks, TaskMessage};
 
 const SESSION_LINE_PREFIX: &str = "session: ";
 
@@ -134,6 +134,27 @@ struct NoticeEvent<'a> {
 }
 
 #[derive(Serialize)]
+struct TaskEvent<'a> {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    subtype: &'static str,
+    #[serde(flatten)]
+    task: TaskMessage,
+    session_id: &'a SessionRef,
+}
+
+impl<'a> TaskEvent<'a> {
+    fn new(task: TaskMessage, session_id: &'a SessionRef) -> Self {
+        Self {
+            event_type: "system",
+            subtype: task.subtype(),
+            task,
+            session_id,
+        }
+    }
+}
+
+#[derive(Serialize)]
 struct RetryEvent<'a> {
     #[serde(rename = "type")]
     event_type: &'static str,
@@ -176,8 +197,8 @@ impl Totals {
             } => {
                 self.num_turns += *num_turns;
                 self.stop_reason = Some(*reason);
-                // Only a stop cancels a run here, and its answer is cut short.
-                self.is_error |= *reason == DoneReason::Cancelled;
+                // A stop or a spent budget cuts the answer short.
+                self.is_error |= matches!(reason, DoneReason::Cancelled | DoneReason::MaxBudget);
                 let run_text = mem::take(&mut self.run_text);
                 if !run_text.is_empty() {
                     self.result_text = run_text;
@@ -207,6 +228,12 @@ impl VerboseOutput {
         }
         Ok(())
     }
+
+    fn emit_tasks(&mut self, tasks: Vec<TaskMessage>, session_id: &SessionRef) -> Result<()> {
+        tasks
+            .into_iter()
+            .try_for_each(|task| self.emit(&TaskEvent::new(task, session_id)))
+    }
 }
 
 pub struct PrintParams {
@@ -230,7 +257,6 @@ pub struct PrintParams {
     /// The right to write [`Self::resumed`]'s session, taken when it was
     /// resolved and held for the whole run.
     pub claim: SessionClaim,
-    pub storage: StateDir,
     /// How long to wait for background work once the prompt's run ends.
     /// `None` runs every call blocking instead.
     pub background_wait: Option<Duration>,
@@ -256,7 +282,6 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         host_prompt,
         resumed,
         claim,
-        storage,
         background_wait,
     } = params;
 
@@ -296,7 +321,6 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         initial_wd,
         resumed,
         claim,
-        storage,
         yolo: false,
         unattended: true,
         host_prompt,
@@ -307,7 +331,8 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         local_tools: Default::default(),
         background: BackgroundMode::from_wait(background_wait),
         stop: interrupt.stop(),
-    });
+    })
+    .await;
 
     let InteractiveHandle {
         tool_names,
@@ -353,6 +378,8 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
     }
 
     let mut totals = Totals::default();
+    // The stream shows Maki's own tool names, so a task message does too.
+    let mut tasks = SubagentTasks::new(|name| name);
 
     let snapshot = HeadlessSnapshot::default();
     snapshot.install(
@@ -370,12 +397,7 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
         // Folded in first, so a plugin handling `TurnEnd` finds the finished
         // totals when it calls `maki.session.read()`.
         snapshot.observe(&envelope);
-        maki_lua::agent_autocmd::dispatch(
-            &lua_handle,
-            &session_id,
-            &envelope,
-            envelope.subagent.is_some(),
-        );
+        maki_lua::agent_autocmd::dispatch(&lua_handle, &session_id, &envelope);
         let Envelope {
             ref event,
             ref subagent,
@@ -385,6 +407,10 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
 
         if !totals.fold(event, parent_tool_use_id) {
             break;
+        }
+        let task_messages = tasks.observe(&envelope);
+        if let Some(out) = &mut verbose_out {
+            out.emit_tasks(task_messages.before, &session_id)?;
         }
         match event {
             AgentEvent::TextDelta { .. }
@@ -474,11 +500,17 @@ pub async fn run(params: PrintParams) -> Result<Interrupt> {
                 }
             }
         }
+        if let Some(out) = &mut verbose_out {
+            out.emit_tasks(task_messages.after, &session_id)?;
+        }
     }
     let track = headless::await_shutdown(task).await;
     lua_handle
         .end_sessions([session_id.id()], SessionEndReason::Completed)
         .await;
+    if let Some(out) = &mut verbose_out {
+        out.emit_tasks(tasks.finish(), &session_id)?;
+    }
     // Background work and plugin jobs are stopped by now, so nothing spends
     // any more. Dropping the track saves the full bill, also what no turn
     // was left to report.
@@ -588,11 +620,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_run_cut_short_by_a_stop_is_an_error() {
+    #[test_case(DoneReason::Cancelled ; "stopped")]
+    #[test_case(DoneReason::MaxBudget ; "budget_spent")]
+    fn a_run_cut_short_is_an_error(reason: DoneReason) {
         let mut totals = Totals::default();
         assert!(totals.fold(&text_delta(FIRST_ANSWER), None));
-        assert!(totals.fold(&run_done(DoneReason::Cancelled), None));
+        assert!(totals.fold(&run_done(reason), None));
 
         assert!(totals.is_error);
         assert_eq!(totals.result_text, FIRST_ANSWER);

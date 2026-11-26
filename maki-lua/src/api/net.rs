@@ -10,14 +10,16 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use maki_config::split_host_port;
 use maki_lua_macro::{lua_class, lua_fn, lua_table};
+use maki_providers::headers::parse_headers;
 use maki_providers::http::{
     DNS_ATTEMPTS, HTTP_SCHEME, HTTPS_SCHEME, ProxyEnv, error_chain, extract_host_port, proxy_env,
     resolve,
 };
 use maki_providers::{Timeouts, client_builder};
+use maki_storage::blocking;
 use mlua::{Lua, LuaString, Result as LuaResult, Table, UserDataRef, Value as LuaValue};
 use regex::bytes::Regex;
-use reqwest::header::{CONTENT_LENGTH, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{CONTENT_LENGTH, HeaderMap, HeaderValue, USER_AGENT as USER_AGENT_NAME};
 use reqwest::{Client, Error as ReqwestError, Method, Request, Response};
 use socket2::SockRef;
 use thiserror::Error;
@@ -49,7 +51,6 @@ const GET: &str = "GET";
 const NO_ATTEMPT: &str = "no request was attempted";
 const MAX_REDIRECTS: u32 = 10;
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-const USER_AGENT_HEADER: &str = "User-Agent";
 const CF_MITIGATED: &str = "cf-mitigated";
 const CF_CHALLENGE: &str = "challenge";
 const FALLBACK_USER_AGENT: &str = "maki";
@@ -65,6 +66,7 @@ const MAX_POOLED_CLIENTS: usize = 8;
 /// A pooled client holds open sockets, so an endpoint nobody reads any more has
 /// to give them back.
 const CLIENT_IDLE_TTL: Duration = Duration::from_secs(120);
+const CLIENT_ERROR: &str = "client error";
 const INVALID_LINE_MATCH: &str = "invalid line_match";
 /// Methods whose requests carry no body at all when the caller gave none.
 const BODYLESS_METHODS: &[&str] = &["GET", "HEAD"];
@@ -719,10 +721,8 @@ fn close(_lua: &Lua, this: &Conn) -> LuaResult<()> {
 }
 
 lua_class! {
-    /// A TCP or Unix socket connection.
-    ///
-    /// `maki.net.connect` opens a TCP one and `maki.net.connect_unix` a Unix
-    /// socket one.
+    /// A TCP or Unix socket connection, from `maki.net.connect`,
+    /// `maki.net.connect_unix` or `Listener:accept`.
     ///
     /// `read` and `write` yield until done and can run at the same time.
     /// The connection closes on `:close()`, when the handle is garbage
@@ -743,8 +743,11 @@ lua_table! {
     /// keep-alive connection rather than pay a fresh handshake each time.
     ///
     /// `connect` follows the same rules, but only reaches hosts the plugin
-    /// lists in `net_hosts`. On Unix, `connect_unix` and `listen_unix` reach
-    /// local sockets, and need the `run` permission instead.
+    /// lists in `net_hosts`.
+    ///
+    /// `connect_unix` and `listen_unix` exist on Unix only. They need the
+    /// `run` permission rather than `net`, because a plugin that can run
+    /// `socat` already reaches every local socket.
     ///
     /// ```lua
     /// local res, err = maki.net.request("https://example.com")
@@ -871,18 +874,13 @@ fn build_request(
 ) -> Result<Request, String> {
     let build_error = |e: &dyn StdError| format!("request build error: {e}");
     let parsed_method = Method::from_bytes(method.as_bytes()).map_err(|e| build_error(&e))?;
-    let default_agent = (!headers
-        .iter()
-        .any(|(k, _)| k.eq_ignore_ascii_case(USER_AGENT_HEADER)))
-    .then_some((USER_AGENT_HEADER, user_agent));
-    let mut header_map = HeaderMap::new();
-    for (k, v) in default_agent
-        .into_iter()
-        .chain(headers.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-    {
-        let name = HeaderName::from_bytes(k.as_bytes()).map_err(|e| build_error(&e))?;
-        let value = HeaderValue::from_str(v).map_err(|e| build_error(&e))?;
-        header_map.append(name, value);
+    // `User-Agent` and `user-agent` in one table are refused: which one won
+    // would come down to the table's iteration order.
+    let mut header_map =
+        parse_headers(headers.iter().map(|(k, v)| (k, v))).map_err(|e| build_error(&e))?;
+    if !header_map.contains_key(USER_AGENT_NAME) {
+        let value = HeaderValue::from_str(user_agent).map_err(|e| build_error(&e))?;
+        header_map.insert(USER_AGENT_NAME, value);
     }
 
     // hyper sends no `content-length` for an empty body, whatever the method.
@@ -1010,7 +1008,7 @@ fn build_client(key: &ClientKey) -> Result<Client, String> {
         Route::Guarded(None) => {}
     }
 
-    builder.build().map_err(|e| format!("client error: {e}"))
+    builder.build().map_err(|e| format!("{CLIENT_ERROR}: {e}"))
 }
 
 /// Everything a client is built from, and so what a request can reuse one by.
@@ -1071,7 +1069,7 @@ fn make_room(pool: &mut ClientPool, now: Instant) {
 }
 
 /// Hands out a client for `params`, reusing the pooled one when the key matches.
-fn pooled_client(params: &RequestParams) -> Result<Arc<Client>, String> {
+async fn pooled_client(params: &RequestParams) -> Result<Arc<Client>, String> {
     let key = ClientKey::of(params);
     let now = Instant::now();
     {
@@ -1082,10 +1080,12 @@ fn pooled_client(params: &RequestParams) -> Result<Arc<Client>, String> {
             return Ok(Arc::clone(client));
         }
     }
-    // Built outside the lock: `build_client` sets up TLS, and this runs on
-    // the Lua thread's executor. Two callers racing the same cold key
-    // each pay for a client, and the loser is dropped when its request ends.
-    let client = Arc::new(build_client(&key)?);
+    // Built on the blocking pool: on Linux `build_client` reads and parses the
+    // system's CA store, and this runs on the Lua thread's executor. Two
+    // callers racing the same cold key each pay for a client, and the loser is
+    // dropped when its request ends.
+    let cold_key = key.clone();
+    let client = Arc::new(blocking(move || build_client(&cold_key)).await?);
     let now = Instant::now();
     let mut pool = lock_pool();
     make_room(&mut pool, now);
@@ -1140,7 +1140,7 @@ pub(crate) async fn provider_get(
 
 async fn do_request(mut params: RequestParams) -> Result<ResponseData, NetError> {
     let allowed = ALLOWED_PRIVATE_HOSTS.load_full();
-    let client = pooled_client(&params)?;
+    let client = pooled_client(&params).await?;
     let mut response = send_with_retries(&client, &params).await?;
 
     for _ in 0..MAX_REDIRECTS {
@@ -1150,7 +1150,7 @@ async fn do_request(mut params: RequestParams) -> Result<ResponseData, NetError>
         params
             .follow_redirect(response.status().as_u16(), &location, &allowed)
             .await?;
-        let client = pooled_client(&params)?;
+        let client = pooled_client(&params).await?;
         response = send_with_retries(&client, &params).await?;
     }
     if redirect_location(&response).is_some() {
@@ -1416,7 +1416,9 @@ fn validate_and_upgrade_url(url: &str, allowed: &HostAllowlist) -> Result<String
 mod tests {
     use super::*;
     use crate::plugin_permissions::PluginPermissions;
+    use maki_providers::headers::HeaderError;
     use reqwest::Body;
+    use reqwest::header::HeaderName;
     use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::net::{Ipv6Addr, TcpListener, TcpStream as StdTcpStream};
@@ -1915,8 +1917,28 @@ mod tests {
             vec![],
         )
         .unwrap();
-        let agents: Vec<_> = req.headers().get_all(USER_AGENT_HEADER).iter().collect();
+        let agents: Vec<_> = req.headers().get_all(USER_AGENT_NAME).iter().collect();
         assert_eq!(agents, ["plugin"]);
+    }
+
+    #[test]
+    fn one_header_in_two_cases_is_refused() {
+        const SPELLINGS: [&str; 2] = ["User-Agent", "user-agent"];
+        let headers: Vec<_> = SPELLINGS
+            .iter()
+            .map(|name| (name.to_string(), "plugin".to_string()))
+            .collect();
+        let error = build_request(
+            &Client::new(),
+            EXAMPLE_URL,
+            "agent",
+            "GET",
+            &headers,
+            vec![],
+        )
+        .unwrap_err();
+        let expected = HeaderError::Duplicate(SPELLINGS[1].into()).to_string();
+        assert!(error.contains(&expected), "{error}");
     }
 
     #[test]
@@ -2366,13 +2388,7 @@ mod tests {
     }
 
     /// The pool is process-wide, so the tests that touch it run one at a time.
-    static POOL_TESTS: Mutex<()> = Mutex::new(());
-
-    fn pool_tests_serialized() -> MutexGuard<'static, ()> {
-        POOL_TESTS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
+    static POOL_TESTS: AsyncMutex<()> = AsyncMutex::const_new(());
 
     const FIRST_POOL_TIMEOUT_SECS: u64 = 400;
     /// Long enough that the sweep sees it as idle, short enough for a test.
@@ -2466,12 +2482,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_pool_never_grows_past_the_cap() {
-        let _guard = pool_tests_serialized();
+    #[tokio::test]
+    async fn the_pool_never_grows_past_the_cap() {
+        let _guard = POOL_TESTS.lock().await;
         clear_client_pool();
         for secs in 101..101 + 3 * MAX_POOLED_CLIENTS as u64 {
-            pooled_client(&params_with_timeout(secs)).unwrap();
+            pooled_client(&params_with_timeout(secs)).await.unwrap();
         }
         assert!(
             lock_pool().len() <= MAX_POOLED_CLIENTS,
@@ -2480,44 +2496,47 @@ mod tests {
         );
     }
 
-    #[test]
-    fn clearing_the_pool_hands_every_client_back() {
-        let _guard = pool_tests_serialized();
+    #[tokio::test]
+    async fn clearing_the_pool_hands_every_client_back() {
+        let _guard = POOL_TESTS.lock().await;
         clear_client_pool();
         let params = params_with_timeout(DEFAULT_TIMEOUT_SECS);
-        let client = pooled_client(&params).unwrap();
+        let client = pooled_client(&params).await.unwrap();
         assert_eq!(lock_pool().len(), 1);
         clear_client_pool();
         assert!(lock_pool().is_empty());
         assert!(
-            !Arc::ptr_eq(&client, &pooled_client(&params).unwrap()),
+            !Arc::ptr_eq(&client, &pooled_client(&params).await.unwrap()),
             "a cleared client came back out of the pool"
         );
     }
 
-    #[test]
-    fn pooled_client_is_reused_when_the_pool_is_full() {
-        let _guard = pool_tests_serialized();
+    #[tokio::test]
+    async fn pooled_client_is_reused_when_the_pool_is_full() {
+        let _guard = POOL_TESTS.lock().await;
         clear_client_pool();
         let params: Vec<_> = (0..MAX_POOLED_CLIENTS as u64)
             .map(|n| params_with_timeout(FIRST_POOL_TIMEOUT_SECS + n))
             .collect();
-        let clients: Vec<_> = params.iter().map(|p| pooled_client(p).unwrap()).collect();
+        let mut clients = Vec::with_capacity(params.len());
+        for p in &params {
+            clients.push(pooled_client(p).await.unwrap());
+        }
         for (params, client) in params.iter().zip(&clients) {
             assert!(
-                Arc::ptr_eq(client, &pooled_client(params).unwrap()),
+                Arc::ptr_eq(client, &pooled_client(params).await.unwrap()),
                 "a hit on a full pool was evicted"
             );
         }
     }
 
-    #[test]
-    fn pooled_client_is_reused_for_the_same_key() {
-        let _guard = pool_tests_serialized();
+    #[tokio::test]
+    async fn pooled_client_is_reused_for_the_same_key() {
+        let _guard = POOL_TESTS.lock().await;
         clear_client_pool();
         let params = redirect_params(PUBLIC_URL);
-        let first = pooled_client(&params).unwrap();
-        let second = pooled_client(&params).unwrap();
+        let first = pooled_client(&params).await.unwrap();
+        let second = pooled_client(&params).await.unwrap();
         assert!(
             Arc::ptr_eq(&first, &second),
             "repeat call built a new client"
@@ -2536,8 +2555,9 @@ mod tests {
     /// the only thing that tells the two apart.
     #[test_case(a_pinned_route() ; "a_pinned_hop")]
     #[test_case(Route::Provider ; "a_provider_origin")]
-    fn pooled_client_is_keyed_on_the_route(route: Route) {
-        let _guard = pool_tests_serialized();
+    #[tokio::test]
+    async fn pooled_client_is_keyed_on_the_route(route: Route) {
+        let _guard = POOL_TESTS.lock().await;
         clear_client_pool();
         let plain = redirect_params(PUBLIC_URL);
         let other = RequestParams {
@@ -2545,8 +2565,8 @@ mod tests {
             ..params_with_timeout(DEFAULT_TIMEOUT_SECS)
         };
         assert!(!Arc::ptr_eq(
-            &pooled_client(&plain).unwrap(),
-            &pooled_client(&other).unwrap()
+            &pooled_client(&plain).await.unwrap(),
+            &pooled_client(&other).await.unwrap()
         ));
     }
 

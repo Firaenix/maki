@@ -1,7 +1,6 @@
 //! Async agent loop with tools.
 
 pub mod agent;
-pub mod btw;
 pub mod call_scope;
 pub mod cancel;
 pub mod child_guard;
@@ -23,23 +22,20 @@ pub use mcp::{
 };
 pub mod session;
 mod session_control;
-pub mod skill;
 pub use session_control::{Activity, Delivery, EndReason, SessionControl};
-mod session_input;
-pub use session_input::{SessionInput, expand_mcp_prompt};
 mod session_loop;
 pub use agent::{
-    Agent, AgentParams, AgentRunParams, Cutter, DisplayItem, History, HistorySnapshot, HostPrompt,
-    Instructions, LoadedInstructions, ModelSlot, RunContext, RunContextBuilder, SharedMessages,
-    Transcript, UNAVAILABLE_RESULT, USER_CANCEL_MARKER, close_dangling_tool_calls, display_order,
-    find_subdirectory_instructions, is_instruction_file, observation_detail, observation_line,
-    unbind_thinking,
+    Agent, AgentParams, AgentRunParams, CompactReason, Cutter, DisplayItem, History,
+    HistorySnapshot, HostPrompt, Instructions, LoadedInstructions, ModelSlot, RunContext,
+    RunContextBuilder, SharedMessages, Transcript, UNAVAILABLE_RESULT, USER_CANCEL_MARKER,
+    close_dangling_tool_calls, display_order, find_subdirectory_instructions, is_instruction_file,
+    observation_detail, observation_line, unbind_thinking,
 };
 pub use call_scope::{AlreadyMoved, CallGuard, CallScope, MovedTrigger, SessionStub, TaskHome};
 pub use cancel::{CancelHandle, CancelMap, CancelToken, CancelTrigger};
 pub use live_session::{
-    AgentSeed, BackgroundNotice, MailboxError, SessionMailbox, TaskLabel, receipt_tag,
-    result_notice,
+    AgentSeed, BackgroundNotice, CompactRequest, MailboxError, SessionMailbox, TaskLabel,
+    receipt_tag, result_notice,
 };
 pub use maki_config::{AgentConfig, PermissionsConfig, SessionDefaults, ToolOutputLines};
 pub use session_loop::{CutShort, TurnHost, run_turns};
@@ -92,9 +88,13 @@ pub enum ExtractedCommand {
     /// since a command like `/compact` rewrites the history the later messages
     /// land in.
     Interrupt(Vec<AgentInput>),
-    /// Carries the guidance typed as `/compact <instructions>`, for this one
-    /// summary.
-    Compact(Option<String>),
+    /// Carries the guidance from `/compact <instructions>`, for this one
+    /// summary. {reason} tells a typed `/compact` from a plugin's
+    /// `maki.session.request_compact`.
+    Compact {
+        instructions: Option<String>,
+        reason: CompactReason,
+    },
 }
 
 pub trait InterruptSource: Send + Sync {
@@ -106,7 +106,7 @@ pub trait InterruptSource: Send + Sync {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct McpPromptRef {
     pub qualified_name: String,
     pub arguments: HashMap<String, String>,

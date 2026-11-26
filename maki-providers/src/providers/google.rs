@@ -2,8 +2,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::TryStreamExt;
+use maki_storage::blocking;
 use maki_storage::id::{MakiId, SessionRef};
-use reqwest::{Client, Method, RequestBuilder};
+use reqwest::{Client, Request, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
@@ -172,22 +173,13 @@ impl Google {
             .to_string()
     }
 
-    fn build_request(&self, method: Method, url: &str) -> RequestBuilder {
-        let auth = self.auth.lock().unwrap();
-        auth.configure_request(
-            self.client
-                .request(method, url)
-                .header("user-agent", super::user_agent()),
-        )
+    fn finish(&self, builder: RequestBuilder) -> Result<Request, AgentError> {
+        self.auth.lock().unwrap().finish(builder)
     }
 
     fn api_key(&self) -> String {
         let auth = self.auth.lock().unwrap();
-        auth.headers
-            .iter()
-            .find(|(k, _)| k == API_KEY_HEADER)
-            .map(|(_, v)| v.clone())
-            .unwrap_or_default()
+        auth.header(API_KEY_HEADER).unwrap_or_default().to_owned()
     }
 
     fn stream_url(&self, model_id: &str) -> String {
@@ -253,11 +245,12 @@ impl Google {
         let url = self.stream_url(&model.id);
         let json_body = serde_json::to_vec(&body)?;
 
-        let request = self
-            .build_request(Method::POST, &url)
-            .header("content-type", "application/json")
-            .body(json_body)
-            .build()?;
+        let request = self.finish(
+            self.client
+                .post(&url)
+                .header("content-type", "application/json")
+                .body(json_body),
+        )?;
 
         ok_sse(&self.client, request, self.stream_timeout, |body| {
             parse_sse(body, event_tx)
@@ -282,7 +275,7 @@ impl Provider for Google {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         let url = self.models_url();
-        let request = self.build_request(Method::GET, &url).build();
+        let request = self.finish(self.client.get(&url));
         let client = self.client.clone();
         Box::pin(async move {
             let body_text = ok_text(&client, request?).await?;
@@ -316,7 +309,7 @@ impl Provider for Google {
             if self.key_pool.is_none() {
                 return Ok(());
             }
-            let pool = KeyPool::resolve(SLUG, ENV_VAR)?;
+            let pool = blocking(|| KeyPool::resolve(SLUG, ENV_VAR)).await?;
             *self.auth.lock().unwrap() =
                 resolve_auth_from_key(pool.current(), self.resolved_base_url.clone())?;
             Ok(())
@@ -364,6 +357,7 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                 ContentBlock::Thinking {
                     thinking,
                     signature,
+                    ..
                 } => {
                     let mut part = json!({"text": thinking, "thought": true});
                     if let Some(sig) = signature {
@@ -377,6 +371,7 @@ fn convert_messages(messages: &[Message]) -> Vec<Value> {
                     name,
                     input,
                     thought_signature,
+                    ..
                 } => {
                     let mut part = json!({
                         "functionCall": {
@@ -574,6 +569,7 @@ fn push_or_extend_thinking(
     if let Some(ContentBlock::Thinking {
         thinking: prev,
         signature: prev_sig,
+        ..
     }) = blocks.last_mut()
     {
         prev.push_str(&text);
@@ -584,6 +580,7 @@ fn push_or_extend_thinking(
         blocks.push(ContentBlock::Thinking {
             thinking: text,
             signature,
+            reasoning_id: None,
         });
     }
 }
@@ -650,6 +647,7 @@ async fn parse_sse(
                         name: func_call.name,
                         input,
                         thought_signature,
+                        input_error: None,
                     });
                     stop_reason = Some(StopReason::ToolUse);
                 } else if let Some(text) = part.text {
@@ -675,7 +673,7 @@ async fn parse_sse(
 mod tests {
     use super::*;
     use crate::error::ErrorProjection;
-    use crate::model::{ModelPricing, ModelTier};
+    use crate::model::{FactSources, ModelPricing, ModelTier};
     use crate::test_support::sse_body;
     use std::sync::Arc;
     use test_case::test_case;
@@ -718,6 +716,7 @@ mod tests {
             discovered_free: false,
             max_output_tokens: Some(8192),
             turn_output_tokens: None,
+            sources: FactSources::default(),
             context_window: 1_048_576,
             thinking_fields: None,
         }
@@ -891,6 +890,7 @@ mod tests {
             content: vec![ContentBlock::Thinking {
                 thinking: "hmm".into(),
                 signature: Some("sig123".into()),
+                reasoning_id: None,
             }],
             ..Default::default()
         }];
@@ -981,6 +981,7 @@ mod tests {
                 name: "read_file".into(),
                 input: json!({"path": "/tmp/a"}),
                 thought_signature: Some(SIG.into()),
+                input_error: None,
             }],
             ..Default::default()
         }];
@@ -1104,7 +1105,7 @@ mod tests {
         assert_eq!(result.message.content.len(), 1);
         assert!(matches!(
             &result.message.content[0],
-            ContentBlock::Thinking { thinking, signature }
+            ContentBlock::Thinking { thinking, signature, .. }
                 if thinking == "reasoning... more." && signature.as_deref() == Some("sig-final")
         ));
     }
@@ -1139,7 +1140,7 @@ mod tests {
         assert_eq!(result.usage.output, 50);
         assert!(matches!(
             &result.message.content[0],
-            ContentBlock::Thinking { thinking, signature } if thinking == "thinking..." && signature.as_deref() == Some("sig1")
+            ContentBlock::Thinking { thinking, signature, .. } if thinking == "thinking..." && signature.as_deref() == Some("sig1")
         ));
         assert!(matches!(
             &result.message.content[1],

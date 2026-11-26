@@ -1,14 +1,17 @@
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
+use maki_storage::auth::OAuthTokens;
 use maki_storage::id::SessionRef;
 use maki_storage::sessions::Effort;
+use reqwest::header::HeaderMap;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::ThinkingConfig;
-use crate::model::{FastSupport, Model, ModelInfo};
+use crate::headers::HeaderError;
+use crate::model::{FactSource, FastSupport, Model, ModelInfo};
 use crate::model_registry;
 use crate::provider::{BoxFuture, Provider};
 use crate::types::{EffortDialect, ThinkingFallback};
@@ -33,34 +36,22 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
     provider_name: Cow::Borrowed("OpenAI"),
 };
 
-// Offline fallback; the Codex backend's `/models` is the source of truth.
-// Codex models match by their `-codex` substring in
-// `coding_plan_context_window`, so they are not listed here.
-pub(crate) const PLAN_MODELS: &[&str] = &[
-    "gpt-6.1-sol",
-    "gpt-6.1-terra",
-    "gpt-6-sol",
-    "gpt-6-luna",
-    "gpt-6-astra",
-    "gpt-5.6-luna",
-    "gpt-5.6-terra",
-    "gpt-5.6-sol",
-    "gpt-5.5",
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.2",
-];
-
+const GPT_PREFIX: &str = "gpt-";
+const CODEX_MARKER: &str = "-codex";
+const CODEX_5_1_PREFIX: &str = "gpt-5.1-codex";
+const CODEX_5_1_MAX_PREFIX: &str = "gpt-5.1-codex-max";
+/// Spoken by every generation newer than the ones named in
+/// [`responses_dialect`], so a release reaches the right wire unannounced.
+const NEWEST_DIALECT: &EffortDialect<'static> = &dialect::GPT_6;
 /// How the chat completions path spells thinking for a model that does not.
 const CHAT_THINKING: ThinkingFallback = ThinkingFallback::Dialect(&dialect::STANDARD);
 const CODEX_PLAN_CONTEXT_WINDOW: u32 = 272_000;
 const GPT_5_6_PLAN_CONTEXT_WINDOW: u32 = 372_000;
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
-// The backend hides models newer than this Codex CLI version, so bump it when
-// a fresh model is missing from the list. 0.156.1 is the first line that
-// surfaces GPT-6 Sol / Luna in the picker, 0.159.x the first with GPT-6.1 Sol;
-// 0.167.0 is latest as of 2026-10-07
-const CODEX_CLIENT_VERSION: &str = "0.167.0";
+// The backend lists a model only to clients at or past its minimal Codex CLI
+// version. That gate guards Codex CLI features Maki never uses, so Maki claims a
+// version no release will reach instead of trailing each one by an update.
+const CODEX_CLIENT_VERSION: &str = "999.0.0";
 const PLAN_MODELS_PATH: &str = "/models?client_version=";
 const LISTED_VISIBILITY: &str = "list";
 const ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
@@ -86,25 +77,41 @@ const SECONDS_PER_HOUR: u64 = 60 * 60;
 const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
 const SECONDS_PER_WEEK: u64 = 7 * SECONDS_PER_DAY;
 
-fn is_codex_model(model_id: &str) -> bool {
-    coding_plan_context_window(model_id).is_some()
+/// `gpt-6.2-sol` is `(6, 2)` and `gpt-6-luna` is `(6, 0)`.
+fn gpt_generation(model_id: &str) -> Option<(u32, u32)> {
+    let version = model_id.strip_prefix(GPT_PREFIX)?.split('-').next()?;
+    let (major, minor) = version.split_once('.').unwrap_or((version, "0"));
+    Some((major.parse().ok()?, minor.parse().ok()?))
 }
 
-// Codex models match by substring so future releases route without a registry
-// edit; the named non-codex plans match exactly to avoid catching near-misses
-// like `gpt-5.6-terra-preview`.
-fn coding_plan_context_window(model_id: &str) -> Option<u32> {
-    if model_id.contains("-codex") {
-        return Some(CODEX_PLAN_CONTEXT_WINDOW);
+/// How the Responses API takes effort for a model, judged from its id so the
+/// models of a generation route alike, named or not. `None` keeps a model
+/// older than GPT-5.2 on chat completions.
+fn responses_dialect(model_id: &str) -> Option<&'static EffortDialect<'static>> {
+    if model_id.contains(CODEX_MARKER) {
+        let is_5_1 =
+            model_id.starts_with(CODEX_5_1_PREFIX) && !model_id.starts_with(CODEX_5_1_MAX_PREFIX);
+        return Some(if is_5_1 {
+            &dialect::CODEX_5_1
+        } else {
+            &dialect::CODEX
+        });
     }
-    if !PLAN_MODELS.contains(&model_id) {
-        return None;
+    match gpt_generation(model_id)? {
+        (6.., _) => Some(NEWEST_DIALECT),
+        (5, 6..) => Some(&dialect::GPT_5_6),
+        (5, 2..) => Some(&dialect::CODING_PLAN),
+        _ => None,
     }
-    Some(if model_id.starts_with("gpt-5.6-") {
-        GPT_5_6_PLAN_CONTEXT_WINDOW
-    } else {
-        CODEX_PLAN_CONTEXT_WINDOW
-    })
+}
+
+/// The plan window until the backend declares the model's own: the curated
+/// rows carry the platform API's far larger one.
+fn plan_context_window(model_id: &str) -> u32 {
+    match gpt_generation(model_id) {
+        Some((5, 6)) => GPT_5_6_PLAN_CONTEXT_WINDOW,
+        _ => CODEX_PLAN_CONTEXT_WINDOW,
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -183,7 +190,7 @@ impl PlanModel {
         };
         ModelInfo {
             id: self.slug,
-            context_window: self.context_window,
+            context_window: self.context_window.filter(|&window| window > 0),
             max_output_tokens: None,
             pricing: None,
             supports_thinking: Some(!info.efforts.is_empty()),
@@ -217,10 +224,7 @@ fn parse_plan_models(
 }
 
 fn plan_account_id(auth: &ResolvedAuth) -> Option<&str> {
-    auth.headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(ACCOUNT_ID_HEADER))
-        .map(|(_, value)| value.as_str())
+    auth.header(ACCOUNT_ID_HEADER)
         .filter(|value| !value.is_empty())
 }
 
@@ -270,10 +274,15 @@ fn apply_plan_fast(
     }
 }
 
-fn apply_session_affinity(body: &mut Value, auth: &mut ResolvedAuth, session: &SessionRef) {
+fn apply_session_affinity(
+    body: &mut Value,
+    auth: &mut ResolvedAuth,
+    session: &SessionRef,
+) -> Result<(), HeaderError> {
     if is_coding_plan(auth) {
-        SESSION_AFFINITY.apply(session, body, auth);
+        SESSION_AFFINITY.apply(session, body, auth)?;
     }
+    Ok(())
 }
 
 #[derive(Deserialize, Default)]
@@ -335,12 +344,14 @@ impl OpenAi {
         self
     }
 
-    fn codex_auth(&self) -> Result<ResolvedAuth, AgentError> {
+    async fn codex_auth(&self) -> Result<ResolvedAuth, AgentError> {
+        self.codex_auth_from(self.auth.stored_tokens().await.as_ref())
+    }
+
+    fn codex_auth_from(&self, tokens: Option<&OAuthTokens>) -> Result<ResolvedAuth, AgentError> {
         // Prefer OAuth tokens for the ChatGPT Coding Plan backend.
-        if let Some(storage) = self.auth.storage()
-            && let Some(tokens) = maki_storage::auth::load_tokens(storage, auth::PROVIDER)
-        {
-            return auth::build_coding_plan_resolved(&tokens);
+        if let Some(tokens) = tokens {
+            return auth::build_coding_plan_resolved(tokens);
         }
         // Fall back to standard API key via the Responses API. Env /
         // providers.toml base_url overrides the platform API only, never the
@@ -356,7 +367,7 @@ impl OpenAi {
     }
 
     async fn fetch_plan_models(&self) -> Result<Vec<ModelInfo>, AgentError> {
-        let auth = self.codex_auth()?;
+        let auth = self.codex_auth().await?;
         let url = format!(
             "{}{PLAN_MODELS_PATH}{CODEX_CLIENT_VERSION}",
             auth::CODING_PLAN_BASE_URL
@@ -434,26 +445,7 @@ fn resolve_openai_base_url() -> Option<String> {
     maki_config::providers::configured_base_url(super::SLUG, config.get(super::SLUG))
 }
 
-// Codex models and GPT-6 drop `minimal` and never take an explicit "none", so
-// they get their own dialects; the plain plan models keep both.
-fn plan_dialect(model_id: &str) -> &'static EffortDialect<'static> {
-    if !model_id.contains("-codex") {
-        return if model_id.starts_with("gpt-6-") || model_id.starts_with("gpt-6.") {
-            &dialect::GPT_6
-        } else if model_id.starts_with("gpt-5.6-") {
-            &dialect::GPT_5_6
-        } else {
-            &dialect::CODING_PLAN
-        };
-    }
-    if model_id.starts_with("gpt-5.1-codex") && !model_id.starts_with("gpt-5.1-codex-max") {
-        &dialect::CODEX_5_1
-    } else {
-        &dialect::CODEX
-    }
-}
-
-/// The dialect of the Codex backend for a model it serves. `None` sends the
+/// The dialect of the Responses API for a model it serves. `None` sends the
 /// model down the chat completions path.
 fn plan_effort_dialect<'a>(
     model_id: &str,
@@ -461,7 +453,18 @@ fn plan_effort_dialect<'a>(
 ) -> Option<EffortDialect<'a>> {
     discovered
         .map(PlanModelInfo::dialect)
-        .or_else(|| is_codex_model(model_id).then(|| plan_dialect(model_id).clone()))
+        .or_else(|| responses_dialect(model_id).cloned())
+}
+
+/// A ChatGPT login opens only the Codex backend. On the chat completions path
+/// its token reaches the platform API, whose 401 reads as a dead login, so a
+/// model the listing has not named yet still goes to the Codex backend.
+fn routed_dialect<'a>(
+    model_id: &str,
+    discovered: Option<&'a PlanModelInfo>,
+    oauth: bool,
+) -> Option<EffortDialect<'a>> {
+    plan_effort_dialect(model_id, discovered).or_else(|| oauth.then(|| NEWEST_DIALECT.clone()))
 }
 
 pub(super) fn sends_thinking(model: &Model, choice: ThinkingConfig) -> ThinkingConfig {
@@ -491,21 +494,28 @@ impl Provider for OpenAi {
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            self.auth.refresh_if_stale().await?;
+            let oauth = self.auth.uses_oauth().await?;
             let mut buf = String::new();
             let system = super::super::with_prefix(&self.system_prefix, system, &mut buf);
 
             let discovered =
                 model_registry::provider_info::<PlanModelInfo>(&CONFIG.slug, &model.id);
-            if let Some(dialect) = plan_effort_dialect(&model.id, discovered.as_deref()) {
+            if let Some(dialect) = routed_dialect(&model.id, discovered.as_deref(), oauth) {
                 let stream_timeout = self.compat.stream_timeout();
                 return self
                     .auth
                     .with_retry(|| async {
-                        let mut codex_auth = self.codex_auth()?;
-                        let mut body = super::responses::build_body(model, messages, system, tools);
+                        let mut codex_auth = self.codex_auth().await?;
+                        let mut body = super::responses::build_body(
+                            model,
+                            messages,
+                            system,
+                            tools,
+                            false,
+                            super::responses::SystemChannel::DeveloperMessage,
+                        );
                         if let Some(session) = session_id {
-                            apply_session_affinity(&mut body, &mut codex_auth, session);
+                            apply_session_affinity(&mut body, &mut codex_auth, session)?;
                         }
                         super::responses::apply_responses_reasoning(
                             &mut body,
@@ -517,6 +527,7 @@ impl Provider for OpenAi {
                         super::responses::do_stream(
                             self.compat.client(),
                             model,
+                            &HeaderMap::new(),
                             &body,
                             event_tx,
                             &codex_auth,
@@ -537,17 +548,20 @@ impl Provider for OpenAi {
                 .with_retry(|| async {
                     let auth = self.auth.current();
                     self.compat
-                        .do_stream(model, &[], &body, event_tx, &auth)
+                        .do_stream(model, &HeaderMap::new(), &body, event_tx, &auth)
                         .await
                 })
                 .await
         })
     }
 
+    fn needs_model_discovery(&self) -> bool {
+        self.auth.held_tokens().is_some()
+    }
+
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async {
-            self.auth.refresh_if_stale().await?;
-            if self.auth.is_oauth() {
+            if self.auth.uses_oauth().await? {
                 return self.auth.with_retry(|| self.fetch_plan_models()).await;
             }
             self.auth
@@ -561,13 +575,12 @@ impl Provider for OpenAi {
 
     fn fetch_usage(&self) -> BoxFuture<'_, Result<Option<ProviderUsage>, AgentError>> {
         Box::pin(async {
-            self.auth.refresh_if_stale().await?;
-            if !self.auth.is_oauth() {
+            if !self.auth.uses_oauth().await? {
                 return Ok(None);
             }
             self.auth
                 .with_retry(|| async {
-                    let auth = self.codex_auth()?;
+                    let auth = self.codex_auth().await?;
                     let response = self.compat.get_text(&auth, USAGE_URL).await?;
                     Ok(Some(parse_usage(&response)?))
                 })
@@ -587,18 +600,22 @@ impl Provider for OpenAi {
     /// would shadow the pricing gate in `Model::supports_fast` for good, and
     /// that gate is not ours to close.
     fn adjust_model(&self, model: &mut Model) {
-        if !self.auth.is_oauth() {
+        let Some(tokens) = self.auth.held_tokens() else {
             return;
-        }
-        let auth = self.codex_auth().ok();
+        };
+        let auth = self.codex_auth_from(Some(&tokens)).ok();
         let info = model_registry::provider_info::<PlanModelInfo>(&CONFIG.slug, &model.id);
         model.supports_fast_override = Some(supports_plan_fast(
             auth.as_ref(),
             info.as_deref(),
             model_registry::discovery_complete(&CONFIG.slug),
         ));
-        if let Some(context_window) = coding_plan_context_window(&model.id) {
-            model.context_window = model.context_window.min(context_window);
+        let declared_window = model_registry::discovered(&CONFIG.slug, &model.id)
+            .and_then(|discovered| discovered.context_window);
+        let plan_window = plan_context_window(&model.id);
+        if declared_window.is_none() && plan_window < model.context_window {
+            model.context_window = plan_window;
+            model.sources.context_window = FactSource::Default;
         }
     }
 }
@@ -617,33 +634,47 @@ mod tests {
             .models()
             .iter()
             .flat_map(|e| &e.prefixes)
-            .filter(|id| is_codex_model(id))
+            .filter(|id| responses_dialect(id).is_some())
             .map(|id| ModelInfo::id_only(id.clone()))
             .collect()
     }
 
-    #[test_case("gpt-5.6-luna")]
-    #[test_case("gpt-5.6-terra")]
-    #[test_case("gpt-5.6-sol")]
-    fn gpt_5_6_models_use_coding_plan(model_id: &str) {
-        assert!(is_codex_model(model_id));
+    #[test_case("gpt-7-nova", Some(NEWEST_DIALECT) ; "future_generation_takes_newest_dialect")]
+    #[test_case("gpt-6.3-sol", Some(&dialect::GPT_6) ; "unnamed_gpt_6_release")]
+    #[test_case("gpt-6.2-astra", Some(&dialect::GPT_6) ; "gpt_6_2")]
+    #[test_case("gpt-6-luna", Some(&dialect::GPT_6) ; "gpt_6")]
+    #[test_case("gpt-5.6-terra-preview", Some(&dialect::GPT_5_6) ; "gpt_5_6_variant")]
+    #[test_case("gpt-5.5", Some(&dialect::CODING_PLAN) ; "gpt_5_5")]
+    #[test_case("gpt-5.4-nano", Some(&dialect::CODING_PLAN) ; "gpt_5_4_nano")]
+    #[test_case("gpt-5.2", Some(&dialect::CODING_PLAN) ; "gpt_5_2")]
+    #[test_case("gpt-5.7-codex", Some(&dialect::CODEX) ; "unnamed_codex")]
+    #[test_case("gpt-5.1-codex-mini", Some(&dialect::CODEX_5_1) ; "codex_5_1")]
+    #[test_case("gpt-5.1-codex-max", Some(&dialect::CODEX) ; "codex_5_1_max")]
+    #[test_case("gpt-5.1", None ; "gpt_5_1_stays_on_chat")]
+    #[test_case("gpt-4.1-mini", None ; "gpt_4_1_stays_on_chat")]
+    #[test_case("o3", None ; "o_series_stays_on_chat")]
+    #[test_case("gpt-latest", None ; "unversioned_id_stays_on_chat")]
+    fn responses_dialect_follows_generation(model_id: &str, expected: Option<&EffortDialect>) {
+        assert_eq!(responses_dialect(model_id), expected);
     }
 
-    #[test_case("gpt-6.1-sol", Some(272_000))]
-    #[test_case("gpt-6.1-terra", Some(272_000))]
-    #[test_case("gpt-6-sol", Some(272_000))]
-    #[test_case("gpt-6-luna", Some(272_000))]
-    #[test_case("gpt-6-astra", Some(272_000))]
-    #[test_case("gpt-5.6-luna", Some(372_000))]
-    #[test_case("gpt-5.6-terra", Some(372_000))]
-    #[test_case("gpt-5.6-sol", Some(372_000))]
-    #[test_case("gpt-5.5", Some(272_000))]
-    #[test_case("gpt-5.3-codex", Some(272_000))]
-    #[test_case("gpt-5.7-codex", Some(272_000) ; "unlisted codex model still routes")]
-    #[test_case("gpt-5.6-terra-preview", None ; "non-codex near-match is rejected")]
-    #[test_case("gpt-5.4-nano", None)]
-    fn coding_plan_context_window_resolves_plan_models(model_id: &str, expected: Option<u32>) {
-        assert_eq!(coding_plan_context_window(model_id), expected);
+    #[test_case("gpt-6.2-sol", 272_000)]
+    #[test_case("gpt-7-nova", 272_000)]
+    #[test_case("gpt-5.3-codex", 272_000)]
+    #[test_case("gpt-5.6-luna", 372_000)]
+    fn plan_context_window_follows_generation(model_id: &str, expected: u32) {
+        assert_eq!(plan_context_window(model_id), expected);
+    }
+
+    #[test_case("gpt-daybreak-blue", true, Some(NEWEST_DIALECT) ; "oauth_sends_any_model_to_codex")]
+    #[test_case("gpt-daybreak-blue", false, None ; "api_key_sends_unknown_model_to_chat")]
+    #[test_case("gpt-6.2-sol", false, Some(&dialect::GPT_6) ; "api_key_sends_new_generation_to_responses")]
+    fn undiscovered_models_route_by_login(
+        model_id: &str,
+        oauth: bool,
+        expected: Option<&EffortDialect>,
+    ) {
+        assert_eq!(routed_dialect(model_id, None, oauth).as_ref(), expected);
     }
 
     #[test_case(ThinkingConfig::Adaptive, "gpt-5.3-codex", "medium" ; "adaptive")]
@@ -677,36 +708,14 @@ mod tests {
     ) {
         let model = Model::from_spec(&format!("openai/{model_id}")).unwrap();
         let mut body = json!({});
-        responses::apply_responses_reasoning(&mut body, thinking, &model, plan_dialect(&model.id));
+        responses::apply_responses_reasoning(
+            &mut body,
+            thinking,
+            &model,
+            responses_dialect(&model.id).unwrap(),
+        );
         assert_eq!(body["reasoning"]["effort"], expected);
         assert!(body.get("reasoning_effort").is_none());
-    }
-
-    #[test]
-    fn plan_models_have_a_reviewed_dialect() {
-        const EXPECTED: &[(&str, &EffortDialect)] = &[
-            ("gpt-6-sol", &dialect::GPT_6),
-            ("gpt-6-luna", &dialect::GPT_6),
-            ("gpt-6-astra", &dialect::GPT_6),
-            ("gpt-6.1-sol", &dialect::GPT_6),
-            ("gpt-6.1-terra", &dialect::GPT_6),
-            ("gpt-5.6-luna", &dialect::GPT_5_6),
-            ("gpt-5.6-terra", &dialect::GPT_5_6),
-            ("gpt-5.6-sol", &dialect::GPT_5_6),
-            ("gpt-5.5", &dialect::CODING_PLAN),
-            ("gpt-5.4", &dialect::CODING_PLAN),
-            ("gpt-5.4-mini", &dialect::CODING_PLAN),
-            ("gpt-5.2", &dialect::CODING_PLAN),
-        ];
-        const UNREVIEWED: &str = "new PLAN_MODELS entry needs an effort dialect decision";
-
-        for model_id in PLAN_MODELS {
-            let (_, expected) = EXPECTED
-                .iter()
-                .find(|(id, _)| id == model_id)
-                .unwrap_or_else(|| panic!("{UNREVIEWED}: {model_id}"));
-            assert_eq!(plan_dialect(model_id), *expected, "{model_id}");
-        }
     }
 
     #[test_case("gpt-5.3-codex")]
@@ -720,7 +729,7 @@ mod tests {
             &mut body,
             ThinkingConfig::Off,
             &model,
-            plan_dialect(&model.id),
+            responses_dialect(&model.id).unwrap(),
         );
         assert!(body.get("reasoning").is_none());
     }
@@ -755,6 +764,7 @@ mod tests {
     }"#;
 
     const ACCOUNT_ID: &str = "account-a";
+    const LISTED_PLAN_MODEL: &str = "gpt-5.5";
     const OTHER_ACCOUNT_ID: &str = "account-b";
 
     fn plan_auth(oauth: bool, account_id: Option<&str>) -> ResolvedAuth {
@@ -824,6 +834,22 @@ mod tests {
         assert_eq!(plan_info(&models[0]).supports_fast, expected);
     }
 
+    /// A zero would become the session's window and compact every turn, so it
+    /// counts as undeclared and `adjust_model` falls back to the plan window.
+    #[test_case(json!(300_000), Some(300_000) ; "declared")]
+    #[test_case(json!(0), None ; "zero_is_undeclared")]
+    #[test_case(Value::Null, None ; "null_is_undeclared")]
+    fn plan_models_parse_context_window(window: Value, expected: Option<u32>) {
+        let model = json!({
+            "slug": "gpt-7-nova",
+            "visibility": LISTED_VISIBILITY,
+            "context_window": window,
+        });
+        let response = json!({"models": [model]}).to_string();
+        let models = parse_plan_models(&response, Some(ACCOUNT_ID)).unwrap();
+        assert_eq!(models[0].context_window, expected);
+    }
+
     fn plan_model_info(supports_fast: bool) -> PlanModelInfo {
         PlanModelInfo {
             efforts: vec![Effort::High],
@@ -835,7 +861,7 @@ mod tests {
     }
 
     #[test_case("discovered-thinking-model" ; "opaque_id")]
-    #[test_case("gpt-6.1-unlisted" ; "gpt_id_not_in_static_fallback")]
+    #[test_case("gpt-4.5-unlisted" ; "gpt_id_on_chat_completions_by_default")]
     fn discovered_responses_routes_ignore_native_fields(model_id: &str) {
         let mut model = Model::from_spec(&format!("{}/{model_id}", CONFIG.slug)).unwrap();
         model.thinking_fields = Some(Box::new(
@@ -891,7 +917,7 @@ mod tests {
             FastSupport::Pending
         );
         model_registry::set_known_models(provider, models);
-        let info = model_registry::provider_info::<PlanModelInfo>(provider, PLAN_MODELS[0]);
+        let info = model_registry::provider_info::<PlanModelInfo>(provider, LISTED_PLAN_MODEL);
         assert_eq!(
             supports_plan_fast(
                 Some(&auth),
@@ -952,12 +978,19 @@ mod tests {
             fast,
         };
         assert_eq!(opts.clamped(&model).fast, expected);
-        let mut body = responses::build_body(&model, &[], "", &json!([]));
+        let mut body = responses::build_body(
+            &model,
+            &[],
+            "",
+            &json!([]),
+            false,
+            responses::SystemChannel::DeveloperMessage,
+        );
         responses::apply_responses_reasoning(
             &mut body,
             opts.thinking,
             &model,
-            plan_dialect(&model.id),
+            responses_dialect(&model.id).unwrap(),
         );
         let standard = body.clone();
         apply_plan_fast(&mut body, fast, &auth, Some(&info));
@@ -976,16 +1009,10 @@ mod tests {
         let expected = oauth.then_some(session.as_str());
         let mut auth = plan_auth(oauth, Some(ACCOUNT_ID));
         let mut body = json!({});
-        apply_session_affinity(&mut body, &mut auth, &session);
+        apply_session_affinity(&mut body, &mut auth, &session).unwrap();
         assert_eq!(body[PROMPT_CACHE_KEY_FIELD].as_str(), expected);
         for header in SESSION_AFFINITY_HEADERS {
-            let values: Vec<&str> = auth
-                .headers
-                .iter()
-                .filter(|(name, _)| name == header)
-                .map(|(_, value)| value.as_str())
-                .collect();
-            assert_eq!(values, Vec::from_iter(expected), "{header}");
+            assert_eq!(auth.header(header), expected, "{header}");
         }
     }
 

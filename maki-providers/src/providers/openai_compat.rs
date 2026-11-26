@@ -1,12 +1,12 @@
 use std::borrow::Cow;
-use std::fmt::Display;
-use std::sync::LazyLock;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::Duration;
 
 use futures::TryStreamExt;
 use maki_storage::id::MakiId;
-use reqwest::header::{HeaderName, HeaderValue};
+use reqwest::header::HeaderMap;
 use reqwest::{Client, Method, RequestBuilder};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
@@ -14,8 +14,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
 use super::copilot::copilot_usd;
-use super::{ResolvedAuth, SseBody};
-use crate::model::ModelFamily;
+use super::{ResolvedAuth, SseBody, parse_tool_input};
+use crate::model::{Model, ModelFamily};
 use crate::types::rejects_sampling;
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
@@ -45,6 +45,11 @@ static PROCESS_TAG: LazyLock<String> = LazyLock::new(|| {
     let id = MakiId::generate().to_string();
     id[id.len() - PROCESS_TAG_LEN..].to_owned()
 });
+/// Gateways and models that refused the thinking fields maki adds. It lives in
+/// a static because providers get rebuilt, on a model switch for example, and
+/// each new one would pay for the refusal again. Nothing is saved to disk, so a
+/// gateway that learns the fields gets them back after a restart.
+static THINKING_REFUSED: Mutex<BTreeSet<(String, String)>> = Mutex::new(BTreeSet::new());
 
 #[derive(Clone)]
 pub(crate) struct OpenAiCompatConfig {
@@ -120,13 +125,7 @@ impl OpenAiCompatProvider {
         auth: &ResolvedAuth,
         url: &str,
     ) -> Result<String, AgentError> {
-        let request = auth
-            .configure_request(
-                self.client
-                    .get(url)
-                    .header("user-agent", super::user_agent()),
-            )
-            .build()?;
+        let request = auth.finish(self.client.get(url))?;
         super::ok_text(&self.client, request).await
     }
 
@@ -137,23 +136,18 @@ impl OpenAiCompatProvider {
         content_type: &str,
         body: &[u8],
     ) -> Result<String, AgentError> {
-        let mut builder = self
-            .client
-            .post(url)
-            .header("user-agent", super::user_agent());
-        for (key, value) in &auth.headers {
-            builder = builder.header(key.as_str(), value.as_str());
-        }
-        let request = builder
-            .header("content-type", content_type)
-            .body(body.to_vec())
-            .build()?;
+        let request = auth.finish(
+            self.client
+                .post(url)
+                .header("content-type", content_type)
+                .body(body.to_vec()),
+        )?;
         super::ok_text(&self.client, request).await
     }
 
     pub fn build_body(
         &self,
-        model: &crate::model::Model,
+        model: &Model,
         messages: &[Message],
         system: &str,
         tools: &Value,
@@ -202,41 +196,88 @@ impl OpenAiCompatProvider {
             .to_owned()
     }
 
-    fn build_request(&self, method: Method, path: &str, auth: &ResolvedAuth) -> RequestBuilder {
-        let base = self.base_url(auth);
-        auth.configure_request(
-            self.client
-                .request(method, format!("{base}{path}"))
-                .header("user-agent", super::user_agent()),
-        )
+    /// Sends `body`, whose top-level `thinking_keys` are fields maki added on
+    /// its own. There is no way to tell up front which gateways refuse them, so
+    /// they go out and a refusal costs one replay without them.
+    ///
+    /// We only remember the refusal once the replay works. If it fails too,
+    /// with a 503 or with a 400 that just happened to name the field, the
+    /// fields were not the problem and the next request offers them again.
+    pub(crate) async fn stream_with_thinking_retry(
+        &self,
+        model: &Model,
+        headers: &HeaderMap,
+        mut body: Value,
+        thinking_keys: &[impl AsRef<str> + Sync],
+        event_tx: &UnboundedSender<ProviderEvent>,
+        auth: &ResolvedAuth,
+    ) -> Result<StreamResponse, AgentError> {
+        if thinking_keys.is_empty() {
+            return self.do_stream(model, headers, &body, event_tx, auth).await;
+        }
+        let gateway = (self.base_url(auth), model.id.clone());
+        let refused_before = THINKING_REFUSED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&gateway);
+        if !refused_before {
+            match self.do_stream(model, headers, &body, event_tx, auth).await {
+                Err(error)
+                    if thinking_keys
+                        .iter()
+                        .any(|key| error.rejects_param(key.as_ref())) =>
+                {
+                    warn!(
+                        base_url = %gateway.0,
+                        model = %model.id,
+                        %error,
+                        "gateway refused the thinking fields, retrying without them. \
+                         Declare thinking_fields for this model to choose what is sent"
+                    )
+                }
+                result => return result,
+            }
+        }
+        if let Some(object) = body.as_object_mut() {
+            for key in thinking_keys {
+                object.remove(key.as_ref());
+            }
+        }
+        let result = self.do_stream(model, headers, &body, event_tx, auth).await;
+        if result.is_ok() {
+            THINKING_REFUSED
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(gateway);
+        }
+        result
     }
 
-    /// Where a provider's own headers meet the credentials. A header already on
-    /// the request wins: no denylist could say which headers carry a
-    /// credential (`x-api-key`, `api-key`, `x-goog-api-key`, ...), so whatever
-    /// the auth layer wrote stays, key rotation included.
+    fn build_request(&self, method: Method, path: &str, auth: &ResolvedAuth) -> RequestBuilder {
+        let base = self.base_url(auth);
+        self.client.request(method, format!("{base}{path}"))
+    }
+
+    /// Where a declaration's static headers meet maki's and the credentials.
+    /// They go over maki's own and under the credentials: no denylist could
+    /// say which headers carry a credential (`x-api-key`, `api-key`,
+    /// `x-goog-api-key`, ...), so whatever the auth layer wrote stays, key
+    /// rotation included.
     pub async fn do_stream(
         &self,
-        model: &crate::model::Model,
-        extra_headers: &[(&str, &str)],
+        model: &Model,
+        declared_headers: &HeaderMap,
         body: &Value,
         event_tx: &UnboundedSender<ProviderEvent>,
         auth: &ResolvedAuth,
     ) -> Result<StreamResponse, AgentError> {
         let json_body = serde_json::to_vec(body)?;
-        let mut request = self
-            .build_request(Method::POST, "/chat/completions", auth)
-            .header("content-type", "application/json")
-            .body(json_body)
-            .build()?;
-        for &(key, value) in extra_headers {
-            if request.headers().contains_key(key) {
-                debug!(header = key, "kept the header already on the request");
-                continue;
-            }
-            let (name, value) = extra_header(key, value)?;
-            request.headers_mut().append(name, value);
-        }
+        let request = auth.finish(
+            self.build_request(Method::POST, "/chat/completions", auth)
+                .header("content-type", "application/json")
+                .headers(declared_headers.clone())
+                .body(json_body),
+        )?;
 
         debug!(
             model = %model.id,
@@ -284,6 +325,7 @@ impl OpenAiCompatProvider {
             .and_then(|v| u32::try_from(v).ok());
         let supports_vision = m["input_modalities"]
             .as_array()
+            .or_else(|| m["architecture"]["input_modalities"].as_array())
             .map(|mods| mods.iter().any(|v| v.as_str() == Some("image")));
         let pricing = m["pricing"].as_object().and_then(|p| {
             Some(crate::model::ModelPricing::per_million(
@@ -322,18 +364,6 @@ impl OpenAiCompatProvider {
         self.fetch_and_parse_models(auth, MODELS_PATH, Self::default_model_parser)
             .await
     }
-}
-
-/// The codec validated declared headers when it built the provider, so this
-/// cannot fail in practice; it keeps a stray one a config error, not a panic.
-fn extra_header(key: &str, value: &str) -> Result<(HeaderName, HeaderValue), AgentError> {
-    let invalid = |e: &dyn Display| AgentError::Config {
-        message: format!("request error: invalid header {key}: {e}"),
-    };
-    Ok((
-        HeaderName::from_bytes(key.as_bytes()).map_err(|e| invalid(&e))?,
-        HeaderValue::from_str(value).map_err(|e| invalid(&e))?,
-    ))
 }
 
 pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
@@ -443,7 +473,7 @@ pub fn convert_messages(messages: &[Message], system: &str) -> Vec<Value> {
 pub(crate) fn tool_parameters(tool: &Value) -> Value {
     match tool.get("input_schema") {
         Some(schema) if schema.is_object() => schema.clone(),
-        _ => json!({ "type": "object", "properties": {} }),
+        _ => json!({"type": "object", "properties": {}, "additionalProperties": true}),
     }
 }
 
@@ -602,6 +632,7 @@ impl ToolAccumulator {
 pub(crate) struct StreamedText {
     text: String,
     pub(crate) reasoning: String,
+    pub(crate) reasoning_id: Option<String>,
     text_started: bool,
 }
 
@@ -645,25 +676,13 @@ impl StreamedText {
             blocks.push(ContentBlock::Thinking {
                 thinking: self.reasoning,
                 signature: None,
+                reasoning_id: self.reasoning_id,
             });
         }
         if !self.text.is_empty() {
             blocks.push(ContentBlock::Text { text: self.text });
         }
         blocks
-    }
-}
-
-pub(crate) fn parse_tool_input(tool: &str, arguments: &str) -> Value {
-    match serde_json::from_str(arguments) {
-        Ok(input) => {
-            debug!(tool = %tool, json = %arguments, "tool input JSON");
-            input
-        }
-        Err(e) => {
-            warn!(error = %e, tool = %tool, json = %arguments, "malformed tool JSON, falling back to {{}}");
-            Value::Object(Default::default())
-        }
     }
 }
 
@@ -819,14 +838,17 @@ pub async fn parse_sse(
     let mut content_blocks = streamed.into_blocks();
 
     for acc in tool_accumulators {
-        let input = parse_tool_input(&acc.name, &acc.arguments);
         let name = if acc.name.is_empty() {
             warn!(id = %acc.id, raw_args = %acc.arguments, "provider sent empty tool_use name; substituting placeholder");
             "maki_unknown_tool".to_owned()
         } else {
             acc.name
         };
-        content_blocks.push(ContentBlock::tool_use(acc.id, name, input));
+        let block = match parse_tool_input(&name, &acc.arguments) {
+            Ok(input) => ContentBlock::tool_use(acc.id, name, input),
+            Err(error) => ContentBlock::invalid_tool_use(acc.id, name, error),
+        };
+        content_blocks.push(block);
     }
 
     Ok(assistant_response(content_blocks, usage, stop_reason))
@@ -840,7 +862,8 @@ mod tests {
     use test_case::test_case;
     use tokio::sync::mpsc::unbounded_channel;
 
-    use crate::model::{Model, ModelPricing, ModelTier};
+    use crate::headers::parse_headers;
+    use crate::model::{FactSources, Model, ModelPricing, ModelTier};
     use crate::test_support::{Canned, serve, sse_body};
 
     const TEST_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
@@ -862,6 +885,9 @@ mod tests {
         MODELS_URL_PATH,
         Canned::json(200, r#"{"data":[{"id":"test-model"}]}"#),
     )];
+    const REJECTED_SCRIPT: &[Canned] = &[Canned::json(400, r#"{"error":{"message":"rejected"}}"#)];
+    const DECLARED_AGENT: &str = "declared-agent";
+    const CREDENTIAL_AGENT: &str = "credential-agent";
     const COUNTS_SURVIVE_A_BAD_COST: &str =
         "a price we cannot read must not take the token counts down with it";
     const TOOL_NAME: &str = "word_count";
@@ -890,7 +916,7 @@ data: [DONE]\n\n";
         assert_eq!(function["name"], json!(TOOL_NAME), "{TOOL_MUST_SURVIVE}");
         assert_eq!(
             function["parameters"],
-            json!({"type": "object", "properties": {}})
+            json!({"type": "object", "properties": {}, "additionalProperties": true})
         );
     }
 
@@ -910,6 +936,8 @@ data: [DONE]\n\n";
 
     #[test_case(json!({"id": "m", "input_modalities": ["text", "image"]}), Some(true) ; "image_modality_enables_vision")]
     #[test_case(json!({"id": "m", "input_modalities": ["text"]}), Some(false) ; "text_only_disables_vision")]
+    #[test_case(json!({"id": "m", "architecture": {"input_modalities": ["text"]}}), Some(false) ; "nested_text_only_disables_vision")]
+    #[test_case(json!({"id": "m", "architecture": {"input_modalities": ["text", "image"]}}), Some(true) ; "nested_image_modality_enables_vision")]
     #[test_case(json!({"id": "m"}), None ; "missing_modalities_stays_unknown")]
     fn default_model_parser_vision_flag(m: Value, expected: Option<bool>) {
         let info = OpenAiCompatProvider::default_model_parser(&m).unwrap();
@@ -1348,7 +1376,7 @@ data: [DONE]\n\n";
     }
 
     #[tokio::test]
-    async fn parse_sse_malformed_tool_json_yields_empty_object() {
+    async fn parse_sse_malformed_tool_json_keeps_the_error_for_dispatch() {
         let sse = "\
 data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]}}]}\n\
 \n\
@@ -1363,10 +1391,15 @@ data: [DONE]\n\n";
             .await
             .unwrap();
 
-        let tools: Vec<_> = resp.message.tool_uses().collect();
+        let tools: Vec<_> = resp.message.tool_uses_with_input_errors().collect();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].1, "bash");
         assert_eq!(*tools[0].2, Value::Object(Default::default()));
+        assert!(
+            tools[0].3.is_some_and(|e| e.contains("line 1")),
+            "input error: {:?}",
+            tools[0].3
+        );
     }
 
     #[tokio::test]
@@ -1465,6 +1498,7 @@ data: [DONE]\n\n";
                 ContentBlock::Thinking {
                     thinking: "Let me think...".into(),
                     signature: None,
+                    reasoning_id: None,
                 },
                 ContentBlock::Text {
                     text: "Hello".into(),
@@ -1486,6 +1520,7 @@ data: [DONE]\n\n";
             content: vec![ContentBlock::Thinking {
                 thinking: "Just thinking...".into(),
                 signature: None,
+                reasoning_id: None,
             }],
             ..Default::default()
         }];
@@ -1571,6 +1606,7 @@ data: [DONE]\n\n";
             discovered_free: false,
             max_output_tokens: Some(8192),
             turn_output_tokens: None,
+            sources: FactSources::default(),
             context_window: 131_072,
             thinking_fields: None,
         }
@@ -1643,6 +1679,35 @@ data: [DONE]\n\n";
             "{ENCODINGS_ARE_RECORDED}: {encodings}"
         );
         assert_eq!(headers[USER_AGENT_HEADER], super::super::user_agent());
+    }
+
+    /// maki's own user agent, then the declaration's, then the credentials':
+    /// each replaces the one below it, and only one ever goes out.
+    #[test_case(None, DECLARED_AGENT ; "declared_over_makis")]
+    #[test_case(Some(CREDENTIAL_AGENT), CREDENTIAL_AGENT ; "credentials_over_declared")]
+    #[tokio::test]
+    async fn each_header_layer_replaces_the_one_below(credential: Option<&str>, expected: &str) {
+        let (base_url, requests) = serve(REJECTED_SCRIPT);
+        let credentials = credential
+            .map(|agent| (USER_AGENT_HEADER.to_owned(), agent.to_owned()))
+            .into_iter()
+            .collect();
+        let auth = ResolvedAuth::for_test(Some(base_url), credentials);
+        let declared = parse_headers([(USER_AGENT_HEADER, DECLARED_AGENT)]).unwrap();
+        let (tx, _rx) = unbounded_channel();
+
+        let _ = test_provider()
+            .do_stream(
+                &test_model(ModelFamily::Generic),
+                &declared,
+                &json!({}),
+                &tx,
+                &auth,
+            )
+            .await;
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0].headers.values(USER_AGENT_HEADER), [expected]);
     }
 
     #[test_case("test-model", ModelFamily::Gpt, ThinkingConfig::Off, true ; "gpt_off_sends")]

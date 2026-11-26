@@ -4,12 +4,15 @@
 pub(crate) mod bedrock;
 pub(crate) mod shared;
 
+use std::str::from_utf8;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::TryStreamExt;
+use maki_storage::blocking;
 use maki_storage::id::SessionRef;
-use reqwest::{Client, Method, RequestBuilder};
+use reqwest::header::HeaderValue;
+use reqwest::{Client, Method, Request, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
@@ -18,6 +21,7 @@ use url::Url;
 
 use maki_config::providers::Protocol;
 
+use crate::headers::header_value;
 use crate::model::{Model, ModelFamily};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::aperture::NO_PATH_PREFIX;
@@ -32,7 +36,7 @@ use crate::{
 use super::codec::SessionCarrier;
 use super::{KeyHeader, KeyPool, KeyRotation, ResolvedAuth, SseBody, Timeouts};
 
-const API_VERSION: &str = "2023-06-01";
+pub(crate) const API_VERSION: &str = "2023-06-01";
 const API_ORIGIN: &str = "https://api.anthropic.com";
 const API_HOST: &str = "api.anthropic.com";
 const MESSAGES_PATH: &str = "/v1/messages";
@@ -41,6 +45,8 @@ const USAGE_PATH: &str = "/api/oauth/usage";
 const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
 const OAUTH_BETA: &str = "oauth-2025-04-20";
 const BLOCK_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+const BETA_HEADER: &str = "anthropic-beta";
+const BETA_SEPARATOR: &str = ",";
 const MONEY_EXPONENT: u32 = 2;
 const LABEL_SESSION: &str = "Current session";
 const LABEL_WEEK_ALL: &str = "Current week (all models)";
@@ -327,14 +333,46 @@ fn is_anthropic_api(base_url: &str) -> bool {
 
 /// Subscription quota only exists for OAuth tokens against the real Anthropic
 /// API; API keys and anthropic-protocol third-party endpoints have none.
+/// [`ResolvedAuth::finish`], except that `anthropic-beta` is a list: the betas
+/// the credentials or `[<slug>.headers]` name join the ones this request needs
+/// (fast mode, 1M context, deferred tools...) instead of replacing them.
+fn finish(
+    auth: &ResolvedAuth,
+    builder: RequestBuilder,
+    betas: &[&str],
+) -> Result<Request, AgentError> {
+    let mut request = auth.finish(builder)?;
+    let merged = merge_betas(betas, request.headers().get(BETA_HEADER));
+    if !merged.is_empty() {
+        let value = header_value(BETA_HEADER, &merged)?;
+        request.headers_mut().insert(BETA_HEADER, value);
+    }
+    Ok(request)
+}
+
+fn merge_betas(betas: &[&str], configured: Option<&HeaderValue>) -> String {
+    let configured = configured
+        .and_then(|value| from_utf8(value.as_bytes()).ok())
+        .unwrap_or_default();
+    let mut merged: Vec<&str> = Vec::new();
+    for beta in betas
+        .iter()
+        .copied()
+        .chain(configured.split(BETA_SEPARATOR).map(str::trim))
+    {
+        if !beta.is_empty() && !merged.contains(&beta) {
+            merged.push(beta);
+        }
+    }
+    merged.join(BETA_SEPARATOR)
+}
+
 fn usage_eligible(
     auth: &super::ResolvedAuth,
     fallback_base_url: Option<&str>,
     configured_override: Option<&str>,
 ) -> bool {
-    auth.headers
-        .iter()
-        .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+    auth.header(super::AUTHORIZATION_HEADER).is_some()
         && auth
             .base_url
             .as_deref()
@@ -433,23 +471,22 @@ impl Anthropic {
             .unwrap_or(API_ORIGIN)
     }
 
-    fn build_request(&self, method: Method, path: &str) -> RequestBuilder {
-        self.build_request_with(&self.auth.lock().unwrap(), method, path)
-    }
-
-    fn build_request_with(
+    fn build_request(
         &self,
-        auth: &ResolvedAuth,
         method: Method,
         path: &str,
-    ) -> RequestBuilder {
+        betas: &[&str],
+    ) -> Result<Request, AgentError> {
+        let auth = self.auth.lock().unwrap();
+        finish(&auth, self.request_with(&auth, method, path), betas)
+    }
+
+    /// What maki sends on its own, for [`finish`] to go over.
+    fn request_with(&self, auth: &ResolvedAuth, method: Method, path: &str) -> RequestBuilder {
         let url = format!("{}{path}", origin(self.base_url(auth)));
-        auth.configure_request(
-            self.client
-                .request(method, url)
-                .header("anthropic-version", API_VERSION)
-                .header("user-agent", super::user_agent()),
-        )
+        self.client
+            .request(method, url)
+            .header("anthropic-version", API_VERSION)
     }
 
     async fn do_stream_request(
@@ -460,13 +497,13 @@ impl Anthropic {
         betas: &[&str],
     ) -> Result<StreamResponse, AgentError> {
         let json_body = serde_json::to_vec(body)?;
-        let mut builder = self
-            .build_request_with(auth, Method::POST, MESSAGES_PATH)
-            .header("content-type", "application/json");
-        if !betas.is_empty() {
-            builder = builder.header("anthropic-beta", betas.join(","));
-        }
-        let request = builder.body(json_body).build()?;
+        let request = finish(
+            auth,
+            self.request_with(auth, Method::POST, MESSAGES_PATH)
+                .header("content-type", "application/json")
+                .body(json_body),
+            betas,
+        )?;
         super::ok_sse(&self.client, request, self.stream_timeout, |body| {
             parse_sse(body, event_tx)
         })
@@ -483,7 +520,7 @@ impl Anthropic {
                 path.push_str(&format!("&after_id={cursor}"));
             }
 
-            let request = self.build_request(Method::GET, &path).build()?;
+            let request = self.build_request(Method::GET, &path, &[])?;
             let body_text = super::ok_text(&self.client, request).await?;
             let page: ModelsPage = serde_json::from_str(&body_text)?;
             for m in page.data {
@@ -563,7 +600,7 @@ impl Provider for Anthropic {
                 betas.push(BLOCK_BINDING_BETA);
             }
             if let Some(session) = session_id {
-                self.session_id.apply(session, &mut body, &mut auth);
+                self.session_id.apply(session, &mut body, &mut auth)?;
             }
 
             debug!(model = %model.id, num_messages = messages.len(), thinking = ?opts.thinking, ?betas, "sending API request");
@@ -582,7 +619,7 @@ impl Provider for Anthropic {
             if self.key_pool.is_none() {
                 return Ok(());
             }
-            let pool = KeyPool::resolve("anthropic", ENV_VAR)?;
+            let pool = blocking(|| KeyPool::resolve("anthropic", ENV_VAR)).await?;
             *self.auth.lock().unwrap() =
                 resolve_auth_from_key(pool.current(), self.resolved_base_url.clone())?;
             debug!("reloaded Anthropic auth from env");
@@ -603,10 +640,7 @@ impl Provider for Anthropic {
             ) {
                 return Ok(None);
             }
-            let request = self
-                .build_request(Method::GET, USAGE_PATH)
-                .header("anthropic-beta", OAUTH_BETA)
-                .build()?;
+            let request = self.build_request(Method::GET, USAGE_PATH, &[OAUTH_BETA])?;
             let body_text = super::ok_text(&self.client, request).await?;
             let parsed: OauthUsage = serde_json::from_str(&body_text)?;
             Ok(Some(parsed.into()))
@@ -691,11 +725,13 @@ pub(crate) async fn parse_sse(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{Canned, serve, sse_body, sse_event};
+    use crate::test_support::{Canned, isolated_home, serve, sse_body, sse_event};
     use crate::{
         ContentBlock, EMPTY_RESPONSE_MARKER, InputTransformation, ProviderEvent, Role, StopReason,
         TokenUsage,
     };
+    use maki_storage::StateDir;
+    use maki_storage::auth::{ProviderCredentials, save_provider_credentials};
     use serde_json::{Value, json};
     use shared::{DISPLACED_ERROR_PREFIX, build_wire_messages};
     use std::iter;
@@ -703,7 +739,11 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     const THIRD_PARTY_BASE_URL: &str = "https://proxy.example.com/v1/messages";
+    const FIRST_SAVED_KEY: &str = "sk-saved-before";
+    const LATER_SAVED_KEY: &str = "sk-saved-after";
+    const ENV_KEY: &str = "sk-env";
     const THINKING_SIGNATURE: &str = "sig";
+    const PARSE_ERROR: &str = "expected value at line 1 column 12";
     const UNKNOWN_BLOCK_TYPE: &str = "server_tool_use";
 
     const USAGE_BODY: &str = r#"{
@@ -785,6 +825,33 @@ mod tests {
         assert_eq!(usage.limits[0].reset_at, None);
     }
 
+    const EXTRA_BETA: &str = "files-api-2025-04-14";
+    const SPACED_BETAS: &str = " files-api-2025-04-14 ,oauth-2025-04-20,";
+
+    #[test_case(&[FAST_MODE_BETA], Some(OAUTH_BETA), &[FAST_MODE_BETA, OAUTH_BETA] ; "credential_beta_joins_makis")]
+    #[test_case(&[OAUTH_BETA, FAST_MODE_BETA], Some(SPACED_BETAS), &[OAUTH_BETA, FAST_MODE_BETA, EXTRA_BETA] ; "shared_beta_sent_once")]
+    #[test_case(&[], Some(OAUTH_BETA), &[OAUTH_BETA] ; "credential_beta_alone")]
+    #[test_case(&[FAST_MODE_BETA], None, &[FAST_MODE_BETA] ; "makis_beta_alone")]
+    #[test_case(&[], None, &[] ; "no_beta_no_header")]
+    fn betas_go_out_in_one_header(betas: &[&str], credential: Option<&str>, expected: &[&str]) {
+        let headers = credential
+            .map(|beta| (BETA_HEADER.to_owned(), beta.to_owned()))
+            .into_iter()
+            .collect();
+        let auth = ResolvedAuth::for_test(None, headers);
+
+        let request = finish(&auth, Client::new().post(API_ORIGIN), betas).unwrap();
+
+        let sent: Vec<_> = request.headers().get_all(BETA_HEADER).iter().collect();
+        let line = expected.join(BETA_SEPARATOR);
+        let expected: Vec<&str> = if expected.is_empty() {
+            Vec::new()
+        } else {
+            vec![&line]
+        };
+        assert_eq!(sent, expected);
+    }
+
     #[test_case("Authorization", None, true ; "bearer_default_url_eligible")]
     #[test_case("authorization", Some("https://api.anthropic.com/v1/messages"), true ; "bearer_anthropic_url_eligible")]
     #[test_case("authorization", Some("https://api.anthropic.com"), true ; "bearer_anthropic_origin_eligible")]
@@ -826,7 +893,39 @@ mod tests {
         )
         .with_fallback_base_url(Some(THIRD_PARTY_BASE_URL.into()));
         provider.reload_auth().await.unwrap();
-        assert_eq!(provider.auth.lock().unwrap().headers, headers);
+        assert_eq!(provider.auth.lock().unwrap().header_list(), headers);
+    }
+
+    fn save_key(key: &str) {
+        let creds = ProviderCredentials {
+            api_key: key.into(),
+            host: None,
+        };
+        save_provider_credentials(&StateDir::resolve().unwrap(), SLUG, &creds).unwrap();
+    }
+
+    #[test_case(None, LATER_SAVED_KEY ; "key_saved_after_construction")]
+    #[test_case(Some(ENV_KEY), ENV_KEY ; "env_key_outranks_the_saved_one")]
+    #[tokio::test]
+    async fn reload_auth_picks_up_the_current_key(env_key: Option<&str>, expected: &str) {
+        let _home = isolated_home();
+        // SAFETY: Nextest runs each test in its own process.
+        unsafe {
+            match env_key {
+                Some(key) => std::env::set_var(ENV_VAR, key),
+                None => std::env::remove_var(ENV_VAR),
+            }
+        }
+        save_key(FIRST_SAVED_KEY);
+        let provider = Anthropic::new(Timeouts::default()).unwrap();
+        save_key(LATER_SAVED_KEY);
+
+        provider.reload_auth().await.unwrap();
+
+        assert_eq!(
+            provider.auth.lock().unwrap().header(API_KEY_HEADER),
+            Some(expected)
+        );
     }
 
     #[test_case(None, true ; "no_fallback_is_anthropic")]
@@ -1141,6 +1240,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
         ContentBlock::Thinking {
             thinking: thinking.into(),
             signature: Some(THINKING_SIGNATURE.into()),
+            reasoning_id: None,
         }
     }
 
@@ -1148,6 +1248,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
         ContentBlock::Thinking {
             thinking: thinking.into(),
             signature: None,
+            reasoning_id: None,
         }
     }
 
@@ -1331,6 +1432,24 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
     fn wire_content(messages: &[Message], tools: &Value) -> Value {
         let mut json: Value = serde_json::to_value(build_wire_messages(messages, tools)).unwrap();
         json[0]["content"].take()
+    }
+
+    /// The API rejects an unknown field on a saved `tool_use` with a 400, and
+    /// the block stays in history, so one broken call would fail every later
+    /// request in the session.
+    #[test]
+    fn broken_tool_call_wire_block_omits_the_input_error() {
+        let messages = vec![message(
+            Role::Assistant,
+            vec![ContentBlock::invalid_tool_use(
+                "tu_bad",
+                "bash",
+                PARSE_ERROR.to_owned(),
+            )],
+        )];
+        let content = wire_content(&messages, &json!([]));
+        assert_eq!(content[0]["id"], "tu_bad");
+        assert_eq!(content[0].get("input_error"), None);
     }
 
     fn set_result<F: FnOnce(&mut String, &mut bool)>(messages: &mut [Message], f: F) {
@@ -1670,7 +1789,7 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n";
     }
 
     #[tokio::test]
-    async fn parse_sse_malformed_tool_json_yields_empty_object() {
+    async fn parse_sse_malformed_tool_json_keeps_the_error_for_dispatch() {
         let sse_data = "\
 event: message_start\n\
 data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\
@@ -1690,10 +1809,15 @@ data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":1}}\n\n";
         let (tx, _rx) = unbounded_channel();
         let resp = parse_sse(sse_body(sse_data.as_bytes()), &tx).await.unwrap();
 
-        let tools: Vec<_> = resp.message.tool_uses().collect();
+        let tools: Vec<_> = resp.message.tool_uses_with_input_errors().collect();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].1, "read");
         assert_eq!(*tools[0].2, Value::Object(Default::default()));
+        assert!(
+            tools[0].3.is_some_and(|e| e.contains("line 1")),
+            "input error: {:?}",
+            tools[0].3
+        );
     }
 
     #[tokio::test]
@@ -1733,7 +1857,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
         let resp = parse_sse(sse_body(sse_data), &tx).await.unwrap();
 
         assert!(
-            matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, signature }
+            matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, signature, .. }
                 if thinking == "Let me think" && *signature == Some("sig123".to_string()))
         );
         assert!(matches!(&resp.message.content[1], ContentBlock::Text { text } if text == "Hello"));

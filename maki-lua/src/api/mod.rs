@@ -28,6 +28,7 @@ pub(crate) mod treesitter;
 pub(crate) mod ui;
 pub(crate) mod util;
 pub(crate) mod uv;
+pub(crate) mod version;
 pub(crate) mod yaml;
 
 use std::sync::Arc;
@@ -96,6 +97,7 @@ pub(crate) fn create_maki_global(
     maki.set("image", image::create_image_table(lua)?)?;
     maki.set("json", json::create_json_table(lua)?)?;
     maki.set("yaml", yaml::create_yaml_table(lua)?)?;
+    maki.set("version", version::create_version_table(lua)?)?;
     warn_invalid_net_hosts(&plugin, reach.egress().declared());
     // One egress value shared by the two namespaces that can open a socket, so
     // a provider registered through `maki.provider` is reachable from
@@ -111,7 +113,7 @@ pub(crate) fn create_maki_global(
     )?;
     maki.set(
         "provider",
-        provider::create_provider_namespace(lua, permissions, owner, egress)?,
+        provider::create_provider_namespace(lua, permissions, owner, egress, ui_action_tx.clone())?,
     )?;
     maki.set("text", text::create_text_table(lua)?)?;
     maki.set(

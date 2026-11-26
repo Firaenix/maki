@@ -11,7 +11,7 @@ use maki_providers::{
 use serde_json::{Value, json};
 use tracing::{info, warn};
 
-use super::frame::{RunContext, fit_frame};
+use super::frame::{RunContextBuilder, fit_frame};
 use super::history::{History, remove_orphaned_tool_results, stamp_new, strip_thinking};
 use super::hook::{AgentHooks, AgentSlot};
 use super::streaming::{StreamError, StreamRequest, min_output, stream_with_retry};
@@ -19,7 +19,9 @@ use crate::mcp::McpSession;
 use crate::prompt::COMPACTION_USER;
 use crate::tools::hook::Verdict;
 use crate::tools::truncate_bytes;
-use crate::{AgentError, AgentEvent, DoneReason, EventSender, RunLedger, TurnCompleteEvent};
+use crate::{
+    AgentError, AgentEvent, DoneReason, EventSender, RunLedger, SteerKind, TurnCompleteEvent,
+};
 
 const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
 const TOOL_RESULT_PLACEHOLDER: &str = "[tool result]";
@@ -49,17 +51,23 @@ const PREPARE_TEXT_MAX: usize = 4 * 1024;
 const MAX_SUMMARY_ATTEMPTS: u32 = 3;
 
 pub(super) const FIELD_SKIP: &str = "skip";
+const FIELD_REASON: &str = "reason";
 const FIELD_INSTRUCTIONS: &str = "instructions";
 pub(super) const FIELD_CONTINUE: &str = "continue";
+pub(super) const FIELD_DEFER: &str = "defer";
 const FIELD_COLLAPSE: &str = "collapse";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum CompactReason {
+pub enum CompactReason {
     Auto,
     /// The provider already refused the prompt as too long. Compaction is the
     /// only way out, so a layer cannot skip this one.
     Overflow,
     Manual,
+    /// A plugin asked through `maki.session.request_compact`. Hooks get it as
+    /// its own reason so a layer honoring user intent can tell it from a
+    /// typed `/compact`.
+    Requested,
 }
 
 impl CompactReason {
@@ -68,6 +76,7 @@ impl CompactReason {
             Self::Auto => "auto",
             Self::Overflow => "overflow",
             Self::Manual => "manual",
+            Self::Requested => "requested",
         }
     }
 }
@@ -96,25 +105,36 @@ pub(super) fn continue_text(value: &Value) -> Option<&str> {
     normalize(value.get(FIELD_CONTINUE).and_then(Value::as_str))
 }
 
-/// `None` when a layer skipped it. The gauge stays where it was, so an
-/// automatic compaction simply asks again before the next turn.
+/// What a layer settled on for a compaction.
+pub(super) enum CompactionPlan {
+    /// The compaction is skipped. The gauge stays where it was, so an
+    /// automatic one simply asks again before the next turn.
+    Skipped,
+    /// The layer bought the transcript one turn: the nudge is the model's
+    /// next message and the ask after that turn is granted. One defer per
+    /// compaction, automatic only, so a layer cannot starve the gauge.
+    Deferred(String),
+    Proceed(CompactSteer),
+}
+
 pub(super) async fn steer_compaction(
     hooks: &AgentHooks<'_>,
     config: &AgentConfig,
     reason: CompactReason,
     request: Option<&str>,
-) -> Option<CompactSteer> {
+    can_defer: bool,
+) -> CompactionPlan {
     let verdict = hooks
         .fire(AgentSlot::CompactBefore, || {
             json!({
-                "reason": reason.as_str(),
+                FIELD_REASON: reason.as_str(),
                 "context_size": hooks.context_size,
                 "usable": usable(hooks.model, config),
                 "request_instructions": request,
             })
         })
         .await;
-    let (skip, added, continue_with) = match &verdict {
+    let (skip, added, continue_with, defer) = match &verdict {
         Verdict::Replaced(value) => (
             value
                 .get(FIELD_SKIP)
@@ -122,21 +142,27 @@ pub(super) async fn steer_compaction(
                 .unwrap_or(false),
             value.get(FIELD_INSTRUCTIONS).and_then(Value::as_str),
             continue_text(value),
+            normalize(value.get(FIELD_DEFER).and_then(Value::as_str)),
         ),
         Verdict::Denied(why) => {
             info!(reason = %why, "agent.compact.before asked to skip");
-            (true, None, None)
+            (true, None, None, None)
         }
-        Verdict::Unchanged | Verdict::Ask { .. } => (false, None, None),
+        Verdict::Unchanged | Verdict::Ask { .. } => (false, None, None, None),
     };
+    // A defer is one turn, so it works the same in a task child as in main.
+    if can_defer && let Some(nudge) = defer {
+        info!("agent.compact.before deferred the compaction");
+        return CompactionPlan::Deferred(nudge.to_owned());
+    }
     if skip && reason != CompactReason::Overflow {
         info!(
             reason = reason.as_str(),
             "agent.compact.before skipped the compaction"
         );
-        return None;
+        return CompactionPlan::Skipped;
     }
-    Some(CompactSteer {
+    CompactionPlan::Proceed(CompactSteer {
         instructions: join_lines([request, added]),
         continue_text: continue_with.map(str::to_owned),
     })
@@ -377,49 +403,75 @@ fn finish_compact(
     Ok((summary, history.len() - summary_len))
 }
 
-/// `next` is what the session would start with now. The summary goes out under
-/// a fresh frame built from it, for the session's own model in `hooks`, so the
+/// `context` builds what the session would start with now. The summary goes
+/// out under a fresh frame built from it, for the session's own model in `hooks`, so the
 /// gauge measures the prompt the next request really sends and the frame never
-/// goes missing between runs. `model` is the one writing the summary.
+/// goes missing between runs. `model` is the one writing the summary, billed to
+/// `ledger`, whose totals the `Done` reports.
 ///
-/// A retry in here can honour a server `Retry-After` that parks the request for
-/// an hour, so esc has to reach it. The cancel comes back as
-/// `Ok(DoneReason::Cancelled)`, like [`Agent::run`](super::Agent::run) does, to
-/// leave the error path for real failures.
+/// Every ending but an `Err` sends its `Done`, a cancel's too, like
+/// [`Agent::run`](super::Agent::run). A retry in here can honour a server
+/// `Retry-After` that parks the request for an hour, so esc has to reach it.
+/// The cancel comes back as `Ok(DoneReason::Cancelled)`, to leave the error
+/// path for real failures. One that fired before the call counts too, so a
+/// driver that waited on something under the same token need not check.
+///
+/// An empty history ends at once: summarizing nothing would pay for a summary
+/// the model made up.
 #[allow(clippy::too_many_arguments)]
 pub async fn compact(
     provider: &dyn maki_providers::provider::Provider,
     model: &Model,
     history: &mut History,
     gauge: &mut ContextGauge,
-    next: RunContext,
+    context: &RunContextBuilder,
+    workflow: bool,
     mcp: Option<&McpSession>,
     event_tx: &EventSender,
     hooks: &AgentHooks<'_>,
     config: &AgentConfig,
     instructions: Option<&str>,
     retry: RetryPolicy,
+    reason: CompactReason,
+    ledger: &RunLedger,
 ) -> Result<DoneReason, AgentError> {
     let size_before = gauge.size();
-    let ledger = RunLedger::default();
-    let finished = |context_size| {
+    let spent_before = ledger.totals();
+    // Only a summary that landed is a turn, so an ending that changed nothing
+    // reports none.
+    let end = |ending: DoneReason,
+               summarized: bool,
+               context_size: u32|
+     -> Result<DoneReason, AgentError> {
         let totals = ledger.totals();
-        AgentEvent::Done {
+        event_tx.send(AgentEvent::Done {
             usage: totals.usage,
             cost: totals.cost,
             list_cost: totals.list_cost,
             context_size,
             context_window: hooks.model.context_window,
-            num_turns: 1,
-            // `Compact` and not `EndTurn`, so a goal loop reading this sees
-            // housekeeping and does not treat it as a turn boundary.
-            reason: DoneReason::Compact,
-        }
+            num_turns: u32::from(summarized),
+            reason: ending,
+        })?;
+        Ok(ending)
     };
-    let Some(steer) = steer_compaction(hooks, config, CompactReason::Manual, instructions).await
-    else {
-        event_tx.send(finished(size_before))?;
-        return Ok(DoneReason::Compact);
+    let plan = if history.is_empty() {
+        CompactionPlan::Skipped
+    } else {
+        steer_compaction(hooks, config, reason, instructions, false).await
+    };
+    if hooks.cancel.is_cancelled() {
+        return end(DoneReason::Cancelled, false, size_before);
+    }
+    // `Compact` and not `EndTurn`, so a goal loop reading this sees
+    // housekeeping and does not treat it as a turn boundary.
+    let CompactionPlan::Proceed(steer) = plan else {
+        return end(DoneReason::Compact, false, size_before);
+    };
+    // Asked for before the transcript goes, while a cancel can still end
+    // this with nothing changed.
+    let Ok(next) = hooks.cancel.race(context(hooks.model, workflow)).await else {
+        return end(DoneReason::Cancelled, false, size_before);
     };
     let Compacted {
         summary, duration, ..
@@ -433,17 +485,21 @@ pub async fn compact(
         steer.instructions.as_deref(),
         0,
         retry,
-        &ledger,
+        ledger,
     )
     .await
     {
-        Ok(done) => done,
+        Ok(compacted) => compacted,
         // `finish_compact` is the only writer in here, so a cancel leaves the
         // transcript and the gauge untouched and the session carries on.
-        Err(AgentError::Cancelled) => return Ok(DoneReason::Cancelled),
+        Err(AgentError::Cancelled) => return end(DoneReason::Cancelled, false, size_before),
         Err(e) => return Err(e),
     };
     if let Some(text) = steer.continue_text {
+        event_tx.send(AgentEvent::Steered {
+            kind: SteerKind::CompactContinued,
+            text: text.clone(),
+        })?;
         history.push(Message::synthetic(text));
     }
     fit_frame(history, next, mcp, hooks.model);
@@ -453,9 +509,10 @@ pub async fn compact(
 
     // The summariser read a subset of the session's prompt, so its own count is
     // a floor on the size before, and the only number a gauge that has not seen
-    // a turn yet can offer.
-    let context_size_before =
-        size_before.max(ledger.totals().usage.total_input().min(u32::MAX as u64) as u32);
+    // a turn yet can offer. The ledger can open with spend carried from moved
+    // work, which read none of it.
+    let summarized_input = ledger.totals().since(&spent_before).usage.total_input();
+    let context_size_before = size_before.max(summarized_input.min(u32::MAX as u64) as u32);
     let context_size_after = gauge.size();
     event_tx.send(AgentEvent::CompactionDone {
         context_size_before,
@@ -464,9 +521,7 @@ pub async fn compact(
         summary,
         duration_ms: duration.as_millis() as u64,
     })?;
-    event_tx.send(finished(context_size_after))?;
-
-    Ok(DoneReason::Compact)
+    end(DoneReason::Compact, true, context_size_after)
 }
 
 /// Context held back from the transcript.
@@ -529,14 +584,15 @@ fn tool_result_positions(messages: &[Message]) -> Vec<(usize, usize)> {
         .collect()
 }
 
-fn tool_result(messages: &[Message], (m, b): (usize, usize)) -> (&str, &str) {
+fn tool_result(messages: &[Message], (m, b): (usize, usize)) -> (&str, &str, bool) {
     match &messages[m].content[b] {
         ContentBlock::ToolResult {
             tool_use_id,
             content,
+            is_error,
             ..
-        } => (tool_use_id, content),
-        _ => ("", ""),
+        } => (tool_use_id, content, *is_error),
+        _ => ("", "", false),
     }
 }
 
@@ -600,7 +656,7 @@ fn prepare_value(
         .iter()
         .enumerate()
         .map(|(i, &pos)| {
-            let (tool_use_id, text) = tool_result(messages, pos);
+            let (tool_use_id, text, is_error) = tool_result(messages, pos);
             let (tool, input) = calls
                 .get(tool_use_id)
                 .map_or((None, None), |(name, input)| (Some(*name), Some(*input)));
@@ -610,6 +666,7 @@ fn prepare_value(
                 "input": input,
                 "bytes": text.len(),
                 "text": truncate_bytes(text, PREPARE_TEXT_MAX),
+                "is_error": is_error,
             })
         })
         .collect();
@@ -685,8 +742,9 @@ pub(super) fn auto_compact_enabled() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::future::{pending, ready};
     use std::iter;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::{
@@ -700,10 +758,11 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::*;
-    use crate::AgentConfig;
+    use crate::agent::frame::RunContext;
     use crate::agent::hook::testing::script;
     use crate::cancel::CancelToken;
     use crate::tools::{RequestTools, ToolRegistry};
+    use crate::{AgentConfig, RunTotals};
     use maki_config::CompactionBuffer;
 
     #[test]
@@ -777,11 +836,12 @@ mod tests {
     /// other, so the baseline would only add noise.
     const NO_SYSTEM: &str = "";
 
-    fn bare_context(model: &Model) -> RunContext {
-        RunContext::fixed(
-            NO_SYSTEM.into(),
-            RequestTools::assembled(Value::Array(Vec::new()), &AgentConfig::default(), model),
-        )
+    fn bare_context() -> RunContextBuilder {
+        Arc::new(|model, _| {
+            let tools =
+                RequestTools::assembled(Value::Array(Vec::new()), &AgentConfig::default(), model);
+            Box::pin(ready(RunContext::fixed(NO_SYSTEM.into(), tools)))
+        })
     }
 
     struct MockProvider {
@@ -889,13 +949,16 @@ mod tests {
             &model,
             history,
             gauge,
-            bare_context(&model),
+            &bare_context(),
+            false,
             None,
             &EventSender::new(raw_tx, 0),
             &test_hooks(&registry, None, &model, cancel),
             config,
             instructions,
             RetryPolicy::default(),
+            CompactReason::Manual,
+            &RunLedger::default(),
         )
         .await
     }
@@ -998,7 +1061,7 @@ mod tests {
 
     #[test_case(vec![] ; "no_content")]
     #[test_case(vec![ContentBlock::Text { text: " \n".into() }] ; "blank_text")]
-    #[test_case(vec![ContentBlock::Thinking { thinking: KEPT_TEXT.into(), signature: None }] ; "thinking_only")]
+    #[test_case(vec![ContentBlock::Thinking { thinking: KEPT_TEXT.into(), signature: None, reasoning_id: None }] ; "thinking_only")]
     #[tokio::test]
     async fn a_failed_compaction_leaves_the_context_alone(content: Vec<ContentBlock>) {
         let empty = || {
@@ -1032,13 +1095,16 @@ mod tests {
             &small_context_model(SUMMARY_CONTEXT_WINDOW),
             &mut history,
             &mut gauge,
-            bare_context(&model),
+            &bare_context(),
+            false,
             None,
             &EventSender::new(raw_tx, 0),
             &hooks,
             &AgentConfig::default(),
             None,
             RetryPolicy::default(),
+            CompactReason::Manual,
+            &RunLedger::default(),
         )
         .await;
 
@@ -1116,13 +1182,16 @@ mod tests {
             &model,
             &mut history,
             &mut ContextGauge::default(),
-            bare_context(&model),
+            &bare_context(),
+            false,
             None,
             &EventSender::new(raw_tx, 0),
             &test_hooks(&registry, None, &model, &cancel),
             &AgentConfig::default(),
             None,
             RetryPolicy::default(),
+            CompactReason::Manual,
+            &RunLedger::default(),
         )
         .await;
 
@@ -1199,6 +1268,164 @@ mod tests {
         );
     }
 
+    const CARRIED_INPUT: u64 = 900_000;
+
+    /// Runs a manual compaction from an empty gauge and hands back every event
+    /// it sent.
+    async fn compact_events(
+        provider: &MockProvider,
+        history: &mut History,
+        ledger: &RunLedger,
+        cancel: &CancelToken,
+        context: &RunContextBuilder,
+    ) -> (Result<DoneReason, AgentError>, Vec<AgentEvent>) {
+        let (raw_tx, mut rx) = unbounded_channel();
+        let registry = ToolRegistry::new();
+        let model = default_model();
+        let result = compact(
+            provider,
+            &model,
+            history,
+            &mut ContextGauge::default(),
+            context,
+            false,
+            None,
+            &EventSender::new(raw_tx, 0),
+            &test_hooks(&registry, None, &model, cancel),
+            &AgentConfig::default(),
+            None,
+            RetryPolicy::default(),
+            CompactReason::Manual,
+            ledger,
+        )
+        .await;
+        (
+            result,
+            iter::from_fn(|| rx.try_recv().ok())
+                .map(|e| e.event)
+                .collect(),
+        )
+    }
+
+    /// The mock holds no responses, so any request would panic. A cancel wins
+    /// over an empty history: it is what the user asked for last.
+    #[test_case(Vec::new(), false, DoneReason::Compact ; "empty_history")]
+    #[test_case(Vec::new(), true, DoneReason::Cancelled ; "cancel_on_an_empty_history")]
+    #[test_case(vec![Message::user(KEPT_TEXT.into())], true, DoneReason::Cancelled ; "cancel_before_the_call")]
+    #[tokio::test]
+    async fn an_ending_without_a_request_sends_one_done_with_no_turn(
+        messages: Vec<Message>,
+        cancelled: bool,
+        expected: DoneReason,
+    ) {
+        let provider = MockProvider::new(Vec::new());
+        let mut history = History::new(messages);
+        let (trigger, cancel) = CancelToken::new();
+        if cancelled {
+            trigger.cancel();
+        }
+
+        let (result, events) = compact_events(
+            &provider,
+            &mut history,
+            &RunLedger::default(),
+            &cancel,
+            &bare_context(),
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), expected);
+        let endings: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Done {
+                    num_turns, reason, ..
+                } => Some((*num_turns, *reason)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(endings, [(0, expected)]);
+    }
+
+    /// The mock holds no responses, so a summary request would panic.
+    #[tokio::test]
+    async fn a_cancel_during_the_context_build_ends_it_before_the_summary() {
+        let provider = MockProvider::new(Vec::new());
+        let mut history = History::new(vec![Message::user(KEPT_TEXT.into())]);
+        let (trigger, cancel) = CancelToken::new();
+        let fire = trigger.handle();
+        let stuck: RunContextBuilder = Arc::new(move |_, _| {
+            let fire = fire.clone();
+            Box::pin(async move {
+                fire.fire();
+                pending().await
+            })
+        });
+
+        let (result, events) = compact_events(
+            &provider,
+            &mut history,
+            &RunLedger::default(),
+            &cancel,
+            &stuck,
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), DoneReason::Cancelled);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Done {
+                reason: DoneReason::Cancelled,
+                ..
+            }
+        )));
+        assert_eq!(history.as_slice()[0].user_text(), Some(KEPT_TEXT));
+    }
+
+    /// A driver's ledger can open with what moved work spent, which read none
+    /// of the transcript.
+    #[tokio::test]
+    async fn the_size_before_ignores_spend_the_ledger_carried() {
+        let provider = MockProvider::new(vec![Ok(StreamResponse {
+            usage: TokenUsage {
+                input: SUMMARISED_INPUT,
+                ..Default::default()
+            },
+            ..text_response(StopReason::EndTurn)
+        })]);
+        let mut history = History::new(vec![Message::user(KEPT_TEXT.into())]);
+        let carried = RunTotals {
+            usage: TokenUsage {
+                input: CARRIED_INPUT,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ledger = RunLedger::carrying(&Arc::default(), carried);
+
+        let (result, events) = compact_events(
+            &provider,
+            &mut history,
+            &ledger,
+            &CancelToken::none(),
+            &bare_context(),
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), DoneReason::Compact);
+        let sizes_before: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::CompactionDone {
+                    context_size_before,
+                    ..
+                } => Some(u64::from(*context_size_before)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sizes_before, [SUMMARISED_INPUT]);
+    }
+
     /// `summary_prompt_merges_instructions` covers the merge, this one the
     /// wiring around it.
     #[tokio::test]
@@ -1244,12 +1471,13 @@ mod tests {
         }
     }
 
-    /// Runs the `/compact` path with a gauge at [`SUMMARISED_PROMPT`] and
-    /// hands back every event it sent.
+    /// Runs a compaction with a gauge at [`SUMMARISED_PROMPT`] and hands
+    /// back every event it sent.
     async fn summarize_steered(
         provider: &MockProvider,
         history: &mut History,
         instructions: Option<&str>,
+        reason: CompactReason,
         answer: impl Fn(AgentSlot, &Value) -> Verdict + Send + Sync + 'static,
     ) -> (Result<DoneReason, AgentError>, Vec<AgentEvent>) {
         let (raw_tx, mut rx) = unbounded_channel();
@@ -1262,13 +1490,16 @@ mod tests {
             &small_context_model(SUMMARY_CONTEXT_WINDOW),
             history,
             &mut ContextGauge::restored(SUMMARISED_PROMPT),
-            bare_context(&model),
+            &bare_context(),
+            false,
             None,
             &EventSender::new(raw_tx, 0),
             &test_hooks(&registry, None, &model, &cancel),
             &AgentConfig::default(),
             instructions,
             RetryPolicy::default(),
+            reason,
+            &RunLedger::default(),
         )
         .await;
         (
@@ -1289,6 +1520,7 @@ mod tests {
             &provider,
             &mut history,
             None,
+            CompactReason::Manual,
             before_answers(json!({ FIELD_SKIP: true })),
         )
         .await;
@@ -1333,6 +1565,7 @@ mod tests {
             &provider,
             &mut history,
             Some(REQUEST_EXTRA),
+            CompactReason::Manual,
             before_answers(json!({ FIELD_INSTRUCTIONS: LAYER_EXTRA })),
         )
         .await;
@@ -1343,6 +1576,66 @@ mod tests {
         let request_at = prompt.find(REQUEST_EXTRA).expect(prompt);
         let layer_at = prompt.find(LAYER_EXTRA).expect(prompt);
         assert!(request_at < layer_at, "{prompt}");
+    }
+
+    #[test_case(CompactReason::Manual, "manual" ; "manual")]
+    #[test_case(CompactReason::Requested, "requested" ; "requested")]
+    #[tokio::test]
+    async fn compact_tells_the_layer_why(reason: CompactReason, expected: &str) {
+        let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+        let mut history = History::new(vec![Message::user("work".into())]);
+        let seen = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&seen);
+
+        let (result, _) = summarize_steered(
+            &provider,
+            &mut history,
+            None,
+            reason,
+            move |slot, payload| {
+                if matches!(slot, AgentSlot::CompactBefore) {
+                    *captured.lock().unwrap() = payload
+                        .get(FIELD_REASON)
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                }
+                Verdict::Unchanged
+            },
+        )
+        .await;
+
+        result.unwrap();
+        assert_eq!(seen.lock().unwrap().as_deref(), Some(expected));
+    }
+
+    const KEEP_GOING: &str = "keep going after the summary";
+
+    #[tokio::test]
+    async fn manual_compact_steers_the_layers_words() {
+        let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+        let mut history = History::new(vec![Message::user("work".into())]);
+
+        let (result, events) = summarize_steered(
+            &provider,
+            &mut history,
+            None,
+            CompactReason::Manual,
+            before_answers(json!({ FIELD_CONTINUE: KEEP_GOING })),
+        )
+        .await;
+        assert_eq!(result.unwrap(), DoneReason::Compact);
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Steered { kind: SteerKind::CompactContinued, text } if text == KEEP_GOING
+            )),
+            "the TUI hears the layer's words: {events:?}"
+        );
+        assert_eq!(
+            history.as_slice().last().unwrap().first_text_content(),
+            Some(KEEP_GOING)
+        );
     }
 
     #[tokio::test]
@@ -1365,8 +1658,14 @@ mod tests {
         })]);
         let mut history = History::new(vec![Message::user("work".into())]);
 
-        let (result, events) =
-            summarize_steered(&provider, &mut history, None, |_, _| Verdict::Unchanged).await;
+        let (result, events) = summarize_steered(
+            &provider,
+            &mut history,
+            None,
+            CompactReason::Manual,
+            |_, _| Verdict::Unchanged,
+        )
+        .await;
         assert_eq!(result.unwrap(), DoneReason::Compact);
 
         let [
@@ -1544,6 +1843,7 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: "hmm".into(),
                     signature: Some("sig".into()),
+                    reasoning_id: None,
                 },
                 ContentBlock::Text {
                     text: "hello".into(),
@@ -1605,7 +1905,7 @@ mod tests {
                 role: Role::User,
                 content: vec![
                     ContentBlock::tool_result("t1", OLD_RESULT, false),
-                    ContentBlock::tool_result("t2", NEW_RESULT, false),
+                    ContentBlock::tool_result("t2", NEW_RESULT, true),
                 ],
                 ..Default::default()
             },
@@ -1628,6 +1928,8 @@ mod tests {
         assert_eq!(slot, AgentSlot::CompactPrepare);
         assert_eq!(value[FIELD_COLLAPSE], json!([1]));
         assert_eq!(value["results"][0]["tool"], TOOL);
+        assert_eq!(value["results"][0]["is_error"], false);
+        assert_eq!(value["results"][1]["is_error"], true);
         let contents: Vec<&str> = messages[1]
             .content
             .iter()

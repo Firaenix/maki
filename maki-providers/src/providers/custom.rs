@@ -4,18 +4,20 @@ use maki_config::providers::{
     ModelDef, Protocol, ProviderDef, ProvidersConfig, ThinkingFields, resolve_api_key_env,
     resolve_base_url, resolve_protocol,
 };
+use maki_storage::blocking;
 use serde_json::{Value, json};
-use tokio::task::spawn_blocking;
 use tracing::warn;
 
-use super::ResolvedAuth;
 use super::anthropic::shared;
 use super::catalog;
 use super::codec::{CodecOptions, protocol_spec};
+use super::{KeyPool, ResolvedAuth};
 use crate::AgentError;
-use crate::model::{FastPricing, Model, ModelEntry, ModelInfo, ModelPricing, ModelTier};
+use crate::model::{
+    FactSource, FactSources, FastPricing, Model, ModelEntry, ModelInfo, ModelPricing, ModelTier,
+};
 use crate::model_registry::{self, DeclaredTiers};
-use crate::provider::Provider;
+use crate::provider::{ModelBatch, Provider, ProviderStatus};
 use crate::providers::Timeouts;
 use crate::spec::{ProviderRegistry, ProviderSpec};
 
@@ -67,36 +69,34 @@ pub(crate) fn is_declared(slug: &str) -> bool {
         .is_some_and(|def| def.protocol.is_some())
 }
 
-/// The credentials and the env var they came out of, which the codec carries
-/// as part of this provider's wire config.
-fn resolve_custom_auth(slug: &str) -> Result<(ResolvedAuth, String), AgentError> {
-    let config = ProvidersConfig::load();
-    let def = config.get(slug).ok_or_else(|| AgentError::Config {
+fn unknown_provider(slug: &str) -> AgentError {
+    AgentError::Config {
         message: format!("unknown custom provider '{slug}'"),
-    })?;
-
-    let env_var = resolve_api_key_env(slug, Some(def));
-    let pool = super::KeyPool::resolve(slug, &env_var)?;
-
-    Ok((
-        ResolvedAuth::bearer(slug, pool.current())?
-            .with_base_url(resolve_base_url(slug, Some(def))),
-        env_var,
-    ))
+    }
 }
 
 pub fn create(slug: &str, timeouts: Timeouts) -> Result<Box<dyn Provider>, AgentError> {
     let config = ProvidersConfig::load();
-    let protocol = config
-        .get(slug)
-        .and_then(|def| def.protocol)
-        .ok_or_else(|| AgentError::Config {
-            message: format!("unknown custom provider '{slug}'"),
-        })?;
-    let (resolved, api_key_env) = resolve_custom_auth(slug)?;
+    let def = config.get(slug).ok_or_else(|| unknown_provider(slug))?;
+    let pool = KeyPool::resolve(slug, &resolve_api_key_env(slug, Some(def)))?;
+    create_from(slug, def, &pool, timeouts)
+}
+
+/// The provider for an entry already read from `providers.toml`, on a key
+/// already resolved for it, so discovery probes with the key it checked.
+fn create_from(
+    slug: &str,
+    def: &ProviderDef,
+    pool: &KeyPool,
+    timeouts: Timeouts,
+) -> Result<Box<dyn Provider>, AgentError> {
+    let protocol = def.protocol.ok_or_else(|| unknown_provider(slug))?;
+    let api_key_env = resolve_api_key_env(slug, Some(def));
+    let resolved = ResolvedAuth::bearer(slug, pool.current())?
+        .with_base_url(resolve_base_url(slug, Some(def)));
     let auth = Arc::new(Mutex::new(resolved));
 
-    // No `base_url`: `resolve_custom_auth` already put the configured origin in
+    // No `base_url`: the auth above already put the configured origin in
     // `auth.base_url`, which outranks anything the config could carry here, so
     // restating it would be the same string twice. The slug is what matters,
     // since that is how the compat layer finds `<SLUG>_BASE_URL` at all.
@@ -159,6 +159,7 @@ impl From<&ModelDef> for ModelEntry {
             thinking_fields: def.thinking_fields.clone(),
             family: None,
             default: false,
+            like: def.like.clone(),
         }
     }
 }
@@ -181,18 +182,43 @@ fn model_from_def(
         .unwrap_or_default();
     let discovered = model_registry::discovered(slug, model_id);
     let discovered = discovered.as_ref();
-    row.max_output_tokens = row
-        .max_output_tokens
-        .or_else(|| discovered.and_then(|d| d.max_output_tokens));
+    // What the endpoint says it serves outranks the row `like` borrows from.
+    let vision_source = match fill(
+        &mut row.supports_vision,
+        discovered.and_then(|d| d.supports_vision),
+    ) {
+        FactSource::Default => FactSource::Like,
+        source => source,
+    };
+    if !row.inherit_like() {
+        warn!(
+            slug,
+            model = model_id,
+            like = row.like.as_deref(),
+            "like names no model Maki knows, ignoring"
+        );
+    }
+    let max_output_source = fill(
+        &mut row.max_output_tokens,
+        discovered.and_then(|d| d.max_output_tokens),
+    );
     // Same precedence as the builtin path ([`Model::from_base`]): the `-1m`
     // suffix only stands in for a window nothing more specific reported, so a
     // proxy that answers /v1/models with its real cap still wins. Without this
     // arm a -1m variant on a custom Anthropic slug (cliproxy on Claude Max)
     // would read back as the 200K protocol default.
+    let context_source = fill(
+        &mut row.context_window,
+        discovered.and_then(|d| d.context_window),
+    );
     row.context_window = row
         .context_window
-        .or_else(|| discovered.and_then(|d| d.context_window))
         .or_else(|| shared::long_context_window(model_id));
+    let thinking_source = if row.supports_thinking.is_some() || row.thinking_fields.is_some() {
+        FactSource::Config
+    } else {
+        FactSource::Default
+    };
     // Resolved here rather than left to `Model::supports_thinking`, which would
     // reach the same spec through `custom::base_spec` and so re-read
     // providers.toml on every call, and would answer from whatever the builtin
@@ -226,18 +252,49 @@ fn model_from_def(
     let declared_pricing = row.pricing.take();
     let using_discovered_pricing = declared_pricing.is_none();
     let discovered_pricing = discovered.and_then(|d| d.pricing.as_ref());
+    let pricing_source = match (&declared_pricing, discovered_pricing) {
+        (Some(_), _) => FactSource::Config,
+        (None, Some(_)) => FactSource::Discovery,
+        (None, None) => FactSource::Default,
+    };
     let pricing = declared_pricing
         .or_else(|| discovered_pricing.cloned())
         .unwrap_or_default();
-    row.pricing = catalog_fallback_id(base, &pricing, subsidy_source.is_some(), model_id)
+    let list_price = catalog_fallback_id(base, &pricing, subsidy_source.is_some(), model_id)
         .and_then(|base_id| catalog::model_meta_if_available(super::anthropic::SLUG, base_id))
-        .and_then(|meta| meta.pricing)
-        .or(Some(pricing));
+        .and_then(|meta| meta.pricing);
+    let pricing_source = if list_price.is_some() {
+        FactSource::Catalog
+    } else {
+        pricing_source
+    };
+    row.pricing = list_price.or(Some(pricing));
     Model {
         subsidised_by: subsidy_source.map(Arc::from),
         discovered_free: using_discovered_pricing
             && discovered_pricing.is_some_and(ModelPricing::is_zero),
+        sources: FactSources {
+            context_window: context_source,
+            max_output_tokens: max_output_source,
+            pricing: pricing_source,
+            thinking: thinking_source,
+            vision: vision_source,
+        },
         ..row.to_model(slug, base, model_id.to_string())
+    }
+}
+
+/// A value the entry states is config. Otherwise discovery fills it, and a
+/// value neither gives is left to the protocol default.
+fn fill<T>(stated: &mut Option<T>, discovered: Option<T>) -> FactSource {
+    if stated.is_some() {
+        return FactSource::Config;
+    }
+    *stated = discovered;
+    if stated.is_some() {
+        FactSource::Discovery
+    } else {
+        FactSource::Default
     }
 }
 
@@ -260,29 +317,6 @@ fn declared_specs_from(config: &ProvidersConfig) -> Vec<String> {
         }
     }
     specs
-}
-
-/// The declared specs, plus the providers whose list they fully describe.
-/// A `discover_models` provider is left out of the second list: its declared
-/// specs show before discovery finishes, but only a successful probe proves
-/// which models it still serves.
-pub fn declared_batch() -> (Vec<String>, Vec<String>) {
-    declared_batch_from(&ProvidersConfig::load())
-}
-
-fn declared_batch_from(config: &ProvidersConfig) -> (Vec<String>, Vec<String>) {
-    let specs = declared_specs_from(config);
-    let providers = config
-        .providers
-        .iter()
-        .filter(|(slug, def)| {
-            !def.discover_models
-                && !is_builtin_slug(slug)
-                && resolve_protocol(slug, Some(*def)).is_some()
-        })
-        .map(|(slug, _)| slug.clone())
-        .collect();
-    (specs, providers)
 }
 
 /// Models a custom provider can start on: its own `default_model`, then one
@@ -372,50 +406,92 @@ pub fn resolve_tier(slug: &str, tier: ModelTier) -> TierLookup {
     }
 }
 
-/// Skip definitions handled by [`declared_model_specs`]; only HTTP `/models`
-/// goes through here, so an empty `discover_models = false` provider returns
-/// nothing and never hits the network. The declared tiers reach the registry
-/// from this same read, so tier lookups notice edits to `providers.toml`.
-pub async fn discover_models(timeouts: Timeouts) -> Vec<String> {
-    let config = spawn_blocking(ProvidersConfig::load)
-        .await
-        .expect("providers config load panicked");
+/// Reports each custom provider as one [`ModelBatch`]: a keyless entry as
+/// [`ProviderStatus::MissingKey`], a `discover_models` entry with its `/models`
+/// answer on top of its declared models, which stay as the fallback when the
+/// probe fails, and the rest with their declared models. Entries that need no
+/// probe go first, so a slow server holds none of them up. The declared tiers
+/// reach the registry from this same read, so tier lookups notice edits to
+/// `providers.toml`.
+pub async fn discover_models(timeouts: Timeouts, mut emit: impl FnMut(ModelBatch)) {
+    let (config, plans) = blocking(move || {
+        let config = ProvidersConfig::load();
+        let plans: Vec<Discovery> = custom_entries(&config)
+            .into_iter()
+            .map(|(slug, def)| Discovery::plan(slug, def, timeouts))
+            .collect();
+        (config, plans)
+    })
+    .await;
     model_registry::set_declared(declared_tiers_from(&config));
-    let mut all_specs = Vec::new();
-    for slug in config.providers.keys() {
-        if is_builtin_slug(slug) {
-            continue;
-        }
-        let def = config.get(slug).unwrap();
-        if !def.discover_models {
-            continue;
-        }
-        if resolve_protocol(slug, Some(def)).is_none() {
-            continue;
-        }
-        match create(slug, timeouts) {
-            Ok(provider) => {
-                let slug_c = slug.clone();
-                let result = provider.list_models().await;
-                match result {
-                    Ok(mut models) => {
-                        overlay_declared_tiers(def, &mut models);
-                        model_registry::set_known_models(&slug_c, models.clone());
-                        for m in models {
-                            all_specs.push(format!("{slug_c}/{}", m.id));
+    let mut entries: Vec<_> = custom_entries(&config).into_iter().zip(plans).collect();
+    entries.sort_by_key(|((_, def), _)| def.discover_models);
+    for ((slug, def), plan) in entries {
+        let mut models: Vec<String> = def
+            .models
+            .iter()
+            .map(|m| format!("{slug}/{}", m.id))
+            .collect();
+        let status = match plan {
+            Discovery::MissingKey => {
+                models.clear();
+                ProviderStatus::MissingKey
+            }
+            Discovery::Declared => ProviderStatus::Live,
+            Discovery::Probe(provider) => match probe(slug, def, provider).await {
+                Ok(listed) => {
+                    for spec in listed {
+                        if !models.contains(&spec) {
+                            models.push(spec);
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(slug, error = %e, "failed to list models for custom provider");
-                    }
+                    ProviderStatus::Live
                 }
-            }
-            Err(e) => {
-                tracing::warn!(slug, error = %e, "failed to create custom provider");
-            }
+                Err(e) => {
+                    warn!(slug, error = %e, "failed to list models for custom provider");
+                    ProviderStatus::Failed(format!("{slug}: {e}"))
+                }
+            },
+        };
+        emit(ModelBatch {
+            provider: slug.clone(),
+            models,
+            status,
+        });
+    }
+}
+
+/// What discovery does with an entry. Deciding it reads the saved key and
+/// `[<slug>.headers]`, so every entry is decided in the blocking job that
+/// read `providers.toml`.
+enum Discovery {
+    MissingKey,
+    Declared,
+    Probe(Result<Box<dyn Provider>, AgentError>),
+}
+
+impl Discovery {
+    fn plan(slug: &str, def: &ProviderDef, timeouts: Timeouts) -> Self {
+        match KeyPool::resolve(slug, &resolve_api_key_env(slug, Some(def))) {
+            Err(_) => Self::MissingKey,
+            Ok(_) if !def.discover_models => Self::Declared,
+            Ok(pool) => Self::Probe(create_from(slug, def, &pool, timeouts)),
         }
     }
-    all_specs
+}
+
+async fn probe(
+    slug: &str,
+    def: &ProviderDef,
+    provider: Result<Box<dyn Provider>, AgentError>,
+) -> Result<Vec<String>, AgentError> {
+    let mut models = provider?.list_models().await?;
+    overlay_declared_tiers(def, &mut models);
+    model_registry::set_known_models(slug, models.clone());
+    Ok(models
+        .into_iter()
+        .map(|m| format!("{slug}/{}", m.id))
+        .collect())
 }
 
 /// Discovery via the openai compat layer never reports tiers, so stored models
@@ -438,14 +514,20 @@ mod tests {
     use maki_storage::sessions::Effort::High;
     use test_case::test_case;
 
+    use super::super::bearer_value;
     use super::*;
-    use crate::test_support::{Canned, Requests, serve};
+    use crate::model::ModelFamily;
+    use crate::test_support::{Canned, Requests, isolated_home, serve};
     use crate::types::{ThinkingConfig, ThinkingFallback};
     use crate::{Message, RequestOptions, StreamResponse};
 
     const FIELDS_MODEL: &str =
         r#"{"id":"m","thinking_fields":{"high":{"reasoning_effort":"xhigh"}}}"#;
     const STARTUP_TIERS: [ModelTier; 2] = [ModelTier::Strong, ModelTier::Medium];
+    const PROBED_SLUG: &str = "probed-gw";
+    const PROBED_KEY: &str = "sk-probed";
+    const PROBED_DECLARED_MODEL: &str = "declared";
+    const PROBED_MODELS_PAGE: &[Canned] = &[Canned::json(200, r#"{"data":[{"id":"listed"}]}"#)];
 
     fn openai_spec() -> &'static ProviderSpec {
         ProviderRegistry::get(super::super::openai::SLUG).unwrap()
@@ -477,28 +559,11 @@ mod tests {
             !specs.iter().any(|s| s.starts_with("opencode/")),
             "builtin slug must be skipped in custom listing: {specs:?}"
         );
-        assert!(specs.contains(&"my-custom/real-model".to_string()));
+        assert!(specs.iter().any(|spec| spec == "my-custom/real-model"));
 
         // Resolution owns the builtin slug regardless of the providers.toml entry.
         let model = Model::from_spec("opencode/shadow-model").unwrap();
         assert_eq!(model.provider.as_ref(), "opencode");
-    }
-
-    /// A `discover_models` provider's declared specs still show before its
-    /// probe lands, but the batch must not claim it answered: a failed probe
-    /// would otherwise mark its undiscovered recents retired.
-    #[test]
-    fn declared_batch_leaves_discovering_providers_out() {
-        let mut config = ProvidersConfig::default();
-        config.upsert("declared".to_string(), openai_def("small"));
-        let mut discovering = openai_def("small");
-        discovering.discover_models = true;
-        config.upsert("discovering".to_string(), discovering);
-
-        let (specs, providers) = declared_batch_from(&config);
-        assert!(specs.contains(&"declared/small".to_string()));
-        assert!(specs.contains(&"discovering/small".to_string()));
-        assert_eq!(providers, ["declared"]);
     }
 
     #[test_case("[localai]", &[] ; "entry_without_protocol_is_skipped")]
@@ -542,6 +607,54 @@ mod tests {
         );
     }
 
+    const LIKE_TARGET: &str = "zai/glm-5.3";
+    const LIKE_SLUG: &str = "custom-gw";
+    const LIKE_MODEL: &str = "local-v4";
+
+    fn like_row(like: &str, fields: &str) -> ProviderDef {
+        serde_json::from_str(&format!(
+            r#"{{"protocol":"openai","models":[{{"id":"{LIKE_MODEL}","like":"{like}"{fields}}}]}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn like_lends_capabilities_but_not_limits_or_price() {
+        let model = model_from_def(
+            &like_row(LIKE_TARGET, ""),
+            openai_spec(),
+            LIKE_SLUG,
+            LIKE_MODEL,
+        );
+        assert_eq!(model.family, ModelFamily::Glm);
+        assert_eq!(model.vision_with_source(), (false, FactSource::Like));
+        assert!(!model.supports_tool_examples());
+        assert_eq!(model.sources.context_window, FactSource::Default);
+        assert_eq!(model.context_window, openai_spec().fallback_context_window);
+        assert_eq!(model.max_output_tokens, openai_spec().fallback_max_output);
+        assert!(model.pricing.is_zero());
+    }
+
+    #[test]
+    fn a_stated_field_wins_over_like() {
+        let def = like_row(
+            LIKE_TARGET,
+            r#","supports_vision":true,"context_window":1024"#,
+        );
+        let model = model_from_def(&def, openai_spec(), LIKE_SLUG, LIKE_MODEL);
+        assert_eq!(model.vision_with_source(), (true, FactSource::Config));
+        assert_eq!(model.context_window, 1024);
+        assert_eq!(model.sources.context_window, FactSource::Config);
+    }
+
+    #[test]
+    fn an_unknown_like_is_ignored() {
+        let def = like_row("nobody/nothing", "");
+        let model = model_from_def(&def, openai_spec(), LIKE_SLUG, LIKE_MODEL);
+        assert_eq!(model.family, openai_spec().family);
+        assert_eq!(model.context_window, openai_spec().fallback_context_window);
+    }
+
     // The exact regression this fixes: discovery parsed context_window but
     // never stored it, so custom models always got the protocol fallback.
     #[test]
@@ -564,6 +677,33 @@ mod tests {
         let model = model_from_def(&def, openai_spec(), slug, model_id);
         assert_eq!(model.context_window, expected_window);
         assert_eq!(model.max_output_tokens, Some(expected_output));
+    }
+
+    #[test_case(Some(true), Some(false), None, true ; "declared_outranks_discovery")]
+    #[test_case(None, Some(false), None, false ; "text_only_discovery_turns_vision_off")]
+    #[test_case(None, Some(true), None, true ; "image_discovery_keeps_vision_on")]
+    #[test_case(None, Some(true), Some(LIKE_TARGET), true ; "image_discovery_outranks_like")]
+    #[test_case(None, None, Some(LIKE_TARGET), false ; "like_fills_what_discovery_leaves_out")]
+    fn discovered_vision_flows_into_custom_model(
+        declared: Option<bool>,
+        discovered: Option<bool>,
+        like: Option<&str>,
+        expected: bool,
+    ) {
+        let slug = format!("custom-vision-test-{declared:?}-{discovered:?}-{like:?}");
+        let model_id = "vllm-model";
+        crate::model_registry::set_known_models(
+            &slug,
+            vec![ModelInfo {
+                supports_vision: discovered,
+                ..ModelInfo::id_only(model_id.to_string())
+            }],
+        );
+        let mut def = openai_def(model_id);
+        def.models[0].supports_vision = declared;
+        def.models[0].like = like.map(str::to_string);
+        let model = model_from_def(&def, openai_spec(), &slug, model_id);
+        assert_eq!(model.supports_vision(), expected);
     }
 
     const ENDPOINT_INPUT_PRICE: f64 = 0.5;
@@ -638,6 +778,45 @@ mod tests {
         overlay_declared_tiers(&def, &mut models);
         assert_eq!(models[0].tier, Some(ModelTier::Strong));
         assert_eq!(models[1].tier, None);
+    }
+
+    #[test_case(Some(PROBED_KEY), ProviderStatus::Live, &["probed-gw/declared", "probed-gw/listed"] ; "keyed_entry_probes_on_the_key_it_checked")]
+    #[test_case(None, ProviderStatus::MissingKey, &[] ; "keyless_entry_reports_without_a_probe")]
+    #[tokio::test]
+    async fn discovery_probes_only_an_entry_with_a_key(
+        api_key: Option<&str>,
+        status: ProviderStatus,
+        models: &[&str],
+    ) {
+        let _home = isolated_home();
+        let (base_url, requests) = serve(PROBED_MODELS_PAGE);
+        let def = serde_json::from_value(json!({
+            "protocol": "openai",
+            "base_url": base_url,
+            "api_key": api_key,
+            "discover_models": true,
+            "models": [{"id": PROBED_DECLARED_MODEL}],
+        }))
+        .unwrap();
+        let mut config = ProvidersConfig::default();
+        config.upsert(PROBED_SLUG.into(), def);
+        config.save().unwrap();
+
+        let mut batches = Vec::new();
+        discover_models(Timeouts::default(), |batch| {
+            batches.push((batch.provider, batch.models, batch.status))
+        })
+        .await;
+
+        let sent: Vec<String> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.authorization().to_owned())
+            .collect();
+        assert_eq!(sent, Vec::from_iter(api_key.map(bearer_value)));
+        let expected = models.iter().map(|spec| spec.to_string()).collect();
+        assert_eq!(batches, [(PROBED_SLUG.to_owned(), expected, status)]);
     }
 
     /// A custom `openai` entry is the one place a user can hand us a model

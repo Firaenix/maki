@@ -4,15 +4,24 @@ local fuzzy_replace = require("maki.fuzzy_replace")
 local replace_lines = require("edit_helpers").replace_lines
 local insert_after = require("edit_helpers").insert_after
 local preserve_line_endings = require("edit_helpers").preserve_line_endings
+local snippet = require("edit_helpers").snippet
+local shift_note = require("edit_helpers").shift_note
 
-local SNIPPET_MAX_CHARS = 32
 local FALLBACK_VIEW_LINES = 5
+local APPROX_NOTE = "matched approximately. Re-read the file before editing it again"
+
+local function drift_suffix(labels)
+  if #labels == 0 then
+    return ""
+  end
+  return "; " .. table.concat(labels, ", ") .. " " .. APPROX_NOTE
+end
 
 local DIFF_OLD = { style = "diff_old", prefix = "- ", sign = "diff_old_sign", nr = "diff_old_line_nr" }
 local DIFF_NEW = { style = "diff_new", prefix = "+ ", sign = "diff_new_sign", nr = "diff_new_line_nr" }
 
 local EDIT_LINES_DESCRIPTION =
-  [[Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range. Do not use with the batch tool.]]
+  [[Edit lines by number. Replaces lines from `start` to `end` (inclusive) with `new_string`. Use empty `new_string` to delete a range. `expect` is the current text of line `start`: line numbers from before your last edit of the file are stale, and a mismatch refuses the edit. Do not use with the batch tool.]]
 
 local INSERT_LINES_DESCRIPTION =
   [[Insert `new_string` after line `line`, or at the top with 0. Only include new lines, never lines already in the file. Do not use with the batch tool.]]
@@ -222,8 +231,9 @@ local function apply_edit(path, transform)
 end
 
 local function diff_result(edit_result, summary)
+  local shift = shift_note(edit_result.before, edit_result.after)
   return {
-    llm_output = summary,
+    llm_output = shift and summary .. "; " .. shift or summary,
     diff_path = edit_result.path,
     diff_before = edit_result.before,
     diff_after = edit_result.after,
@@ -242,6 +252,9 @@ local function register_tool_if(enabled, tool)
     maki.api.register_tool(tool)
   end
 end
+
+local SEVERAL_EDITS_HINT = opts.multiedit and "Use multiedit for several edits."
+  or "edit takes one old_string/new_string pair. Call it once per edit."
 
 maki.api.register_tool({
   name = "edit",
@@ -265,11 +278,15 @@ maki.api.register_tool({
         type = "string",
         description = "Exact string to find (must match uniquely unless replace_all is true)",
         required = true,
+        alias = "old",
+        hint = SEVERAL_EDITS_HINT,
       },
       new_string = {
         type = "string",
         description = "Replacement string",
         required = true,
+        alias = "new",
+        hint = SEVERAL_EDITS_HINT,
       },
       replace_all = {
         type = "boolean",
@@ -284,14 +301,21 @@ maki.api.register_tool({
   end),
 
   handler = function(input)
+    local approximate = false
     local result, err = apply_edit(input.path, function(content)
-      return fuzzy_replace.replace(content, input.old_string, input.new_string, input.replace_all or false)
+      local replaced, replace_err, inexact =
+        fuzzy_replace.replace(content, input.old_string, input.new_string, input.replace_all or false)
+      approximate = inexact and true or false
+      return replaced, replace_err
     end)
     if not result then
       return { llm_output = err, is_error = true }
     end
 
-    return diff_result(result, "edited " .. shorten_path(result.path))
+    return diff_result(
+      result,
+      "edited " .. shorten_path(result.path) .. drift_suffix(approximate and { "old_string" } or {})
+    )
   end,
 })
 
@@ -356,17 +380,16 @@ register_tool_if(opts.multiedit, {
       return { llm_output = "provide at least one edit", is_error = true }
     end
 
+    local drifted = {}
     local result, err = apply_edit(input.path, function(content)
       for i, edit in ipairs(edits) do
-        local replaced, replace_err =
+        local replaced, replace_err, inexact =
           fuzzy_replace.replace(content, edit.old_string, edit.new_string, edit.replace_all or false)
         if replace_err then
-          local snippet = edit.old_string:match("[^\n]*")
-          local cut = utf8.offset(snippet, SNIPPET_MAX_CHARS + 1)
-          if cut then
-            snippet = snippet:sub(1, cut - 1) .. "…"
-          end
-          return nil, string.format("edits[%d] (old_string %q): %s", i - 1, snippet, replace_err)
+          return nil, string.format("edits[%d] (old_string %q): %s", i - 1, snippet(edit.old_string), replace_err)
+        end
+        if inexact then
+          drifted[#drifted + 1] = string.format("edits[%d]", i - 1)
         end
         content = replaced
       end
@@ -378,7 +401,10 @@ register_tool_if(opts.multiedit, {
 
     local n = #edits
     local s = n == 1 and "" or "s"
-    return diff_result(result, string.format("applied %d edit%s to %s", n, s, shorten_path(result.path)))
+    return diff_result(
+      result,
+      string.format("applied %d edit%s to %s", n, s, shorten_path(result.path)) .. drift_suffix(drifted)
+    )
   end,
 })
 
@@ -410,6 +436,11 @@ register_tool_if(opts.edit_lines, {
         description = "Last line, inclusive",
         required = true,
       },
+      expect = {
+        type = "string",
+        description = "Current text of line `start`, indentation optional",
+        required = true,
+      },
       new_string = {
         type = "string",
         description = "Replacement text",
@@ -425,7 +456,7 @@ register_tool_if(opts.edit_lines, {
 
   handler = function(input)
     local result, err = apply_edit(input.path, function(content)
-      return replace_lines(content, input.start, input["end"], input.new_string)
+      return replace_lines(content, input.start, input["end"], input.new_string, input.expect)
     end)
     if not result then
       return { llm_output = err, is_error = true }

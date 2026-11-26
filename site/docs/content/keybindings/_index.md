@@ -90,6 +90,7 @@ Some pickers add extra bindings on top of the defaults:
 | Commands | `Tab` | Complete command |
 | Model Picker | `!/@/#/$` | Set tier (strong/medium/weak/compaction) |
 | Model Picker | `%` | Fold or unfold provider |
+| Model Picker | `*` | Fold or unfold all providers |
 | Session Picker | `Ctrl+N` | New session |
 | Session Picker | `Ctrl+R` | Rename session |
 | Session Picker | `Ctrl+D` | Delete session (press twice) |
@@ -108,6 +109,8 @@ Built-in plugins register these themselves, and your own plugins can add more wi
 | `Ctrl+P` | Browse sessions |
 | `Ctrl+X` | Open tasks |
 | `Alt+T` | Thinking effort |
+| `Alt+,` | Less thinking |
+| `Alt+.` | More thinking |
 
 ## Context Inheritance
 

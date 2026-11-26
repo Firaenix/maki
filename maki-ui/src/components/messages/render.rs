@@ -1,7 +1,7 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui_image::{
     Image,
@@ -62,7 +62,14 @@ impl RenderCursor {
         }
         let Some(protocol) = image.protocol(self.viewport.width) else {
             let fallback = image.fallback().map(Line::from);
-            self.render(fallback.as_slice(), height, None, false, frame);
+            self.render(
+                fallback.as_slice(),
+                height,
+                Style::default(),
+                0,
+                None,
+                frame,
+            );
             return;
         };
         let visible_rows = height
@@ -93,12 +100,13 @@ impl RenderCursor {
         self.y += visible_rows;
     }
 
-    pub fn render(
+    fn render(
         &mut self,
         lines: &[Line<'static>],
         h: u16,
-        style: Option<Style>,
-        highlight: bool,
+        base: Style,
+        gutter_cols: u16,
+        marker: Option<&Span<'static>>,
         frame: &mut Frame,
     ) {
         if self.skip >= h {
@@ -111,13 +119,20 @@ impl RenderCursor {
         let visible_h = h
             .saturating_sub(self.skip)
             .min(self.bottom.saturating_sub(self.y));
-        let seg_area = Rect::new(self.viewport.x, self.y, self.viewport.width, visible_h);
-        let mut p = Paragraph::new(lines.to_vec()).wrap(Wrap { trim: false });
-        let mut base = style.unwrap_or_default();
-        if highlight {
-            base = base.add_modifier(Modifier::REVERSED);
+        let gutter_area = Rect::new(self.viewport.x, self.y, gutter_cols, visible_h);
+        let seg_area = Rect::new(
+            self.viewport.x + gutter_cols,
+            self.y,
+            self.viewport.width - gutter_cols,
+            visible_h,
+        );
+        if gutter_cols > 0 {
+            let marker = Line::from(marker.cloned().unwrap_or_default());
+            frame.render_widget(Paragraph::new(marker).style(base), gutter_area);
         }
-        p = p.style(base);
+        let mut p = Paragraph::new(lines.to_vec())
+            .wrap(Wrap { trim: false })
+            .style(base);
         if self.skip > 0 {
             p = p.scroll((self.skip, 0));
             self.skip = 0;
@@ -142,6 +157,11 @@ impl RenderCursor {
             self.skip -= h;
             return;
         }
+        let mut base = style.unwrap_or_default();
+        if highlight {
+            base = base.add_modifier(Modifier::REVERSED);
+        }
+        let cols = seg.gutter_cols(self.viewport.width);
         let mut walk = seg.rows_from(self.skip, self.viewport.width);
         while self.y < self.bottom
             && let Some((lines, rows)) = walk.next_chunk(self.bottom - self.y)
@@ -150,7 +170,13 @@ impl RenderCursor {
             // only the rows above `skip` inside that line are left to drop.
             // `render` zeroes `skip`, so later chunks drop nothing.
             self.skip = self.skip.saturating_sub(rows.start);
-            self.render(lines, rows.end - rows.start, style, highlight, frame);
+            // The gutter paints from the top of what is visible, so the marker
+            // only goes in while the segment's first row is on screen.
+            let marker = seg
+                .gutter
+                .as_ref()
+                .filter(|_| rows.start == 0 && self.skip == 0);
+            self.render(lines, rows.end - rows.start, base, cols, marker, frame);
         }
     }
 }
@@ -163,7 +189,12 @@ mod tests {
     use color_eyre::eyre::Result;
     use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
     use maki_providers::{ImageMediaType, ImageSource};
-    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+    use ratatui::{
+        Terminal,
+        backend::TestBackend,
+        layout::Rect,
+        text::{Line, Span},
+    };
     use ratatui_image::{
         FontSize,
         picker::{Picker, ProtocolType},
@@ -171,6 +202,7 @@ mod tests {
     use test_case::test_case;
 
     use super::RenderCursor;
+    use crate::components::messages::segment::Segment;
     use crate::terminal_image::InlineImage;
 
     const VIEWPORT: Rect = Rect::new(2, 2, 4, 2);
@@ -180,6 +212,7 @@ mod tests {
     const OVERDRAW: &str = "a clipped image must not paint outside the viewport";
     const BLANK_ROW: &str = "every viewport row must get some of the image";
     const WRONG_ROW: &str = "the clipped rows must be the ones the full draw put there";
+    const GUTTER_VIEWPORT: Rect = Rect::new(0, 0, 8, 4);
 
     #[test_case(ProtocolType::Iterm2; "iterm2")]
     #[test_case(ProtocolType::Kitty; "kitty")]
@@ -253,6 +286,29 @@ mod tests {
         assert_eq!(cursor.skip, 0);
         assert_eq!(cursor.y, VIEWPORT.bottom());
         assert!(cursor.past_bottom());
+        Ok(())
+    }
+
+    #[test_case(0, &["● abcdef", "  ghijkl"] ; "first_row_carries_the_marker")]
+    #[test_case(1, &["  ghijkl"] ; "no_marker_once_the_first_row_scrolls_off")]
+    fn gutter_shows_the_marker_on_the_first_row_only(skip: u16, expected: &[&str]) -> Result<()> {
+        let mut seg = Segment::with_lines(vec![Line::raw("abcdefghijkl")], None);
+        seg.gutter = Some(Span::raw("● "));
+        let mut terminal = Terminal::new(TestBackend::new(
+            GUTTER_VIEWPORT.width,
+            GUTTER_VIEWPORT.height,
+        ))?;
+        let buf = &terminal
+            .draw(|frame| {
+                RenderCursor::new(skip, GUTTER_VIEWPORT).render_segment(&seg, None, false, frame);
+            })?
+            .buffer;
+        for (y, row) in expected.iter().enumerate() {
+            let drawn: String = (0..GUTTER_VIEWPORT.width)
+                .map(|x| buf[(x, y as u16)].symbol())
+                .collect();
+            assert_eq!(drawn, *row);
+        }
         Ok(())
     }
 }

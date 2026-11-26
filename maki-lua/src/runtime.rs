@@ -3,7 +3,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, c_int};
 use std::fmt::Display;
-use std::future::{Future, pending};
+use std::future::{Future, pending, poll_fn};
 use std::panic::catch_unwind;
 use std::path::{Path, PathBuf};
 use std::pin::{Pin, pin};
@@ -12,11 +12,10 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::mpsc::sync_channel;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use include_dir::Dir;
 use maki_agent::cancel::{CancelMap, CancelSlot, CancelToken};
 use maki_agent::permissions::{LayerAnswer, LayerVerdict, PluginRuleStore};
 use maki_agent::prompt::{PromptId, ResolvedPrompts, Slot, SlotEntry};
@@ -37,13 +36,15 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
-use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, watch};
-use tokio::task::{LocalSet, spawn_local, yield_now};
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, watch};
+use tokio::task::{JoinHandle as LocalJoinHandle, LocalSet, spawn_local, yield_now};
 use tokio::time::{sleep, sleep_until, timeout, timeout_at};
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::task_tracker::TaskTrackerToken;
 use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
 use maki_config::RawConfig;
+use maki_providers::Message;
 use maki_providers::plugin::DeclAuthority;
 use maki_storage::id::{MakiId, SessionRef};
 use maki_storage::now_epoch;
@@ -54,10 +55,10 @@ use crate::api::agent::adopt_session;
 use crate::api::autocmd::AutocmdStore;
 use crate::api::fs::publish_walks;
 use crate::api::keymap::KeymapReader;
-use crate::api::keymap::{KeybindTicket, KeymapStore, KeymapWriter, release_mode};
+use crate::api::keymap::{KeybindTicket, KeymapStore, KeymapWriter, release_cursor, release_mode};
 use crate::api::options::{PluginOptionSpecs, PluginOpts, collect_plugin_options};
 use crate::api::plan::{
-    PlanRowHandlers, RowOwners, clear_menu_generation, clear_plugin_rows, clear_session_rows,
+    PlanRowHandlers, RowHandler, RowOwners, clear_plugin_rows, clear_session_rows,
     install_row_handlers, row_handler_opts, rows_from_table, rows_to_table,
 };
 use crate::api::slot::{
@@ -69,25 +70,23 @@ use crate::api::tool::{
 };
 use crate::api::ui::buf::{BufHandle, BufferStore};
 use crate::api::ui::marks::{InputRuleStore, InputRulesReader};
-use crate::api::ui::{HintStore, WinStore, clear_session_hints};
+use crate::api::ui::{HintStore, WinStore, clear_session_hints, publish_hint_snapshot};
 use crate::api::util::command::{CommandHandlerMap, HintWriter, publish_command_snapshot};
 use crate::api::util::command::{
-    LuaCommandReader, LuaCommandWriter, PlanActionOutcome, PlanFormRow, PlanMenu, SessionHostOnly,
-    UiAction, as_plugin_load, ui_send,
+    LuaCommandReader, LuaCommandWriter, PlanActionOutcome, PlanFormRow, PlanMenu, UiAction,
+    as_plugin_load, ui_send,
 };
 use crate::api::util::convert::{TableExt, json_to_lua, lua_to_json_within};
 use crate::api::util::ctx::{DeadlineExpire, LuaCtx, RestoreCtx};
 use crate::api::util::pair::{Pair, err_pair};
 use crate::api::util::setup::ConfigStore;
 use crate::api::{Owner, create_maki_global};
-use crate::background::{
-    BackgroundInfo, BackgroundTask, BackgroundTasks, Fire, Kind, Lifetime, MovedEnd,
-};
+use crate::background::{BackgroundInfo, BackgroundTask, BackgroundTasks, Fire, Kind, MovedEnd};
 use crate::docs_render;
 use crate::error::PluginError;
 use crate::jobs::{JobEvent, JobOwner, JobReaper, JobStore, deliver_job_event};
 use crate::key_lint::KeyLint;
-use crate::loader::EventHandle;
+use crate::loader::{EventHandle, bundled_source};
 use crate::pack::Interaction;
 use crate::plugin_permissions::{
     Ceiling, Permission, PluginPermissions, PluginReach, denied_error, grant_hint,
@@ -519,6 +518,9 @@ pub enum Request {
     OpenPlanForm {
         path: String,
         session: String,
+        /// The UI's request number, which the menu answers with as its
+        /// generation.
+        request: u64,
         /// The rows the host proposes, i.e. the bottom of the actions chain.
         rows: Vec<PlanFormRow>,
         /// The menu to draw, or `None` when a layer took the form over.
@@ -600,6 +602,8 @@ pub enum Request {
     FireAutocmd {
         event: String,
         data: Value,
+        /// A `TurnComplete` reply, which only the Lua thread can shape.
+        message: Option<Message>,
     },
     EndSession(EndSession),
     ClickTool {
@@ -619,7 +623,7 @@ pub enum Request {
         plugin: Arc<str>,
         tool: Arc<str>,
         dctx: Value,
-        reply: SyncSender<Option<String>>,
+        reply: oneshot::Sender<Option<String>>,
     },
     /// Runs the tool's `start` fn so it can publish a live buf before the
     /// permission prompt paints. Best-effort: Lua errors are logged, never
@@ -641,7 +645,11 @@ pub enum Request {
 /// from serving anything else, including the priority lane. One consumer
 /// keeps them in the order the host fired them.
 enum HostHook {
-    Autocmd { event: String, data: Value },
+    Autocmd {
+        event: String,
+        data: Value,
+        message: Option<Message>,
+    },
     EndSession(EndSession),
 }
 
@@ -1267,7 +1275,6 @@ impl LiveTask {
             },
             session: chat,
             task: None,
-            lifetime: Lifetime::Call,
             stopped,
             control: None,
             replied: false,
@@ -1539,7 +1546,6 @@ fn install_compiler(lua: &Lua, jit: bool) -> Compiler {
 /// VM rather than once per plugin.
 #[derive(Clone)]
 struct BundledModules {
-    dirs: &'static [&'static Dir<'static>],
     compiler: Compiler,
     bytecode: Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>,
 }
@@ -1550,11 +1556,7 @@ impl BundledModules {
         if let Some(cached) = cache.get(rel_path) {
             return Ok(Some(Arc::clone(cached)));
         }
-        let Some(source) = self
-            .dirs
-            .iter()
-            .find_map(|dir| dir.get_file(rel_path).and_then(|f| f.contents_utf8()))
-        else {
+        let Some(source) = bundled_source(rel_path) else {
             return Ok(None);
         };
         let compiled = Arc::new(self.compiler.compile(source)?);
@@ -1575,20 +1577,14 @@ fn queue_codegen(queue: &CodegenQueue, func: &Function) {
     }
 }
 
-/// Runs `f` against the package declarations `init.lua` built up.
-///
-/// Every reader goes through here: the store is app data behind a mutex, and
-/// each site that spelled that lookup out by hand was another place to get the
-/// missing-store case or the poisoned lock wrong.
+/// Runs `f` against the package declarations `init.lua` built up, or returns
+/// `R::default()` when this VM has no store.
 fn with_packs<R: Default>(
     lua: &Lua,
     f: impl FnOnce(&mut crate::api::pack::PackDeclarations) -> R,
 ) -> R {
-    let Some(store) = lua.app_data_ref::<crate::api::pack::PackStore>() else {
-        return R::default();
-    };
-    let mut declarations = store.lock().expect("pack declarations");
-    f(&mut declarations)
+    lua.app_data_mut::<crate::api::pack::PackDeclarations>()
+        .map_or_else(R::default, |mut packs| f(&mut packs))
 }
 
 fn module_io_error(modname: &str, path: &Path, error: &std::io::Error) -> mlua::Error {
@@ -1649,13 +1645,150 @@ impl RequireRoot {
     }
 }
 
+/// A module whose body is running.
+#[derive(Default)]
+struct Load {
+    done: Arc<Notify>,
+    /// Modules other tasks are loading that this load waits for, in its own
+    /// body or in a load nested in it.
+    waits_for: Vec<Arc<str>>,
+}
+
+/// One plugin's modules whose body is still running. A body can yield, so
+/// another task can ask for a module halfway through its load.
+#[derive(Default)]
+struct ModuleLoads {
+    pending: Mutex<HashMap<Arc<str>, Load>>,
+    /// The modules whose body the current poll is running, innermost last.
+    polling: Mutex<Vec<Arc<str>>>,
+}
+
+/// What a require of a module that is not loaded yet has to do.
+enum LoadState {
+    Absent,
+    /// The load would wait for this require's own caller, in this task or
+    /// through another task waiting on it.
+    Cycle,
+    Elsewhere(Arc<Notify>, Waiting),
+}
+
+impl ModuleLoads {
+    fn lock_pending(&self) -> MutexGuard<'_, HashMap<Arc<str>, Load>> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lock_polling(&self) -> MutexGuard<'_, Vec<Arc<str>>> {
+        self.polling.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn enter(&self, name: &Arc<str>) -> PollFrame<'_> {
+        self.lock_polling().push(Arc::clone(name));
+        PollFrame(self)
+    }
+
+    fn state(self: &Arc<Self>, modname: &str) -> LoadState {
+        let mut pending = self.lock_pending();
+        let Some(done) = pending.get(modname).map(|load| Arc::clone(&load.done)) else {
+            return LoadState::Absent;
+        };
+        let chain = self.lock_polling().clone();
+        if leads_into(&pending, modname, &chain) {
+            return LoadState::Cycle;
+        }
+        let on = Arc::<str>::from(modname);
+        for name in &chain {
+            if let Some(load) = pending.get_mut(name) {
+                load.waits_for.push(Arc::clone(&on));
+            }
+        }
+        let waiting = Waiting {
+            loads: Arc::clone(self),
+            chain,
+            on,
+        };
+        LoadState::Elsewhere(done, waiting)
+    }
+}
+
+/// Whether `modname` is on `chain` or its load waits, through any number of
+/// other loads, for one that is. Waiting edges only go in after this check, so
+/// they never form a loop.
+fn leads_into(pending: &HashMap<Arc<str>, Load>, modname: &str, chain: &[Arc<str>]) -> bool {
+    chain.iter().any(|name| &**name == modname)
+        || pending.get(modname).is_some_and(|load| {
+            load.waits_for
+                .iter()
+                .any(|next| leads_into(pending, next, chain))
+        })
+}
+
+/// A module on [`ModuleLoads::polling`] for one poll of its body.
+struct PollFrame<'a>(&'a ModuleLoads);
+
+impl Drop for PollFrame<'_> {
+    fn drop(&mut self) {
+        self.0.lock_polling().pop();
+    }
+}
+
+/// Marks a module as loading until its load finishes, fails or is dropped,
+/// then wakes whoever waits for it, so a failed or cancelled require never
+/// leaves the module wedged as in progress. The pending `require` call holds
+/// it, so the collector can drop it.
+struct PendingLoad {
+    loads: Arc<ModuleLoads>,
+    name: Arc<str>,
+}
+
+impl PendingLoad {
+    fn start(loads: &Arc<ModuleLoads>, name: &Arc<str>) -> Self {
+        loads
+            .lock_pending()
+            .insert(Arc::clone(name), Load::default());
+        Self {
+            loads: Arc::clone(loads),
+            name: Arc::clone(name),
+        }
+    }
+}
+
+impl Drop for PendingLoad {
+    fn drop(&mut self) {
+        let load = self.loads.lock_pending().remove(&self.name);
+        if let Some(load) = load {
+            load.done.notify_waiters();
+        }
+    }
+}
+
+/// The loads on one poll's stack, recorded as waiting for `on` until the
+/// wait ends. Held by the pending `require` call, so the collector can drop it.
+struct Waiting {
+    loads: Arc<ModuleLoads>,
+    chain: Vec<Arc<str>>,
+    on: Arc<str>,
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        let mut pending = self.loads.lock_pending();
+        for name in &self.chain {
+            if let Some(load) = pending.get_mut(name)
+                && let Some(at) = load.waits_for.iter().position(|on| *on == self.on)
+            {
+                load.waits_for.swap_remove(at);
+            }
+        }
+    }
+}
+
 struct ModuleLoader {
     bundled: BundledModules,
     require_root: Option<RequireRoot>,
     env: Table,
     codegen: CodegenQueue,
     loaded: Table,
-    loading: Table,
+    loads: Arc<ModuleLoads>,
 }
 
 impl ModuleLoader {
@@ -1718,7 +1851,11 @@ impl ModuleLoader {
     /// Both forms Neovim accepts are tried, `<mod>.lua` before
     /// `<mod>/init.lua`. Every bundled candidate is tried before any plugin
     /// file, so a package still cannot shadow a bundled module.
-    fn load(&self, lua: &Lua, modname: &str) -> Result<LuaValue, mlua::Error> {
+    ///
+    /// The lookup reads with `std::fs` on purpose: a require of a module that
+    /// does not yield then answers on its first poll, so it still works where
+    /// Lua cannot yield, like a `table.sort` comparator.
+    fn find(&self, lua: &Lua, modname: &str) -> Result<Function, mlua::Error> {
         let base = modname.replace('.', "/");
         let candidates = [format!("{base}.lua"), format!("{base}/init.lua")];
 
@@ -1747,24 +1884,43 @@ impl ModuleLoader {
         };
 
         queue_codegen(&self.codegen, &func);
-        func.call(())
+        Ok(func)
     }
 
-    fn require(&self, lua: &Lua, modname: &str) -> Result<LuaValue, mlua::Error> {
+    /// A module body runs as its own call and may yield, so its top level can
+    /// use the async `maki.*` APIs. A require from another task while it runs
+    /// waits for that load. A require that is part of the load gets `true`, as
+    /// for any cycle.
+    ///
+    /// Where the caller cannot yield, like a `table.sort` comparator, the body
+    /// runs as a plain call instead. A body that yields then fails inside the
+    /// require, rather than leaving a half-run load behind for the collector.
+    async fn require(&self, lua: &Lua, modname: &str) -> Result<LuaValue, mlua::Error> {
         if modname.is_empty() {
             return Err(mlua::Error::runtime(
                 "require: module name must be non-empty",
             ));
         }
+        // SAFETY: the first poll runs inside the call, so the state is the
+        // live thread that called `require`, and the check only reads it.
+        let can_yield = lua.exec_raw_lua(|raw| unsafe { ffi::lua_isyieldable(raw.state()) } != 0);
 
-        if let Ok(cached) = self.loaded.get::<LuaValue>(modname)
-            && cached != LuaValue::Nil
-        {
-            return Ok(cached);
-        }
-
-        if self.loading.opt_bool(modname).unwrap_or(false) {
-            return Ok(LuaValue::Boolean(true));
+        loop {
+            if let Ok(cached) = self.loaded.get::<LuaValue>(modname)
+                && cached != LuaValue::Nil
+            {
+                return Ok(cached);
+            }
+            match self.loads.state(modname) {
+                LoadState::Absent => break,
+                LoadState::Cycle => return Ok(LuaValue::Boolean(true)),
+                LoadState::Elsewhere(..) if !can_yield => {
+                    return Err(mlua::Error::runtime(format!(
+                        "require '{modname}': still loading in another task, and this call cannot wait for it"
+                    )));
+                }
+                LoadState::Elsewhere(done, _waiting) => done.notified().await,
+            }
         }
 
         if let Some(module) = docs_render::virtual_module(lua, modname) {
@@ -1773,12 +1929,20 @@ impl ModuleLoader {
             return Ok(LuaValue::Table(module));
         }
 
-        // Cleared on every path, so a failed require never leaves the module
-        // wedged as "in progress".
-        self.loading.set(modname, true)?;
-        let result = self.load(lua, modname);
-        self.loading.set(modname, LuaValue::Nil)?;
-        let result = result?;
+        let func = self.find(lua, modname)?;
+        let name = Arc::from(modname);
+        let _pending = PendingLoad::start(&self.loads, &name);
+        let result = if can_yield {
+            let mut body = pin!(func.call_async::<LuaValue>(()));
+            poll_fn(|cx| {
+                let _frame = self.loads.enter(&name);
+                body.as_mut().poll(cx)
+            })
+            .await?
+        } else {
+            let _frame = self.loads.enter(&name);
+            func.call::<LuaValue>(())?
+        };
 
         let stored = if result == LuaValue::Nil {
             LuaValue::Boolean(true)
@@ -1827,8 +1991,9 @@ impl Watchdog {
         let stop = Arc::new(AtomicBool::new(false));
         let thread = thread::spawn({
             let stop = Arc::clone(&stop);
-            // Keeps the VM alive while this thread can still write to it,
-            // even if a refactor reorders drops.
+            // Keeps the VM alive while this thread can still write to it.
+            // `LuaRuntime` joins the thread before dropping its `lua`, so this
+            // clone never closes the VM.
             let keep_alive = lua.clone();
             move || {
                 let _keep_alive = keep_alive;
@@ -2399,10 +2564,14 @@ fn collect_turn_garbage(lua: &Lua) {
 
 async fn run_host_hook(lua: &Lua, hook: HostHook) {
     match hook {
-        HostHook::Autocmd { event, data } => {
+        HostHook::Autocmd {
+            event,
+            data,
+            message,
+        } => {
             let data = json_to_lua(lua, &data).unwrap_or(LuaValue::Nil);
             let is_turn_end = event == TURN_END_EVENT;
-            crate::api::autocmd::dispatch(lua.clone(), event, None, data).await;
+            crate::api::autocmd::dispatch(lua.clone(), event, None, data, message).await;
             if is_turn_end {
                 collect_turn_garbage(lua);
             }
@@ -2423,7 +2592,8 @@ async fn run_host_hook(lua: &Lua, hook: HostHook) {
             };
             let data =
                 json_to_lua(lua, &event.payload(Some(&end.session))).unwrap_or(LuaValue::Nil);
-            crate::api::autocmd::dispatch(lua.clone(), event.name().to_owned(), None, data).await;
+            crate::api::autocmd::dispatch(lua.clone(), event.name().to_owned(), None, data, None)
+                .await;
             with_jobs(lua, |store| store.kill_session(lua, end.session));
             BackgroundTasks::of(lua).end_session(end.session);
             // Nothing can pick from this session's plan form again.
@@ -2457,18 +2627,18 @@ async fn deliver_pending(
     }
 }
 
-/// Deliver what {job_id} has queued, then leave {delivering} so the next
-/// event it queues gets a task again. The delivery scope republishes the
-/// task handle across callback yields: an unscoped resume would run with no
-/// task, out of the watchdog's reach.
-async fn deliver_job(lua: Lua, job_id: u32, delivering: Rc<RefCell<HashSet<u32>>>) {
+/// Deliver what {job_id} has queued. The job watch starts a task for the
+/// job's next event only once this one has finished, so it returns as soon
+/// as it finds the queue empty. The delivery scope republishes the task
+/// handle across callback yields: an unscoped resume would run with no task,
+/// out of the watchdog's reach.
+async fn deliver_job(lua: Lua, job_id: u32) {
     let scope = TaskScope::delivery(&lua);
     scope
         .scope_future(deliver_pending(&lua, usize::MAX, || {
             with_jobs(&lua, |store| store.next_event_of(job_id)).map(|event| (job_id, event))
         }))
         .await;
-    delivering.borrow_mut().remove(&job_id);
 }
 
 impl Drop for ScopeEnd {
@@ -2557,7 +2727,7 @@ fn try_active_task(lua: &Lua) -> mlua::Result<TaskHandle> {
 
 pub(crate) fn with_jobs<R>(lua: &Lua, f: impl FnOnce(&mut JobStore) -> R) -> R {
     if lua.app_data_ref::<JobStore>().is_none() {
-        lua.set_app_data(JobStore::new());
+        lua.set_app_data(JobStore::new(None));
     }
     let mut store = lua
         .app_data_mut::<JobStore>()
@@ -2785,20 +2955,24 @@ struct InflightGate {
     slots: Arc<Semaphore>,
     /// What [`Self::drain`] waits on: a token per piece of held work, from the
     /// moment it queues for a slot until it gives the slot back. Unlike the
-    /// slots, it leaves out work under a `maki.async.spawn` task. Closed from
-    /// the start, so `wait` resolves whenever it is empty; tokens can still be
-    /// taken.
+    /// slots, it leaves out work under a `maki.async.spawn` task.
     held: TaskTracker,
+}
+
+/// Closed from the start, so `wait` resolves whenever it is empty; tokens can
+/// still be taken.
+fn closed_tracker() -> TaskTracker {
+    let tracker = TaskTracker::new();
+    tracker.close();
+    tracker
 }
 
 impl InflightGate {
     fn new(lua: Lua) -> Self {
-        let held = TaskTracker::new();
-        held.close();
         Self {
             gc: GcPacer::new(lua, LUA_MEMORY_LIMIT),
             slots: Arc::new(Semaphore::new(MAX_INFLIGHT_TOOLS)),
-            held,
+            held: closed_tracker(),
         }
     }
 
@@ -2976,47 +3150,29 @@ impl Drop for GateGuard {
 /// Restore items run as spawned tasks, so queue order no longer says when a
 /// batch is done: the App sends its `restoring` flag after the items, and the
 /// flag may only clear once every in-flight item has finished (it drives the
-/// restore spinner).
-#[derive(Default)]
-struct RestoreTracker {
-    inflight: Cell<usize>,
-    flags: RefCell<Vec<Arc<AtomicBool>>>,
+/// restore spinner). Every session shares the tracker, and a flag clears at
+/// the first idle after its waiter starts, so it can also wait out a batch
+/// queued right behind it.
+fn release_once_restored(restores: &TaskTracker, flag: Arc<AtomicBool>) {
+    let release = ClearOnDrop(flag);
+    if restores.is_empty() {
+        drop(release);
+        return;
+    }
+    let restores = restores.clone();
+    spawn_local(async move {
+        restores.wait().await;
+        drop(release);
+    });
 }
 
-impl RestoreTracker {
-    /// Flags are global across sessions on purpose: any batch reaching idle
-    /// releases every registered spinner flag.
-    fn release_if_idle(&self) {
-        if self.inflight.get() == 0 {
-            for flag in self.flags.borrow_mut().drain(..) {
-                flag.store(false, Ordering::Relaxed);
-            }
-        }
-    }
+/// Also clears the flag when the Lua thread goes down with a waiter still
+/// parked, so a dead dispatcher can't strand the spinner.
+struct ClearOnDrop(Arc<AtomicBool>);
 
-    fn finish(&self) {
-        self.inflight.set(self.inflight.get().saturating_sub(1));
-        self.release_if_idle();
-    }
-
-    fn complete(&self, flag: Arc<AtomicBool>) {
-        self.flags.borrow_mut().push(flag);
-        self.release_if_idle();
-    }
-
-    /// Counts one in-flight item until the guard drops, so an early return
-    /// (or future refactor) inside a restore task can't strand the spinner.
-    fn track(self: &Rc<Self>) -> RestoreGuard {
-        self.inflight.set(self.inflight.get() + 1);
-        RestoreGuard(Rc::clone(self))
-    }
-}
-
-struct RestoreGuard(Rc<RestoreTracker>);
-
-impl Drop for RestoreGuard {
+impl Drop for ClearOnDrop {
     fn drop(&mut self) {
-        self.0.finish();
+        self.0.store(false, Ordering::Relaxed);
     }
 }
 
@@ -3125,13 +3281,13 @@ impl<T> QueueRx<T> {
 /// script deadline. Meant for UI intent that must outlive the caller
 /// (a toast dismissing itself, a debounced repaint).
 ///
-/// `cancel` is what the `Timer` handed back to Lua flips, and what
-/// [`DeferQueue::cancel_plugin`] flips on unload.
+/// `cancel` is what the `Timer` handed back to Lua cancels, and a child of the
+/// plugin's token, so [`DeferQueue::cancel_plugin`] cancels it on unload.
 pub(crate) struct DeferredCallback {
     pub func: RegistryKey,
     pub delay: Duration,
     pub plugin: Arc<str>,
-    pub cancel: Arc<AtomicBool>,
+    pub cancel: CancellationToken,
     /// The [`Ceiling`] up where the timer was set, which the callback runs
     /// under.
     pub ceiling: Option<Ceiling>,
@@ -3140,12 +3296,12 @@ pub(crate) struct DeferredCallback {
 pub(crate) struct DeferQueue {
     tx: UnboundedSender<DeferredCallback>,
     pub(crate) rx: QueueRx<DeferredCallback>,
-    /// Timers that have not fired yet, by owner. A sleeping timer holds no
+    /// The parent of every timer a plugin set. A sleeping timer holds no
     /// [`GateGuard`], so [`drain_barrier`] walks straight past it and a reload
     /// would leave the callback to wake up against a torn down env. Cancelling
-    /// the doomed plugin's timers in [`LuaRuntime::clear_plugin`] closes that
+    /// the doomed plugin's token in [`LuaRuntime::clear_plugin`] closes that
     /// window: whatever is left is either cancelled or already gated.
-    timers: Mutex<Vec<(Arc<str>, Arc<AtomicBool>)>>,
+    plugins: RefCell<HashMap<Arc<str>, CancellationToken>>,
 }
 
 /// A spawned task holds no [`GateGuard`], so [`drain_barrier`] never waits
@@ -3163,35 +3319,45 @@ impl DeferQueue {
         Self {
             tx,
             rx: QueueRx::new(rx),
-            timers: Mutex::new(Vec::new()),
+            plugins: RefCell::default(),
         }
     }
 
-    fn locked(&self) -> std::sync::MutexGuard<'_, Vec<(Arc<str>, Arc<AtomicBool>)>> {
-        self.timers.lock().unwrap_or_else(|e| e.into_inner())
+    /// The token of a new timer of {plugin}, cancelled along with the plugin.
+    pub(crate) fn timer_token(&self, plugin: &Arc<str>) -> CancellationToken {
+        self.plugins
+            .borrow_mut()
+            .entry(Arc::clone(plugin))
+            .or_default()
+            .child_token()
     }
 
-    /// Hands the callback to the dispatcher and remembers it as pending, so
-    /// the two can never drift apart.
     pub(crate) fn push(&self, cb: DeferredCallback) -> Result<(), DeferredCallback> {
-        let pending = (Arc::clone(&cb.plugin), Arc::clone(&cb.cancel));
-        self.tx.send(cb).map_err(|e| e.0)?;
-        self.locked().push(pending);
-        Ok(())
+        self.tx.send(cb).map_err(|e| e.0)
     }
 
-    fn forget(&self, cancel: &Arc<AtomicBool>) {
-        self.locked().retain(|(_, c)| !Arc::ptr_eq(c, cancel));
-    }
-
+    /// The parent stays, so a timer the plugin sets on its way out is born
+    /// cancelled too, until [`Self::revive`] at its next load.
     fn cancel_plugin(&self, plugin: &str) {
-        self.locked().retain(|(owner, cancel)| {
-            let doomed = &**owner == plugin;
-            if doomed {
-                cancel.store(true, Ordering::Release);
-            }
-            !doomed
-        });
+        let parent = self
+            .plugins
+            .borrow_mut()
+            .entry(plugin.into())
+            .or_default()
+            .clone();
+        parent.cancel();
+    }
+
+    /// A plugin that loads again needs a fresh parent, or every timer it sets
+    /// would be born cancelled.
+    fn revive(&self, plugin: &str) {
+        let mut plugins = self.plugins.borrow_mut();
+        if plugins
+            .get(plugin)
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            plugins.remove(plugin);
+        }
     }
 }
 
@@ -3278,22 +3444,29 @@ async fn run_work_fn(
 /// cheaply, but the bodies compete for the `MAX_INFLIGHT_TOOLS` budget so
 /// `for i=1,10000 do maki.defer_fn(f, 0) end` can't run 10k coroutines at
 /// once. Errors are logged and dropped, nobody is awaiting a result.
-fn spawn_deferred_callback(lua: &Lua, gate: &Rc<InflightGate>, cb: DeferredCallback) {
+fn spawn_deferred_callback(
+    lua: &Lua,
+    gate: &Rc<InflightGate>,
+    cb: DeferredCallback,
+) -> LocalJoinHandle<()> {
     let lua = lua.clone();
     let gate = Rc::clone(gate);
     spawn_local(async move {
-        sleep(cb.delay).await;
-        let _guard = gate.acquire().await;
-        // Only now stop advertising the timer as pending: up to here a
-        // `clear_plugin` can still flip the flag we read below, and from here
-        // on the drain barrier waits for the guard instead.
-        if let Some(queue) = lua.app_data_ref::<DeferQueue>() {
-            queue.forget(&cb.cancel);
-        }
-        if cb.cancel.load(Ordering::Acquire) {
+        // Biased, so a stop that lands as the gate opens still wins. Once the
+        // guard is held the drain barrier waits for it, and a `clear_plugin`
+        // cannot reach the callback any more.
+        let fired = tokio::select! {
+            biased;
+            () = cb.cancel.cancelled() => None,
+            guard = async {
+                sleep(cb.delay).await;
+                gate.acquire().await
+            } => Some(guard),
+        };
+        let Some(_guard) = fired else {
             let _ = lua.remove_registry_value(cb.func);
             return;
-        }
+        };
         let run = async {
             let func: Function = lua.registry_value(&cb.func)?;
             func.call_async::<()>(()).await
@@ -3303,7 +3476,7 @@ fn spawn_deferred_callback(lua: &Lua, gate: &Rc<InflightGate>, cb: DeferredCallb
             record_error(&lua, &cb.plugin, ErrorSeam::DeferFn, strip_traceback(&e));
         }
         let _ = lua.remove_registry_value(cb.func);
-    });
+    })
 }
 
 /// Runs a keybind callback. The host consumed the key to get here, and the key
@@ -3613,8 +3786,9 @@ struct PluginOwner {
 type PluginMap = Rc<RefCell<HashMap<Arc<str>, PluginOwner>>>;
 
 struct LuaRuntime {
-    /// Held for its Drop (joins the poker thread). Field order doesn't
-    /// matter: the thread keeps its own `Lua` clone alive.
+    /// Held for its Drop (joins the poker thread). Declared before `lua`, so
+    /// the thread's `Lua` clone is gone when `lua` drops and the VM closes on
+    /// the Lua thread, inside the runtime.
     _watchdog: Watchdog,
     lua: Lua,
     pending: PendingTools,
@@ -3636,7 +3810,6 @@ impl LuaRuntime {
         registry: Arc<ToolRegistry>,
         tx: UnboundedSender<Request>,
         shutdown: Arc<AtomicBool>,
-        bundled_dirs: &'static [&'static Dir<'static>],
         ui_action_tx: Option<UnboundedSender<UiAction>>,
         command_writer: LuaCommandWriter,
         keymap_writer: KeymapWriter,
@@ -3673,6 +3846,7 @@ impl LuaRuntime {
         })?;
 
         lua.set_app_data(CommandHandlerMap::new());
+        lua.set_app_data(JobStore::new(Some(EventHandle::from_tx(tx.clone()))));
         lua.set_app_data(SpawnQueue::new());
         lua.set_app_data(DeferQueue::new());
         lua.set_app_data(SpawnedTasks::default());
@@ -3682,7 +3856,7 @@ impl LuaRuntime {
         lua.set_app_data(command_writer);
         lua.set_app_data(PromptHintCallbacks::default());
         lua.set_app_data(PluginOptionSpecs::default());
-        lua.set_app_data(crate::api::pack::PackStore::default());
+        lua.set_app_data(crate::api::pack::PackDeclarations::default());
         lua.set_app_data(AutocmdStore::default());
         lua.set_app_data(SlotStore::new(Arc::clone(&layered)));
         registry.set_hook(crate::hook::SlotHook {
@@ -3703,24 +3877,29 @@ impl LuaRuntime {
         lua.set_app_data(Arc::clone(&registry));
 
         let plugins: PluginMap = Rc::new(RefCell::new(HashMap::new()));
+        // The thread-locals outlive `self`. A strong `Lua` in them would close
+        // the VM during thread-local destruction, outside the tokio runtime.
         {
-            let lua = lua.clone();
+            let lua = lua.weak();
             let plugins = Rc::clone(&plugins);
             crate::api::tool::set_local_describe(move |plugin, tool, dctx| {
-                run_describe(&lua, &plugins, plugin, tool, dctx)
+                lua.try_upgrade()
+                    .and_then(|lua| run_describe(&lua, &plugins, plugin, tool, dctx))
             });
         }
         {
-            let lua = lua.clone();
+            let lua = lua.weak();
             let plugins = Rc::clone(&plugins);
             crate::api::slot::set_layer_delegation(move |layer, cost, slot| {
-                layer_delegation(&lua, &plugins, cost)(layer, slot)
+                lua.try_upgrade()
+                    .is_some_and(|lua| layer_delegation(&lua, &plugins, cost)(layer, slot))
             });
         }
         {
-            let lua = lua.clone();
+            let lua = lua.weak();
             let plugins = Rc::clone(&plugins);
             crate::api::tool::set_local_tool_handles(move |tool| {
+                let lua = lua.try_upgrade()?;
                 let plugins = plugins.borrow();
                 let tk = plugins.values().find_map(|owner| owner.tools.get(tool))?;
                 let to_fn = |key: Option<&RegistryKey>| {
@@ -3743,7 +3922,6 @@ impl LuaRuntime {
             tx,
             shutdown,
             bundled: BundledModules {
-                dirs: bundled_dirs,
                 compiler,
                 bytecode: Arc::default(),
             },
@@ -3792,6 +3970,7 @@ impl LuaRuntime {
         clear_plugin_rows(&self.lua, name);
         clear_plugin_actions(&self.lua, name);
         release_mode(&self.lua, name);
+        release_cursor(&self.lua, name);
         let mut revision_guard = None;
         if let Some(owner) = self.plugins.borrow_mut().remove(name) {
             unload_ui(&self.lua, name);
@@ -3981,10 +4160,7 @@ impl LuaRuntime {
         let env = self.lua.create_table()?;
         env.set("maki", maki)?;
 
-        if require_root.is_some() || !self.bundled.dirs.is_empty() {
-            let require_fn = self.create_require_fn(&env, require_root)?;
-            env.set("require", require_fn)?;
-        }
+        env.set("require", self.create_require_fn(&env, require_root)?)?;
 
         let meta = self.lua.create_table()?;
         meta.set("__index", self.lua.globals())?;
@@ -4000,17 +4176,19 @@ impl LuaRuntime {
         env: &mlua::Table,
         require_root: Option<RequireRoot>,
     ) -> Result<Function, mlua::Error> {
-        let loader = ModuleLoader {
+        let loader = Arc::new(ModuleLoader {
             bundled: self.bundled.clone(),
             require_root,
             env: env.clone(),
             codegen: self.codegen_queue.clone(),
             loaded: self.lua.create_table()?,
-            loading: self.lua.create_table()?,
-        };
+            loads: Arc::default(),
+        });
 
-        self.lua
-            .create_function(move |lua, modname: String| loader.require(lua, &modname))
+        self.lua.create_async_function(move |lua, modname: String| {
+            let loader = Arc::clone(&loader);
+            async move { loader.require(&lua, &modname).await }
+        })
     }
 
     /// `plugins.<name>` options only reach a plugin through
@@ -4111,6 +4289,9 @@ impl LuaRuntime {
         }
         if let Some(spawned) = self.lua.app_data_ref::<SpawnedTasks>() {
             spawned.0.revive(&name);
+        }
+        if let Some(queue) = self.lua.app_data_ref::<DeferQueue>() {
+            queue.revive(&name);
         }
 
         // Chunks run in order against one environment, so a later file sees
@@ -4282,11 +4463,8 @@ impl LuaRuntime {
         }
         if let Some(mut store) = self.lua.app_data_mut::<HintStore>() {
             store.clear_plugin(plugin);
-            let entries = store.snapshot_entries();
             drop(store);
-            if let Some(writer) = self.lua.app_data_ref::<HintWriter>() {
-                writer.publish(entries);
-            }
+            publish_hint_snapshot(&self.lua);
         }
         if let Some(mut store) = self.lua.app_data_mut::<InputRuleStore>() {
             store.clear_plugin(plugin);
@@ -4479,7 +4657,7 @@ impl LuaRuntime {
     fn click_tool(
         &self,
         gate: &Rc<InflightGate>,
-        restores: &Rc<RestoreTracker>,
+        restores: &TaskTracker,
         tool_use_id: String,
         row: usize,
         fallback: Option<Box<ClickFallback>>,
@@ -4735,18 +4913,16 @@ async fn run_inline_tasks(lua: &Lua, scope: &TaskScope) {
 /// the stale view.
 fn spawn_restore(
     gate: &Rc<InflightGate>,
-    restores: &Rc<RestoreTracker>,
+    restores: &TaskTracker,
     rt: &LuaRuntime,
     item: RestoreItem,
     event_tx: maki_agent::EventSender,
 ) {
     rt.evict_warm(&item.tool_use_id);
-    let tracker = restores.track();
     let lua = rt.lua.clone();
     let plugins = Rc::clone(&rt.plugins);
     let g = Rc::clone(gate);
-    spawn_local(async move {
-        let _tracker = tracker;
+    restores.spawn_local(async move {
         // Acquired before the timeout race starts, so the per-item deadline
         // measures the item's own run, not time queued behind the whole batch.
         let slot = Some(g.acquire().await);
@@ -5102,9 +5278,8 @@ async fn plan_form_opens(
     }
 }
 
-/// Asks the `ui.plan_form.actions` chain for the menu the form draws, and
-/// stashes the handlers of the plugin rows that came back so a pick can find
-/// them, under the generation the form has to echo back.
+/// Asks the `ui.plan_form.actions` chain for the menu the form draws, and the
+/// handlers of the plugin rows that came back.
 ///
 /// The default answers with {proposed}, the host's own rows, which is also
 /// what a layer that throws, parks for good, or answers off contract leaves
@@ -5115,10 +5290,9 @@ async fn plan_form_rows(
     plugins: &PluginMap,
     gate: &Rc<InflightGate>,
     deadline: Instant,
-    session: &str,
     args: MultiValue,
     proposed: Vec<PlanFormRow>,
-) -> PlanMenu {
+) -> (Vec<PlanFormRow>, Vec<Option<RowHandler>>) {
     let allow_layer = layer_delegation(lua, plugins, PLAN_FORM_COST);
     let host_rows = proposed.clone();
     // Which layer put which handler in the menu, the one thing the answered
@@ -5179,29 +5353,9 @@ async fn plan_form_rows(
     };
     // A plugin that wants no form keeps `ui.plan_form` closed instead of
     // answering with an empty menu.
-    let (rows, handlers) = answered
+    answered
         .filter(|answered| !answered.0.is_empty())
-        .unwrap_or_else(|| (proposed, Vec::new()));
-    match install_row_handlers(lua, session.to_owned(), handlers) {
-        Ok(generation) => PlanMenu { generation, rows },
-        Err(e) => {
-            // Nothing was stashed, so no row may go on claiming a handler: a
-            // pick would echo a generation that answers for nothing, and the
-            // built-in outcome the row named would go with it.
-            tracing::warn!(error = %e, "could not stash the plan form row handlers");
-            PlanMenu {
-                generation: 0,
-                rows: rows.into_iter().filter_map(without_handler).collect(),
-            }
-        }
-    }
-}
-
-/// A row the host could not stash a handler for. What is left is the built-in
-/// outcome it named, and a row that named none is one nobody can run.
-fn without_handler(mut row: PlanFormRow) -> Option<PlanFormRow> {
-    row.plugin = None;
-    row.action.is_some().then_some(row)
+        .unwrap_or_else(|| (proposed, Vec::new()))
 }
 
 /// Both chains a landed plan fires, under one deadline: they run back to back
@@ -5215,22 +5369,19 @@ async fn open_plan_form(
     path: String,
     session: &str,
     rows: Vec<PlanFormRow>,
-) -> Option<PlanMenu> {
+) -> Option<(Vec<PlanFormRow>, Vec<Option<RowHandler>>)> {
     let deadline = Instant::now() + PLAN_FORM_SLOT_DEADLINE;
     let args = match plan_form_event(lua, &path, session) {
         Ok(args) => args,
         Err(e) => {
             tracing::warn!(error = %e, "could not build the plan form slot event");
-            return Some(PlanMenu {
-                generation: 0,
-                rows,
-            });
+            return Some((rows, Vec::new()));
         }
     };
     if !plan_form_opens(lua, plugins, gate, deadline, args.clone()).await {
         return None;
     }
-    Some(plan_form_rows(lua, plugins, gate, deadline, session, args, rows).await)
+    Some(plan_form_rows(lua, plugins, gate, deadline, args, rows).await)
 }
 
 /// Fires a host-owned chain and reads back the one contract every host slot
@@ -5497,7 +5648,7 @@ async fn run_tool_call(
     }
 
     let (finish_tx, mut finish_rx) = oneshot::channel::<ToolCallReply>();
-    ctx.finish_tx = Some(finish_tx);
+    ctx.finish_tx = Mutex::new(Some(finish_tx));
     let cancel = ctx.cancel.clone();
 
     let input_lua = match json_to_lua(&lua, &input) {
@@ -5666,7 +5817,7 @@ pub(crate) struct LuaThread {
     pub keymap_reader: KeymapReader,
     pub hint_reader: crate::api::util::command::HintReader,
     pub input_rules_reader: InputRulesReader,
-    pub ui_action_rx: Mutex<Option<UnboundedReceiver<UiAction>>>,
+    pub ui_action_rx: Option<UnboundedReceiver<UiAction>>,
     pub ui_waker: UiWaker,
     /// What [`load_user_source`] found on the Lua thread, for the host to
     /// report.
@@ -5679,7 +5830,6 @@ pub(crate) struct LuaThread {
 /// in-flight tools.
 pub fn spawn(
     registry: Arc<ToolRegistry>,
-    bundled_dirs: &'static [&'static Dir<'static>],
     interaction: Interaction,
     jit: bool,
     plugin_rules: Arc<PluginRuleStore>,
@@ -5724,8 +5874,7 @@ pub fn spawn(
                 registry,
                 tx_clone,
                 shutdown_thread,
-                bundled_dirs,
-                matches!(interaction, Interaction::Tty | Interaction::Host).then_some(ui_action_tx),
+                (interaction == Interaction::Tty).then_some(ui_action_tx),
                 command_writer,
                 keymap_writer,
                 hint_writer,
@@ -5734,9 +5883,6 @@ pub fn spawn(
                 layered_thread,
             ) {
                 Ok(r) => {
-                    if interaction == Interaction::Host {
-                        r.lua.set_app_data(SessionHostOnly);
-                    }
                     r.lua.set_app_data(key_lint_thread);
                     r.lua.set_app_data(plugin_status_thread);
                     r.lua.set_app_data(background_thread);
@@ -5768,21 +5914,21 @@ pub fn spawn(
                 local.spawn_local(async move {
                     // One task per job, so a callback parked on a prompt or a
                     // request holds back only its own job's events.
-                    let delivering = Rc::new(RefCell::new(HashSet::new()));
+                    let mut delivering = HashMap::<u32, LocalJoinHandle<()>>::new();
                     let mut jobs_changed = with_jobs(&lua, |s| s.subscribe());
                     jobs_changed.mark_changed();
                     while jobs_changed.changed().await.is_ok() {
+                        delivering.retain(|_, task| !task.is_finished());
                         for job_id in with_jobs(&lua, |s| s.plugin_jobs_with_events()) {
-                            if delivering.borrow_mut().insert(job_id) {
-                                let delivering = Rc::clone(&delivering);
-                                spawn_local(deliver_job(lua.clone(), job_id, delivering));
-                            }
+                            delivering
+                                .entry(job_id)
+                                .or_insert_with(|| spawn_local(deliver_job(lua.clone(), job_id)));
                         }
                     }
                 });
             }
             let gate = Rc::new(InflightGate::new(rt.lua.clone()));
-            let restores = Rc::new(RestoreTracker::default());
+            let restores = closed_tracker();
             let (hook_tx, mut hook_rx) = unbounded_channel::<HostHook>();
             {
                 let lua = rt.lua.clone();
@@ -6000,6 +6146,7 @@ pub fn spawn(
                         Request::OpenPlanForm {
                             path,
                             session,
+                            request,
                             rows,
                             reply,
                         } => {
@@ -6010,16 +6157,22 @@ pub fn spawn(
                             let plugins = Rc::clone(&rt.plugins);
                             let gate = Rc::clone(&gate);
                             spawn_local(async move {
-                                let menu =
+                                let (rows, handlers) =
                                     open_plan_form(&lua, &plugins, &gate, path, &session, rows)
-                                        .await;
-                                let generation = menu.as_ref().map_or(0, |m| m.generation);
-                                if reply.send(menu).is_err() {
-                                    // The form gave up on this answer, or the
-                                    // session it was asked about is gone. The
-                                    // handlers stashed for a menu nobody will
-                                    // ever draw go with it.
-                                    clear_menu_generation(&lua, &session, generation);
+                                        .await
+                                        .unzip();
+                                let menu = rows.map(|rows| PlanMenu {
+                                    generation: request,
+                                    rows,
+                                });
+                                // No await after send: newer requests drop this receiver first.
+                                if reply.send(menu).is_ok() {
+                                    install_row_handlers(
+                                        &lua,
+                                        session,
+                                        request,
+                                        handlers.unwrap_or_default(),
+                                    );
                                 }
                             });
                         }
@@ -6145,15 +6298,23 @@ pub fn spawn(
                             spawn_restore(&gate, &restores, &rt, item, event_tx);
                         }
                         Request::RestoreComplete { flag } => {
-                            restores.complete(flag);
+                            release_once_restored(&restores, flag);
                         }
                         Request::ClickTool {
                             tool_use_id,
                             row,
                             fallback,
                         } => rt.click_tool(&gate, &restores, tool_use_id, row, fallback),
-                        Request::FireAutocmd { event, data } => {
-                            let _ = hook_tx.send(HostHook::Autocmd { event, data });
+                        Request::FireAutocmd {
+                            event,
+                            data,
+                            message,
+                        } => {
+                            let _ = hook_tx.send(HostHook::Autocmd {
+                                event,
+                                data,
+                                message,
+                            });
                         }
                         Request::EndSession(end) => {
                             let _ = hook_tx.send(HostHook::EndSession(end));
@@ -6249,7 +6410,7 @@ pub fn spawn(
         keymap_reader,
         hint_reader,
         input_rules_reader,
-        ui_action_rx: Mutex::new(Some(ui_action_rx)),
+        ui_action_rx: Some(ui_action_rx),
         ui_waker,
         key_lint,
         plugin_status,
@@ -6299,7 +6460,6 @@ mod tests {
     use std::task::{Context, Poll, Wake, Waker};
     use test_case::test_case;
     use tokio::sync::Notify;
-    use tokio_util::sync::CancellationToken;
 
     fn make_buf_handle(text: &str) -> BufHandle {
         let buf = Arc::new(maki_agent::SharedBuf::new());
@@ -6381,6 +6541,7 @@ mod tests {
 
     #[test]
     fn task_scope_clears_only_its_jobs_on_drop() {
+        let _runtime = HOST_RUNTIME.enter();
         let lua = Lua::new();
         let scope = TaskScope::new(&lua, task_cell(None));
         let task_owner = JobOwner::Task(lock_cell(scope.handle()).id);
@@ -6413,7 +6574,12 @@ mod tests {
         WaitLease,
         DepthGuard,
         TaskScope,
+        PendingLoad,
+        Waiting,
     }
+
+    const TEST_MODULE: &str = "slow";
+    const OUTER_MODULE: &str = "outer";
 
     /// Frees `value` the way the collector frees a coroutine parked on it:
     /// inside `collect_userdata`, where any VM call aborts the process.
@@ -6432,7 +6598,10 @@ mod tests {
     #[test_case(LuaOwned::WaitLease ; "wait_lease")]
     #[test_case(LuaOwned::DepthGuard ; "depth_guard")]
     #[test_case(LuaOwned::TaskScope ; "task_scope")]
+    #[test_case(LuaOwned::PendingLoad ; "pending_load")]
+    #[test_case(LuaOwned::Waiting ; "waiting")]
     fn dropped_by_collector_releases_its_hold(owned: LuaOwned) {
+        let _runtime = HOST_RUNTIME.enter();
         let lua = Lua::new();
         match owned {
             LuaOwned::WaitLease => {
@@ -6473,6 +6642,42 @@ mod tests {
                 assert!(
                     with_jobs(&lua, |store| store.is_empty(&owner)),
                     "the next store access must reap the task's jobs"
+                );
+            }
+            LuaOwned::PendingLoad => {
+                let loads = Arc::<ModuleLoads>::default();
+                let pending = PendingLoad::start(&loads, &Arc::from(TEST_MODULE));
+                let LoadState::Elsewhere(done, _waiting) = loads.state(TEST_MODULE) else {
+                    panic!("the load must be pending");
+                };
+                let woken = done.notified();
+
+                drop_in_collector(&lua, pending);
+
+                assert!(woken.now_or_never().is_some(), "a waiter must wake");
+                assert!(
+                    matches!(loads.state(TEST_MODULE), LoadState::Absent),
+                    "the module must be free to load again"
+                );
+            }
+            LuaOwned::Waiting => {
+                let loads = Arc::<ModuleLoads>::default();
+                let outer = Arc::from(OUTER_MODULE);
+                let _outer = PendingLoad::start(&loads, &outer);
+                let _slow = PendingLoad::start(&loads, &Arc::from(TEST_MODULE));
+                let waiting = {
+                    let _frame = loads.enter(&outer);
+                    let LoadState::Elsewhere(_, waiting) = loads.state(TEST_MODULE) else {
+                        panic!("the load must be pending");
+                    };
+                    waiting
+                };
+
+                drop_in_collector(&lua, waiting);
+
+                assert!(
+                    loads.lock_pending()[OUTER_MODULE].waits_for.is_empty(),
+                    "the wait must be taken back"
                 );
             }
         }
@@ -6536,33 +6741,68 @@ mod tests {
 
     #[test]
     fn defer_queue_cancels_only_the_doomed_plugins_timers() {
-        let lua = Lua::new();
         let queue = DeferQueue::new();
-        let timer = |plugin: &str| {
-            let cancel = Arc::new(AtomicBool::new(false));
-            let queued = queue.push(DeferredCallback {
-                func: lua.create_registry_value(true).unwrap(),
-                delay: Duration::ZERO,
-                plugin: Arc::from(plugin),
-                cancel: Arc::clone(&cancel),
-                ceiling: None,
-            });
-            assert!(queued.is_ok(), "the queue is unbounded");
-            cancel
-        };
-        let doomed = timer("memory");
-        let bystander = timer("other");
+        let (memory, other) = (Arc::from("memory"), Arc::from("other"));
+        let doomed = queue.timer_token(&memory);
+        let bystander = queue.timer_token(&other);
 
         queue.cancel_plugin("memory");
-        assert!(doomed.load(Ordering::Acquire));
-        assert!(!bystander.load(Ordering::Acquire));
 
-        queue.forget(&bystander);
-        queue.cancel_plugin("other");
+        assert!(doomed.is_cancelled());
+        assert!(!bystander.is_cancelled());
         assert!(
-            !bystander.load(Ordering::Acquire),
-            "a timer past the gate is running, not pending"
+            queue.timer_token(&memory).is_cancelled(),
+            "a plugin on its way out sets no live timers"
         );
+
+        queue.revive("memory");
+
+        assert!(
+            !queue.timer_token(&memory).is_cancelled(),
+            "a plugin that loads again sets live timers"
+        );
+    }
+
+    #[test]
+    fn defer_queue_cancels_a_plugin_that_never_set_a_timer() {
+        let queue = DeferQueue::new();
+        let quiet: Arc<str> = Arc::from("quiet");
+
+        queue.cancel_plugin(&quiet);
+
+        assert!(queue.timer_token(&quiet).is_cancelled());
+    }
+
+    /// The clock is paused, so a timer still waiting out its hour lets the
+    /// shorter timeout fire at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_timer_ends_without_waiting_out_its_delay() {
+        const STILL_SLEEPING: &str = "the stopped timer still holds its task";
+        LocalSet::new()
+            .run_until(async {
+                let lua = Lua::new();
+                let cancel = CancellationToken::new();
+                let timer = spawn_deferred_callback(
+                    &lua,
+                    &Rc::new(gate()),
+                    DeferredCallback {
+                        func: lua.create_registry_value(true).unwrap(),
+                        delay: Duration::from_secs(3600),
+                        plugin: Arc::from("memory"),
+                        cancel: cancel.clone(),
+                        ceiling: None,
+                    },
+                );
+                yield_now().await;
+
+                cancel.cancel();
+
+                timeout(Duration::from_secs(1), timer)
+                    .await
+                    .expect(STILL_SLEEPING)
+                    .expect("the timer task panicked");
+            })
+            .await;
     }
 
     fn gate() -> InflightGate {
@@ -6823,6 +7063,64 @@ mod tests {
                 assert!(g.held.is_empty(), "a given-up admission left its hold");
             })
             .await;
+    }
+
+    const CLEARED_IN_FLIGHT: &str = "cleared with an item in flight";
+
+    #[tokio::test]
+    async fn a_restore_flag_clears_only_once_every_overlapping_batch_finished() {
+        wake_or_fail(LocalSet::new().run_until(async {
+            let restores = closed_tracker();
+            let first_item = restores.token();
+            let first = Arc::new(AtomicBool::new(true));
+            release_once_restored(&restores, Arc::clone(&first));
+            let second_item = restores.token();
+            let second = Arc::new(AtomicBool::new(true));
+            release_once_restored(&restores, Arc::clone(&second));
+
+            drop(first_item);
+            for _ in 0..SETTLE_YIELDS {
+                yield_now().await;
+            }
+            assert!(first.load(Ordering::Relaxed), "{CLEARED_IN_FLIGHT}");
+
+            drop(second_item);
+            for _ in 0..SETTLE_YIELDS {
+                yield_now().await;
+            }
+            assert!(!first.load(Ordering::Relaxed) && !second.load(Ordering::Relaxed));
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_flag_for_a_finished_batch_does_not_wait_for_the_next_one() {
+        wake_or_fail(LocalSet::new().run_until(async {
+            let restores = closed_tracker();
+            let flag = Arc::new(AtomicBool::new(true));
+            release_once_restored(&restores, Arc::clone(&flag));
+            let _next_item = restores.token();
+            for _ in 0..SETTLE_YIELDS {
+                yield_now().await;
+            }
+            assert!(!flag.load(Ordering::Relaxed));
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_restore_flag_clears_when_the_lua_thread_drops_its_waiter() {
+        let restores = closed_tracker();
+        let _item = restores.token();
+        let flag = Arc::new(AtomicBool::new(true));
+        let local = LocalSet::new();
+        local
+            .run_until(async { release_once_restored(&restores, Arc::clone(&flag)) })
+            .await;
+        assert!(flag.load(Ordering::Relaxed), "{CLEARED_IN_FLIGHT}");
+
+        drop(local);
+        assert!(!flag.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -7300,18 +7598,19 @@ mod tests {
 
     /// `while true do end` only stops if the watchdog kills it, so run it on
     /// a helper thread with a bounded wait: a broken watchdog then fails the
-    /// test with a reason instead of hanging the harness. The clock starts
-    /// before the loop can, so the reported time is a lower bound.
-    fn hot_loop_expecting_kill(lua: &Lua) -> (mlua::Error, Duration) {
+    /// test with a reason instead of hanging the harness. Returns when the
+    /// kill reached the test: callers time it from before they arm the kill,
+    /// as compiling the loop (with the JIT, slowly) already counts against a
+    /// deadline.
+    fn hot_loop_expecting_kill(lua: &Lua) -> (mlua::Error, Instant) {
         let f = lua.load("while true do end").into_function().unwrap();
         let (tx, rx) = sync_channel(1);
-        let start = Instant::now();
         thread::spawn(move || drop(tx.send(f.call::<bool>(()))));
         let err = rx
             .recv_timeout(WATCHDOG_TEST_TIMEOUT)
             .expect("watchdog never killed the hot loop")
             .unwrap_err();
-        (err, start.elapsed())
+        (err, Instant::now())
     }
 
     /// Runs long enough (50ms) to guarantee several watchdog pokes.
@@ -7337,12 +7636,16 @@ mod tests {
     #[test]
     fn stale_cancelled_handle_aborts_callback_after_the_grace() {
         let (lua, _watchdog) = watchdog_lua(false);
+        let armed = Instant::now();
         lua.set_app_data::<TaskHandle>(cancelled_handle());
 
-        let (err, elapsed) = hot_loop_expecting_kill(&lua);
+        let (err, killed) = hot_loop_expecting_kill(&lua);
 
         assert!(err.to_string().contains(INTERRUPT_CANCELLED_MSG));
-        assert!(elapsed >= KILL_GRACE, "kill skipped the cleanup grace");
+        assert!(
+            killed - armed >= KILL_GRACE,
+            "kill skipped the cleanup grace"
+        );
     }
 
     /// A healthy poke must leave nothing armed, or the first poke after esc
@@ -8016,6 +8319,7 @@ mod tests {
     ) -> (Result<String, String>, Duration) {
         let (tx, rx) = sync_channel(1);
         thread::spawn(move || {
+            let _runtime = HOST_RUNTIME.enter();
             let lua = Lua::new();
             let scope = TaskScope::new(&lua, cell);
             let owner = JobOwner::Task(lock_cell(scope.handle()).id);
@@ -8112,6 +8416,7 @@ mod tests {
     fn dispatch_async_wakes_from_its_park(wake: ParkedWake, expected: Result<String, String>) {
         let (tx, rx) = sync_channel(1);
         thread::spawn(move || {
+            let _runtime = HOST_RUNTIME.enter();
             let (trigger, token) = CancelToken::new();
             let mut cell = TaskCell::new(token, None, None);
             cell.deadline_secs = Some(DISPATCH_TEST_DEADLINE_SECS);
@@ -8376,13 +8681,14 @@ mod tests {
     #[test]
     fn shutdown_outranks_the_cleanup_grace() {
         let (lua, _watchdog) = watchdog_lua(true);
+        let armed = Instant::now();
         lua.set_app_data::<TaskHandle>(cancelled_handle());
 
-        let (err, elapsed) = hot_loop_expecting_kill(&lua);
+        let (err, killed) = hot_loop_expecting_kill(&lua);
 
         assert!(err.to_string().contains(INTERRUPT_SHUTDOWN_MSG));
         assert!(
-            elapsed < KILL_GRACE,
+            killed - armed < KILL_GRACE,
             "shutdown waited out the cleanup grace"
         );
     }
@@ -8395,15 +8701,15 @@ mod tests {
         let (lua, _watchdog) = watchdog_lua(false);
         install_compiler(&lua, true);
 
-        let deadline = Instant::now() + JIT_DEADLINE;
-        let cell = TaskCell::new(CancelToken::none(), Some(deadline), None);
+        let armed = Instant::now();
+        let cell = TaskCell::new(CancelToken::none(), Some(armed + JIT_DEADLINE), None);
         lua.set_app_data::<TaskHandle>(Arc::new(Mutex::new(cell)));
 
-        let (err, elapsed) = hot_loop_expecting_kill(&lua);
+        let (err, killed) = hot_loop_expecting_kill(&lua);
 
         assert!(err.to_string().contains(INTERRUPT_DEADLINE_MSG));
         assert!(
-            elapsed >= JIT_DEADLINE + KILL_GRACE,
+            killed - armed >= JIT_DEADLINE + KILL_GRACE,
             "kill skipped the cleanup grace"
         );
     }

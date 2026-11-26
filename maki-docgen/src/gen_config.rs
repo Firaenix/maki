@@ -144,6 +144,20 @@ fn write_theme_section(out: &mut String) {
     .unwrap();
     writeln!(
         out,
+        "User messages use `user` for the `you> ` prefix, `user_text` for the \
+         body, and `user_bg` for the full-width background behind both. \
+         `user_text` defaults to `assistant`, and `user_bg` to no background.\n\n\
+         ```toml\n\
+         # themes/<name>.toml\n\
+         [ui]\n\
+         user = {{ fg = \"blue\" }}\n\
+         user_text = {{ fg = \"foreground\" }}\n\
+         user_bg = {{ bg = \"#1d2021\" }}\n\
+         ```\n"
+    )
+    .unwrap();
+    writeln!(
+        out,
         "Diff signs use `diff_old_sign` and `diff_new_sign`, which default to \
          `diff_old` and `diff_new`. These styles are applied after `code_block`, \
          so their properties take precedence. Diff gutters use \
@@ -153,10 +167,9 @@ fn write_theme_section(out: &mut String) {
     .unwrap();
     writeln!(
         out,
-        "The input caret uses `cursor` when the terminal has focus and \
-         `cursor_unfocused` when focus is lost. `cursor_unfocused` defaults \
-         to `cursor`, so themes only need it when the two should differ. \
-         Terminals that do not report focus events keep the focused caret.\n"
+        "The chat input uses your terminal's own cursor, in its shape and \
+         colors. The search, file, list and login pickers paint their caret \
+         with `cursor`.\n"
     )
     .unwrap();
     writeln!(

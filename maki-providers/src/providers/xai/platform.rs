@@ -2,10 +2,12 @@ use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 
 use maki_storage::id::SessionRef;
+use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::model::Model;
+use crate::headers::parse_headers;
+use crate::model::{FactSource, Model};
 use crate::provider::{BoxFuture, Provider};
 use crate::providers::ResolvedAuth;
 use crate::providers::managed_auth::ManagedAuth;
@@ -113,12 +115,19 @@ impl Provider for Xai {
         session_id: Option<&'a SessionRef>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            self.auth.refresh_if_stale().await?;
+            let oauth = self.auth.uses_oauth().await?;
             let mut buf = String::new();
             let system = super::super::with_prefix(&self.system_prefix, system, &mut buf);
 
-            if self.auth.is_oauth() {
-                let mut body = responses::build_body(model, messages, system, tools);
+            if oauth {
+                let mut body = responses::build_body(
+                    model,
+                    messages,
+                    system,
+                    tools,
+                    false,
+                    responses::SystemChannel::Instructions,
+                );
                 apply_grok_reasoning(&mut body, &opts, model);
                 if let Some(session) = session_id {
                     body["prompt_cache_key"] = json!(session.as_str());
@@ -127,12 +136,11 @@ impl Provider for Xai {
                 return self
                     .auth
                     .with_retry(|| async {
-                        let mut auth = self.auth.current();
-                        auth.headers
-                            .extend(proxy_request_headers(model, session_id));
+                        let auth = self.auth.current();
                         responses::do_stream(
                             self.compat.client(),
                             model,
+                            &parse_headers(proxy_request_headers(model, session_id))?,
                             &body,
                             event_tx,
                             &auth,
@@ -153,7 +161,7 @@ impl Provider for Xai {
                 .with_retry(|| async {
                     let auth = self.auth.current();
                     self.compat
-                        .do_stream(model, &[], &body, event_tx, &auth)
+                        .do_stream(model, &HeaderMap::new(), &body, event_tx, &auth)
                         .await
                 })
                 .await
@@ -162,8 +170,7 @@ impl Provider for Xai {
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
         Box::pin(async {
-            self.auth.refresh_if_stale().await?;
-            if self.auth.is_oauth() {
+            if self.auth.uses_oauth().await? {
                 return self
                     .auth
                     .with_retry(|| async {
@@ -202,38 +209,39 @@ impl Provider for Xai {
         };
         model.context_window = cached.context_window;
         model.max_output_tokens = Some(cached.max_tokens);
+        model.sources.context_window = FactSource::Discovery;
+        model.sources.max_output_tokens = FactSource::Discovery;
         if cached.pricing.input > 0.0 || cached.pricing.output > 0.0 {
             model.pricing.input = cached.pricing.input;
             model.pricing.output = cached.pricing.output;
             model.pricing.cache_write = cached.pricing.cache_write;
             model.pricing.cache_read = cached.pricing.cache_read;
+            model.sources.pricing = FactSource::Discovery;
         }
         model.supports_vision_override = Some(cached.vision);
+        model.sources.vision = FactSource::Discovery;
         model.thinking_override = Some(if cached.reasoning {
             crate::model::ThinkingSupport::Yes
         } else {
             crate::model::ThinkingSupport::No
         });
+        model.sources.thinking = FactSource::Discovery;
     }
 }
 
 fn bearer_token(auth: &ResolvedAuth) -> Option<String> {
-    auth.headers.iter().find_map(|(key, value)| {
-        if !key.eq_ignore_ascii_case("authorization") {
-            return None;
-        }
-        value
-            .strip_prefix("Bearer ")
-            .or_else(|| value.strip_prefix("bearer "))
-            .map(ToOwned::to_owned)
-    })
+    let value = auth.header("authorization")?;
+    value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+        .map(ToOwned::to_owned)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::ThinkingConfig;
-    use crate::{ModelFamily, ModelPricing, ModelTier};
+    use crate::{FactSources, ModelFamily, ModelPricing, ModelTier};
 
     fn test_model(thinking: bool) -> Model {
         Model {
@@ -254,6 +262,7 @@ mod tests {
             discovered_free: false,
             max_output_tokens: Some(131_072),
             turn_output_tokens: None,
+            sources: FactSources::default(),
             context_window: 500_000,
             thinking_fields: None,
         }

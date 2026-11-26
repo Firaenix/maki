@@ -12,13 +12,15 @@ use maki_agent::{AgentEvent, EventSender, SpanStyle};
 use maki_config::ToolOutputLines;
 use maki_highlight::highlight_code;
 use maki_lua::test_support::{fire_autocmd, runtime};
-use maki_lua::{PluginHost, RestoreReason, Split, UiAction};
+use maki_lua::{PluginHost, RestoreReason, Split, UiAction, WinCommand};
 use maki_storage::id::{MakiId, SessionRef};
 use serde_json::{Value, json};
 use test_case::test_case;
 use tokio::sync::mpsc::unbounded_channel;
 
 const BASH_SRC: &str = include_str!("../../plugins/bash/init.lua");
+const FILE_TOOL_NOTE: &str =
+    "[Use dedicated tools for files, not bash: the read tool instead of cat.]";
 const GREP_SRC: &str = include_str!("../../plugins/grep/init.lua");
 /// The bash restore cases all run `echo`, and their output `hi` does not contain it.
 const COMMAND_WORD: &str = "echo";
@@ -45,6 +47,14 @@ const INDEX_VIEW_CAP: usize = 2;
 const READ_VIEW_CAP: usize = 5;
 const TODO_TOOL: &str = "todo_write";
 const TODO_ITEM: &str = "wire the panel";
+/// What a user's `init.lua` does with the action while a panel is shown: call
+/// it by name, and expect the `true` that says the key was consumed, with no
+/// error and no permission prompt.
+const TODO_TOGGLE_CALLER_SHOWN: &str = r#"
+local ok, err = maki.ui.action('todo_write.toggle')
+assert(err == nil, err)
+assert(ok == true, tostring(ok))
+"#;
 const SUBAGENT_TASK_ID: &str = "toolu_sub";
 const SESSION_ID: &str = "01965087-4c71-7f00-8000-000000000000";
 
@@ -231,6 +241,23 @@ fn bash_restore_titles_a_call_and_shows_its_command(
     );
     assert_eq!(r.header, header);
     assert!(r.body.contains(COMMAND_WORD), "{}", r.body);
+}
+
+#[test_case("hi", "hi" ; "with_output")]
+#[test_case("Exit code: 0", "No output" ; "without_output")]
+fn bash_restore_shows_the_file_tool_note_below_the_output(reply: &str, shown: &str) {
+    let host = load_host();
+    let r = restore(
+        &host,
+        "bash",
+        json!({ "command": "cat hi.txt" }),
+        &format!("{FILE_TOOL_NOTE}\n{reply}"),
+        None,
+        Vec::new(),
+    );
+    let (output, note) = r.body.split_once(FILE_TOOL_NOTE).expect(&r.body);
+    assert!(output.contains(shown), "{}", r.body);
+    assert_eq!(note.trim(), "", "{}", r.body);
 }
 
 /// The session's own directory tells the reader nothing.
@@ -553,12 +580,70 @@ fn todo_write_live_call_starts_folded() {
     assert!(!live.body.contains(TODO_ITEM), "list shown: {}", live.body);
 }
 
+#[test_case(json!({ "todos": [
+    { "content": TODO_ITEM, "status": "completed" },
+    { "content": "second", "status": "in_progress" },
+    { "content": "third", "status": "pending" },
+    { "content": "fourth", "status": "cancelled" },
+] }), "Todos updated: 1 completed, 1 in progress, 1 pending, 1 cancelled" ; "list")]
+#[test_case(json!({ "todos": [] }), "Todos cleared" ; "cleared")]
+fn todo_write_live_call_reports_the_result(input: Value, expected: &str) {
+    let reg = Arc::new(ToolRegistry::new());
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(TODO_TOOL, TODO_SRC).unwrap();
+
+    assert_eq!(exec_live(&host, &reg, TODO_TOOL, input).output, expected);
+}
+
+/// This key handles hiding a shown panel when the caller's `init.lua` lacks permissions after a list is focused.
+#[test]
+fn todo_write_toggle_action_hides_a_shown_panel() {
+    let reg = Arc::new(ToolRegistry::new());
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(TODO_TOOL, TODO_SRC).unwrap();
+    let input = json!({ "todos": [{ "content": TODO_ITEM, "status": "in_progress" }] });
+    let mut ctx = maki_agent::tools::test_support::stub_ctx(&maki_agent::AgentMode::Build);
+    ctx.session_id = Some(session_ref());
+    let tool = &reg.get(TODO_TOOL).unwrap().tool;
+    runtime().block_on(tool.parse(&input).unwrap().execute(&ctx));
+
+    let sid = session_ref().id().to_string();
+    fire_autocmd(
+        &host.event_handle(),
+        "TaskFocusChanged",
+        json!({ "session_id": sid, "id": maki_agent::tools::MAIN_TASK_ID }),
+    );
+    host.load_source("barrier", "").unwrap();
+
+    let mut ui = host.take_ui_action_rx().unwrap();
+    let mut cmd_rx = loop {
+        match ui.try_recv() {
+            Ok(UiAction::OpenWin { config, cmd_rx, .. }) if config.split == Split::Panel => {
+                break cmd_rx;
+            }
+            Ok(_) => {}
+            Err(_) => panic!("the toggle never had a panel to hide"),
+        }
+    };
+
+    host.load_source("global/init.lua", TODO_TOGGLE_CALLER_SHOWN)
+        .unwrap();
+
+    let last_visible = iter::from_fn(|| cmd_rx.try_recv().ok())
+        .filter(|cmd| matches!(cmd, WinCommand::SetVisible(_)))
+        .last();
+    assert!(
+        matches!(last_visible, Some(WinCommand::SetVisible(false))),
+        "panel was left shown",
+    );
+}
+
 /// A session load replays a transcript, so its restores run with the panel
 /// closed. Refilling per-session state here would pop the panel open on the
 /// next focus change, resurrecting a list the turn already finished.
 #[test]
 fn todo_load_restore_leaves_the_panel_closed() {
-    let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+    let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
     host.load_source(TODO_TOOL, TODO_SRC).unwrap();
     let input = json!({ "todos": [{ "content": TODO_ITEM, "status": "in_progress" }] });
     run_restore(
@@ -589,7 +674,7 @@ fn todo_load_restore_leaves_the_panel_closed() {
 #[test]
 fn todo_panel_opens_in_the_tab_of_each_writing_session() {
     let reg = Arc::new(ToolRegistry::new());
-    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    let mut host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source(TODO_TOOL, TODO_SRC).unwrap();
     let sessions = [MakiId::generate(), MakiId::generate()];
     let input = json!({ "todos": [{ "content": TODO_ITEM, "status": "in_progress" }] });

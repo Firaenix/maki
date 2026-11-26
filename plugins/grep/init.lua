@@ -5,8 +5,16 @@ local color = require("maki.color")
 local output_limits = require("maki.output_limits")
 
 local NO_MATCHES = "No files found"
+local COUNT_TOTAL = "%d %s in %d %s"
+local COUNT_LINE = "%s: %d"
+local LIMIT_NOTE = "[limit of %d reached, %d more %s from %d %s not shown]"
+local MIN_PER_CALL_LIMIT = 1
 local MAX_PER_CALL_LIMIT = 1000
 local DIM_FACTOR = 0.3
+
+local function plural(n, word)
+  return n == 1 and word or word .. "s"
+end
 
 local opts = maki.api.register_options(output_limits.extend({
   search_result_limit = {
@@ -47,6 +55,17 @@ local function format_llm_output(entries)
   return table.concat(parts, "\n")
 end
 
+local function format_counts(counts)
+  local total = 0
+  local parts = { "" }
+  for _, file in ipairs(counts) do
+    total = total + file.matches
+    parts[#parts + 1] = COUNT_LINE:format(file.path, file.matches)
+  end
+  parts[1] = COUNT_TOTAL:format(total, plural(total, "matching line"), #counts, plural(#counts, "file"))
+  return table.concat(parts, "\n"), parts[1]
+end
+
 local function count_matches(entries)
   local matches = 0
   for _, entry in ipairs(entries) do
@@ -58,8 +77,7 @@ local function count_matches(entries)
       end
     end
   end
-  local f = #entries == 1 and "file" or "files"
-  return string.format("%d matches in %d %s", matches, #entries, f)
+  return string.format("%d matches in %d %s", matches, #entries, plural(#entries, "file"))
 end
 
 local function grep_view_opts(ctx)
@@ -212,6 +230,7 @@ maki.api.register_tool({
       context_before = { type = "integer", description = "Context lines before match" },
       context_after = { type = "integer", description = "Context lines after match" },
       limit = { type = "integer", description = "Max match groups to return" },
+      count = { type = "boolean", description = "Return how many lines match in each file instead of the lines" },
     },
   },
 
@@ -246,11 +265,23 @@ maki.api.register_tool({
 
     local max_lines, max_bytes = output_limits.resolve(opts, ctx)
 
-    local limit = math.min(input.limit or opts.search_result_limit, MAX_PER_CALL_LIMIT)
+    if input.count then
+      local counts, count_err = maki.fs.grep_count(pattern, { path = input.path, include = input.include })
+      if not counts then
+        return { llm_output = "error: " .. tostring(count_err), is_error = true }
+      end
+      if #counts == 0 then
+        return { llm_output = NO_MATCHES }
+      end
+      local llm_output, total = format_counts(counts)
+      return { llm_output = truncate(llm_output, max_lines, max_bytes), annotation = total }
+    end
+
+    local limit = math.max(MIN_PER_CALL_LIMIT, math.min(input.limit or opts.search_result_limit, MAX_PER_CALL_LIMIT))
 
     local max_line_bytes = output_limits.line_bytes(opts, ctx)
 
-    local entries, err = maki.fs.grep(pattern, {
+    local entries, err, omitted = maki.fs.grep(pattern, {
       path = input.path,
       include = input.include,
       context_before = input.context_before or 0,
@@ -273,6 +304,11 @@ maki.api.register_tool({
 
     local llm_output = format_llm_output(entries)
     llm_output = truncate(llm_output, max_lines, max_bytes)
+    if omitted then
+      local groups, files = omitted.groups, omitted.files
+      local note = string.format(LIMIT_NOTE, limit, groups, plural(groups, "match group"), files, plural(files, "file"))
+      llm_output = llm_output .. "\n\n" .. note
+    end
 
     return {
       llm_output = llm_output,

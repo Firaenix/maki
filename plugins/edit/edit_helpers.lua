@@ -2,6 +2,8 @@ local M = {}
 
 local LF = "\n"
 local CRLF = "\r\n"
+local SNIPPET_MAX_CHARS = 32
+local LINE_CUT_MARKER = "..."
 
 -- A tie stays LF, so the answer never depends on which ending the file happens
 -- to show first.
@@ -35,7 +37,63 @@ local function split_lines(s)
   return maki.split(s, "\n")
 end
 
-function M.replace_lines(content, start_line, end_line, new_string)
+function M.snippet(text: string): string
+  local line = text:match("[^\n]*") or ""
+  local cut = utf8.offset(line, SNIPPET_MAX_CHARS + 1)
+  if cut then
+    return line:sub(1, cut - 1) .. "…"
+  end
+  return line
+end
+
+local function trim(s)
+  return (s:match("^%s*(.-)%s*$"))
+end
+
+-- `read` cuts a long line and ends it with the marker, so that is all the model
+-- can quote of it. A re-read shows the same cut line, hence the prefix match.
+local function line_matches(line, wanted)
+  local text = trim(line)
+  if text == wanted then
+    return true
+  end
+  if wanted:sub(-#LINE_CUT_MARKER) ~= LINE_CUT_MARKER then
+    return false
+  end
+  local shown = wanted:sub(1, -#LINE_CUT_MARKER - 1)
+  return text:sub(1, #shown) == shown
+end
+
+local function nearest_line(lines, wanted, from)
+  for distance = 1, #lines do
+    for _, i in ipairs({ from - distance, from + distance }) do
+      if lines[i] and line_matches(lines[i], wanted) then
+        return i
+      end
+    end
+  end
+  return nil
+end
+
+-- The model's line numbers go stale after its own earlier edit, and nothing
+-- else can tell: the file is exactly as maki left it.
+local function stale_line_error(lines, start_line, expected)
+  local wanted = trim(expected)
+  if line_matches(lines[start_line], wanted) then
+    return nil
+  end
+  local found = wanted ~= "" and nearest_line(lines, wanted, start_line)
+  local hint = found and string.format("that text is at line %d, shift the range", found) or "read the file again"
+  return string.format(
+    "line %d is %q, not %q: line numbers are stale, %s",
+    start_line,
+    M.snippet(lines[start_line]),
+    M.snippet(expected),
+    hint
+  )
+end
+
+function M.replace_lines(content, start_line, end_line, new_string, expected_first_line)
   local trailing_nl = content:sub(-1) == "\n"
   local lines = split_lines(content)
   local inserting = end_line == nil
@@ -50,6 +108,10 @@ function M.replace_lines(content, start_line, end_line, new_string)
     end
     if end_line < start_line or end_line > #lines then
       return nil, string.format("end line %d out of range (%d-%d)", end_line, start_line, #lines)
+    end
+    local stale = expected_first_line and stale_line_error(lines, start_line, expected_first_line)
+    if stale then
+      return nil, stale
     end
   end
 
@@ -71,6 +133,29 @@ function M.replace_lines(content, start_line, end_line, new_string)
 
   local joined = table.concat(result, "\n")
   return trailing_nl and joined .. "\n" or joined
+end
+
+-- What the model needs to keep its line numbers right after an edit: every
+-- line below the change moved by the same amount. Nothing when no line moved.
+function M.shift_note(before, after)
+  local old, new = split_lines(before), split_lines(after)
+  local delta = #new - #old
+  if delta == 0 then
+    return nil
+  end
+  local shortest = math.min(#old, #new)
+  local head = 0
+  while head < shortest and old[head + 1] == new[head + 1] do
+    head += 1
+  end
+  local tail = 0
+  while tail < shortest - head and old[#old - tail] == new[#new - tail] do
+    tail += 1
+  end
+  if tail == 0 then
+    return nil
+  end
+  return string.format("lines after %d shifted by %+d", #old - tail, delta)
 end
 
 -- Insert `new_string` after line `after_line` and check arguments.

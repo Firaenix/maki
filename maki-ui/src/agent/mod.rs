@@ -1,5 +1,5 @@
 mod agent_loop;
-mod model_slots;
+pub(crate) mod model_slots;
 mod run_cancels;
 pub(crate) mod shared_queue;
 
@@ -216,7 +216,7 @@ impl AgentHandles {
         );
         let old = mem::replace(self, new);
         // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
-        // the last old `QueueSender` alive and the old loop parks in `recv_notify` forever.
+        // the last old `QueueSender` alive and the old loop parks on its notify receiver forever.
         self.apply_to_app(app);
         // The first restored prompt can start a run at once, and that run
         // has to drain the lost notices with it.
@@ -240,7 +240,9 @@ impl AgentHandles {
     }
 }
 
-/// Wait for every agent task under one shared timeout, not one per task.
+/// Wait for every agent task under one shared timeout, not one per task. A
+/// task that panicked was logged when it did, and the shutdown after this
+/// still has to run, so it only ends its own wait.
 pub(crate) async fn join_all(tasks: Vec<AbortOnDropHandle<()>>, timeout: Duration) {
     info!(
         count = tasks.len(),
@@ -248,7 +250,9 @@ pub(crate) async fn join_all(tasks: Vec<AbortOnDropHandle<()>>, timeout: Duratio
     );
     let joined = tokio::time::timeout(timeout, async {
         for task in tasks {
-            task.await.expect("agent task panicked");
+            if let Err(error) = task.await {
+                warn!(%error, "agent task failed");
+            }
         }
     })
     .await;
@@ -266,7 +270,7 @@ fn spawn_agent_internal(
     reload_auth: bool,
 ) -> AgentHandles {
     let (answer_tx, answer_rx) = unbounded_channel::<String>();
-    let (queue_tx, queue_rx) = shared_queue::queue();
+    let (queue_tx, queue_rx, notify_rx) = shared_queue::queue();
     // Seeded empty because `AgentLoop::new` below publishes the real snapshot
     // synchronously, before any handle escapes.
     let shared_history: SharedMessages =
@@ -286,6 +290,7 @@ fn spawn_agent_internal(
             agent_tx: agent_tx.clone(),
             answer_rx,
             queue: Arc::new(queue_rx),
+            notify_rx,
             cancels: Arc::clone(&cancels),
             mailbox: mailbox.clone(),
             subagent_cancels: Arc::clone(&subagent_cancels),
@@ -320,6 +325,7 @@ fn spawn_agent_internal(
 mod tests {
     mod background_e2e;
 
+    use std::panic::panic_any;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::{Receiver, Sender, channel};
     use std::time::Instant;
@@ -337,6 +343,8 @@ mod tests {
     use test_case::test_case;
     use tokio::sync::Mutex as AsyncMutex;
     use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+    use tokio::sync::oneshot;
+    use tokio::task::yield_now;
 
     use super::shared_queue::{QueueItem, QueuedInput};
     use super::*;
@@ -359,6 +367,7 @@ mod tests {
     const GATE_CLOSED: &str = "the in-flight call is no longer waiting to be released";
     const SEED_NOT_LIVE: &str = "the respawned loop publishes a seed for the app's session";
     const LOST_ID: &str = "toolu_lost_on_exit";
+    const AGENT_PANIC: &str = "agent loop panicked";
 
     /// `auth_gate` parks a respawned loop in `reload_auth`, before it reads
     /// its queue, until the test drops the gate's sender.
@@ -813,6 +822,30 @@ mod tests {
             LONG_TIMEOUT,
         )
         .await;
+    }
+
+    #[test_case(0 ; "panicking_first")]
+    #[test_case(2 ; "panicking_last")]
+    #[tokio::test]
+    async fn join_all_waits_past_a_panicked_task(panic_at: usize) {
+        let (done_tx, mut done_rx) = oneshot::channel();
+        let mut tasks = vec![
+            AbortOnDropHandle::new(tokio::spawn(async {})),
+            AbortOnDropHandle::new(tokio::spawn(async move {
+                yield_now().await;
+                let _ = done_tx.send(());
+            })),
+        ];
+        tasks.insert(
+            panic_at,
+            AbortOnDropHandle::new(tokio::spawn(async { panic_any(AGENT_PANIC) })),
+        );
+        let start = Instant::now();
+
+        join_all(tasks, LONG_TIMEOUT).await;
+
+        assert!(start.elapsed() < LONG_TIMEOUT);
+        assert_eq!(done_rx.try_recv(), Ok(()));
     }
 
     #[tokio::test]

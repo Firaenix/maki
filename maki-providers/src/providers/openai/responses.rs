@@ -5,16 +5,15 @@ use std::time::Duration;
 
 use futures::TryStreamExt;
 use reqwest::Client;
+use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, warn};
 
 use crate::model::Model;
 use crate::providers::copilot::copilot_usd;
-use crate::providers::openai_compat::{
-    StreamedText, assistant_response, parse_tool_input, tool_parameters,
-};
-use crate::providers::{ResolvedAuth, SseBody, ok_sse, sse_error_status};
+use crate::providers::openai_compat::{StreamedText, assistant_response, tool_parameters};
+use crate::providers::{ResolvedAuth, SseBody, ok_sse, parse_tool_input, sse_error_status};
 use crate::types::EffortDialect;
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse,
@@ -24,22 +23,59 @@ use crate::{
 const RESPONSES_PATH: &str = "/responses";
 const FAILED_RESPONSE_STATUS: u16 = 500;
 
+pub(crate) enum SystemChannel {
+    Instructions,
+    DeveloperMessage,
+}
+
+/// GPT-6.2 and later append top-level `instructions` after `input` and bill
+/// them at the uncached rate on every request, so a stable system prompt
+/// belongs in a leading `developer` message instead, where the prefix cache
+/// picks it up from the second step on (see the "Using GPT-6.2" guide and
+/// opencode PR anomalyco/opencode#64542 for the measurements).
 pub(crate) fn build_body(
     model: &Model,
     messages: &[Message],
     system: &str,
     tools: &Value,
+    replay_reasoning: bool,
+    system_channel: SystemChannel,
 ) -> Value {
-    let input = convert_input(messages);
+    let mut input = convert_input(messages, replay_reasoning);
+    if matches!(system_channel, SystemChannel::DeveloperMessage)
+        && !system.is_empty()
+        && let Value::Array(items) = &mut input
+    {
+        items.insert(
+            0,
+            json!({
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": system}]
+            }),
+        );
+    }
     let wire_tools = convert_tools(tools);
 
-    let mut body = json!({
-        "model": model.id,
-        "instructions": system,
-        "input": input,
-        "stream": true,
-        "store": false,
-    });
+    // agent-client-protocol-schema turns on serde_json's preserve_order in the
+    // maki binary, so the instructions arm repeats the fields to serialize
+    // exactly like the pre-channel wire: xAI, compat and local backends keep
+    // receiving byte-identical bodies.
+    let mut body = match system_channel {
+        SystemChannel::Instructions => json!({
+            "model": model.id,
+            "instructions": system,
+            "input": input,
+            "stream": true,
+            "store": false,
+        }),
+        SystemChannel::DeveloperMessage => json!({
+            "model": model.id,
+            "input": input,
+            "stream": true,
+            "store": false,
+        }),
+    };
     if wire_tools.as_array().is_some_and(|a| !a.is_empty()) {
         body["tools"] = wire_tools;
     }
@@ -61,7 +97,7 @@ pub(crate) fn apply_responses_reasoning(
     }
 }
 
-pub(crate) fn convert_input(messages: &[Message]) -> Value {
+pub(crate) fn convert_input(messages: &[Message], replay_reasoning: bool) -> Value {
     let mut input = Vec::new();
 
     for msg in messages {
@@ -102,11 +138,21 @@ pub(crate) fn convert_input(messages: &[Message]) -> Value {
                 }
             }
             Role::Assistant => {
+                let mut reasoning = String::new();
+                let mut reasoning_id = None;
                 let mut text_parts = Vec::new();
                 let mut tool_calls = Vec::new();
 
                 for block in &msg.content {
                     match block {
+                        ContentBlock::Thinking {
+                            thinking,
+                            reasoning_id: id,
+                            ..
+                        } => {
+                            reasoning.push_str(thinking);
+                            reasoning_id = reasoning_id.or_else(|| id.clone());
+                        }
                         ContentBlock::Text { text } => text_parts.push(text.as_str()),
                         ContentBlock::ToolUse {
                             id, name, input, ..
@@ -115,10 +161,21 @@ pub(crate) fn convert_input(messages: &[Message]) -> Value {
                         }
                         ContentBlock::ToolResult { .. }
                         | ContentBlock::Image { .. }
-                        | ContentBlock::Thinking { .. }
                         | ContentBlock::RedactedThinking { .. }
                         | ContentBlock::Unknown(_) => {}
                     }
+                }
+
+                if replay_reasoning && !reasoning.is_empty() {
+                    let mut item = json!({
+                        "type": "reasoning",
+                        "summary": [],
+                        "content": [{"type": "reasoning_text", "text": reasoning}]
+                    });
+                    if let Some(id) = reasoning_id {
+                        item["id"] = json!(id);
+                    }
+                    input.push(item);
                 }
 
                 if !text_parts.is_empty() {
@@ -188,9 +245,12 @@ fn strip_summary(body: &mut Value) {
     }
 }
 
+/// `headers` are the provider's own for this request: over maki's, under
+/// the credentials.
 pub(crate) async fn do_stream(
     client: &Client,
     model: &crate::model::Model,
+    headers: &HeaderMap,
     body: &Value,
     event_tx: &UnboundedSender<ProviderEvent>,
     auth: &ResolvedAuth,
@@ -203,12 +263,32 @@ pub(crate) async fn do_stream(
     if summary_rejected(base) && has_summary(&body) {
         strip_summary(body.to_mut());
     }
-    let result = post_responses(client, model, &body, event_tx, auth, base, stream_timeout).await;
+    let result = post_responses(
+        client,
+        model,
+        headers,
+        &body,
+        event_tx,
+        auth,
+        base,
+        stream_timeout,
+    )
+    .await;
     match result {
         Err(err) if has_summary(&body) && err.is_unsupported_reasoning_summary() => {
             reject_summary(base);
             strip_summary(body.to_mut());
-            post_responses(client, model, &body, event_tx, auth, base, stream_timeout).await
+            post_responses(
+                client,
+                model,
+                headers,
+                &body,
+                event_tx,
+                auth,
+                base,
+                stream_timeout,
+            )
+            .await
         }
         result => result,
     }
@@ -218,6 +298,7 @@ pub(crate) async fn do_stream(
 async fn post_responses(
     client: &Client,
     model: &crate::model::Model,
+    headers: &HeaderMap,
     body: &Value,
     event_tx: &UnboundedSender<ProviderEvent>,
     auth: &ResolvedAuth,
@@ -226,15 +307,13 @@ async fn post_responses(
 ) -> Result<StreamResponse, AgentError> {
     let json_body = serde_json::to_vec(body)?;
 
-    let request = auth
-        .configure_request(
-            client
-                .post(format!("{base}{RESPONSES_PATH}"))
-                .header("content-type", "application/json")
-                .header("user-agent", super::super::user_agent()),
-        )
-        .body(json_body)
-        .build()?;
+    let request = auth.finish(
+        client
+            .post(format!("{base}{RESPONSES_PATH}"))
+            .header("content-type", "application/json")
+            .headers(headers.clone())
+            .body(json_body),
+    )?;
 
     debug!(
         model = %model.id,
@@ -304,21 +383,27 @@ pub(crate) async fn parse_sse(
                 let output_index = parsed["output_index"]
                     .as_u64()
                     .unwrap_or(tool_accumulators.len() as u64);
-                if item["type"].as_str() == Some("function_call") {
-                    let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
-                    let name = item["name"].as_str().unwrap_or_default().to_string();
-                    if !name.is_empty() {
-                        event_tx.send(ProviderEvent::ToolUseStart {
-                            id: call_id.clone(),
-                            name: name.clone(),
-                        })?;
+                match item["type"].as_str() {
+                    Some("function_call") => {
+                        let call_id = item["call_id"].as_str().unwrap_or_default().to_string();
+                        let name = item["name"].as_str().unwrap_or_default().to_string();
+                        if !name.is_empty() {
+                            event_tx.send(ProviderEvent::ToolUseStart {
+                                id: call_id.clone(),
+                                name: name.clone(),
+                            })?;
+                        }
+                        tool_accumulators.push(ToolAccumulator {
+                            output_index,
+                            call_id,
+                            name,
+                            arguments: String::new(),
+                        });
                     }
-                    tool_accumulators.push(ToolAccumulator {
-                        output_index,
-                        call_id,
-                        name,
-                        arguments: String::new(),
-                    });
+                    Some("reasoning") => {
+                        streamed.reasoning_id = item["id"].as_str().map(str::to_owned);
+                    }
+                    _ => {}
                 }
             }
 
@@ -463,8 +548,11 @@ pub(crate) async fn parse_sse(
     let mut content_blocks = streamed.into_blocks();
 
     for acc in tool_accumulators {
-        let input = parse_tool_input(&acc.name, &acc.arguments);
-        content_blocks.push(ContentBlock::tool_use(acc.call_id, acc.name, input));
+        let block = match parse_tool_input(&acc.name, &acc.arguments) {
+            Ok(input) => ContentBlock::tool_use(acc.call_id, acc.name, input),
+            Err(error) => ContentBlock::invalid_tool_use(acc.call_id, acc.name, error),
+        };
+        content_blocks.push(block);
     }
 
     Ok(assistant_response(content_blocks, usage, stop_reason))
@@ -534,7 +622,42 @@ mod tests {
         );
         assert_eq!(
             converted[0]["parameters"],
-            json!({"type": "object", "properties": {}})
+            json!({"type": "object", "properties": {}, "additionalProperties": true})
+        );
+    }
+
+    #[test_case(SystemChannel::DeveloperMessage, SYSTEM_PROMPT, None, "developer", SYSTEM_PROMPT, 2 ; "developer_message_leads_the_input")]
+    #[test_case(SystemChannel::Instructions, SYSTEM_PROMPT, Some(SYSTEM_PROMPT), "user", USER_PROMPT, 1 ; "instructions_wire_keeps_system_out_of_input")]
+    #[test_case(SystemChannel::DeveloperMessage, "", None, "user", USER_PROMPT, 1 ; "empty_system_skips_the_developer_message")]
+    fn build_body_routes_the_system_prompt_by_channel(
+        channel: SystemChannel,
+        system: &str,
+        expected_instructions: Option<&str>,
+        expected_first_role: &str,
+        expected_first_text: &str,
+        expected_input_len: usize,
+    ) {
+        let model = Model::from_spec(GPT_SPEC).unwrap();
+        let messages = vec![Message::user(USER_PROMPT.to_string())];
+        let body = build_body(&model, &messages, system, &json!([]), false, channel);
+
+        assert_eq!(
+            body["input"][0],
+            json!({
+                "type": "message",
+                "role": expected_first_role,
+                "content": [{"type": "input_text", "text": expected_first_text}]
+            })
+        );
+        assert_eq!(
+            body.get("instructions").and_then(Value::as_str),
+            expected_instructions
+        );
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), expected_input_len);
+        assert_eq!(
+            input.last().unwrap()["content"][0]["text"],
+            json!(USER_PROMPT)
         );
     }
 
@@ -546,6 +669,10 @@ mod tests {
 
     const COPILOT_NANO_AIU: u64 = 375_000;
     const COPILOT_USD: f64 = 0.00000375;
+
+    const GPT_SPEC: &str = "openai/gpt-5.5";
+    const SYSTEM_PROMPT: &str = "You are maki, an interactive CLI coding agent.";
+    const USER_PROMPT: &str = "hello";
 
     #[test_case("response.completed", "completed", StopReason::EndTurn, json!({"total_nano_aiu": COPILOT_NANO_AIU}), Some(COPILOT_USD) ; "completed")]
     #[test_case("response.incomplete", "incomplete", StopReason::MaxTokens, json!({"total_nano_aiu": COPILOT_NANO_AIU}), Some(COPILOT_USD) ; "incomplete")]
@@ -736,7 +863,7 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
             },
         ];
 
-        let input = convert_input(&messages);
+        let input = convert_input(&messages, false);
         let items = input.as_array().unwrap();
 
         assert_eq!(items[0]["type"], "message");
@@ -759,6 +886,48 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
     }
 
     #[test]
+    fn convert_input_replays_past_reasoning() {
+        let assistant = |reasoning_id: Option<String>| Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "weighing it".to_string(),
+                    signature: None,
+                    reasoning_id,
+                },
+                ContentBlock::Text {
+                    text: "answer".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        let messages = [Message::user("hello".to_string()), assistant(None)];
+
+        let input = convert_input(&messages, true);
+        let items = input.as_array().unwrap();
+
+        assert_eq!(items[1]["type"], "reasoning");
+        assert_eq!(items[1]["summary"], json!([]));
+        assert_eq!(items[1]["content"][0]["type"], "reasoning_text");
+        assert_eq!(items[1]["content"][0]["text"], "weighing it");
+        assert!(items[1].get("id").is_none());
+        assert_eq!(items[2]["type"], "message");
+        assert_eq!(items[2]["role"], "assistant");
+        assert_eq!(items[2]["content"][0]["text"], "answer");
+
+        let dropped = convert_input(&messages, false);
+        assert_eq!(dropped[1]["type"], "message");
+        assert_eq!(dropped[1]["role"], "assistant");
+
+        let with_id = [
+            Message::user("hello".to_string()),
+            assistant(Some("rs_1".to_string())),
+        ];
+        let input = convert_input(&with_id, true);
+        assert_eq!(input[1]["id"], "rs_1");
+    }
+
+    #[test]
     fn convert_input_blank_tool_result_gets_marker() {
         let messages = vec![Message {
             role: Role::User,
@@ -766,7 +935,7 @@ data: {\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":10,\"
             ..Default::default()
         }];
 
-        let input = convert_input(&messages);
+        let input = convert_input(&messages, false);
         assert_eq!(input[0]["type"], "function_call_output");
         assert_eq!(input[0]["output"], crate::types::EMPTY_RESPONSE_MARKER);
     }
@@ -802,7 +971,7 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"
 
         assert_eq!(resp.message.content.len(), 2);
         assert!(
-            matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Let me think about this")
+            matches!(&resp.message.content[0], ContentBlock::Thinking { thinking, reasoning_id, .. } if thinking == "Let me think about this" && reasoning_id.as_deref() == Some("rs_1"))
         );
         assert!(
             matches!(&resp.message.content[1], ContentBlock::Text { text } if text == "Hello world")
@@ -878,7 +1047,7 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"o
     }
 
     #[tokio::test]
-    async fn parse_sse_malformed_tool_json_yields_empty_object() {
+    async fn parse_sse_malformed_tool_json_keeps_the_error_for_dispatch() {
         let sse = "\
 event: response.output_item.added\n\
 data: {\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"bash\"}}\n\
@@ -892,10 +1061,15 @@ data: {\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"ou
 
         let (resp, _) = run_sse(sse).await;
         let resp = resp.unwrap();
-        let tools: Vec<_> = resp.message.tool_uses().collect();
+        let tools: Vec<_> = resp.message.tool_uses_with_input_errors().collect();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].1, "bash");
         assert_eq!(*tools[0].2, Value::Object(Default::default()));
+        assert!(
+            tools[0].3.is_some_and(|e| e.contains("line 1")),
+            "input error: {:?}",
+            tools[0].3
+        );
     }
 
     // llama.cpp's /v1/responses endpoint omits output_index in SSE events

@@ -1,4 +1,6 @@
+use std::mem;
 use std::path::Path;
+use std::slice::from_ref;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -11,11 +13,12 @@ use tracing::{debug, error, info, warn};
 use maki_providers::provider::Provider;
 use maki_providers::{
     ContentBlock, ContextGauge, IMAGE_PLACEHOLDER, ImageSource, InputTransformation, Message,
-    Model, ModelTier, RequestOptions, Role, StopReason, StreamResponse, model_registry,
+    Model, ModelTier, RequestOptions, Role, StopReason, StreamResponse, accept_sent_images,
+    forgive_refused_images, model_registry, refuse_sent_images,
 };
 use maki_storage::frame::{LiveFacts, PromptFacts};
 
-use super::compaction::{self, CompactReason, CompactSteer, Compacted};
+use super::compaction::{self, CompactReason, CompactSteer, Compacted, CompactionPlan};
 use super::display_order::{observation_detail, observation_line};
 use super::frame::{
     FRAME_REBUILT, FrameFit, RunContextBuilder, context_update, fingerprint, fit_frame,
@@ -23,7 +26,7 @@ use super::frame::{
 use super::history::{Cutter, History, sanitize_cancelled_history};
 use super::hook::{AgentHooks, AgentSlot};
 use super::instructions::{CallInstructions, LoadedInstructions};
-use super::streaming::{StreamError, StreamRequest, stream_with_retry};
+use super::streaming::{StreamError, StreamRequest, min_output, stream_with_retry};
 use super::tool_dispatch::{self, RecentCalls};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::mcp::{McpSession, ToolDeferral};
@@ -72,6 +75,7 @@ const MODEL_BINDING_MISMATCH: &str = "model_binding_mismatch";
 const MAX_LOGGED_PATHS: usize = 5;
 const THINKING_DROPPED: &str =
     "The prompt changed under earlier reasoning, so it was dropped to keep the session going.";
+const IMAGES_WITHHELD: &str = "The server refused the request, retrying without its images:";
 
 fn served_window_notice(model: &str, served: u32, planned: u32) -> String {
     format!(
@@ -174,6 +178,9 @@ pub struct Agent<'h> {
     instruction_files: Arc<Vec<String>>,
     rollback_len: usize,
     carry_from: usize,
+    /// A defer over input no turn has answered holds `carry_from` through the
+    /// save turn.
+    defer_pins: bool,
     mcp: Option<McpSession>,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
@@ -184,6 +191,8 @@ pub struct Agent<'h> {
     opts: RequestOptions,
     session_id: Option<SessionRef>,
     background_for: BackgroundFor,
+    /// The task whose tool call opened this run: `Some` only for a task
+    /// child, whose hooks see it as `ctx.task_id`.
     task_id: Option<Arc<str>>,
     mailbox: Option<SessionMailbox>,
     timeouts: maki_providers::Timeouts,
@@ -228,6 +237,7 @@ impl<'h> Agent<'h> {
             instruction_files: Arc::default(),
             rollback_len: 0,
             carry_from: 0,
+            defer_pins: false,
             mcp: None,
             reauth: false,
             reauth_attempts: 0,
@@ -328,19 +338,23 @@ impl<'h> Agent<'h> {
         let mut prompt = None;
         for (message, images, preamble) in burst {
             let kept = match self
-                .filter_user_message(message, images.len(), source)
+                .filter_user_message(&message, images.len(), source)
                 .await
             {
                 Err(AgentError::Cancelled) => return self.finish(Err(AgentError::Cancelled)),
                 kept => kept?,
             };
-            // A burst dropped whole or a run already cancelled sends nothing,
+            // A burst dropped whole or a run cancelled by now sends nothing,
             // so it must not rebuild the frame either. The next run sees the
-            // same change.
-            if kept.is_some() && prompt.is_none() && !self.cancel.is_cancelled() {
-                self.refresh_frame()?;
+            // same change. The input still lands.
+            if kept.is_some() && prompt.is_none() {
+                match self.refresh_frame().await {
+                    Err(AgentError::Cancelled) => {}
+                    refreshed => refreshed?,
+                }
             }
             let kept = kept.map(|text| {
+                self.history.offer_title_source(&message, &text);
                 prompt = Some(text.clone());
                 Message::user_with_images(text, images)
             });
@@ -529,9 +543,12 @@ impl<'h> Agent<'h> {
             // Ahead of `try_auto_compact`: a switch landing after the check
             // would compact against the old window and then overflow the new
             // one.
-            self.sync_model();
+            self.sync_model().await;
             if self.turns_exhausted() {
                 return Ok(DoneReason::MaxTurns);
+            }
+            if self.ledger.exhausted() {
+                return Ok(DoneReason::MaxBudget);
             }
             self.follow_served_window().await?;
             self.try_auto_compact().await?;
@@ -546,8 +563,13 @@ impl<'h> Agent<'h> {
     /// reload, a model with other capabilities, the workflow toggle) or new
     /// host prompt text can't be told in a message, so they start a new frame,
     /// and the user hears that the cache is gone.
-    fn refresh_frame(&mut self) -> Result<(), AgentError> {
-        let candidate = (self.context)(&self.model, self.workflow);
+    async fn refresh_frame(&mut self) -> Result<(), AgentError> {
+        let build = (self.context)(&self.model, self.workflow);
+        let candidate = self
+            .cancel
+            .race(build)
+            .await
+            .map_err(|_| AgentError::Cancelled)?;
         self.prompt_facts.clone_from(&candidate.facts);
         if fit_frame(self.history, candidate, self.mcp.as_ref(), &self.model) == FrameFit::Rebuilt {
             info!(session = ?self.session_id, model = %self.model.id, "frame fingerprint changed, rebuilt the frame");
@@ -586,7 +608,7 @@ impl<'h> Agent<'h> {
     /// thinking block Anthropic then demands. And a model with other tools
     /// (or without tool search) needs a new frame, which only a run start may
     /// build.
-    fn sync_model(&mut self) {
+    async fn sync_model(&mut self) {
         let Some(slot) = &self.model_sync else {
             return;
         };
@@ -597,7 +619,10 @@ impl<'h> Agent<'h> {
         {
             return;
         }
-        let candidate = (self.context)(&current.model, self.workflow);
+        let build = (self.context)(&current.model, self.workflow);
+        let Ok(candidate) = self.cancel.race(build).await else {
+            return;
+        };
         let fingerprint = fingerprint(&candidate, self.mcp.as_ref(), &current.model);
         if self
             .history
@@ -650,9 +675,9 @@ impl<'h> Agent<'h> {
     /// Right before every request. A compaction drops the frame, so it may
     /// have to be built again, and MCP servers that connected since the last
     /// request join here too.
-    fn prepare_request(&mut self) -> Result<(), AgentError> {
+    async fn prepare_request(&mut self) -> Result<(), AgentError> {
         if self.history.live_frame().is_none() {
-            self.refresh_frame()?;
+            self.refresh_frame().await?;
         }
         if let Some(mcp) = &self.mcp {
             self.history
@@ -675,7 +700,7 @@ impl<'h> Agent<'h> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
-        self.prepare_request()?;
+        self.prepare_request().await?;
         let Some((system, tools)) = self.history.request_prefix() else {
             return Err(no_frame());
         };
@@ -700,6 +725,7 @@ impl<'h> Agent<'h> {
             Ok(r) => {
                 self.reauth_attempts = 0;
                 self.overflow_recoveries = 0;
+                accept_sent_images(&self.model, self.history.as_slice());
                 r
             }
             Err(StreamError::Cancelled { streamed }) => {
@@ -724,6 +750,9 @@ impl<'h> Agent<'h> {
             }
             Err(StreamError::Other(e)) if e.is_thinking_unbound() => {
                 return self.recover_unbound_thinking(e);
+            }
+            Err(StreamError::Refused(e)) => {
+                return self.recover_refused_body(e);
             }
             Err(StreamError::Other(e)) => {
                 error!(error = %e, model = %self.model.id, self.num_turns, "stream_message failed");
@@ -774,8 +803,11 @@ impl<'h> Agent<'h> {
         }
 
         // Everything the turn appended is answered, so a compaction from here
-        // on may summarize it. Input arriving after this point may not.
-        self.carry_from = self.history.len();
+        // on may summarize it. Input arriving after this point may not, and a
+        // defer over unanswered input holds the carry for this one turn.
+        if !mem::take(&mut self.defer_pins) {
+            self.carry_from = self.history.len();
+        }
 
         if self.handle_queued_command().await? {
             return Ok(TurnOutcome::Continue);
@@ -837,12 +869,12 @@ impl<'h> Agent<'h> {
     /// text comes back empty, since providers refuse a whitespace-only block.
     async fn filter_user_message(
         &self,
-        message: String,
+        message: &str,
         images: usize,
         source: InputSource,
     ) -> Result<Option<String>, AgentError> {
         let blank = |text: &str| text.trim().is_empty();
-        if blank(&message) && images == 0 {
+        if blank(message) && images == 0 {
             return Ok(Some(String::new()));
         }
         let hooks = self.hooks();
@@ -873,10 +905,10 @@ impl<'h> Agent<'h> {
                     self.steer(SteerKind::MessageRewritten, text.to_owned())?;
                     text.to_owned()
                 }
-                _ => message,
+                _ => message.to_owned(),
             },
             Verdict::Denied(reason) => return dropped(reason),
-            Verdict::Unchanged | Verdict::Ask { .. } => message,
+            Verdict::Unchanged | Verdict::Ask { .. } => message.to_owned(),
         };
         Ok(Some(if blank(&text) { String::new() } else { text }))
     }
@@ -967,6 +999,30 @@ impl<'h> Agent<'h> {
         warn!(session = ?self.session_id, model = %self.model.id, dropped, error = %err, "thinking bound to a moved prefix, dropped it all");
         self.event_tx.send(AgentEvent::Notice {
             text: THINKING_DROPPED.into(),
+        })?;
+        Ok(TurnOutcome::Continue)
+    }
+
+    /// A server that refuses a body refuses it again on every later turn, and
+    /// the session is stuck. Each server explains the cause in its own words,
+    /// but images are the usual reason (a model that claims vision it lacks,
+    /// a format it cannot read, a size limit), and they are the one part of a
+    /// request we can drop without breaking it. So we blame images this model
+    /// never took, newest first, and retry without them. Only the wire loses
+    /// them, history keeps the pixels. Each round blames at least one more
+    /// image, so this ends. Once a retry is refused with nothing left to
+    /// blame, our guess was wrong, so we take the blame back and show the
+    /// real error.
+    fn recover_refused_body(&mut self, err: AgentError) -> Result<TurnOutcome, AgentError> {
+        let withheld = refuse_sent_images(&self.model, self.history.as_slice());
+        if withheld == 0 {
+            let restored = forgive_refused_images(&self.model, self.history.as_slice());
+            error!(error = %err, model = %self.model.id, self.num_turns, restored, "stream_message failed");
+            return Err(err);
+        }
+        warn!(session = ?self.session_id, model = %self.model.id, withheld, error = %err, "server refused a request with images, retrying without them");
+        self.event_tx.send(AgentEvent::Notice {
+            text: format!("{IMAGES_WITHHELD} {}", err.user_message()),
         })?;
         Ok(TurnOutcome::Continue)
     }
@@ -1120,7 +1176,18 @@ impl<'h> Agent<'h> {
         }
     }
 
+    /// The threshold gate, and the landing spot of a plugin's compaction
+    /// request. A landing compaction leaves the continuation message the
+    /// model answers next.
     async fn try_auto_compact(&mut self) -> Result<(), AgentError> {
+        let pending = self.mailbox.as_ref().and_then(|m| m.take_compact());
+        if let Some(request) = pending
+            && self
+                .run_compaction(CompactReason::Requested, request.instructions.as_deref())
+                .await?
+        {
+            return Ok(());
+        }
         let context_size = self.gauge.size();
         if !self.auto_compact
             || !compaction::is_overflow(u64::from(context_size), &self.model, &self.config)
@@ -1131,19 +1198,56 @@ impl<'h> Agent<'h> {
         self.compact_now(CompactReason::Auto).await
     }
 
-    /// A layer may skip an automatic compaction to wait for a better moment,
-    /// but only until the provider itself refuses the prompt.
-    async fn compact_now(&mut self, reason: CompactReason) -> Result<(), AgentError> {
-        let Some(steer) =
-            compaction::steer_compaction(&self.hooks(), &self.config, reason, None).await
+    /// A compaction the user or the model asked for, whatever the context
+    /// size; true when one landed. A layer may skip it, since unlike the
+    /// overflow guard nothing here has to happen before this very request.
+    async fn run_compaction(
+        &mut self,
+        reason: CompactReason,
+        instructions: Option<&str>,
+    ) -> Result<bool, AgentError> {
+        let CompactionPlan::Proceed(steer) =
+            compaction::steer_compaction(&self.hooks(), &self.config, reason, instructions, false)
+                .await
         else {
-            return Ok(());
+            return Ok(false);
         };
-        self.event_tx.send(AgentEvent::AutoCompacting {
-            context_size: self.gauge.size(),
-            context_window: self.model.context_window,
-        })?;
-        self.do_compact(steer).await
+        self.do_compact(steer).await?;
+        Ok(true)
+    }
+
+    /// A layer may skip an automatic compaction to wait for a better moment,
+    /// but only until the provider itself refuses the prompt. A defer skips
+    /// one ask and hands the model a nudge; the next gate compacts.
+    async fn compact_now(&mut self, reason: CompactReason) -> Result<(), AgentError> {
+        // A defer needs room for the turn that saves before it, or the next
+        // request would overflow instead of landing the compaction.
+        let can_defer = reason == CompactReason::Auto
+            && !self.gauge.defer_used()
+            && u64::from(self.gauge.size()) + u64::from(min_output(&self.model))
+                <= u64::from(self.model.context_window);
+        let plan =
+            compaction::steer_compaction(&self.hooks(), &self.config, reason, None, can_defer)
+                .await;
+        match plan {
+            CompactionPlan::Skipped => Ok(()),
+            CompactionPlan::Deferred(text) => {
+                self.gauge.mark_deferred();
+                self.defer_pins = self.carry_from < self.history.len();
+                self.steer(SteerKind::CompactDeferred, text.clone())?;
+                let nudge = Message::synthetic(text);
+                self.gauge.append(from_ref(&nudge));
+                self.history.push(nudge);
+                Ok(())
+            }
+            CompactionPlan::Proceed(steer) => {
+                self.event_tx.send(AgentEvent::AutoCompacting {
+                    context_size: self.gauge.size(),
+                    context_window: self.model.context_window,
+                })?;
+                self.do_compact(steer).await
+            }
+        }
     }
 
     async fn do_compact(&mut self, steer: CompactSteer) -> Result<(), AgentError> {
@@ -1153,6 +1257,15 @@ impl<'h> Agent<'h> {
         // own prompt, plus anything queued in since the last turn ended.
         let carry_len = self.history.len().saturating_sub(self.carry_from);
         let context_size_before = self.gauge.size();
+        // Asked for before the transcript goes, while a cancel can still end
+        // the run with nothing changed. Past the summary the frame is gone,
+        // and a run stopping there would leave the gauge at the old size.
+        let build = (self.context)(&self.model, self.workflow);
+        let next = self
+            .cancel
+            .race(build)
+            .await
+            .map_err(|_| AgentError::Cancelled)?;
         let (compact_provider, compact_model) = resolve_compaction_model(
             &self.provider,
             &self.model,
@@ -1190,11 +1303,16 @@ impl<'h> Agent<'h> {
         let carry_from = self.history.len() - carried;
         self.rollback_len = carry_from;
         self.carry_from = carry_from;
+        self.defer_pins = false;
         // The old prefix has nothing worth keeping now, so the new prompt picks
         // up every fact told since.
-        self.refresh_frame()?;
+        self.prompt_facts.clone_from(&next.facts);
+        fit_frame(self.history, next, self.mcp.as_ref(), &self.model);
         // An unanswered prompt says what to do next better than the generic
         // nudge, so it stands in for it. A layer's own words still go in.
+        if let Some(text) = &steer.continue_text {
+            self.steer(SteerKind::CompactContinued, text.clone())?;
+        }
         if carried == 0 {
             self.history
                 .push(Message::synthetic(compaction::continue_message(
@@ -1239,10 +1357,12 @@ impl<'h> Agent<'h> {
                         images: input.images.clone(),
                     })?;
                     let kept = self
-                        .filter_user_message(input.message, input.images.len(), input.source)
+                        .filter_user_message(&input.message, input.images.len(), input.source)
                         .await?;
-                    let message =
-                        kept.map(|text| interrupt_message(text, input.images, input.source));
+                    let message = kept.map(|text| {
+                        self.history.offer_title_source(&input.message, &text);
+                        interrupt_message(text, input.images, input.source)
+                    });
                     if message.is_some() {
                         self.mode = input.mode;
                         // The user spoke, so `agent.stop` gets its full
@@ -1256,20 +1376,10 @@ impl<'h> Agent<'h> {
                 }
                 Ok(kept_any)
             }
-            ExtractedCommand::Compact(instructions) => {
-                let Some(steer) = compaction::steer_compaction(
-                    &self.hooks(),
-                    &self.config,
-                    CompactReason::Manual,
-                    instructions.as_deref(),
-                )
-                .await
-                else {
-                    return Ok(false);
-                };
-                self.do_compact(steer).await?;
-                Ok(true)
-            }
+            ExtractedCommand::Compact {
+                instructions,
+                reason,
+            } => self.run_compaction(reason, instructions.as_deref()).await,
         }
     }
 }
@@ -1298,6 +1408,7 @@ fn interrupt_message(message: String, images: Vec<ImageSource>, source: InputSou
 
 #[cfg(test)]
 pub(crate) mod testing {
+    use std::future::ready;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -1307,7 +1418,7 @@ pub(crate) mod testing {
     use maki_providers::provider::Provider;
 
     use super::AgentParams;
-    use crate::agent::frame::RunContext;
+    use crate::agent::frame::{RunContext, RunContextBuilder};
     use crate::cancel::CancelMap;
     use crate::permissions::PermissionManager;
     use crate::prompt::ResolvedPrompts;
@@ -1351,12 +1462,19 @@ pub(crate) mod testing {
     pub(crate) fn fixed_context() -> RunContext {
         RunContext::fixed(SYSTEM.into(), RequestTools::default())
     }
+
+    pub(crate) fn sync_builder(
+        build: impl Fn(&Model, bool) -> RunContext + Send + Sync + 'static,
+    ) -> RunContextBuilder {
+        Arc::new(move |model, workflow| Box::pin(ready(build(model, workflow))))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
     use std::collections::{BTreeMap, VecDeque};
+    use std::future::pending;
     use std::iter;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -1366,8 +1484,9 @@ mod tests {
     use maki_providers::provider::{BoxFuture, Provider};
     use maki_providers::test_support::isolated_home;
     use maki_providers::{
-        ContentBlock, FastPricing, Message, Model, ModelPricing, ProviderEvent, RequestOptions,
-        Role, StopReason, StreamResponse, ThinkingSupport, TokenUsage,
+        ContentBlock, FastPricing, ImageMediaType, Message, Model, ModelPricing, ProviderEvent,
+        RequestOptions, Role, StopReason, StreamResponse, ThinkingSupport, TokenUsage,
+        adapt_images_for_model,
     };
     use maki_storage::frame::{FactsUpdate, PlanChange};
     use maki_storage::id::MakiId;
@@ -1378,7 +1497,7 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     use super::compaction::FIELD_CONTINUE;
-    use super::testing::{agent_params, fixed_context};
+    use super::testing::{agent_params, fixed_context, sync_builder};
     use super::*;
     use crate::agent::Transcript;
     use crate::agent::frame::RunContext;
@@ -1598,6 +1717,7 @@ mod tests {
         assistant_response(vec![ContentBlock::Thinking {
             thinking: "stalled".into(),
             signature: None,
+            reasoning_id: None,
         }])
     }
 
@@ -1608,6 +1728,7 @@ mod tests {
             ContentBlock::Thinking {
                 thinking: THOUGHT.into(),
                 signature: Some(THOUGHT_SIGNATURE.into()),
+                reasoning_id: None,
             },
         );
         response
@@ -1650,14 +1771,23 @@ mod tests {
         model: Model,
         history: &mut History,
     ) -> (Agent<'_>, UnboundedReceiver<Envelope>) {
+        make_agent_with_gauge(provider, model, history, Box::leak(Box::default()))
+    }
+
+    fn make_agent_with_gauge<'a>(
+        provider: Arc<dyn Provider>,
+        model: Model,
+        history: &'a mut History,
+        gauge: &'a mut ContextGauge,
+    ) -> (Agent<'a>, UnboundedReceiver<Envelope>) {
         let (raw_tx, event_rx) = unbounded_channel();
         let mut agent = Agent::new(
             agent_params(provider, model),
             AgentRunParams {
                 history,
-                gauge: Box::leak(Box::default()),
+                gauge,
                 event_tx: EventSender::new(raw_tx, 0),
-                context: Arc::new(|_, _| fixed_context()),
+                context: sync_builder(|_, _| fixed_context()),
             },
         );
         agent.registry = Arc::new(ToolRegistry::new());
@@ -1704,7 +1834,7 @@ mod tests {
             let (mut agent, mut events) =
                 make_agent_with(Arc::clone(&provider), default_model(), &mut history);
             agent.prompt_slots = Arc::clone(&prompts);
-            agent.context = Arc::new(move |model, _| {
+            agent.context = sync_builder(move |model, _| {
                 RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default())
             });
             agent.run(default_input()).await.unwrap();
@@ -1763,7 +1893,7 @@ mod tests {
             MockProvider::new(vec![text_response(StopReason::EndTurn)]),
             &mut history,
         );
-        agent.context = Arc::new(move |model, _| {
+        agent.context = sync_builder(move |model, _| {
             RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default())
         });
         agent.run(default_input()).await.unwrap();
@@ -1807,7 +1937,7 @@ mod tests {
             let (mut agent, mut events) =
                 make_agent_with(Arc::clone(&provider), default_model(), &mut history);
             agent.prompt_slots = Arc::clone(&prompts);
-            agent.context = Arc::new(move |model, _| {
+            agent.context = sync_builder(move |model, _| {
                 RunContext::render(&vars, instructions, &slots, model, RequestTools::default())
             });
             agent.run(default_input()).await.unwrap();
@@ -1851,7 +1981,7 @@ mod tests {
             let (mut agent, _events) =
                 make_agent_with(Arc::clone(&provider), default_model(), &mut history);
             agent.prompt_slots = Arc::clone(&prompts);
-            agent.context = Arc::new(move |model, _| {
+            agent.context = sync_builder(move |model, _| {
                 RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default())
             });
             agent.run(default_input()).await.unwrap();
@@ -1890,7 +2020,7 @@ mod tests {
             let (mut agent, _events) =
                 make_agent_with(Arc::clone(&provider), default_model(), &mut history);
             agent.prompt_slots = Arc::clone(&prompts);
-            agent.context = Arc::new(move |model, _| {
+            agent.context = sync_builder(move |model, _| {
                 RunContext::render(&Vars::new(), "", &prompts, model, RequestTools::default())
             });
             agent
@@ -2487,6 +2617,34 @@ mod tests {
         assert_eq!(reason, expected_reason);
     }
 
+    /// `--max-budget-usd`: the turn that crosses the cap finishes, and the
+    /// continuation it would have earned never reaches the provider.
+    #[tokio::test]
+    async fn spent_budget_stops_before_the_next_request() {
+        let mut first = text_response(StopReason::MaxTokens);
+        first.usage = TokenUsage {
+            input: 1_000,
+            output: 400,
+            ..Default::default()
+        };
+        let provider = MockProvider::new(vec![first, text_response(StopReason::EndTurn)]);
+        let mut history = History::new(Vec::new());
+        let (mut agent, mut event_rx) = make_agent(provider, &mut history);
+        agent.ledger = Arc::new(RunLedger::capped(0.000_001));
+        let _ = agent.run(default_input()).await;
+        drop(agent);
+
+        let done = drain_events(&mut event_rx)
+            .into_iter()
+            .find_map(|e| match e.event {
+                AgentEvent::Done {
+                    num_turns, reason, ..
+                } => Some((num_turns, reason)),
+                _ => None,
+            });
+        assert_eq!(done, Some((1, DoneReason::MaxBudget)));
+    }
+
     #[test_case(Some(true),  true,  true  ; "after_tool_use_turn")]
     #[test_case(Some(false), true,  true  ; "after_text_only_turn")]
     #[test_case(None,        false, false ; "channel_empty")]
@@ -2697,7 +2855,7 @@ mod tests {
         let (agent, _event_rx) =
             make_agent_with(Arc::clone(&provider), start.clone(), &mut history);
         let mut agent = agent.with_model_sync(slot).with_interrupt_source(picker);
-        agent.context = Arc::new(build);
+        agent.context = sync_builder(build);
         agent.run(default_input()).await.unwrap();
         drop(agent);
 
@@ -2738,7 +2896,7 @@ mod tests {
 
         fn builder(&self) -> RunContextBuilder {
             let world = self.clone();
-            Arc::new(move |model, _| {
+            sync_builder(move |model, _| {
                 let facts = PromptFacts {
                     model: model.spec(),
                     ..world.facts.lock().unwrap().clone()
@@ -2828,8 +2986,16 @@ mod tests {
             .collect()
     }
 
+    const RUN_START_BUILDS: u32 = 1;
+    const REQUESTS_BEFORE_THE_SUMMARY: usize = 2;
+    const UNPAID_SUMMARY_MSG: &str =
+        "a compaction cancelled before it starts must not send the summary request";
+
     fn with_compact(agent: &mut Agent<'_>) {
-        let compact = vec![ExtractedCommand::Compact(None)];
+        let compact = vec![ExtractedCommand::Compact {
+            instructions: None,
+            reason: CompactReason::Manual,
+        }];
         agent.interrupt_source = Some(MockInterruptSource::new(compact));
     }
 
@@ -2891,8 +3057,10 @@ mod tests {
         assert!(!thinking.iter().any(is_signed), "{STALE_THINKING_MSG}");
     }
 
+    #[test_case(false ; "before_the_run")]
+    #[test_case(true ; "during_the_build")]
     #[tokio::test]
-    async fn a_cancelled_run_leaves_the_frame_to_the_next_one() {
+    async fn a_cancelled_run_leaves_the_frame_to_the_next_one(during_build: bool) {
         let rebuilt = |events: &[Envelope]| {
             events.iter().any(|e| {
                 matches!(
@@ -2907,9 +3075,22 @@ mod tests {
         *h.world.tool.lock().unwrap() = "reloaded";
 
         let (trigger, cancel) = CancelToken::new();
-        trigger.cancel();
+        let fire = trigger.handle();
         let (reason, events) = h
-            .run(default_input(), Vec::new(), |agent| agent.cancel = cancel)
+            .run(default_input(), Vec::new(), |agent| {
+                agent.cancel = cancel;
+                if during_build {
+                    agent.context = Arc::new(move |_, _| {
+                        let fire = fire.clone();
+                        Box::pin(async move {
+                            fire.fire();
+                            pending().await
+                        })
+                    });
+                } else {
+                    fire.fire();
+                }
+            })
             .await;
         assert_eq!(reason, DoneReason::Cancelled);
         assert!(!rebuilt(&events));
@@ -3245,6 +3426,48 @@ mod tests {
         assert!(updates(&h.history).is_empty());
     }
 
+    /// Once the transcript is summarized its frame is gone, and a run that
+    /// stopped there would keep the old size on the gauge, for the next run to
+    /// compact the summary again. So the cancel has to end it before that.
+    #[tokio::test]
+    async fn a_cancel_during_the_context_build_stops_the_compaction_before_it_starts() {
+        let mut h = Harness::new(Vec::new());
+        h.run_in(AgentMode::Build).await;
+        let frame = h.history.frame().cloned();
+
+        let (trigger, cancel) = CancelToken::new();
+        let fire = trigger.handle();
+        let world = h.world.builder();
+        let builds = AtomicU32::new(0);
+        let replies = vec![thought_response(), summary_response()];
+        let (reason, events) = h
+            .run(default_input(), replies, |agent| {
+                with_compact(agent);
+                agent.cancel = cancel;
+                agent.context = Arc::new(move |model, workflow| {
+                    let build = world(model, workflow);
+                    if builds.fetch_add(1, Ordering::Relaxed) < RUN_START_BUILDS {
+                        return build;
+                    }
+                    let fire = fire.clone();
+                    Box::pin(async move {
+                        fire.fire();
+                        pending().await
+                    })
+                });
+            })
+            .await;
+
+        assert_eq!(reason, DoneReason::Cancelled);
+        assert!(compaction_events(&events).is_empty());
+        assert_eq!(h.history.frame().cloned(), frame);
+        assert_eq!(
+            h.requests.lock().unwrap().len(),
+            REQUESTS_BEFORE_THE_SUMMARY,
+            "{UNPAID_SUMMARY_MSG}"
+        );
+    }
+
     /// The prompt a compaction builds can't say plan mode either. If the
     /// update was summarized away it has to be told again, and if it was
     /// carried over with the unanswered prompt it must not be told twice.
@@ -3441,15 +3664,15 @@ mod tests {
             &mut h.history,
         );
         agent.context = builder;
-        agent.refresh_frame().unwrap();
+        agent.refresh_frame().await.unwrap();
 
-        agent.prepare_request().unwrap();
+        agent.prepare_request().await.unwrap();
         assert!(matches!(
             agent.history.as_slice().last().unwrap().role,
             Role::Assistant
         ));
         agent.history.push(Message::user(PENDING_PROMPT.into()));
-        agent.prepare_request().unwrap();
+        agent.prepare_request().await.unwrap();
         assert!(agent.history.as_slice().last().unwrap().is_context_update());
     }
 
@@ -3507,7 +3730,10 @@ mod tests {
 
     #[test_case(
         (0..10).map(|i| Message::user(format!("msg {i}"))).collect(),
-        vec![ExtractedCommand::Compact(None)],
+        vec![ExtractedCommand::Compact {
+            instructions: None,
+            reason: CompactReason::Manual,
+        }],
         vec![tool_call_response("glob", "t1"), text_response(StopReason::EndTurn), text_response(StopReason::EndTurn)]
         ; "compaction_via_interrupt_source"
     )]
@@ -3527,6 +3753,36 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
+        assert!(matches!(
+            compaction_events(&drain_events(&mut event_rx)).as_slice(),
+            [
+                AgentEvent::CompactionStarted,
+                AgentEvent::CompactionDone { .. }
+            ]
+        ));
+    }
+
+    /// The summarizer runs on the ask that would have sent the full
+    /// transcript, so the request never waits for a model answer.
+    #[tokio::test]
+    async fn mailbox_compact_request_compacts_before_the_first_request() {
+        let id = MakiId::generate();
+        let mailbox = SessionMailbox::register(id);
+        SessionMailbox::request_compact(id, None).unwrap();
+        let mut history = History::new(vec![Message::user("go".into())]);
+        let (mut agent, mut event_rx) = make_agent(
+            MockProvider::new(vec![
+                text_response(StopReason::EndTurn),
+                text_response(StopReason::EndTurn),
+            ]),
+            &mut history,
+        );
+        agent.mailbox = Some(mailbox.clone());
+
+        agent.run(default_input()).await.unwrap();
+        drop(agent);
+
+        assert!(mailbox.take_compact().is_none());
         assert!(matches!(
             compaction_events(&drain_events(&mut event_rx)).as_slice(),
             [
@@ -3701,7 +3957,13 @@ mod tests {
     const OVERFLOW_CHUNKS: u32 = 400;
     const TINY_CONTEXT_WINDOW: u32 = 1_000;
     const TINY_MAX_OUTPUT: u32 = 256;
+    /// Wide enough that `usable` to `context_window - min_output` leaves room
+    /// for a defer, unlike [`TINY_CONTEXT_WINDOW`] where the two coincide.
+    const DEFER_CONTEXT_WINDOW: u32 = 200_000;
+    const DEFER_MAX_OUTPUT: u32 = 8_192;
+    const DEFER_GAUGE: u32 = 170_000;
     const PENDING_PROMPT: &str = "fix the flaky test in run.rs";
+    const NEXT_PROMPT: &str = "now do the next thing";
     const COMPACT_FIRST_MSG: &str =
         "a resumed session over the threshold must compact before its first request";
     const PROMPT_KEPT_MSG: &str =
@@ -3753,6 +4015,56 @@ mod tests {
                 .iter()
                 .flat_map(|m| &m.content)
                 .any(|b| matches!(b, ContentBlock::Text { text } if text == PENDING_PROMPT)),
+            "{PROMPT_KEPT_MSG}"
+        );
+    }
+
+    /// A defer at the start of a request must not let the save turn mark the
+    /// prompt answered: it stays carried verbatim across the compaction.
+    #[tokio::test]
+    async fn resumed_overflowing_history_carries_the_prompt_past_a_defer() {
+        let prior = (0..OVERFLOW_CHUNKS)
+            .map(|i| Message::user(format!("{OVERFLOW_CHUNK}{i}")))
+            .collect();
+        let mut history = History::new(prior);
+        let (mut agent, mut event_rx) = make_agent(
+            MockProvider::new(vec![
+                tool_call_response("glob", "t1"),
+                summary_response(),
+                text_response(StopReason::EndTurn),
+            ]),
+            &mut history,
+        );
+        agent.model = Arc::new(small_context_model(DEFER_CONTEXT_WINDOW, DEFER_MAX_OUTPUT));
+        *agent.gauge = ContextGauge::restored(DEFER_GAUGE);
+        agent.auto_compact = true;
+        script(
+            &agent.registry,
+            answer_only(
+                AgentSlot::CompactBefore,
+                json!({ compaction::FIELD_DEFER: DEFER_NUDGE }),
+            ),
+        );
+
+        agent
+            .run(AgentInput {
+                message: PENDING_PROMPT.into(),
+                ..default_input()
+            })
+            .await
+            .unwrap();
+
+        let events = drain_events(&mut event_rx);
+        assert_nudge_shown(&events);
+        assert!(
+            has_event(&events, |e| matches!(e, AgentEvent::CompactionDone { .. })),
+            "the save turn is followed by the compaction"
+        );
+        assert!(
+            history
+                .as_slice()
+                .iter()
+                .any(|m| m.first_text_content() == Some(PENDING_PROMPT)),
             "{PROMPT_KEPT_MSG}"
         );
     }
@@ -3870,6 +4182,7 @@ mod tests {
                 ContentBlock::Thinking {
                     thinking: "hmm".into(),
                     signature: Some("sig".into()),
+                    reasoning_id: None,
                 },
                 ContentBlock::Text {
                     text: "done".into(),
@@ -3899,6 +4212,157 @@ mod tests {
             )),
             "{message}"
         );
+    }
+
+    const IMAGE_REFUSED_MESSAGE: &str = "could not process image";
+    const PARTIAL_REPLY: &str = "Looking at the";
+    const GOOD_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    const BAD_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+    /// Refuses with `status` every request that carries the `refused` image,
+    /// or every request at all when `always` is set. With `mid_stream` the
+    /// error comes after a bit of reply, like an error frame in the middle of
+    /// a stream.
+    struct ImageRefusingProvider {
+        status: u16,
+        refused: &'static str,
+        always: bool,
+        mid_stream: bool,
+    }
+
+    impl ImageRefusingProvider {
+        fn refusing(refused: &'static str) -> Self {
+            Self {
+                status: 400,
+                refused,
+                always: false,
+                mid_stream: false,
+            }
+        }
+    }
+
+    impl Provider for ImageRefusingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            events: &'a UnboundedSender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a SessionRef>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            let refused = self.always || carries_image(messages, self.refused);
+            if refused && self.mid_stream {
+                let _ = events.send(ProviderEvent::TextDelta {
+                    text: PARTIAL_REPLY.into(),
+                });
+            }
+            Box::pin(async move {
+                if refused {
+                    Err(AgentError::api(self.status, IMAGE_REFUSED_MESSAGE))
+                } else {
+                    Ok(text_response(StopReason::EndTurn))
+                }
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<maki_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { unimplemented!() })
+        }
+    }
+
+    fn carries_image(messages: &[Message], data: &str) -> bool {
+        messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .any(|b| matches!(b, ContentBlock::Image { source } if *source.data == *data))
+    }
+
+    fn image_input(data: &str) -> AgentInput {
+        AgentInput {
+            images: vec![ImageSource::new(ImageMediaType::Png, data.into())],
+            ..default_input()
+        }
+    }
+
+    #[test_case(400, false, false, true,  true  ; "retries_without_the_image")]
+    #[test_case(400, true,  false, false, true  ; "refused_without_it_gives_it_back")]
+    #[test_case(403, true,  false, false, false ; "forbidden_leaves_it_alone")]
+    #[test_case(400, false, true,  false, false ; "error_mid_reply_leaves_it_alone")]
+    #[tokio::test]
+    async fn refused_body_recovery(
+        status: u16,
+        always: bool,
+        mid_stream: bool,
+        recovers: bool,
+        notices: bool,
+    ) {
+        let mut history = History::new(Vec::new());
+        fit_frame(&mut history, fixed_context(), None, &default_model());
+        let provider = ImageRefusingProvider {
+            status,
+            always,
+            mid_stream,
+            ..ImageRefusingProvider::refusing(BAD_PNG)
+        };
+        let (mut agent, mut event_rx) = make_agent(provider, &mut history);
+
+        let recovered = agent.run(image_input(BAD_PNG)).await.is_ok();
+        drop(agent);
+
+        assert_eq!(recovered, recovers);
+        assert!(
+            carries_image(history.as_slice(), BAD_PNG),
+            "history keeps the pixels"
+        );
+        assert_eq!(
+            has_event(&drain_events(&mut event_rx), |e| matches!(
+                e,
+                AgentEvent::Notice { text } if text.starts_with(IMAGES_WITHHELD)
+            )),
+            notices
+        );
+        let next = adapt_images_for_model(&default_model(), history.as_slice()).await;
+        assert_eq!(
+            carries_image(&next, BAD_PNG),
+            !recovers,
+            "only a recovery keeps the image off the wire"
+        );
+    }
+
+    /// The user pastes a screenshot under a model without vision, then
+    /// switches to one that claims vision but cannot read it. Nothing new is
+    /// left to blame, so the older image takes the blame, but never the one
+    /// this model took before.
+    #[tokio::test]
+    async fn an_older_image_is_blamed_when_nothing_new_is_left() {
+        let text_only = Model {
+            supports_vision_override: Some(false),
+            ..default_model()
+        };
+        let switched = Model {
+            id: SWITCHED_MODEL.into(),
+            ..default_model()
+        };
+        let mut history = History::new(Vec::new());
+        fit_frame(&mut history, fixed_context(), None, &switched);
+        for (model, input) in [
+            (&switched, image_input(GOOD_PNG)),
+            (&text_only, image_input(BAD_PNG)),
+            (&switched, default_input()),
+        ] {
+            let (mut agent, _event_rx) = make_agent_with(
+                Arc::new(ImageRefusingProvider::refusing(BAD_PNG)),
+                model.clone(),
+                &mut history,
+            );
+            assert!(agent.run(input).await.is_ok());
+        }
+
+        let next = adapt_images_for_model(&switched, history.as_slice()).await;
+        assert!(carries_image(&next, GOOD_PNG));
+        assert!(!carries_image(&next, BAD_PNG));
     }
 
     const QUEUED_INPUT: &str = "actually, check the other module first";
@@ -4312,7 +4776,10 @@ mod tests {
             .collect()
     }
 
+    const TYPED: &str = "hello";
     const REWRITTEN: &str = "hello, with the CI log attached";
+    const PREFIXED: &str = "Memories: the user prefers short answers.\n\nhello";
+    const REDACTED: &str = "h[REDACTED]";
     const DROP_REASON: &str = "that prompt is on the blocklist";
     const KEEP_GOING: &str = "The todo list still has open items.";
     const BLOCKED: &str = "blocked";
@@ -4351,6 +4818,32 @@ mod tests {
             steers(&drain_events(&mut event_rx)),
             [(SteerKind::MessageRewritten, REWRITTEN.to_owned())]
         );
+    }
+
+    /// Context a layer wraps around the prompt must not name the session, but
+    /// a prompt it redacted or dropped offers nothing, so the secret it kept
+    /// out can never become the title.
+    #[test_case(|_, _| Verdict::Unchanged, Some(TYPED) ; "unchanged")]
+    #[test_case(|_, _| Verdict::Replaced(json!({ FIELD_TEXT: PREFIXED })), Some(TYPED) ; "prefixed")]
+    #[test_case(|_, _| Verdict::Replaced(json!({ FIELD_TEXT: REWRITTEN })), Some(TYPED) ; "suffixed")]
+    #[test_case(|_, _| Verdict::Replaced(json!({ FIELD_TEXT: REDACTED })), None ; "redacted")]
+    #[test_case(|_, _| Verdict::Denied(DROP_REASON.into()), None ; "denied")]
+    #[tokio::test]
+    async fn title_source_is_the_typed_text_only_when_the_layer_kept_it(
+        answer: fn(AgentSlot, &Value) -> Verdict,
+        expected: Option<&str>,
+    ) {
+        let mut history = History::new(Vec::new());
+        let (mut agent, _event_rx) = make_agent(
+            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+            &mut history,
+        );
+        script(&agent.registry, answer);
+
+        agent.run(default_input()).await.unwrap();
+        drop(agent);
+
+        assert_eq!(history.snapshot().title_source.as_deref(), expected);
     }
 
     /// A cut turn ends on its marker, so a dropped interrupt still leaves
@@ -4415,7 +4908,7 @@ mod tests {
     /// The mock holds one response, so a run that went on anyway would panic
     /// on its second request.
     #[test_case(ExtractedCommand::Interrupt(vec![AgentInput { message: BLOCKED.into(), ..default_input() }]) ; "dropped_interrupt")]
-    #[test_case(ExtractedCommand::Compact(None) ; "skipped_compact")]
+    #[test_case(ExtractedCommand::Compact { instructions: None, reason: CompactReason::Manual } ; "skipped_compact")]
     #[tokio::test]
     async fn queued_command_that_lands_nothing_ends_the_run(cmd: ExtractedCommand) {
         let mut history = History::new(Vec::new());
@@ -4627,10 +5120,563 @@ mod tests {
 
     const POST_COMPACTION: &str = "Re-read plan.md";
 
+    const DEFER_NUDGE: &str = "save your session state before this compaction";
+    const DEFER_SKIPPED_MSG: &str = "a deferred compaction must not compact or announce one";
+
+    fn nudges(messages: &[Message]) -> usize {
+        messages
+            .iter()
+            .filter(|m| m.first_text_content() == Some(DEFER_NUDGE))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn defer_skips_one_ask_and_renews_after_the_compaction() {
+        let mut history = History::new(vec![Message::user("go".into())]);
+        let (mut agent, mut event_rx) = make_agent(
+            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+            &mut history,
+        );
+        script(
+            &agent.registry,
+            answer_only(
+                AgentSlot::CompactBefore,
+                json!({ compaction::FIELD_DEFER: DEFER_NUDGE }),
+            ),
+        );
+
+        agent.compact_now(CompactReason::Auto).await.unwrap();
+        assert!(agent.gauge.defer_used(), "the one defer is spent");
+        assert_eq!(
+            nudges(agent.history.as_slice()),
+            1,
+            "the nudge lands as a message"
+        );
+        let events = drain_events(&mut event_rx);
+        assert!(
+            !has_event(&events, |e| matches!(e, AgentEvent::AutoCompacting { .. })),
+            "{DEFER_SKIPPED_MSG}"
+        );
+        assert_nudge_shown(&events);
+
+        agent.compact_now(CompactReason::Auto).await.unwrap();
+        assert!(
+            has_event(&drain_events(&mut event_rx), |e| matches!(
+                e,
+                AgentEvent::CompactionDone { .. }
+            )),
+            "the next ask compacts, whatever the hook still says"
+        );
+        assert!(
+            !agent.gauge.defer_used(),
+            "the compaction renews the one defer"
+        );
+
+        agent.compact_now(CompactReason::Auto).await.unwrap();
+        assert_eq!(
+            nudges(agent.history.as_slice()),
+            2,
+            "a new crossing buys a new turn"
+        );
+        drop(agent);
+    }
+
+    #[test_case(CompactReason::Manual ; "manual_is_not_deferred")]
+    #[test_case(CompactReason::Overflow ; "overflow_is_not_deferred")]
+    #[tokio::test]
+    async fn defer_only_licenses_auto(reason: CompactReason) {
+        let mut history = History::new(vec![Message::user("go".into())]);
+        let (mut agent, mut event_rx) = make_agent(
+            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+            &mut history,
+        );
+        script(
+            &agent.registry,
+            answer_only(
+                AgentSlot::CompactBefore,
+                json!({ compaction::FIELD_DEFER: DEFER_NUDGE }),
+            ),
+        );
+
+        agent.compact_now(reason).await.unwrap();
+        let events = drain_events(&mut event_rx);
+
+        assert!(
+            has_event(&events, |e| matches!(e, AgentEvent::CompactionDone { .. })),
+            "a {reason:?} compaction does not wait on a defer"
+        );
+        assert_eq!(
+            nudges(agent.history.as_slice()),
+            0,
+            "the ignored nudge stays out"
+        );
+        assert!(!agent.gauge.defer_used(), "an ignored defer is not spent");
+        drop(agent);
+    }
+
+    /// The nudge buys one model turn, not a final answer. When that turn
+    /// saves with a tool, the gate asks again at the top of the loop and
+    /// lands the compaction without asking the model to wrap up first. The
+    /// prompt that triggered the defer stays carried verbatim.
+    #[tokio::test]
+    async fn defer_compacts_after_the_save_turn() {
+        let prior = (0..OVERFLOW_CHUNKS)
+            .map(|i| Message::user(format!("{OVERFLOW_CHUNK}{i}")))
+            .collect();
+        let mut history = History::new(prior);
+        // The save turn, the summary, and the model's turn on the carried save.
+        let (mut agent, mut event_rx) = make_agent(
+            MockProvider::new(vec![
+                tool_call_response("glob", "t1"),
+                summary_response(),
+                text_response(StopReason::EndTurn),
+            ]),
+            &mut history,
+        );
+        agent.model = Arc::new(small_context_model(DEFER_CONTEXT_WINDOW, DEFER_MAX_OUTPUT));
+        *agent.gauge = ContextGauge::restored(DEFER_GAUGE);
+        agent.auto_compact = true;
+        script(
+            &agent.registry,
+            answer_only(
+                AgentSlot::CompactBefore,
+                json!({ compaction::FIELD_DEFER: DEFER_NUDGE }),
+            ),
+        );
+
+        assert_eq!(
+            agent
+                .run(AgentInput {
+                    message: PENDING_PROMPT.into(),
+                    ..default_input()
+                })
+                .await
+                .unwrap(),
+            DoneReason::EndTurn
+        );
+
+        let events = drain_events(&mut event_rx);
+        assert_nudge_shown(&events);
+        assert!(
+            has_event(&events, |e| matches!(e, AgentEvent::CompactionDone { .. })),
+            "the save turn is followed by the compaction"
+        );
+        assert!(
+            !agent.gauge.defer_used(),
+            "the compaction renews the one defer"
+        );
+        let messages = agent.history.as_slice();
+        let summary_at = messages
+            .iter()
+            .position(|m| m.first_text_content() == Some(SUMMARY))
+            .expect("the compaction wrote its summary");
+        let prompt_at = messages
+            .iter()
+            .position(|m| m.first_text_content() == Some(PENDING_PROMPT))
+            .expect(PROMPT_KEPT_MSG);
+        assert!(
+            summary_at < prompt_at,
+            "the prompt that triggered the defer stays carried past the summary"
+        );
+        assert!(
+            messages
+                .last()
+                .is_some_and(|m| matches!(m.role, Role::Assistant)),
+            "the model answered the carried save turn"
+        );
+    }
+
+    /// A run that ends on the nudge's answer has nothing left to save, so it
+    /// ends like any other run: the next request compacts first.
+    #[tokio::test]
+    async fn a_defer_waits_for_the_next_request_when_the_model_answers() {
+        let prior = (0..OVERFLOW_CHUNKS)
+            .map(|i| Message::user(format!("{OVERFLOW_CHUNK}{i}")))
+            .collect();
+        let mut history = History::new(prior);
+        let (mut agent, mut event_rx) = make_agent(
+            MockProvider::new(vec![text_response(StopReason::EndTurn), summary_response()]),
+            &mut history,
+        );
+        agent.model = Arc::new(small_context_model(DEFER_CONTEXT_WINDOW, DEFER_MAX_OUTPUT));
+        *agent.gauge = ContextGauge::restored(DEFER_GAUGE);
+        agent.auto_compact = true;
+        script(
+            &agent.registry,
+            answer_only(
+                AgentSlot::CompactBefore,
+                json!({ compaction::FIELD_DEFER: DEFER_NUDGE }),
+            ),
+        );
+
+        assert_eq!(
+            agent
+                .run(AgentInput {
+                    message: PENDING_PROMPT.into(),
+                    ..default_input()
+                })
+                .await
+                .unwrap(),
+            DoneReason::EndTurn
+        );
+
+        let events = drain_events(&mut event_rx);
+        assert_nudge_shown(&events);
+        assert!(
+            !has_event(&events, |e| matches!(e, AgentEvent::CompactionDone { .. })),
+            "the run does not compact after its own answer"
+        );
+        assert!(agent.gauge.defer_used(), "the defer is still owed");
+
+        agent.try_auto_compact().await.unwrap();
+        assert!(
+            has_event(&drain_events(&mut event_rx), |e| matches!(
+                e,
+                AgentEvent::CompactionDone { .. }
+            )),
+            "the next request compacts first"
+        );
+    }
+
+    /// A defer owed from a finished run lands on the next run's first request.
+    /// That run already answered its prompt, so the compaction summarizes the
+    /// transcript instead of carrying all of it.
+    #[tokio::test]
+    async fn a_defer_owed_from_a_finished_run_lands_without_carrying_it() {
+        let prior = (0..OVERFLOW_CHUNKS)
+            .map(|i| Message::user(format!("{OVERFLOW_CHUNK}{i}")))
+            .collect();
+        let mut history = History::new(prior);
+        let mut gauge = ContextGauge::restored(DEFER_GAUGE);
+        let provider: Arc<dyn Provider> = Arc::new(MockProvider::new(vec![
+            text_response(StopReason::EndTurn),
+            summary_response(),
+            text_response(StopReason::EndTurn),
+        ]));
+        let model = small_context_model(DEFER_CONTEXT_WINDOW, DEFER_MAX_OUTPUT);
+
+        let (mut agent, _event_rx) = make_agent_with_gauge(
+            Arc::clone(&provider),
+            model.clone(),
+            &mut history,
+            &mut gauge,
+        );
+        agent.auto_compact = true;
+        script(
+            &agent.registry,
+            answer_only(
+                AgentSlot::CompactBefore,
+                json!({ compaction::FIELD_DEFER: DEFER_NUDGE }),
+            ),
+        );
+        agent
+            .run(AgentInput {
+                message: PENDING_PROMPT.into(),
+                ..default_input()
+            })
+            .await
+            .unwrap();
+        assert!(agent.gauge.defer_used(), "the defer is still owed");
+        drop(agent);
+
+        let (mut agent, mut event_rx) =
+            make_agent_with_gauge(provider, model, &mut history, &mut gauge);
+        agent.auto_compact = true;
+        script(
+            &agent.registry,
+            answer_only(
+                AgentSlot::CompactBefore,
+                json!({ compaction::FIELD_DEFER: DEFER_NUDGE }),
+            ),
+        );
+        agent
+            .run(AgentInput {
+                message: NEXT_PROMPT.into(),
+                ..default_input()
+            })
+            .await
+            .unwrap();
+        drop(agent);
+
+        let events = drain_events(&mut event_rx);
+        assert!(
+            has_event(&events, |e| matches!(e, AgentEvent::CompactionDone { .. })),
+            "the owed defer lands on the next run"
+        );
+        let messages = history.as_slice();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.first_text_content() == Some(SUMMARY)),
+            "the finished run's transcript is summarized"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.first_text_content() == Some(PENDING_PROMPT)),
+            "a finished run already answered its prompt, so it is not carried"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.first_text_content() == Some(NEXT_PROMPT)),
+            "the new run's prompt is carried"
+        );
+    }
+
+    /// A defer mid-run has no unanswered input to protect, so the save turn
+    /// counts as answered and the compaction still tells the model to go on.
+    #[tokio::test]
+    async fn a_mid_run_defer_compacts_with_the_continue_message() {
+        let mut crossing = tool_call_response("glob", "t1");
+        crossing.usage.input = u64::from(DEFER_GAUGE);
+        let mut history = History::new(Vec::new());
+        let (mut agent, mut event_rx) = make_agent(
+            MockProvider::new(vec![
+                crossing,
+                tool_call_response("glob", "t2"),
+                summary_response(),
+                text_response(StopReason::EndTurn),
+            ]),
+            &mut history,
+        );
+        agent.model = Arc::new(small_context_model(DEFER_CONTEXT_WINDOW, DEFER_MAX_OUTPUT));
+        agent.auto_compact = true;
+        script(
+            &agent.registry,
+            answer_only(
+                AgentSlot::CompactBefore,
+                json!({ compaction::FIELD_DEFER: DEFER_NUDGE }),
+            ),
+        );
+
+        agent
+            .run(AgentInput {
+                message: PENDING_PROMPT.into(),
+                ..default_input()
+            })
+            .await
+            .unwrap();
+
+        let events = drain_events(&mut event_rx);
+        assert_nudge_shown(&events);
+        assert!(
+            has_event(&events, |e| matches!(e, AgentEvent::CompactionDone { .. })),
+            "the save turn is followed by the compaction"
+        );
+        assert_eq!(
+            nudges(agent.history.as_slice()),
+            0,
+            "nothing pins the nudge past the save turn"
+        );
+        let continue_text = compaction::continue_message(None);
+        assert!(
+            agent
+                .history
+                .as_slice()
+                .iter()
+                .any(|m| m.first_text_content() == Some(continue_text.as_str())),
+            "the model is told to go on after the compaction"
+        );
+    }
+
+    /// A skip on the ask after the save turn must not keep the pin for the
+    /// rest of the run, or an overflow compaction frees nothing.
+    #[tokio::test]
+    async fn a_skip_after_the_save_turn_releases_the_pin() {
+        let prior = (0..OVERFLOW_CHUNKS)
+            .map(|i| Message::user(format!("{OVERFLOW_CHUNK}{i}")))
+            .collect();
+        let mut history = History::new(prior);
+        let (mut agent, mut event_rx) = make_agent(
+            MockProvider::new(vec![
+                tool_call_response("glob", "t1"),
+                tool_call_response("glob", "t2"),
+                summary_response(),
+                text_response(StopReason::EndTurn),
+            ]),
+            &mut history,
+        );
+        agent.model = Arc::new(small_context_model(DEFER_CONTEXT_WINDOW, DEFER_MAX_OUTPUT));
+        *agent.gauge = ContextGauge::restored(DEFER_GAUGE);
+        agent.auto_compact = true;
+        let asks = AtomicU32::new(0);
+        script(&agent.registry, move |slot, _| {
+            if slot != AgentSlot::CompactBefore {
+                return Verdict::Unchanged;
+            }
+            match asks.fetch_add(1, Ordering::SeqCst) {
+                0 => Verdict::Replaced(json!({ compaction::FIELD_DEFER: DEFER_NUDGE })),
+                1 => Verdict::Replaced(json!({ compaction::FIELD_SKIP: true })),
+                _ => Verdict::Unchanged,
+            }
+        });
+
+        agent
+            .run(AgentInput {
+                message: PENDING_PROMPT.into(),
+                ..default_input()
+            })
+            .await
+            .unwrap();
+
+        let events = drain_events(&mut event_rx);
+        assert_nudge_shown(&events);
+        assert!(
+            has_event(&events, |e| matches!(e, AgentEvent::CompactionDone { .. })),
+            "the ask after the skip compacts"
+        );
+        assert!(
+            !agent
+                .history
+                .as_slice()
+                .iter()
+                .any(|m| m.first_text_content() == Some(PENDING_PROMPT)),
+            "the skip releases the pin, so the prompt is summarized"
+        );
+        let continue_text = compaction::continue_message(None);
+        assert!(
+            agent
+                .history
+                .as_slice()
+                .iter()
+                .any(|m| m.first_text_content() == Some(continue_text.as_str())),
+            "the compaction tells the model to go on"
+        );
+    }
+
+    /// A defer needs room for the turn that saves before it: past
+    /// `context_window - min_output` it is refused and the compaction lands.
+    #[tokio::test]
+    async fn a_defer_with_no_room_for_the_turn_is_refused() {
+        let mut history = History::new(vec![Message::user("go".into())]);
+        let (mut agent, mut event_rx) =
+            make_agent(MockProvider::new(vec![summary_response()]), &mut history);
+        agent.model = Arc::new(small_context_model(TINY_CONTEXT_WINDOW, TINY_MAX_OUTPUT));
+        *agent.gauge = ContextGauge::restored(TINY_CONTEXT_WINDOW);
+        script(
+            &agent.registry,
+            answer_only(
+                AgentSlot::CompactBefore,
+                json!({ compaction::FIELD_DEFER: DEFER_NUDGE }),
+            ),
+        );
+
+        agent.compact_now(CompactReason::Auto).await.unwrap();
+
+        assert_eq!(nudges(agent.history.as_slice()), 0, "no room, no nudge");
+        assert!(!agent.gauge.defer_used(), "the refused defer is not spent");
+        assert!(
+            has_event(&drain_events(&mut event_rx), |e| matches!(
+                e,
+                AgentEvent::CompactionDone { .. }
+            )),
+            "the compaction lands at once"
+        );
+    }
+
+    /// A task child runs the same gate, so a defer works there too.
+    #[tokio::test]
+    async fn a_subagent_run_can_defer() {
+        let mut history = History::new(vec![Message::user("go".into())]);
+        let (mut agent, _event_rx) = make_agent(
+            MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+            &mut history,
+        );
+        *agent.gauge = ContextGauge::restored(DEFER_GAUGE);
+        agent.model = Arc::new(small_context_model(DEFER_CONTEXT_WINDOW, DEFER_MAX_OUTPUT));
+        agent.task_id = Some(Arc::from("toolu_sub"));
+        script(
+            &agent.registry,
+            answer_only(
+                AgentSlot::CompactBefore,
+                json!({ compaction::FIELD_DEFER: DEFER_NUDGE }),
+            ),
+        );
+
+        agent.try_auto_compact().await.unwrap();
+        assert!(agent.gauge.defer_used());
+        assert_eq!(nudges(agent.history.as_slice()), 1);
+        drop(agent);
+    }
+
+    /// Above whatever `usable` the tiny model computes: the provider's own
+    /// count is what pushes a gauge over the threshold after a final answer;
+    /// a byte estimate of a mock response never reaches it.
+    const CLOSING_CROSSING_TOKENS: u64 = 2_000;
+
+    /// The provider's own count can cross the threshold only after the
+    /// final answer. With no plugin installed the run must end right
+    /// there: no reply nobody asked for, and the compaction waits for the
+    /// next request.
+    #[tokio::test]
+    async fn a_closing_crossing_waits_for_the_next_request() {
+        let mut history = History::new(vec![Message::user("go".into())]);
+        let mut crossing = text_response(StopReason::EndTurn);
+        crossing.usage.input = CLOSING_CROSSING_TOKENS;
+        // The answer crosses the threshold; the summary is for the next
+        // request only.
+        let (mut agent, mut event_rx) = make_agent(
+            MockProvider::new(vec![crossing, text_response(StopReason::EndTurn)]),
+            &mut history,
+        );
+        agent.model = Arc::new(small_context_model(TINY_CONTEXT_WINDOW, TINY_MAX_OUTPUT));
+        agent.auto_compact = true;
+
+        assert_eq!(
+            agent
+                .run(AgentInput {
+                    message: PENDING_PROMPT.into(),
+                    ..default_input()
+                })
+                .await
+                .unwrap(),
+            DoneReason::EndTurn
+        );
+
+        let events = drain_events(&mut event_rx);
+        assert!(
+            steers(&events).is_empty(),
+            "a plugin-less run announces nothing"
+        );
+        assert!(
+            !has_event(&events, |e| matches!(e, AgentEvent::CompactionDone { .. })),
+            "the run does not compact after its own answer"
+        );
+        let messages = agent.history.as_slice();
+        assert!(
+            matches!(messages[messages.len() - 1].role, Role::Assistant),
+            "the real answer is the last message"
+        );
+
+        agent.try_auto_compact().await.unwrap();
+        let events = drain_events(&mut event_rx);
+        assert!(
+            has_event(&events, |e| matches!(e, AgentEvent::CompactionDone { .. })),
+            "the next request compacts first"
+        );
+    }
+
+    fn assert_nudge_shown(events: &[Envelope]) {
+        assert_eq!(
+            steers(events),
+            [(SteerKind::CompactDeferred, DEFER_NUDGE.to_owned())],
+            "the nudge shows as it lands"
+        );
+    }
+
+    fn assert_words_shown(events: &[Envelope]) {
+        assert_eq!(
+            steers(events),
+            [(SteerKind::CompactContinued, KEEP_GOING.to_owned())],
+            "the layer's words show apart from the host's own nudge"
+        );
+    }
+
     #[tokio::test]
     async fn compact_before_continue_follows_the_configured_instructions() {
         let mut history = History::new(vec![Message::user("go".into())]);
-        let (mut agent, _event_rx) = make_agent(
+        let (mut agent, mut event_rx) = make_agent(
             MockProvider::new(vec![text_response(StopReason::EndTurn)]),
             &mut history,
         );
@@ -4645,6 +5691,7 @@ mod tests {
         );
 
         agent.compact_now(CompactReason::Auto).await.unwrap();
+        assert_words_shown(&drain_events(&mut event_rx));
         drop(agent);
 
         let last = history
@@ -4671,7 +5718,7 @@ mod tests {
             Message::user("go".into()),
             Message::user(CARRIED.into()),
         ]);
-        let (mut agent, _event_rx) = make_agent(
+        let (mut agent, mut event_rx) = make_agent(
             MockProvider::new(vec![text_response(StopReason::EndTurn)]),
             &mut history,
         );
@@ -4685,6 +5732,7 @@ mod tests {
         );
 
         agent.compact_now(CompactReason::Auto).await.unwrap();
+        assert_words_shown(&drain_events(&mut event_rx));
         drop(agent);
 
         let tail: Vec<_> = history.as_slice()[2..]
