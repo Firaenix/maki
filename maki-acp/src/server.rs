@@ -36,7 +36,8 @@ use maki_agent::{
 use maki_config::project::{self, TrustAnswer, TrustMode, policy_grant};
 use maki_config::{MAX_SERVER_NAME_LEN, ModelPolicy, ProjectConfig, TrustConfig};
 use maki_providers::model::Model;
-use maki_providers::provider::{available_model_specs, fetch_all_models};
+use maki_providers::models_cache::{cached_model_specs, fetch_all_models_cached};
+use maki_providers::provider::available_model_specs;
 use maki_providers::settle_session;
 use maki_storage::StateDir;
 use maki_storage::id::{MakiId, SessionRef};
@@ -212,7 +213,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
     let relay = Relay::new(child_env, out_tx.clone(), relay_sink(in_tx.downgrade()));
     let mut server = Server {
         out_tx,
-        model_specs: available_model_specs(&stack.model_policy),
+        model_specs: seed_model_specs(&stack.model_policy).await,
         client_elicits_form: false,
         sessions: Sessions::new(),
         closing: HashMap::new(),
@@ -271,17 +272,27 @@ fn relay_sink(tx: WeakUnboundedSender<Incoming>) -> EventSink {
 /// should not wait behind it.
 fn discover_models(policy: Arc<ModelPolicy>, tx: WeakUnboundedSender<Incoming>) {
     tokio::spawn(async move {
-        fetch_all_models(
-            &policy,
-            |batch| {
-                if let Some(tx) = tx.upgrade() {
-                    let _ = tx.send(Incoming::Models(batch.models));
-                }
-            },
-            None,
-        )
+        fetch_all_models_cached(&policy, |list, _| {
+            if let Some(tx) = tx.upgrade() {
+                let _ = tx.send(Incoming::Models(list.specs));
+            }
+        })
         .await;
     });
+}
+
+/// The registry's offline list plus whatever discovery cached on disk last run.
+/// An ACP client snapshots the model selector straight after `session/new`, so
+/// discovered providers have to be in that first list rather than arrive as a
+/// config update the client has already read past.
+async fn seed_model_specs(policy: &ModelPolicy) -> Vec<String> {
+    let mut specs = available_model_specs(policy);
+    for spec in cached_model_specs(policy).await {
+        if !specs.contains(&spec) {
+            specs.push(spec);
+        }
+    }
+    specs
 }
 
 /// Discovery lands in batches after the client built its selector from the

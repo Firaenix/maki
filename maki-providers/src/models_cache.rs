@@ -242,6 +242,25 @@ async fn store_discovery(path: PathBuf, listing: &Listing, fingerprint: String, 
     blocking(move || store_at(&path, &cache)).await;
 }
 
+/// The specs the last successful discovery left on disk, filtered by `policy`.
+/// A front end that reads the model selector before the network round trip -
+/// an ACP client probing `session/new` - needs this to offer discovered
+/// providers at all, since `available_model_specs` only knows declared manifests.
+pub async fn cached_model_specs(policy: &ModelPolicy) -> Vec<String> {
+    let Some(path) = cache_path() else {
+        return Vec::new();
+    };
+    let fingerprint =
+        blocking(|| fingerprint(build_registry().iter().map(|(spec, _)| spec.slug))).await;
+    replay(
+        &path,
+        policy,
+        &fingerprint,
+        maki_storage::auth::now_millis(),
+    )
+    .await
+}
+
 /// Like [`fetch_all_models`](crate::provider::fetch_all_models), but the
 /// first `on_update` comes straight from the on-disk cache. Every call carries
 /// the whole list to show, not a delta, plus the warning of the batch that
